@@ -438,8 +438,13 @@ unimplemented future stage.
   `sealed_not_submitted` is the only durable release proof; `absent`/`intent`
   are transient routing evidence. Every pre-flight refusal happens before
   `submitted`, so an operation PVE was always going to reject never enters the
-  permanently uncertain window. Combining rollback into the snapshot helper was
-  considered and rejected: keeping create and rollback in separate
+  permanently uncertain window: that includes **any** non-empty PVE config
+  lock (upstream `check_lock` dies on a truthy lock of any type, not just the
+  snapshot family) and a final **ownership** proof of the target snapshot from
+  the host's own fresh listing -- a snapshot name is a physical PVE key and is
+  never ownership proof, and PVE state can change between authority's arming
+  proof and the destructive call. Combining rollback into the snapshot helper
+  was considered and rejected: keeping create and rollback in separate
   forced-command boundaries means one deployed key never carries both.
 - **Completion is proven, never assumed:** `rollback_completed` requires the
   coherent set -- a terminal non-error PVE task by PVE's own rule, the durable

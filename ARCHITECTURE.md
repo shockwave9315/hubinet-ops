@@ -1638,10 +1638,35 @@ durable"), and complete-write journal semantics. `submitted` is fsynced before
 `pvesh create` runs and is never resubmitted from; `sealed_not_submitted` is
 the only durable release proof; `absent`/`intent` are transient routing
 evidence that report `uncertain`, never `not_submitted`. Every pre-flight
-refusal — a wrong live target, an in-flight config lock, a missing or
-incomplete target snapshot — happens *before* the journal reaches `submitted`,
-so an operation PVE was always going to reject never enters the permanently
-uncertain window.
+refusal — a wrong live target, **any** config lock, a missing, incomplete, or
+no-longer-job-owned target snapshot — happens *before* the journal reaches
+`submitted`, so an operation PVE was always going to reject never enters the
+permanently uncertain window.
+
+Two of those refusals are worth stating exactly, because a narrower version of
+each would be wrong:
+
+- **Any config lock refuses, not a curated list.** Upstream
+  `PVE::AbstractConfig::check_lock` dies whenever `$conf->{lock}` is truthy; it
+  does not accept `backup`, `migrate`, or any other lock type. Treating only
+  the snapshot-family locks as blockers would let a legitimately locked
+  container reach the durable `submitted` record, after which PVE refuses the
+  rollback and the operation can no longer be sealed or retried — the job
+  would hold the one global destructive slot for a refusal that was observable
+  beforehand.
+- **The final proof is ownership, never the name.** A snapshot name is a
+  physical PVE key and is never ownership proof. Authority proves the strict
+  structured metadata when it arms the rollback, but PVE state can change
+  between that proof and the destructive call: the same name can come to exist
+  carrying absent, malformed, foreign, or another job's metadata. So the host
+  re-proves ownership from its OWN fresh listing immediately before
+  `submitted`, against the `expected_snapshot_ownership` the request carries —
+  derived by the same `_snapshot_ownership_in_transaction` the arming
+  transaction uses, bound into the request fingerprint, and never chooseable by
+  a caller. It parses the description through the same strict protocol the
+  snapshot helper writes, and fails closed on malformed Hubinet-looking
+  metadata, on a second entry claiming this job under another name, and on any
+  mismatch.
 
 **`submitted` without a UPID never recovers into success**, which is a
 deliberate difference from the snapshot helper. A snapshot's existence with

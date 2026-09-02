@@ -3404,12 +3404,22 @@ class InventoryAuthority:
         durable job. The snapshot half comes from the job's OWN confirmed
         snapshot columns -- there is deliberately no parameter through which a
         caller could name a different snapshot.
+
+        ``expected_snapshot_ownership`` is derived here through the SAME
+        :meth:`_snapshot_ownership_in_transaction` the arming transaction and
+        confirmation already use, so there is exactly one derivation of a
+        job's snapshot ownership in this codebase. The host re-proves it
+        against its own fresh canonical listing immediately before the
+        destructive call, because a snapshot NAME is never ownership proof.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             identity = self._rollback_identity_in_transaction(connection, job)
+            expected_ownership = self._snapshot_ownership_in_transaction(
+                connection, job
+            )
             backend_instance_id = str(
                 connection.execute(
                     "SELECT backend_instance_id FROM backend_instance"
@@ -3429,6 +3439,7 @@ class InventoryAuthority:
                 expected_node=str(job["expected_node_name"]),
                 snapshot_name=str(job["snapshot_name"]),
                 snapshot_operation_id=str(job["snapshot_operation_id"]),
+                expected_snapshot_ownership=expected_ownership,
             )
 
     @staticmethod

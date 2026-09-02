@@ -33,6 +33,7 @@ from app.inventory import (
     MAX_ROLLBACK_SUBMISSION_TIMEOUT_SECONDS,
     ObservedSnapshot,
     PackageUpdateRollbackRequest,
+    SnapshotOwnership,
 )
 from app.package_scan_host_control import (
     BoundedProcessResult,
@@ -224,6 +225,9 @@ class SshPackageUpdateRollbackHostControl:
             value = getattr(request, field)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{field} must be a positive integer")
+        expected_ownership = request.expected_snapshot_ownership
+        if not isinstance(expected_ownership, SnapshotOwnership):
+            raise ValueError("expected snapshot ownership metadata is required")
 
         payload = {
             "request_version": 1,
@@ -236,6 +240,22 @@ class SshPackageUpdateRollbackHostControl:
                 "rollback_operation_id": request.rollback_operation_id,
                 "snapshot_name": request.snapshot_name,
                 "snapshot_operation_id": request.snapshot_operation_id,
+            },
+            # The strict structured ownership the target snapshot MUST carry
+            # in its PVE description. A snapshot name is a physical PVE key
+            # and never ownership proof, so the host re-proves this against
+            # its own fresh listing immediately before the destructive call.
+            # Authority-derived; no caller can choose it.
+            "expected_snapshot_ownership": {
+                "protocol": expected_ownership.protocol,
+                "kind": expected_ownership.kind,
+                "job_id": expected_ownership.job_id,
+                "resource_id": expected_ownership.resource_id,
+                "resource_continuity_revision": (
+                    expected_ownership.resource_continuity_revision
+                ),
+                "inventory_source_id": expected_ownership.inventory_source_id,
+                "backend_instance_id": expected_ownership.backend_instance_id,
             },
             # Typed fields only. The helper rebuilds its own request
             # fingerprint from these, so no free text crosses this boundary

@@ -33,6 +33,12 @@ Scope is deliberately minimal:
 - **No snapshot create, no snapshot delete, no lifecycle control.**
 - `start` is pinned to 0 by this file, never by the request. A successful
   rollback always leaves the guest stopped.
+- The final preflight proves the target snapshot's strict structured
+  OWNERSHIP metadata from a fresh listing, never merely its name. A snapshot
+  name is a physical PVE key; the description metadata is the ownership
+  proof. Authority proves this when it arms the rollback, but PVE state can
+  change afterwards, and this file runs closest in time to the real `pvesh`
+  call.
 
 `submit_same_job_rollback` is submission-only: it never polls the PVE task to
 completion. It journals the submission, invokes `pvesh create` at most once,
@@ -117,6 +123,14 @@ product's threat model (see `AGENTS.md`).
 - `PVE::LXC::Config::__snapshot_rollback_vm_stop` is
   `PVE::LXC::vm_stop($vmid, 1)` -- a forced stop -- so a running guest is
   stopped as part of the rollback.
+- `PVE::AbstractConfig::check_lock` dies whenever `$conf->{lock}` is truthy.
+  It does not accept `backup`, `migrate`, or any other lock type, so ANY
+  non-empty config lock is refused here before the `submitted` boundary
+  rather than after it.
+- a snapshot description carries this product's strict structured ownership
+  metadata, and PVE's LXC config parser appends a newline to every
+  description line it reads back, so the marker is parsed with normalised
+  line framing.
 - `GET /nodes/{node}/tasks/{upid}/status` gives `status` in
   `running`/`stopped` plus an optional `exitstatus`; PVE's own rule treats
   `OK` and `WARNINGS: <n>` as non-errors.
@@ -168,8 +182,25 @@ UPID_RE = re.compile(
     r":[^:\s/]+:[^:\s/]*:[^:\s/]+:"
 )
 
-#: Container config locks that prove some PVE operation is still in flight.
-_IN_FLIGHT_LOCKS = frozenset({"snapshot", "snapshot-delete", "rollback"})
+#: The snapshot ownership protocol, identical to the one the snapshot helper
+#: writes and `app/inventory/snapshot_identity.py` defines. This file parses
+#: it independently because each dark helper is standalone on the PVE host
+#: and imports nothing from the backend; the FORMAT is shared, not invented
+#: a second time.
+SNAPSHOT_METADATA_PROTOCOL = 1
+SNAPSHOT_METADATA_MARKER = "hubinet-ops-snapshot-v1"
+#: Any description containing this token CLAIMS to be Hubinet's. One that
+#: claims it but will not parse strictly is reported as malformed and fails
+#: closed, so ownership can never be silently ambiguous.
+SNAPSHOT_METADATA_TOKEN = "hubinet-ops-snapshot"
+SNAPSHOT_KIND_PRE_UPDATE = "pre_update"
+_OWNERSHIP_FIELDS = (
+    "job_id",
+    "resource_id",
+    "resource_continuity_revision",
+    "inventory_source_id",
+    "backend_instance_id",
+)
 
 #: PVE's `start` parameter for the rollback endpoint, pinned here as this
 #: file's own constant. It is deliberately NOT reachable from the request:
@@ -322,6 +353,75 @@ def _positive_integer(value: Any, field: str) -> int:
     return value
 
 
+def parse_snapshot_ownership(payload: Any, what: str) -> dict[str, Any]:
+    """Strictly validate one structured snapshot-ownership record.
+
+    Shared by the request validator and the PVE description parser, so the
+    request's expected ownership and the ownership actually observed on the
+    guest are held to exactly the same grammar. Anything else fails closed.
+    """
+
+    expected = {"protocol", "kind", *_OWNERSHIP_FIELDS}
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise RequestError(f"{what} does not have the exact expected shape")
+    if payload["protocol"] != SNAPSHOT_METADATA_PROTOCOL:
+        raise RequestError(f"{what} protocol is unsupported")
+    if payload["kind"] != SNAPSHOT_KIND_PRE_UPDATE:
+        raise RequestError(f"{what} kind is not pre-update")
+    for field in (
+        "job_id",
+        "resource_id",
+        "inventory_source_id",
+        "backend_instance_id",
+    ):
+        _canonical_uuid(payload[field], field)
+    _positive_integer(
+        payload["resource_continuity_revision"], "resource_continuity_revision"
+    )
+    return {
+        "protocol": SNAPSHOT_METADATA_PROTOCOL,
+        "kind": SNAPSHOT_KIND_PRE_UPDATE,
+        **{field: payload[field] for field in _OWNERSHIP_FIELDS},
+    }
+
+
+def parse_snapshot_description(description: Any) -> dict[str, Any] | None:
+    """Strictly parse Hubinet ownership metadata out of a PVE description.
+
+    Returns ``None`` for a description that makes no Hubinet claim at all -- a
+    foreign or manual snapshot. Raises :class:`RequestError` when it *does*
+    look like a Hubinet snapshot but does not parse into exactly one
+    well-formed claim, so a caller fails closed rather than silently skipping
+    it.
+
+    PVE's LXC config parser appends a newline to every description line it
+    reads back, so a description never round-trips byte-identically; this
+    normalises line framing before applying its strict checks, exactly as the
+    snapshot helper and `app/inventory/snapshot_identity.py` do.
+    """
+
+    if (
+        not isinstance(description, str)
+        or SNAPSHOT_METADATA_TOKEN not in description
+    ):
+        return None
+    marker_lines = [
+        line.strip()
+        for line in description.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if line.strip().startswith(SNAPSHOT_METADATA_MARKER)
+    ]
+    if len(marker_lines) != 1:
+        raise RequestError("snapshot metadata is not exactly one marker line")
+    remainder = marker_lines[0][len(SNAPSHOT_METADATA_MARKER):]
+    if not remainder.startswith(" "):
+        raise RequestError("snapshot marker line is malformed")
+    try:
+        payload = json.loads(remainder.strip())
+    except ValueError as exc:
+        raise RequestError("snapshot metadata is not valid JSON") from exc
+    return parse_snapshot_ownership(payload, "snapshot metadata")
+
+
 def parse_request(payload: Any) -> dict[str, Any]:
     """Validate one typed rollback request strictly, or refuse it."""
 
@@ -333,6 +433,7 @@ def parse_request(payload: Any) -> dict[str, Any]:
         "target",
         "operation_identity",
         "ownership",
+        "expected_snapshot_ownership",
     }:
         raise RequestError("request does not have the exact expected shape")
     if payload["request_version"] != 1:
@@ -398,6 +499,26 @@ def parse_request(payload: Any) -> dict[str, Any]:
             ownership["backend_instance_id"], "backend_instance_id"
         ),
     }
+    expected_snapshot_ownership = parse_snapshot_ownership(
+        payload["expected_snapshot_ownership"], "expected_snapshot_ownership"
+    )
+    # The expected ownership must belong to the SAME job and resource
+    # incarnation the operation itself does. A request that expects some
+    # other job's snapshot metadata is incoherent on its face and is refused
+    # before any PVE state is read.
+    if (
+        expected_snapshot_ownership["job_id"] != parsed_ownership["job_id"]
+        or expected_snapshot_ownership["resource_id"]
+        != parsed_ownership["resource_id"]
+        or expected_snapshot_ownership["resource_continuity_revision"]
+        != parsed_ownership["resource_continuity_revision"]
+        or expected_snapshot_ownership["backend_instance_id"]
+        != parsed_ownership["backend_instance_id"]
+    ):
+        raise RequestError(
+            "expected_snapshot_ownership does not describe this operation's "
+            "own job and resource incarnation"
+        )
     return {
         "operation": operation,
         "vmid": vmid,
@@ -406,6 +527,7 @@ def parse_request(payload: Any) -> dict[str, Any]:
         "snapshot_operation_id": snapshot_operation_id,
         "snapshot_name": snapshot_name,
         "ownership": parsed_ownership,
+        "expected_snapshot_ownership": expected_snapshot_ownership,
     }
 
 
@@ -425,6 +547,12 @@ def request_fingerprint(request: Mapping[str, Any]) -> str:
                 "vmid": request["vmid"],
                 "expected_node": request["expected_node"],
                 "ownership": dict(request["ownership"]),
+                # Bound in, so an operation journaled against one expected
+                # snapshot ownership can never be reused by a request that
+                # expects different ownership.
+                "expected_snapshot_ownership": dict(
+                    request["expected_snapshot_ownership"]
+                ),
                 "start": ROLLBACK_START_AFTER,
             }
         ).encode("ascii")
@@ -757,7 +885,16 @@ def revalidate_live_target(runner: Runner, vmid: int, expected_node: str) -> Non
 
 
 def read_config_lock(runner: Runner, vmid: int, expected_node: str) -> str | None:
-    """Return the container's current config `lock`, if any."""
+    """Return the container's current config `lock`, if any.
+
+    ``None`` means the config carries no ``lock`` key at all -- the only
+    state in which upstream `check_lock` permits a rollback. Every other
+    outcome is returned or raised rather than normalised away: a non-string
+    lock is malformed and fails closed, and an empty string is returned as-is
+    so the caller refuses it too. PVE's own config parser does not emit an
+    empty lock, so treating one as "unlocked" would be inventing permissive
+    semantics for a state that should never occur.
+    """
 
     config = _json_command(
         runner,
@@ -854,31 +991,91 @@ def _task_is_terminal_success(status: Mapping[str, Any]) -> bool | None:
 
 
 def _require_target_snapshot_is_rollbackable(
-    snapshots: list[dict[str, Any]], snapshot_name: str
+    snapshots: list[dict[str, Any]],
+    snapshot_name: str,
+    expected_ownership: Mapping[str, Any],
 ) -> None:
-    """Refuse before submission unless PVE itself would accept the target.
+    """Prove, from ONE fresh listing, that this exact snapshot may be rolled to.
 
-    Upstream `snapshot_rollback` dies on a missing snapshot and on one still
-    carrying `snapstate`. Checking here means those refusals happen BEFORE the
-    journal reaches `submitted`, so an operation PVE was always going to
-    reject never enters the permanently-uncertain window.
+    Two independent things are proved here, and both must hold before the
+    journal may reach `submitted`:
+
+    1. **PVE would accept the operation.** Upstream `snapshot_rollback` dies
+       on a missing snapshot and on one still carrying `snapstate`. Refusing
+       here means an operation PVE was always going to reject never enters
+       the permanently-uncertain window.
+
+    2. **The snapshot is still this job's own.** A snapshot NAME is a
+       physical PVE key and is NEVER ownership proof -- the strict structured
+       metadata in its description is. Authority proved that when it armed
+       the rollback, but PVE state can change afterwards: the same name can
+       come to exist carrying absent, malformed, foreign, or another job's
+       metadata. Because this check runs on the host, from the listing
+       closest in time to the real `pvesh` call, it closes that window rather
+       than trusting a proof taken earlier.
+
+    Ambiguity is never resolved in the operation's favour. A Hubinet-looking
+    description that will not parse, a second entry claiming this same job
+    under a different name, and a duplicate of the target name all fail
+    closed, exactly as the backend's own
+    `_require_exactly_one_job_owned_snapshot` does.
     """
 
-    matches = [
-        row
-        for row in snapshots
-        if row.get("name") == snapshot_name and row.get("name") != "current"
-    ]
+    matches: list[dict[str, Any]] = []
+    for row in snapshots:
+        name = row.get("name")
+        if name == "current":
+            continue
+        try:
+            ownership = parse_snapshot_description(row.get("description", ""))
+        except RequestError as exc:
+            # Looks like Hubinet metadata but does not parse. If it is the
+            # target itself this is fatal; if it is some OTHER entry it
+            # cannot be attributed, so it cannot be ruled out as a second
+            # claim on this job either.
+            raise RollbackError(
+                "snapshot_ownership_malformed",
+                "canonical PVE state contains malformed Hubinet snapshot "
+                "metadata; job-owned snapshot ownership is ambiguous",
+                submission="not_submitted",
+            ) from exc
+        claims_this_job = (
+            ownership is not None
+            and ownership["job_id"] == expected_ownership["job_id"]
+        )
+        if name != snapshot_name:
+            if claims_this_job:
+                raise RollbackError(
+                    "snapshot_ownership_ambiguous",
+                    "another snapshot claims this job under a different name",
+                    submission="not_submitted",
+                )
+            continue
+        if row.get("snapstate"):
+            raise RollbackError(
+                "snapshot_incomplete",
+                "the target snapshot is incomplete and PVE would refuse to "
+                "roll back",
+                submission="not_submitted",
+            )
+        if ownership is None:
+            raise RollbackError(
+                "snapshot_ownership_absent",
+                "the target snapshot carries no Hubinet ownership metadata",
+                submission="not_submitted",
+            )
+        if ownership != dict(expected_ownership):
+            raise RollbackError(
+                "snapshot_ownership_mismatch",
+                "the target snapshot does not carry this job's exact "
+                "ownership metadata",
+                submission="not_submitted",
+            )
+        matches.append(row)
     if len(matches) != 1:
         raise RollbackError(
             "snapshot_absent",
             "canonical PVE state does not contain exactly this job's snapshot",
-            submission="not_submitted",
-        )
-    if matches[0].get("snapstate"):
-        raise RollbackError(
-            "snapshot_incomplete",
-            "the target snapshot is incomplete and PVE would refuse to roll back",
             submission="not_submitted",
         )
 
@@ -1144,17 +1341,31 @@ def submit_same_job_rollback(
         # refusal here leaves the operation releasable rather than
         # permanently uncertain.
         revalidate_live_target(runner, request["vmid"], request["expected_node"])
+        # ANY config lock refuses, not a curated list of "interesting" ones.
+        # Upstream `PVE::AbstractConfig::check_lock` dies whenever
+        # `$conf->{lock}` is truthy -- it does not accept `backup`,
+        # `migrate`, or any other lock type. Treating only snapshot-family
+        # locks as blockers let a legitimately locked container reach the
+        # durable `submitted` record, after which PVE refuses the rollback
+        # and the operation can no longer be sealed or retried: the job would
+        # hold the one global destructive slot for a refusal that was
+        # observable beforehand.
         lock = read_config_lock(runner, request["vmid"], request["expected_node"])
-        if lock is not None and lock in _IN_FLIGHT_LOCKS:
+        if lock is not None:
             raise RollbackError(
                 "operation_in_progress",
-                f"the container is locked by an in-flight PVE operation ({lock})",
+                f"the container configuration is locked ({lock or 'empty'}) "
+                "and PVE would refuse to roll back",
                 submission="not_submitted",
             )
         snapshots = read_snapshot_listing(
             runner, request["vmid"], request["expected_node"]
         )
-        _require_target_snapshot_is_rollbackable(snapshots, request["snapshot_name"])
+        _require_target_snapshot_is_rollbackable(
+            snapshots,
+            request["snapshot_name"],
+            request["expected_snapshot_ownership"],
+        )
 
         if record is None:
             journal.write(_journal_record(request, "intent"))

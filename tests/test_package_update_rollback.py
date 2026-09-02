@@ -124,6 +124,13 @@ class FakePve:
         self.task_status = "running"
         self.task_exitstatus: str | None = None
         self.fail_reads: set[str] = set()
+        #: Overrides the target snapshot's PVE description. Tests set this
+        #: AFTER authority has already armed the rollback, to model the real
+        #: TOCTOU window: the physical snapshot name survives while its
+        #: ownership metadata changes underneath.
+        self.snapshot_description: str | None = None
+        #: Extra listing rows, for ambiguity cases.
+        self.extra_rows: list[dict] = []
 
     # -- rendering -----------------------------------------------------
 
@@ -132,14 +139,22 @@ class FakePve:
         if self.snapshot_present:
             from app.inventory.snapshot_identity import encode_snapshot_description
 
+            description = (
+                self.snapshot_description
+                if self.snapshot_description is not None
+                # PVE's LXC config parser appends a newline to every
+                # description line it reads back.
+                else encode_snapshot_description(self.ownership) + "\n"
+            )
             row = {
                 "name": self.snapshot_name,
-                "description": encode_snapshot_description(self.ownership) + "\n",
+                "description": description,
                 "snaptime": 1_700_000_000,
             }
             if self.snapshot_incomplete:
                 row["snapstate"] = "prepare"
             rows.append(row)
+        rows.extend(self.extra_rows)
         rows.append({"name": "operator-manual", "description": "by hand", "snaptime": 1})
         current = {"name": "current", "description": "You are here!", "digest": "d"}
         if self.current_parent is not None:
@@ -1211,27 +1226,87 @@ def test_the_helper_exposes_no_create_delete_or_lifecycle_operation() -> None:
         assert forbidden not in source
 
 
-def test_a_reserved_snapshot_name_can_never_form_a_request() -> None:
+def _synthetic_payload(**overrides) -> dict:
+    """One structurally complete request, for parser-level tests."""
+
+    job_id = str(uuid.uuid4())
+    resource_id = str(uuid.uuid4())
+    backend_instance_id = str(uuid.uuid4())
     payload = {
         "request_version": 1,
         "operation": "submit_same_job_rollback",
         "target": {"vmid": 110, "expected_node": NODE},
         "operation_identity": {
             "rollback_operation_id": str(uuid.uuid4()),
-            "snapshot_name": "current",
+            "snapshot_name": "hubinet-preupd-abc",
             "snapshot_operation_id": str(uuid.uuid4()),
         },
         "ownership": {
-            "job_id": str(uuid.uuid4()),
-            "resource_id": str(uuid.uuid4()),
+            "job_id": job_id,
+            "resource_id": resource_id,
             "resource_continuity_revision": 1,
             "binding_id": str(uuid.uuid4()),
             "locator_generation": 1,
-            "backend_instance_id": str(uuid.uuid4()),
+            "backend_instance_id": backend_instance_id,
+        },
+        "expected_snapshot_ownership": {
+            "protocol": 1,
+            "kind": "pre_update",
+            "job_id": job_id,
+            "resource_id": resource_id,
+            "resource_continuity_revision": 1,
+            "inventory_source_id": str(uuid.uuid4()),
+            "backend_instance_id": backend_instance_id,
         },
     }
+    for path, value in overrides.items():
+        section, _, field = path.partition(".")
+        if field:
+            payload[section][field] = value
+        else:
+            payload[section] = value
+    return payload
+
+
+def test_a_reserved_snapshot_name_can_never_form_a_request() -> None:
+    payload = _synthetic_payload(**{"operation_identity.snapshot_name": "current"})
 
     with pytest.raises(helper.RequestError, match="reserved"):
+        helper.parse_request(payload)
+
+
+def test_a_request_without_expected_snapshot_ownership_is_refused() -> None:
+    payload = _synthetic_payload()
+    del payload["expected_snapshot_ownership"]
+
+    with pytest.raises(helper.RequestError, match="exact expected shape"):
+        helper.parse_request(payload)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("protocol", 2),
+        ("kind", "manual"),
+        ("resource_continuity_revision", 0),
+        ("job_id", "not-a-uuid"),
+    ],
+)
+def test_malformed_expected_snapshot_ownership_is_refused(field, value) -> None:
+    payload = _synthetic_payload(**{f"expected_snapshot_ownership.{field}": value})
+
+    with pytest.raises(helper.RequestError):
+        helper.parse_request(payload)
+
+
+def test_expected_ownership_must_describe_this_operations_own_job() -> None:
+    """A request expecting another job's snapshot metadata is incoherent."""
+
+    payload = _synthetic_payload(
+        **{"expected_snapshot_ownership.job_id": str(uuid.uuid4())}
+    )
+
+    with pytest.raises(helper.RequestError, match="own job and resource"):
         helper.parse_request(payload)
 
 
@@ -2052,3 +2127,307 @@ def test_only_the_exact_not_submitted_token_reports_a_release() -> None:
 
     assert released.outcome is RollbackOperationOutcome.NOT_SUBMITTED
     assert unknown.outcome is RollbackOperationOutcome.UNCERTAIN
+
+
+# ===========================================================================
+# L. FINAL HOST-SIDE OWNERSHIP PROOF (a snapshot NAME is never ownership)
+# ===========================================================================
+#
+# Authority proves the exact same-job ownership when it ARMS the rollback.
+# These regressions cover the window AFTER that proof and BEFORE the
+# destructive `pvesh` call, in which the physical snapshot name can survive
+# while its ownership metadata changes underneath. The load-bearing shape is
+# always the same: arm with correct ownership, mutate ONLY the fake PVE
+# description, submit, and require zero rollbacks.
+
+
+def _armed_request(authority, job, ownership, identity):
+    """Arm the rollback with correct ownership and return its typed request."""
+
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    return authority.package_update_rollback_request(job.job_id)
+
+
+def _foreign_description(job, identity, **overrides) -> str:
+    """A well-formed Hubinet marker describing someone else's snapshot."""
+
+    from app.inventory.snapshot_identity import (
+        build_snapshot_ownership,
+        encode_snapshot_description,
+    )
+
+    fields = {
+        "job_id": job.job_id,
+        "resource_id": job.resource_id,
+        "resource_continuity_revision": job.expected_resource_continuity_revision,
+        "inventory_source_id": job.inventory_source_id,
+        "backend_instance_id": str(uuid.uuid4()),
+    }
+    fields.update(overrides)
+    return encode_snapshot_description(build_snapshot_ownership(**fields)) + "\n"
+
+
+def test_correct_ownership_still_submits_exactly_one_rollback(
+    tmp_path: Path,
+) -> None:
+    """Positive control: the legal path stays legal."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+
+    result = host.submit_same_job_rollback(request)
+
+    assert len(pve.rollbacks) == 1
+    assert result.rollback_state is HostRollbackState.TASK_KNOWN
+
+
+def test_ownership_metadata_disappearing_after_arm_refuses_the_rollback(
+    tmp_path: Path,
+) -> None:
+    """The exact witness this correction closes.
+
+    Authority armed against a correctly-owned snapshot. Before the host
+    submits, the same physical name comes to carry ordinary manual metadata.
+    """
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.snapshot_description = "taken by hand before a config change\n"
+
+    result = host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+    assert result.outcome is RollbackOperationOutcome.NOT_SUBMITTED
+    # Refused BEFORE the durable boundary, so the operation stays releasable.
+    assert host.journal.read(request.rollback_operation_id) is None
+
+
+def test_another_jobs_ownership_after_arm_refuses_the_rollback(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.snapshot_description = _foreign_description(
+        job, identity, job_id=str(uuid.uuid4())
+    )
+
+    host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+    assert host.journal.read(request.rollback_operation_id) is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param({"resource_id": str(uuid.uuid4())}, id="wrong-resource"),
+        pytest.param({"resource_continuity_revision": 99}, id="wrong-incarnation"),
+        pytest.param(
+            {"inventory_source_id": str(uuid.uuid4())}, id="wrong-source"
+        ),
+    ],
+)
+def test_wrong_resource_ownership_after_arm_refuses_the_rollback(
+    tmp_path: Path, override
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    # Keep this job's own job_id so the entry still claims THIS job -- only
+    # the resource incarnation facts differ.
+    pve.snapshot_description = _foreign_description(
+        job, identity, backend_instance_id=ownership.backend_instance_id, **override
+    )
+
+    host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+
+
+def test_wrong_backend_ownership_after_arm_refuses_the_rollback(
+    tmp_path: Path,
+) -> None:
+    """A reused VMID on a different Hubinet installation never inherits it."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.snapshot_description = _foreign_description(job, identity)
+
+    host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+
+
+def test_malformed_hubinet_ownership_after_arm_fails_closed(tmp_path: Path) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    # Claims to be Hubinet's, but will not parse strictly.
+    pve.snapshot_description = "hubinet-ops-snapshot-v1 {not-json\n"
+
+    host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+
+
+def test_a_second_entry_claiming_this_job_fails_closed(tmp_path: Path) -> None:
+    """Ambiguity is never resolved in the operation's favour."""
+
+    from app.inventory.snapshot_identity import encode_snapshot_description
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.extra_rows = [
+        {
+            "name": "hubinet-preupd-duplicate",
+            "description": encode_snapshot_description(ownership) + "\n",
+            "snaptime": 2,
+        }
+    ]
+
+    host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+
+
+def test_malformed_metadata_on_an_unrelated_entry_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """An unattributable Hubinet-looking entry cannot be ruled out."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.extra_rows = [
+        {
+            "name": "hubinet-preupd-broken",
+            "description": "hubinet-ops-snapshot-v1 nonsense\n",
+            "snaptime": 2,
+        }
+    ]
+
+    host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+
+
+def test_expected_ownership_is_bound_into_the_request_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """A different expected ownership can never reuse an existing journal."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    payload = _helper_request(authority, job.job_id)
+    helper.handle(payload, runner=pve.runner, journal=host.journal)
+
+    poisoned = json.loads(json.dumps(payload))
+    poisoned["expected_snapshot_ownership"]["inventory_source_id"] = str(uuid.uuid4())
+    poisoned["ownership"]["job_id"] = poisoned["expected_snapshot_ownership"]["job_id"]
+
+    with pytest.raises(helper.RollbackError) as raised:
+        helper.handle(poisoned, runner=pve.runner, journal=host.journal)
+    assert raised.value.classification == "request_mismatch"
+
+
+def test_the_expected_ownership_comes_from_the_one_authority_derivation(
+    tmp_path: Path,
+) -> None:
+    """No second derivation of a job's snapshot ownership exists."""
+
+    _, _, authority, _, job, ownership, identity, *_ = _mutating_job(tmp_path)
+
+    request = authority.package_update_rollback_request(job.job_id)
+
+    assert request.expected_snapshot_ownership == ownership
+    assert request.expected_snapshot_ownership == (
+        authority.package_update_snapshot_ownership(job.job_id)
+    )
+
+
+# ===========================================================================
+# M. ANY CONFIG LOCK REFUSES BEFORE THE SUBMITTED BOUNDARY
+# ===========================================================================
+#
+# Upstream `PVE::AbstractConfig::check_lock` dies whenever `$conf->{lock}` is
+# truthy -- it does not accept `backup`, `migrate`, or any other lock type.
+# A curated allowlist of snapshot-family locks let a legitimately locked
+# container reach the durable `submitted` record, after which PVE refuses the
+# rollback and the operation can no longer be sealed or retried.
+
+
+@pytest.mark.parametrize(
+    "lock",
+    ["snapshot", "snapshot-delete", "rollback", "backup", "migrate", "clone",
+     "create", "disk", "fstrim", "mounted", "destroyed", "unknown-future-lock"],
+)
+def test_any_non_empty_config_lock_refuses_before_submitted(
+    tmp_path: Path, lock: str
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.config_lock = lock
+
+    result = host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+    assert result.outcome is RollbackOperationOutcome.NOT_SUBMITTED
+    # Nothing durable was written, so the operation is still releasable.
+    assert host.journal.read(request.rollback_operation_id) is None
+
+
+def test_an_empty_config_lock_fails_closed(tmp_path: Path) -> None:
+    """PVE never emits one; treating it as unlocked would be permissive."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.config_lock = ""
+
+    host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+
+
+def test_no_config_lock_still_submits_normally(tmp_path: Path) -> None:
+    """Positive control for the lock family."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    assert pve.config_lock is None
+
+    host.submit_same_job_rollback(request)
+
+    assert len(pve.rollbacks) == 1
+
+
+def test_the_helper_keeps_no_config_lock_allowlist() -> None:
+    """The refusal must be "any lock", not a curated set of names."""
+
+    source = HELPER_PATH.read_text()
+    assert "_IN_FLIGHT_LOCKS" not in source
+    assert "snapshot-delete" not in source

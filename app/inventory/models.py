@@ -859,7 +859,21 @@ class PackageUpdateRollbackRequest:
       execution locator the host independently re-validates against live PVE
       immediately before it does anything;
     - ``snapshot_name``/``snapshot_operation_id`` -- the exact same-job
-      snapshot selected by authority, never by a caller.
+      snapshot selected by authority, never by a caller;
+    - ``expected_snapshot_ownership`` -- the strict structured ownership
+      metadata that snapshot must carry in its PVE description.
+
+    ``expected_snapshot_ownership`` exists because **a snapshot name is a
+    physical PVE key and is never ownership proof** (see
+    ``snapshot_identity.py``). Authority proves ownership from a fresh
+    canonical listing when it ARMS the rollback, but PVE state can change
+    between that proof and the destructive call: the same name can come to
+    exist carrying absent, malformed, foreign, or another job's metadata. So
+    the host re-proves ownership from its OWN fresh listing immediately
+    before it crosses the ``submitted`` boundary, and this field is what it
+    compares against. It is derived entirely from authority -- never from a
+    caller -- and is bound into the host's request fingerprint, so a request
+    naming different expected ownership is a different operation.
 
     There is deliberately no ``start`` field: this stage always rolls back
     with PVE's ``start`` parameter at 0, as a code-owned constant on the host
@@ -878,6 +892,7 @@ class PackageUpdateRollbackRequest:
     expected_node: str
     snapshot_name: str
     snapshot_operation_id: str
+    expected_snapshot_ownership: SnapshotOwnership
 
 
 @dataclass(frozen=True, slots=True)
