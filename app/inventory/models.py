@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 
 class EndpointLifecycle(StrEnum):
@@ -145,6 +145,7 @@ class PackageUpdateCheckpoint(StrEnum):
     MUTATION_MAY_HAVE_STARTED = "mutation_may_have_started"
     MUTATION_COMPLETED = "mutation_completed"
     HEALTH_STARTED = "health_started"
+    HEALTH_COMPLETED = "health_completed"
     ROLLBACK_MAY_HAVE_STARTED = "rollback_may_have_started"
     ROLLBACK_COMPLETED = "rollback_completed"
 
@@ -167,6 +168,16 @@ class PackageUpdateCheckpoint(StrEnum):
 #: tied to its OWN checkpoint in both directions, and no rank implies
 #: another stage's success fact. See ``store.py`` and ``ARCHITECTURE.md``,
 #: "Same-job rollback execution".
+#:
+#: Schema v16 adds ``health_completed`` and keeps exactly that discipline for
+#: the health branch too. ``health_completed`` means "this job's frozen health
+#: contract was evaluated to a DEFINITIVE verdict", not "the workload is
+#: healthy": the verdict itself lives in ``health_outcome``, and a job that
+#: reaches this checkpoint with ``health_outcome='failed'`` stays ACTIVE and
+#: rollback-capable. Rollback is reachable from ``mutation_may_have_started``,
+#: ``mutation_completed``, ``health_started`` and a FAILED
+#: ``health_completed`` alike, so no constraint may let ranks 9/10 imply a
+#: health fact any more than they may imply ``mutation_completed_at``.
 CHECKPOINT_ORDER: tuple[PackageUpdateCheckpoint, ...] = (
     PackageUpdateCheckpoint.ISSUED,
     PackageUpdateCheckpoint.PREFLIGHT_PASSED,
@@ -175,6 +186,7 @@ CHECKPOINT_ORDER: tuple[PackageUpdateCheckpoint, ...] = (
     PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
     PackageUpdateCheckpoint.MUTATION_COMPLETED,
     PackageUpdateCheckpoint.HEALTH_STARTED,
+    PackageUpdateCheckpoint.HEALTH_COMPLETED,
     PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
     PackageUpdateCheckpoint.ROLLBACK_COMPLETED,
 )
@@ -221,6 +233,10 @@ class PackageUpdateEventType(StrEnum):
     MUTATION_OUTCOME_UNCERTAIN = "mutation_outcome_uncertain"
     MUTATION_COMPLETED = "mutation_completed"
     MUTATION_BLOCKED_BEFORE_SUBMISSION = "mutation_blocked_before_submission"
+    HEALTH_STARTED = "health_started"
+    HEALTH_PASSED = "health_passed"
+    HEALTH_FAILED = "health_failed"
+    HEALTH_OUTCOME_UNKNOWN = "health_outcome_unknown"
     ROLLBACK_MAY_HAVE_STARTED = "rollback_may_have_started"
     ROLLBACK_SUBMITTED = "rollback_submitted"
     ROLLBACK_TASK_OBSERVED = "rollback_task_observed"
@@ -299,6 +315,91 @@ class HealthProbeKind(StrEnum):
     #: therefore cannot satisfy this probe -- that is the point of choosing
     #: it over ``docker_container_running``.
     DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
+
+
+class HealthProbeOutcome(StrEnum):
+    """How ONE frozen probe of a job's health contract was resolved.
+
+    Three values, and the difference between the last two is the whole point
+    of this stage:
+
+    - ``PASSED`` -- the exact requested object was positively observed in the
+      exact state the probe requires.
+    - ``FAILED`` -- the exact requested object was positively observed in a
+      state that does NOT satisfy the probe. This is a proof that the
+      contract is false, not an absence of proof that it is true.
+    - ``UNKNOWN`` -- the probe could not be evaluated truthfully: the host
+      round trip failed, the command timed out, the output was malformed, the
+      Docker daemon could not be reached, or the target could not be resolved
+      to one exact object. It is NEVER a pass and never a failure.
+    """
+
+    PASSED = "passed"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class HealthOutcome(StrEnum):
+    """The verdict over one job's COMPLETE frozen probe set.
+
+    A health contract is an ALL-OF: every declared probe must hold. So the
+    aggregation is not a vote and not a score:
+
+    - ``PASSED`` requires EVERY frozen probe to be positively proven
+      ``PASSED``. Absence of failure is not a pass.
+    - ``FAILED`` needs exactly one definitively ``FAILED`` member -- one false
+      conjunct proves an ALL-OF false, whatever the other members did, so a
+      deterministic failure alongside an unknown is still a failure.
+    - ``UNKNOWN`` is the remainder: nothing proved the contract false, and at
+      least one required probe could not be evaluated truthfully. It is never
+      success, and it is deliberately NOT durable -- see
+      ``InventoryAuthority.complete_package_update_health``, which refuses it.
+    """
+
+    PASSED = "passed"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+#: The health outcomes that may ever be written to
+#: ``package_update_jobs.health_outcome``. ``UNKNOWN`` is absent on purpose:
+#: a durable health completion is a definitive verdict about the frozen
+#: contract, and "I could not tell" must stay a retryable non-answer rather
+#: than becoming a durable one.
+DEFINITIVE_HEALTH_OUTCOMES: tuple[HealthOutcome, ...] = (
+    HealthOutcome.PASSED,
+    HealthOutcome.FAILED,
+)
+
+
+def aggregate_health_outcome(
+    outcomes: Iterable[HealthProbeOutcome],
+) -> HealthOutcome:
+    """Aggregate one complete frozen probe set into one ALL-OF verdict.
+
+    Pure and total, with no ordering, threshold, majority, quorum, or
+    percentage anywhere in it -- deliberately, because a contract that needs
+    those is not a contract anyone can read at 3am (`PRODUCT.md`).
+
+    The caller is responsible for having proved that ``outcomes`` is the
+    result set for the job's COMPLETE frozen contract; an empty set raises,
+    because "zero required things all held" is exactly the false pass the
+    product refuses to make.
+    """
+
+    materialized = tuple(HealthProbeOutcome(outcome) for outcome in outcomes)
+    if not materialized:
+        raise AuthorityInvariantError(
+            "a health contract verdict requires at least one probe result"
+        )
+    if any(outcome is HealthProbeOutcome.FAILED for outcome in materialized):
+        # One false conjunct is enough. Checked BEFORE unknown on purpose:
+        # a deterministic failure beside an unevaluable probe is still a
+        # deterministic failure of the whole contract.
+        return HealthOutcome.FAILED
+    if all(outcome is HealthProbeOutcome.PASSED for outcome in materialized):
+        return HealthOutcome.PASSED
+    return HealthOutcome.UNKNOWN
 
 
 class PersistentSourceHealth(StrEnum):
@@ -683,6 +784,43 @@ class ResourceHealthContract:
 
 
 @dataclass(frozen=True, slots=True)
+class PackageUpdateJobHealthProbe:
+    """ONE probe of the health contract generation a job froze at issuance.
+
+    A copy, not a reference. The live
+    :class:`ResourceHealthContract` may be edited, replaced, or cleared while
+    a job runs, and after that job may have mutated the workload its success
+    criterion must not move with it. So the exact ``(kind, target)`` material
+    is copied into immutable job-owned rows, in the same canonical order the
+    contract's fingerprint covers.
+    """
+
+    probe_index: int
+    kind: HealthProbeKind
+    target: str
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateJobHealthProbeResult:
+    """The durable, definitive result recorded for ONE frozen probe.
+
+    Only ever written by the one definitive finalization boundary, and only
+    as a complete set covering every frozen probe. ``outcome`` may be
+    ``UNKNOWN`` for an individual probe inside a FAILED contract verdict --
+    an unevaluable member alongside a proven failure is truthful history --
+    but a PASSED contract requires every one of these to be ``PASSED``.
+
+    ``reason`` is a bounded token from a closed taxonomy, never raw command
+    output: nothing a guest printed reaches durable state.
+    """
+
+    probe_index: int
+    outcome: HealthProbeOutcome
+    checked_at: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class PackageUpdateJobPackage:
     package_index: int
     package_name: str
@@ -720,6 +858,14 @@ class PackageUpdateJob:
     expected_node_id: str
     expected_node_name: str
     package_count: int
+    #: The exact health contract GENERATION this job froze at issuance, from
+    #: the live contract that existed before any workload mutation could
+    #: begin. Immutable, non-null: a job may not be issued for a resource
+    #: with no declared health contract, because a job whose success
+    #: criterion does not exist yet could never be called successful.
+    health_contract_revision: int
+    health_contract_fingerprint: str
+    health_contract_probe_count: int
     status: PackageUpdateJobStatus
     checkpoint: PackageUpdateCheckpoint
     snapshot_operation_id: str | None
@@ -736,6 +882,15 @@ class PackageUpdateJob:
     accepted_prepared_evidence_digest: str | None
     mutation_completed_at: str | None
     health_started_at: str | None
+    #: Set by the ONE definitive health finalization boundary, together with
+    #: ``health_outcome`` and the complete durable probe result set, in one
+    #: statement. An UNKNOWN contract verdict deliberately writes neither:
+    #: health execution is read-only and safe to repeat, so a non-answer
+    #: stays retryable instead of becoming a durable one.
+    health_completed_at: str | None
+    #: ``passed`` or ``failed`` only. ``passed`` is the single legal route to
+    #: ``SUCCEEDED`` and the schema ties the two together in both directions.
+    health_outcome: HealthOutcome | None
     #: The deterministic same-job rollback operation identity, committed
     #: together with ``rollback_may_have_started_at`` as ONE indivisible
     #: write-ahead authority fact, and write-once from then on.
@@ -750,6 +905,13 @@ class PackageUpdateJob:
     terminalized_at: str | None
     terminal_reason: str | None
     packages: tuple[PackageUpdateJobPackage, ...] = ()
+    #: The complete frozen contract material, in canonical order. Always
+    #: exactly ``health_contract_probe_count`` long; the read path refuses to
+    #: hand back a job whose frozen probes disagree with its own header.
+    health_probes: tuple[PackageUpdateJobHealthProbe, ...] = ()
+    #: Empty until a definitive verdict was durably recorded, and complete
+    #: from then on.
+    health_probe_results: tuple[PackageUpdateJobHealthProbeResult, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -875,6 +1037,42 @@ class PackageUpdateRollbackTarget:
     snapshot_name: str
     snapshot_operation_id: str
     snapshot_confirmed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateHealthRequest:
+    """Everything the dark health boundary is told, for one evaluation.
+
+    Assembled by :meth:`InventoryAuthority.package_update_health_request` in
+    ONE read transaction, so every field is a consistent view of the same
+    durable job, and assembled ENTIRELY from job authority: there is no
+    parameter through which any caller may supply a VMID, a node, a contract
+    revision, a fingerprint, a probe, a probe kind, or a probe target. Those
+    are durable facts this job froze, not arguments.
+
+    Unlike the snapshot, mutation, and rollback requests, this one carries no
+    operation identity and binds no host journal. That is deliberate rather
+    than an omission: the operation is READ-ONLY, so there is no at-most-once
+    property to protect and inventing a destructive-operation journal to
+    mimic the other stages would add a failure mode without adding a
+    guarantee. Repeating a health read is safe.
+    """
+
+    job_id: str
+    backend_instance_id: str
+    resource_id: str
+    binding_id: str
+    locator_generation: int
+    resource_continuity_revision: int
+    vmid: int
+    expected_node: str
+    #: The exact frozen contract generation this evaluation is about. The
+    #: host echoes both back, and the backend re-proves them against the job
+    #: before believing a single probe result.
+    health_contract_revision: int
+    health_contract_fingerprint: str
+    #: The complete frozen probe set, in canonical order.
+    probes: tuple[PackageUpdateJobHealthProbe, ...]
 
 
 @dataclass(frozen=True, slots=True)

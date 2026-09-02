@@ -1447,7 +1447,14 @@ def test_sql_still_permits_health_started_after_a_proven_mutation(
     tmp_path: Path,
 ) -> None:
     """The other positive control: a mutation actually proven complete may
-    still legally reach health_started under the new, narrower gate."""
+    still legally reach health_started under the new, narrower gate.
+
+    Schema v16 additionally binds ``health_started_at`` to that checkpoint in
+    both directions, so the legal write is the checkpoint AND its timestamp
+    together -- which is exactly what
+    ``InventoryAuthority.start_package_update_health`` commits in one
+    statement.
+    """
 
     _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
         tmp_path
@@ -1459,13 +1466,15 @@ def test_sql_still_permits_health_started_after_a_proven_mutation(
 
     with store._transaction() as connection:
         connection.execute(
-            "UPDATE package_update_jobs SET checkpoint='health_started' WHERE job_id=?",
-            (job.job_id,),
+            "UPDATE package_update_jobs SET checkpoint='health_started', "
+            "health_started_at=? WHERE job_id=?",
+            ("2027-01-01T00:00:00+00:00", job.job_id),
         )
 
     after = authority.package_update_job(job.job_id)
     assert after.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
     assert after.mutation_completed_at is not None
+    assert after.health_started_at == "2027-01-01T00:00:00+00:00"
 
 
 def test_sql_makes_the_mutation_identity_and_timestamps_write_once(

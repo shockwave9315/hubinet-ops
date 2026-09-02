@@ -7,16 +7,20 @@ compensation half of the update lifecycle can be built and adversarially
 tested before it is ever activated, and `tests/test_r0_architecture_regression.py`
 proves it stays unreachable.
 
-It contains no snapshot deletion, no retention, no healthcheck, and no
-automatic rollback policy: a caller must ask for one exact job to be rolled
-back. Deciding *when* compensation is appropriate is a later stage that
-depends on a health contract this product has not yet defined (see
-`STATUS.md`).
+It contains no snapshot deletion, no retention, and no automatic rollback
+policy: a caller must ask for one exact job to be rolled back. Health
+execution now exists (`app/package_update_health.py`) and a proven health
+failure is a legal entry point here, but nothing connects the two: a failed
+health verdict leaves the job active and rollback-CAPABLE, and never calls
+anything in this module. Deciding *when* compensation should happen
+automatically is a policy this product has not made, and inventing one here
+would be inventing a product decision (see `PRODUCT.md`, `STATUS.md`).
 
 ## What the orchestrator guarantees
 
 ```text
-job ACTIVE at mutation_may_have_started OR mutation_completed
+job ACTIVE at mutation_may_have_started, mutation_completed, health_started,
+  or health_completed with outcome=failed
   -> fresh canonical PVE snapshot listing
   -> exact same-job rollback target (authority-selected, never caller-named)
   -> DURABLY COMMIT rollback_may_have_started  (write-ahead, before any call)
@@ -30,12 +34,20 @@ job ACTIVE at mutation_may_have_started OR mutation_completed
   -> rollback_completed  ->  status = ROLLED_BACK
 ```
 
-Both mutation checkpoints are legal entry points. That is deliberate and is
-the reason schema v14 exists: a package mutation that failed, was partial,
-timed out, was killed, or simply could not be proven complete never reaches
-`mutation_completed`, and it is exactly that job which most needs
-compensating. Nothing in this module writes, or reads as permission,
-`mutation_completed_at`.
+Every one of those checkpoints is a legal entry point, and that is deliberate.
+It is the reason schema v14 exists, and schema v16 extends exactly the same
+rule to the health branch: a package mutation that failed, was partial, timed
+out, was killed, or simply could not be proven complete never reaches
+`mutation_completed`, and a health evaluation that was interrupted or could
+not reach a verdict never reaches `health_completed` -- yet those are exactly
+the jobs that most need compensating. Requiring an earlier stage's SUCCESS
+before allowing compensation would fence out the only guests that need it.
+Nothing in this module writes, or reads as permission,
+`mutation_completed_at`, `health_completed_at`, or `health_outcome`.
+
+A job whose health verdict PASSED is deliberately not eligible: a passing
+verdict and `status=succeeded` are one indivisible durable fact, so such a job
+is terminal and is refused before eligibility is even consulted.
 
 ## The guest is left STOPPED
 
@@ -191,6 +203,25 @@ class RollbackStageResult:
 DEFAULT_TASK_POLL_TIMEOUT_SECONDS = 1800.0
 DEFAULT_TASK_POLL_INTERVAL_SECONDS = 2.0
 
+#: Every checkpoint this orchestrator may be entered at. The four authority
+#: entry points plus ``rollback_may_have_started`` itself, which is how a
+#: crashed attempt re-enters to reattach rather than resubmit.
+#:
+#: The health additions carry exactly the same meaning the mutation ones do:
+#: a job whose health evaluation was interrupted or could not reach a verdict
+#: (``health_started``), and one whose frozen contract was PROVEN to fail
+#: (``health_completed``, which is only ever reachable while active with a
+#: FAILED verdict), are both jobs that may need compensating. Requiring
+#: health success before rollback would fence exactly the guests that need
+#: it, in the same way requiring mutation success once did.
+_ELIGIBLE_CHECKPOINTS = (
+    PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+    PackageUpdateCheckpoint.MUTATION_COMPLETED,
+    PackageUpdateCheckpoint.HEALTH_STARTED,
+    PackageUpdateCheckpoint.HEALTH_COMPLETED,
+    PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
+)
+
 #: Journal phases that still permit a NEW submission for this exact operation
 #: identity. Everything else -- including ``None``, which only an older host
 #: would report -- means a rollback may already have crossed PVE's door.
@@ -264,11 +295,7 @@ class PackageUpdateRollbackOrchestrator:
         job = self._authority.package_update_job(job_id)
         if job.status is not PackageUpdateJobStatus.ACTIVE:
             raise PackageUpdateRollbackError("package update job is terminal")
-        if job.checkpoint not in (
-            PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
-            PackageUpdateCheckpoint.MUTATION_COMPLETED,
-            PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
-        ):
+        if job.checkpoint not in _ELIGIBLE_CHECKPOINTS:
             raise PackageUpdateRollbackError(
                 "package update job is not eligible for same-job rollback"
             )
