@@ -820,8 +820,12 @@ def test_health_contract_compare_and_set_refuses_a_stale_editor(
         },
     )
     assert stale.status_code == 409
-    assert stale.json()["detail"]["error"] == "resource_not_current"
-    assert client.delete(f"{path}?expected_revision=7", headers=headers).status_code == 409
+    # A lost compare-and-set is its own answer: the resource is fine and the
+    # request was well formed, someone else just got there first.
+    assert stale.json()["detail"]["error"] == "revision_conflict"
+    conflicted_clear = client.delete(f"{path}?expected_revision=7", headers=headers)
+    assert conflicted_clear.status_code == 409
+    assert conflicted_clear.json()["detail"]["error"] == "revision_conflict"
     # The refused writes left the original contract exactly as it was.
     assert client.get(path, headers=headers).json() == first.json()
     assert client.delete(f"{path}?expected_revision=1", headers=headers).status_code == 200

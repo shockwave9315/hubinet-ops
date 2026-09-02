@@ -48,6 +48,7 @@ from .models import (
     PackageUpdateRollbackRequest,
     PackageUpdateRollbackTarget,
     PackageUpdateSnapshotIdentity,
+    HealthContractRevisionConflict,
     HostRollbackState,
     ResourceHealthContract,
     ResourceHealthProbe,
@@ -1142,7 +1143,7 @@ class InventoryAuthority:
                     (canonical_resource_id, existing.revision),
                 ).rowcount
                 if deleted != 1:
-                    raise AuthorityConflict(
+                    raise HealthContractRevisionConflict(
                         "resource health contract changed during replacement"
                     )
             # Order matters, and the schema enforces it: the live contract row
@@ -1227,7 +1228,7 @@ class InventoryAuthority:
                 (canonical_resource_id, existing.revision),
             ).rowcount
             if deleted != 1:
-                raise AuthorityConflict(
+                raise HealthContractRevisionConflict(
                     "resource health contract changed during clearing"
                 )
             connection.execute(
@@ -1273,7 +1274,7 @@ class InventoryAuthority:
             return
         current = 0 if existing is None else existing.revision
         if expected_revision != current:
-            raise AuthorityConflict(
+            raise HealthContractRevisionConflict(
                 "resource health contract revision does not match the expected revision"
             )
 

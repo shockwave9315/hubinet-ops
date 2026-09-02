@@ -1830,8 +1830,9 @@ single-editor path unconditional.
 **HTTP.** `GET`/`PUT`/`DELETE
 /r0/v1/resources/{resource_id}/health-contract`, bearer-authenticated, with a
 machine-distinguishable error taxonomy: `resource_not_found` (404),
-`contract_unconfigured` (404), `resource_not_current` (409), and
-`invalid_contract` (422). The unconfigured case is deliberately *not* a 200
+`contract_unconfigured` (404), `resource_not_current` (409),
+`revision_conflict` (409, a lost compare-and-set, which is a different
+problem from a stale resource), and `invalid_contract` (422). The unconfigured case is deliberately *not* a 200
 with an empty probe list — a caller must never be able to read absence as a
 contract that nothing has to satisfy. `PUT` forbids unknown fields, so no
 `command`, `argv`, `shell`, `script`, `executable`, `working_directory`, or

@@ -23,6 +23,7 @@ from app.inventory import (
     AuthorityInvariantError,
     AuthorityNotFound,
     HealthContractError,
+    HealthContractRevisionConflict,
     HealthProbeKind,
     InventoryAuthority,
     InventoryAuthorityStore,
@@ -729,7 +730,7 @@ def test_compare_and_set_refuses_a_stale_editor(tmp_path: Path) -> None:
     first = authority.replace_resource_health_contract(
         rid, DEFAULT_PROBES, expected_revision=0
     )
-    with pytest.raises(AuthorityConflict, match="expected revision"):
+    with pytest.raises(HealthContractRevisionConflict, match="expected revision"):
         authority.replace_resource_health_contract(
             rid, _probes((RUNNING, "redis")), expected_revision=0
         )
@@ -739,12 +740,15 @@ def test_compare_and_set_refuses_a_stale_editor(tmp_path: Path) -> None:
     )
     assert second.revision == 2
     # An editor still holding revision 1 may not discard revision 2.
-    with pytest.raises(AuthorityConflict, match="expected revision"):
+    with pytest.raises(HealthContractRevisionConflict, match="expected revision"):
         authority.replace_resource_health_contract(
             rid, _probes((SYSTEMD, "other.service")), expected_revision=1
         )
-    with pytest.raises(AuthorityConflict, match="expected revision"):
+    with pytest.raises(HealthContractRevisionConflict, match="expected revision"):
         authority.clear_resource_health_contract(rid, expected_revision=1)
+    # It is still an AuthorityConflict, so an ordinary caller that only
+    # distinguishes "refused" keeps working.
+    assert issubclass(HealthContractRevisionConflict, AuthorityConflict)
     assert store.resource_health_contract(rid) == second
 
     assert authority.clear_resource_health_contract(rid, expected_revision=2) is True

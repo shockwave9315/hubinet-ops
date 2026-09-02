@@ -334,6 +334,16 @@ class AuthorityConflict(AuthorityError):
     """A durable ownership or lifecycle precondition did not hold."""
 
 
+class HealthContractRevisionConflict(AuthorityConflict):
+    """A health contract write lost its compare-and-set on the revision.
+
+    Distinct from an ordinary conflict because it means something different to
+    the operator: the resource is fine and the request was well formed, but
+    someone else changed the contract first. Collapsing it into "this resource
+    is not current" would send them looking for the wrong problem.
+    """
+
+
 class SnapshotSubmissionRefusedBeforeCallback(AuthorityConflict):
     """Current-authority proof refused a snapshot submission before the host
     submission callback was ever invoked.

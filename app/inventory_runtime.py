@@ -53,6 +53,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.inventory import (
     AuthorityConflict,
     AuthorityNotFound,
+    HealthContractRevisionConflict,
     HealthProbeKind,
     InventoryAuthority,
     InventoryAuthorityStore,
@@ -402,6 +403,8 @@ def create_read_only_app(
             )
         except AuthorityNotFound as exc:
             raise _health_contract_error(404, "resource_not_found", str(exc)) from exc
+        except HealthContractRevisionConflict as exc:
+            raise _health_contract_error(409, "revision_conflict", str(exc)) from exc
         except AuthorityConflict as exc:
             raise _health_contract_error(409, "resource_not_current", str(exc)) from exc
         except ValueError as exc:
@@ -428,6 +431,8 @@ def create_read_only_app(
             )
         except AuthorityNotFound as exc:
             raise _health_contract_error(404, "resource_not_found", str(exc)) from exc
+        except HealthContractRevisionConflict as exc:
+            raise _health_contract_error(409, "revision_conflict", str(exc)) from exc
         except AuthorityConflict as exc:
             raise _health_contract_error(409, "resource_not_current", str(exc)) from exc
         except ValueError as exc:
