@@ -2054,3 +2054,155 @@ def test_a_losing_creator_still_fsyncs_and_never_raises(
 
     assert directory.is_dir()
     assert directory.parent in fsynced
+
+
+# ===========================================================================
+# F. A SHORT `os.write()` NEVER BECOMES THE DURABLE JOURNAL RECORD
+#
+# `os.write(fd, payload)` is only permitted to return `len(payload)`; a
+# valid call may legally write fewer bytes than that without raising. The
+# ordering these tests hold constant is:
+#
+#   durable directory -> COMPLETE payload write -> fsync(file) -> replace
+#     -> fsync(directory) -> submitted -> apt
+#
+# so a write that stops partway (or fails, or makes no progress at all)
+# must never reach `fsync`/`os.replace`, and must never leave a truncated
+# temp file that a later read could mistake for the record.
+# ===========================================================================
+
+
+def test_a_short_first_write_is_completed_by_a_later_write(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A. A truncated first `os.write` is completed by a subsequent one."""
+
+    journal = helper.OperationJournal(tmp_path / "operations")
+    real_write = os.write
+    calls = {"n": 0}
+
+    def spy_write(fd, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The kernel accepted only a short prefix of the first call.
+            return real_write(fd, bytes(data)[:5])
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", spy_write)
+
+    journal.write(_submitted_record(_request_fingerprint()))
+
+    assert calls["n"] > 1
+    stored = journal.read(OPERATION_ID)
+    assert stored is not None
+    assert stored["phase"] == "submitted"
+
+
+def test_many_tiny_short_writes_reconstruct_the_exact_payload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """B. The whole payload survives being written one byte at a time."""
+
+    journal = helper.OperationJournal(tmp_path / "operations")
+    real_write = os.write
+
+    def spy_write(fd, data):
+        return real_write(fd, bytes(data)[:1])
+
+    monkeypatch.setattr(os, "write", spy_write)
+
+    journal.write(_submitted_record(_request_fingerprint()))
+
+    # `read()` fully parses and schema-checks the record; a payload that
+    # arrived out of order, duplicated, or truncated would fail this, not
+    # merely look different.
+    stored = journal.read(OPERATION_ID)
+    assert stored is not None
+    assert stored["phase"] == "submitted"
+    assert stored["mutation_operation_id"] == OPERATION_ID
+
+
+def test_a_write_that_makes_no_progress_never_replaces_the_journal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C. `os.write()` returning 0 fails closed: no replace, no record."""
+
+    directory = tmp_path / "operations"
+    journal = helper.OperationJournal(directory)
+
+    monkeypatch.setattr(os, "write", lambda fd, data: 0)
+
+    with pytest.raises(OSError):
+        journal.write(_submitted_record(_request_fingerprint()))
+
+    assert journal.read(OPERATION_ID) is None
+    assert not (directory / f"op-{OPERATION_ID}.json.tmp").exists()
+    assert not (directory / f"op-{OPERATION_ID}.json").exists()
+
+
+def test_a_write_error_after_partial_progress_never_replaces_the_journal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D. A write that fails partway leaves no authoritative rename."""
+
+    directory = tmp_path / "operations"
+    journal = helper.OperationJournal(directory)
+    real_write = os.write
+    calls = {"n": 0}
+
+    def spy_write(fd, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_write(fd, bytes(data)[:5])
+        raise OSError("simulated ENOSPC mid-write")
+
+    monkeypatch.setattr(os, "write", spy_write)
+
+    with pytest.raises(OSError):
+        journal.write(_submitted_record(_request_fingerprint()))
+
+    assert journal.read(OPERATION_ID) is None
+    assert not (directory / f"op-{OPERATION_ID}.json.tmp").exists()
+    assert not (directory / f"op-{OPERATION_ID}.json").exists()
+
+
+def test_an_incomplete_submitted_write_never_launches_a_mutation(
+    host, journal, monkeypatch
+) -> None:
+    """E. `intent -> submitted` durability gates the one real package command.
+
+    The `intent` record (a different phase, a different payload) still
+    writes normally; only the `submitted` record's write is made to fail,
+    exactly at the boundary `_execute` crosses immediately before spawning
+    the detached runner. `spawn=_never_spawn` additionally proves the
+    runner is never reached, not merely that its count stayed at 0 by
+    coincidence.
+    """
+
+    real_write = os.write
+
+    def spy_write(fd, data):
+        if b'"phase":"submitted"' in bytes(data):
+            raise OSError("simulated short/failed write for the submitted record")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", spy_write)
+
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    assert prepared["ok"] is True
+    digest = prepared["evidence"]["prepared_evidence_digest"]
+
+    with pytest.raises(OSError):
+        _handle(
+            _request(
+                "execute_exact_package_mutation", prepared_evidence_digest=digest
+            ),
+            host,
+            journal,
+            spawn=_never_spawn,
+        )
+
+    assert host.mutations == 0
+    stored = journal.read(OPERATION_ID)
+    assert stored is not None
+    assert stored["phase"] == "intent"

@@ -922,6 +922,39 @@ def _result_is_success(result: Mapping[str, Any]) -> bool:
     )
 
 
+def _write_all(descriptor: int, payload: bytes) -> None:
+    """Write every byte of `payload` to `descriptor`, or raise.
+
+    `os.write(fd, payload)` is only permitted to return `len(payload)`; a
+    valid call may legally write anything from `0` (would-block on a
+    non-blocking descriptor, or, transiently, on a blocking one under
+    pressure) up to `len(payload)` bytes without that being an error.
+    Treating a short write as if it wrote everything lets `write()` on the
+    journal fsync and rename a truncated JSON payload into place as the
+    durable record -- exactly the corruption a crash mid-`apt` recovery
+    depends on the journal NOT having. Loop until the whole payload is
+    confirmed written, and fail loudly (never silently) the moment a write
+    stops making progress.
+    """
+
+    view = memoryview(payload)
+    offset = 0
+    total = len(view)
+    while offset < total:
+        try:
+            written = os.write(descriptor, view[offset:])
+        except InterruptedError:
+            # Retry: Python does not transparently retry `os.write` across
+            # EINTR the way it does for some higher-level calls.
+            continue
+        if written <= 0:
+            raise OSError(
+                "package mutation journal write made no progress "
+                f"({offset} of {total} bytes written)"
+            )
+        offset += written
+
+
 def _ensure_durable_directory(path: Path, *, mode: int) -> None:
     """Create `path`, and any missing parents, as a crash-durable link.
 
@@ -1091,8 +1124,21 @@ class OperationJournal:
         payload = _canonical_json(dict(record)).encode("utf-8")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
+            try:
+                _write_all(descriptor, payload)
+                os.fsync(descriptor)
+            except BaseException:
+                # A short or failed write must never become the durable
+                # record: no rename, and the incomplete temp file must not
+                # linger where a future read could mistake it for state (it
+                # never can -- `_path` never returns a `.tmp` name -- but a
+                # leftover truncated file is still cleaned up here rather
+                # than left behind).
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
         finally:
             os.close(descriptor)
         os.replace(temporary, path)
