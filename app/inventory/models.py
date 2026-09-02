@@ -96,6 +96,47 @@ class HostMutationState(StrEnum):
     TERMINAL_FAILURE = "terminal_failure"
 
 
+class HostRollbackState(StrEnum):
+    """Durable host journal phase for one job-owned same-job rollback.
+
+    Deliberately the same SHAPE as :class:`HostSubmissionState`, and
+    deliberately a DIFFERENT type. The shape matches because the verified
+    upstream semantics match: like snapshot create, an LXC rollback is
+    submitted through an asynchronous PVE endpoint that returns a UPID
+    immediately (`fork_worker('vzrollback', ...)`), so there is a real
+    ``task_known`` phase between "submission crossed PVE's door" and "the
+    operation reached a terminal result".
+
+    The type is separate so a snapshot journal phase can never be fed into a
+    rollback decision, or the reverse, merely because the two enums happen to
+    spell their members the same way. Rollback is strictly more destructive
+    than create -- it force-stops a running container and replaces its config
+    -- so conflating the two evidence channels must be impossible by typing,
+    not by convention.
+    """
+
+    #: No journal record exists. Ordinary pre-submission routing evidence
+    #: only: a helper launched by a backend that then died may not have taken
+    #: its per-VMID lease yet, so absence is NEVER a release proof.
+    ABSENT = "absent"
+    #: The request was journaled but no rollback has been submitted to PVE.
+    #: Transient routing evidence, exactly like ``ABSENT``.
+    INTENT = "intent"
+    #: The durable no-future-submit fence, and the ONLY evidence that may
+    #: release a job already past its write-ahead rollback checkpoint.
+    SEALED_NOT_SUBMITTED = "sealed_not_submitted"
+    #: The rollback was durably journaled BEFORE `pvesh create` was invoked.
+    #: The container may be stopping, or its volumes and config may be being
+    #: replaced right now. NEVER resubmitted, and never inferred to be a
+    #: failure.
+    SUBMITTED = "submitted"
+    #: PVE returned a UPID for this exact rollback. The caller polls that
+    #: task through the read-only inspection operation.
+    TASK_KNOWN = "task_known"
+    #: The operation reached a recorded terminal result.
+    TERMINAL = "terminal"
+
+
 class PackageUpdateCheckpoint(StrEnum):
     ISSUED = "issued"
     PREFLIGHT_PASSED = "preflight_passed"
@@ -113,6 +154,19 @@ class PackageUpdateCheckpoint(StrEnum):
 #: already have been submitted, so nothing may ever conclude that no PVE
 #: mutation happened. Used by the schema and by every typed transition; the
 #: SQL CHECK/trigger set in ``store.py`` encodes exactly this order.
+#:
+#: **This order is a monotonic no-regression fence, NOT a chain of implied
+#: successes.** The lifecycle branches: a package mutation that failed, was
+#: partial, timed out, was killed, or simply could not be proven complete
+#: stays at ``mutation_may_have_started`` with ``mutation_completed_at``
+#: NULL -- and it is exactly that job which most needs compensation, so it
+#: must be able to reach ``rollback_may_have_started`` without anything
+#: fabricating a completion it never had. A later rank therefore means only
+#: "this job has passed this boundary", never "every earlier milestone
+#: succeeded". Schema v14 encodes that distinction: each durable fact is
+#: tied to its OWN checkpoint in both directions, and no rank implies
+#: another stage's success fact. See ``store.py`` and ``ARCHITECTURE.md``,
+#: "Same-job rollback execution".
 CHECKPOINT_ORDER: tuple[PackageUpdateCheckpoint, ...] = (
     PackageUpdateCheckpoint.ISSUED,
     PackageUpdateCheckpoint.PREFLIGHT_PASSED,
@@ -167,6 +221,13 @@ class PackageUpdateEventType(StrEnum):
     MUTATION_OUTCOME_UNCERTAIN = "mutation_outcome_uncertain"
     MUTATION_COMPLETED = "mutation_completed"
     MUTATION_BLOCKED_BEFORE_SUBMISSION = "mutation_blocked_before_submission"
+    ROLLBACK_MAY_HAVE_STARTED = "rollback_may_have_started"
+    ROLLBACK_SUBMITTED = "rollback_submitted"
+    ROLLBACK_TASK_OBSERVED = "rollback_task_observed"
+    ROLLBACK_OUTCOME_UNCERTAIN = "rollback_outcome_uncertain"
+    ROLLBACK_TERMINAL_FAILURE = "rollback_terminal_failure"
+    ROLLBACK_COMPLETED = "rollback_completed"
+    ROLLBACK_BLOCKED_BEFORE_SUBMISSION = "rollback_blocked_before_submission"
 
 
 class PackageUpdateExecutionOutcome(StrEnum):
@@ -286,6 +347,30 @@ class MutationSubmissionRefusedBeforeCallback(AuthorityConflict):
     raised by that same method stays ordinary :class:`AuthorityConflict`:
     those say nothing about whether the host was asked to mutate, and must
     never be routed into the durable seal path.
+    """
+
+
+class RollbackSubmissionRefusedBeforeCallback(AuthorityConflict):
+    """Rollback authority proof refused a submission before the host callback.
+
+    The same-job rollback mirror of
+    :class:`SnapshotSubmissionRefusedBeforeCallback`, raised ONLY by
+    :meth:`InventoryAuthority.execute_rollback_submission_if_current` for the
+    one case where its rollback-authority predicate itself proved false --
+    structurally guaranteeing the submission callback ran zero times, so no
+    PVE rollback can possibly have been submitted by this call. A terminal
+    job, a checkpoint other than ``rollback_may_have_started``, or any other
+    lifecycle/invariant conflict raised by that same method stays an ordinary
+    :class:`AuthorityConflict`: those say nothing about whether the host was
+    asked to roll back, and must never be routed into the durable seal path.
+
+    Note what this predicate is, and is not. It re-proves the job's ACTIVE
+    ownership, its exact rollback operation identity, its exact confirmed
+    same-job snapshot, and its exact resource/locator context. It deliberately
+    does NOT re-prove current package-plan authority: rollback is compensation
+    for a workload that may ALREADY have been mutated, so a newer scan or a
+    stale approval must never be able to strand a half-upgraded guest by
+    withdrawing its recovery path.
     """
 
 
@@ -594,7 +679,16 @@ class PackageUpdateJob:
     accepted_prepared_evidence_digest: str | None
     mutation_completed_at: str | None
     health_started_at: str | None
+    #: The deterministic same-job rollback operation identity, committed
+    #: together with ``rollback_may_have_started_at`` as ONE indivisible
+    #: write-ahead authority fact, and write-once from then on.
+    rollback_operation_id: str | None
     rollback_may_have_started_at: str | None
+    #: The PVE task identity observed for this exact rollback, recorded the
+    #: instant the host durably knows one. Write-once; it is what lets a
+    #: restarted backend reattach to an asynchronous `vzrollback` task
+    #: instead of guessing.
+    rollback_task_upid: str | None
     rollback_completed_at: str | None
     terminalized_at: str | None
     terminal_reason: str | None
@@ -724,6 +818,81 @@ class PackageUpdateRollbackTarget:
     snapshot_name: str
     snapshot_operation_id: str
     snapshot_confirmed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateRollbackIdentity:
+    """One package update job's single deterministic same-job rollback.
+
+    Derived purely from immutable authority -- this backend instance, the
+    job, the resource incarnation, its continuity revision, and the job's own
+    CONFIRMED snapshot identity -- so the exact same job derives the exact
+    same operation id after any restart, and no other job can ever derive it.
+    ``rollback_operation_id`` keys the host-side durable at-most-once journal.
+
+    Binding the confirmed snapshot identity in is what makes the operation
+    id mean "roll THIS job back to THIS exact snapshot" rather than merely
+    "roll this job back": a rollback aimed at any other snapshot is a
+    different operation and can never reuse this one's durable journal.
+    """
+
+    rollback_operation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateRollbackRequest:
+    """Everything the dark host boundary is fenced against for one rollback.
+
+    Assembled by :meth:`InventoryAuthority.package_update_rollback_request` in
+    ONE read transaction, so every field is a consistent view of the same
+    durable job. The host binds all of it into its journal's request
+    fingerprint, so a request differing in ANY of these facts is a different
+    request and is refused rather than allowed to reuse an existing
+    operation:
+
+    - ``rollback_operation_id`` -- the deterministic job-owned identity;
+    - ``backend_instance_id``/``job_id``/``resource_id``/
+      ``resource_continuity_revision`` -- who owns the operation and which
+      exact resource incarnation it belongs to, so a reused VMID or a
+      replaced guest can never inherit it;
+    - ``binding_id``/``locator_generation``/``vmid``/``expected_node`` -- the
+      execution locator the host independently re-validates against live PVE
+      immediately before it does anything;
+    - ``snapshot_name``/``snapshot_operation_id`` -- the exact same-job
+      snapshot selected by authority, never by a caller;
+    - ``expected_snapshot_ownership`` -- the strict structured ownership
+      metadata that snapshot must carry in its PVE description.
+
+    ``expected_snapshot_ownership`` exists because **a snapshot name is a
+    physical PVE key and is never ownership proof** (see
+    ``snapshot_identity.py``). Authority proves ownership from a fresh
+    canonical listing when it ARMS the rollback, but PVE state can change
+    between that proof and the destructive call: the same name can come to
+    exist carrying absent, malformed, foreign, or another job's metadata. So
+    the host re-proves ownership from its OWN fresh listing immediately
+    before it crosses the ``submitted`` boundary, and this field is what it
+    compares against. It is derived entirely from authority -- never from a
+    caller -- and is bound into the host's request fingerprint, so a request
+    naming different expected ownership is a different operation.
+
+    There is deliberately no ``start`` field: this stage always rolls back
+    with PVE's ``start`` parameter at 0, as a code-owned constant on the host
+    side, so a successful rollback leaves the container STOPPED and nothing
+    on this boundary can ask for anything else.
+    """
+
+    rollback_operation_id: str
+    backend_instance_id: str
+    job_id: str
+    resource_id: str
+    binding_id: str
+    locator_generation: int
+    resource_continuity_revision: int
+    vmid: int
+    expected_node: str
+    snapshot_name: str
+    snapshot_operation_id: str
+    expected_snapshot_ownership: SnapshotOwnership
 
 
 @dataclass(frozen=True, slots=True)

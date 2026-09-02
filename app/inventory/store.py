@@ -47,7 +47,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 13
+AUTHORITY_SCHEMA_VERSION = 14
 
 #: Every authority connection's writer wait policy -- both `PRAGMA
 #: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
@@ -119,8 +119,12 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "package_update_job_checkpoint_never_regresses",
         "package_update_job_mutation_identity_immutable",
         "package_update_job_mutation_completion_immutable",
+        "package_update_job_rollback_identity_immutable",
+        "package_update_job_rollback_task_immutable",
+        "package_update_job_rollback_completion_immutable",
         "one_package_update_job_snapshot_operation",
         "one_package_update_job_mutation_operation",
+        "one_package_update_job_rollback_operation",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -130,7 +134,15 @@ _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
 # can never drift between copies. Rank 3 is snapshot_may_have_started (the
 # write-ahead PVE snapshot uncertainty boundary), rank 4 snapshot_confirmed,
 # rank 5 mutation_may_have_started (the write-ahead workload package
-# mutation uncertainty boundary), and rank 6 mutation_completed.
+# mutation uncertainty boundary), rank 6 mutation_completed, rank 8
+# rollback_may_have_started (the write-ahead PVE rollback uncertainty
+# boundary), and rank 9 rollback_completed.
+#
+# This is a monotonic no-regression fence, not a chain of implied successes:
+# see models.CHECKPOINT_ORDER. A job whose mutation failed, was partial, or
+# could not be proven complete stays at rank 5 and must still be able to
+# reach rank 8, so no constraint below may make a later rank imply an
+# earlier stage's SUCCESS fact.
 _CHECKPOINT_RANK_SQL = """(CASE {column}
         WHEN 'issued' THEN 1
         WHEN 'preflight_passed' THEN 2
@@ -1044,7 +1056,9 @@ def _package_update_job(
         accepted_prepared_evidence_digest=row["accepted_prepared_evidence_digest"],
         mutation_completed_at=row["mutation_completed_at"],
         health_started_at=row["health_started_at"],
+        rollback_operation_id=row["rollback_operation_id"],
         rollback_may_have_started_at=row["rollback_may_have_started_at"],
+        rollback_task_upid=row["rollback_task_upid"],
         rollback_completed_at=row["rollback_completed_at"],
         terminalized_at=row["terminalized_at"],
         terminal_reason=row["terminal_reason"],
@@ -1069,11 +1083,15 @@ def _package_update_job_event(row: sqlite3.Row) -> PackageUpdateJobEvent:
 
 
 _SCHEMA_STATEMENTS = (
-    """
+    # Interpolated from AUTHORITY_SCHEMA_VERSION rather than restated, so a
+    # version bump can never leave a fresh database asserting the previous
+    # version's CHECK -- which is exactly how the v13->v14 bump first failed.
+    f"""
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 13)
+        schema_version INTEGER NOT NULL
+            CHECK(schema_version = {AUTHORITY_SCHEMA_VERSION})
     )
     """,
     """
@@ -1625,7 +1643,20 @@ _SCHEMA_STATEMENTS = (
                    NOT accepted_prepared_evidence_digest GLOB '*[^0-9a-f]*')),
         mutation_completed_at TEXT,
         health_started_at TEXT,
+        -- One job may cause AT MOST ONE PVE snapshot rollback, and only to
+        -- the snapshot that exact job created and confirmed. The identity is
+        -- derived from immutable authority INCLUDING that confirmed snapshot
+        -- (see app/inventory/rollback_identity.py), so it is stable across
+        -- restarts, and the triggers below make it write-once.
+        rollback_operation_id TEXT
+            CHECK(rollback_operation_id IS NULL OR
+                  length(rollback_operation_id) = 36),
         rollback_may_have_started_at TEXT,
+        -- Same verified UPID contract as snapshot_task_upid: PVE's rollback
+        -- endpoint is asynchronous and returns a task id immediately.
+        rollback_task_upid TEXT CHECK(rollback_task_upid IS NULL OR
+            (length(rollback_task_upid) BETWEEN 20 AND 300 AND
+             rollback_task_upid GLOB 'UPID:?*:?*:?*:?*:?*:*:?*:')),
         rollback_completed_at TEXT,
         terminalized_at TEXT,
         terminal_reason TEXT CHECK(terminal_reason IS NULL OR
@@ -1670,16 +1701,105 @@ _SCHEMA_STATEMENTS = (
               (mutation_operation_id IS NULL AND
                mutation_may_have_started_at IS NULL AND
                accepted_prepared_evidence_digest IS NULL)),
-        CHECK({_checkpoint_rank_sql('checkpoint')} < 6 OR
+        -- Rank 6 is mutation_completed. A job sitting AT that checkpoint must
+        -- carry its completion timestamp, and a completion may never exist
+        -- below the write-ahead boundary that precedes it.
+        --
+        -- Deliberately NOT the v13 form "rank >= 6 IMPLIES completed". Ranks
+        -- 8 and 9 are the rollback boundary and rollback completion, and a
+        -- job whose package mutation FAILED, was partial, timed out, was
+        -- killed, or simply could not be proven complete stays at rank 5
+        -- with mutation_completed_at NULL -- while being exactly the job
+        -- that most needs compensation. Under the v13 form the only way to
+        -- reach rollback from there was to write a mutation_completed_at
+        -- that never happened. mutation_completed means the exact approved
+        -- package mutation was INDEPENDENTLY PROVEN COMPLETE; it is never a
+        -- routing flag, so a later rank must not imply it.
+        CHECK(checkpoint != 'mutation_completed' OR
               mutation_completed_at IS NOT NULL),
-        CHECK({_checkpoint_rank_sql('checkpoint')} >= 6 OR
-              mutation_completed_at IS NULL),
+        CHECK(mutation_completed_at IS NULL OR
+              {_checkpoint_rank_sql('checkpoint')} >= 6),
         -- A completed mutation can never exist without EVERY write-ahead
         -- arming fact that must precede it.
         CHECK(mutation_completed_at IS NULL OR
               (mutation_may_have_started_at IS NOT NULL AND
                mutation_operation_id IS NOT NULL AND
-               accepted_prepared_evidence_digest IS NOT NULL))
+               accepted_prepared_evidence_digest IS NOT NULL)),
+        -- Rank 7 is health_started. Unlike ranks 8/9 (rollback), health
+        -- validation is never compensation for an uncertain mutation -- it
+        -- is the next stage of a mutation that already succeeded. So,
+        -- deliberately UNLIKE the rollback ranks below, health_started may
+        -- NOT be reached from an unproven mutation: a job stuck at rank 5
+        -- with mutation_completed_at NULL must route to rollback, never to
+        -- health. This is intentionally narrower than the old v13 form
+        -- "rank >= 6 IMPLIES completed" -- it binds ONLY health_started, so
+        -- ranks 8 and 9 remain reachable without mutation_completed_at.
+        CHECK(checkpoint != 'health_started' OR
+              mutation_completed_at IS NOT NULL),
+        -- Rank 8 is rollback_may_have_started -- the write-ahead PVE
+        -- rollback uncertainty boundary. Both directions, so neither the
+        -- checkpoint nor the durable rollback facts can be forged
+        -- independently of the other.
+        CHECK({_checkpoint_rank_sql('checkpoint')} < 8 OR
+              (rollback_operation_id IS NOT NULL AND
+               rollback_may_have_started_at IS NOT NULL)),
+        CHECK({_checkpoint_rank_sql('checkpoint')} >= 8 OR
+              (rollback_operation_id IS NULL AND
+               rollback_may_have_started_at IS NULL AND
+               rollback_task_upid IS NULL AND
+               rollback_completed_at IS NULL)),
+        -- A rollback operation identity is all-or-nothing.
+        CHECK((rollback_operation_id IS NULL) =
+              (rollback_may_have_started_at IS NULL)),
+        -- A PVE task may only be recorded for an operation that exists.
+        CHECK(rollback_task_upid IS NULL OR rollback_operation_id IS NOT NULL),
+        -- Rank 9 is rollback_completed, in both directions.
+        CHECK({_checkpoint_rank_sql('checkpoint')} < 9 OR
+              rollback_completed_at IS NOT NULL),
+        CHECK({_checkpoint_rank_sql('checkpoint')} >= 9 OR
+              rollback_completed_at IS NULL),
+        -- Rollback completion is impossible without the write-ahead
+        -- uncertainty boundary that must precede it.
+        CHECK(rollback_completed_at IS NULL OR
+              (rollback_operation_id IS NOT NULL AND
+               rollback_may_have_started_at IS NOT NULL)),
+        -- ...and impossible without the exact PVE task identity this
+        -- rollback observed. Unlike snapshot create, a rollback has no
+        -- unique canonical witness of its own: the source snapshot survives
+        -- either way, and `parent == snapname` is equally true after any
+        -- earlier rollback to the same snapshot. The recorded UPID is
+        -- therefore the ONLY durable fact that ties a completion to THIS
+        -- operation, and the application proof already requires it. Without
+        -- this constraint one buggy backend UPDATE could persist a
+        -- materially false `rolled_back` -- releasing the global destructive
+        -- slot and discarding recovery ownership -- for a rollback PVE was
+        -- never durably known to have accepted.
+        CHECK(rollback_completed_at IS NULL OR
+              rollback_task_upid IS NOT NULL),
+        -- Rollback needs the job's OWN confirmed snapshot to roll back to,
+        -- and only ever compensates a workload that may already have been
+        -- mutated, so both of those write-ahead facts must already exist.
+        CHECK(rollback_operation_id IS NULL OR
+              snapshot_confirmed_at IS NOT NULL),
+        CHECK(rollback_operation_id IS NULL OR
+              mutation_may_have_started_at IS NOT NULL),
+        -- Terminal-status invariants. ROLLED_BACK is impossible without
+        -- proven exact rollback completion. SUCCEEDED is impossible without
+        -- proven package mutation completion -- the healthcheck gate that
+        -- must ALSO hold before a job may succeed is a later stage, and this
+        -- schema version deliberately ships no transition to 'succeeded' at
+        -- all.
+        CHECK(status != 'rolled_back' OR rollback_completed_at IS NOT NULL),
+        CHECK(status != 'succeeded' OR mutation_completed_at IS NOT NULL),
+        -- The completion checkpoint and the terminal status are one fact and
+        -- must agree in BOTH directions. The reverse implication
+        -- (rolled_back => rollback_completed) already follows transitively:
+        -- rolled_back requires rollback_completed_at, which requires rank 9.
+        -- This is the forward half, which nothing else covered -- a job left
+        -- at rank 9 while still `active` would claim a completed rollback
+        -- yet keep holding the one global destructive slot forever. The one
+        -- legal transition writes both in the same atomic statement.
+        CHECK(checkpoint != 'rollback_completed' OR status = 'rolled_back')
     )
     """,
     """
@@ -1695,6 +1815,11 @@ _SCHEMA_STATEMENTS = (
     CREATE UNIQUE INDEX one_package_update_job_mutation_operation
     ON package_update_jobs(mutation_operation_id)
     WHERE mutation_operation_id IS NOT NULL
+    """,
+    """
+    CREATE UNIQUE INDEX one_package_update_job_rollback_operation
+    ON package_update_jobs(rollback_operation_id)
+    WHERE rollback_operation_id IS NOT NULL
     """,
     """
     CREATE TABLE package_update_job_packages (
@@ -1991,6 +2116,37 @@ _SCHEMA_STATEMENTS = (
      AND NEW.mutation_completed_at IS NOT OLD.mutation_completed_at
     BEGIN SELECT RAISE(ABORT,
         'package update job mutation completion is write-once'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_rollback_identity_immutable
+    BEFORE UPDATE OF rollback_operation_id, rollback_may_have_started_at
+    ON package_update_jobs
+    WHEN (OLD.rollback_operation_id IS NOT NULL
+          OR OLD.rollback_may_have_started_at IS NOT NULL)
+     AND (NEW.rollback_operation_id IS NOT OLD.rollback_operation_id
+          OR NEW.rollback_may_have_started_at
+             IS NOT OLD.rollback_may_have_started_at)
+    BEGIN SELECT RAISE(ABORT,
+        'package update job rollback operation identity is write-once'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_rollback_task_immutable
+    BEFORE UPDATE OF rollback_task_upid ON package_update_jobs
+    WHEN OLD.rollback_task_upid IS NOT NULL
+     AND NEW.rollback_task_upid IS NOT OLD.rollback_task_upid
+    BEGIN SELECT RAISE(ABORT,
+        'package update job rollback task identity is write-once'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_rollback_completion_immutable
+    BEFORE UPDATE OF rollback_completed_at ON package_update_jobs
+    WHEN OLD.rollback_completed_at IS NOT NULL
+     AND NEW.rollback_completed_at IS NOT OLD.rollback_completed_at
+    BEGIN SELECT RAISE(ABORT,
+        'package update job rollback completion is write-once'
     ); END
     """,
     f"""

@@ -41,15 +41,17 @@ a guest in Proxmox never requires touching this repository or its config.
 
 Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never
 installs packages. Internal durable package-update job authority, job-owned
-snapshot safety, the execution-time plan equality gate, and crash-safe workload
-package mutation are built, but none of them is production-reachable: no HTTP,
-Home Assistant, scheduler, bootstrap, or updater path can create a PVE snapshot
-or change a workload package, and no snapshot, execution, or mutation helper,
-key, or PVE mutation privilege is deployed. Healthchecks and rollback execution
-are not built yet — see `STATUS.md`.
+snapshot safety, the execution-time plan equality gate, crash-safe workload
+package mutation, and same-job rollback execution are built, but none of them
+is production-reachable: no HTTP, Home Assistant, scheduler, bootstrap, or
+updater path can create a PVE snapshot, change a workload package, or roll a
+guest back, and no snapshot, execution, mutation, or rollback helper, key, or
+PVE mutation privilege is deployed. Healthchecks are not built yet, because
+the product has no truthful generic workload-health definition — see
+`STATUS.md`.
 
 Pre-release authority schema versions are not migrated in place: the current
-schema is v13 and has no migration from v12 or earlier. An existing
+schema is v14 and has no migration from v13 or earlier. An existing
 pre-release deployment uses
 `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
 authority schema, backs it up, and resets only the authority database (with

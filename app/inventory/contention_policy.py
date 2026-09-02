@@ -24,12 +24,14 @@ the modules above) -- this is wait *policy*, not transaction shape.
 
 Crash-safe package mutation adds a second pair of such critical sections
 (`execute_package_mutation_submission_if_current` and
-`resolve_pre_mutation_block`), for exactly the same reason and with exactly
-the same shape: one bounded host round trip that crosses (or durably forbids)
-a mutation submission boundary, never the mutation itself. The budget below
-is therefore derived from the worst case over *every* such critical section,
-so adding one can never silently leave ordinary writers with a wait budget
-shorter than a healthy one of them.
+`resolve_pre_mutation_block`), and same-job rollback execution adds a third
+(`execute_rollback_submission_if_current` and `resolve_pre_rollback_block`),
+for exactly the same reason and with exactly the same shape: one bounded host
+round trip that crosses (or durably forbids) a submission boundary, never the
+destructive operation itself. The budget below is therefore derived from the
+worst case over *every* such critical section, so adding one can never
+silently leave ordinary writers with a wait budget shorter than a healthy one
+of them.
 """
 
 from __future__ import annotations
@@ -87,6 +89,22 @@ MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS = (
 #: minutes, which is exactly why it may never happen inside the lock.
 MAX_PACKAGE_MUTATION_SUBMISSION_TIMEOUT_SECONDS = 90
 
+#: Deliberate upper bound on `timeout_seconds` for
+#: `SshPackageUpdateRollbackHostControl` -- the wall-clock budget for ONE
+#: bounded SSH round trip running a typed operation that this backend calls
+#: while it still holds the authority writer lock
+#: (`submit_same_job_rollback` or `seal_rollback_never_submitted`). Neither
+#: waits for PVE's own asynchronous `vzrollback` task: the rollback endpoint
+#: returns a UPID immediately, so the submission call journals `submitted`,
+#: invokes `pvesh create` once, journals the returned task identity, and
+#: returns. What this bounds is a live PVE target read, a canonical snapshot
+#: read, two or three fsynced journal writes, and one `pvesh` trigger --
+#: never the rollback's own duration, which includes force-stopping the
+#: container and replacing its volumes and config. The helper's read-only
+#: `inspect_rollback_state` runs strictly OUTSIDE the writer lock and is
+#: deliberately NOT bounded by this value.
+MAX_ROLLBACK_SUBMISSION_TIMEOUT_SECONDS = 90
+
 #: Explicit scheduling margin on top of the worst-case critical section --
 #: OS/interpreter thread scheduling jitter, SQLite's own lock-handoff
 #: bookkeeping, and clock coarseness -- so the writer budget below is not
@@ -113,14 +131,24 @@ MAX_PACKAGE_MUTATION_CRITICAL_SECTION_SECONDS = (
     MAX_PACKAGE_MUTATION_SUBMISSION_TIMEOUT_SECONDS + BOUNDED_PROCESS_CLEANUP_SECONDS
 )
 
+#: The worst-case wall-clock duration ONE same-job rollback host critical
+#: section (`execute_rollback_submission_if_current` or
+#: `resolve_pre_rollback_block`) may legitimately hold the authority store's
+#: writer lock. Same shape and same reason as the two bounds above, over the
+#: rollback transport's own submission ceiling.
+MAX_ROLLBACK_CRITICAL_SECTION_SECONDS = (
+    MAX_ROLLBACK_SUBMISSION_TIMEOUT_SECONDS + BOUNDED_PROCESS_CLEANUP_SECONDS
+)
+
 #: The worst case over EVERY critical section that may legitimately hold the
 #: authority store's writer lock across a bounded host round trip. The writer
 #: wait budget is derived from this, not from the snapshot bound alone, so
-#: adding a second such critical section can never silently leave ordinary
+#: adding a further such critical section can never silently leave ordinary
 #: writers with a budget shorter than a healthy one of them.
 MAX_HOST_CRITICAL_SECTION_SECONDS = max(
     MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS,
     MAX_PACKAGE_MUTATION_CRITICAL_SECTION_SECONDS,
+    MAX_ROLLBACK_CRITICAL_SECTION_SECONDS,
 )
 
 AUTHORITY_WRITER_WAIT_BUDGET_SECONDS = (
@@ -146,4 +174,11 @@ assert (
 ), (
     "authority writer wait budget must exceed the maximum bounded package "
     "mutation host critical-section duration plus its scheduling margin"
+)
+
+assert (
+    AUTHORITY_WRITER_WAIT_BUDGET_SECONDS > MAX_ROLLBACK_CRITICAL_SECTION_SECONDS
+), (
+    "authority writer wait budget must exceed the maximum bounded same-job "
+    "rollback host critical-section duration plus its scheduling margin"
 )

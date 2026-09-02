@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v13):
+  SQLite authority database (schema v14):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -25,7 +25,14 @@
   statement as the checkpoint, the operation identity, and the timestamp, so
   the mutation-arm facts are one indivisible write-ahead authority fact and
   only the invocation carrying that digest can submit (see "Crash-safe
-  package mutation" below).
+  package mutation" below). Schema v14 adds the same-job rollback operation
+  identity, its write-ahead uncertainty checkpoint, the observed PVE rollback
+  task identity, and rollback completion -- and, critically, replaces v13's
+  "any checkpoint at or beyond `mutation_completed` implies
+  `mutation_completed_at`" implication with per-fact invariants, so a failed,
+  partial, or unproven package mutation can reach the rollback boundary
+  without fabricating a completion it never had (see "Same-job rollback
+  execution" below).
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus exactly
   one authority-only mutation,
   `PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
@@ -76,15 +83,15 @@
 The PVE API inventory surface remains read-only. The backend's sole mutation
 route records Hubinet approval authority state only. Internal update-job
 issuance, job-owned snapshot safety, the execution-time plan equality gate,
-and crash-safe package mutation are not production-reachable: there is no
-HTTP/HA creation control and no worker or scheduler consuming jobs, and no
-snapshot helper, execution helper, mutation helper, key, or PVE mutation
-privilege is deployed. Package scanning may write APT index/cache metadata
+crash-safe package mutation, and same-job rollback execution are not
+production-reachable: there is no HTTP/HA creation control and no worker or
+scheduler consuming jobs, and no snapshot helper, execution helper, mutation
+helper, rollback helper, key, or PVE mutation privilege is deployed. Package scanning may write APT index/cache metadata
 but never changes workload packages, and neither does the execution-time
 gate's or the mutation stage's own metadata refresh and simulation. There is
-no production-reachable workload package mutation, and no healthcheck
-execution, rollback execution, snapshot deletion, lifecycle mutation, policy,
-or endpoint failover anywhere.
+no production-reachable workload package mutation and no production-reachable
+rollback, and no healthcheck execution, snapshot deletion, lifecycle mutation,
+policy, or endpoint failover anywhere.
 
 ## Human0 validation
 
@@ -121,9 +128,9 @@ Hubinet Ops performed neither the package upgrade nor the snapshot rollback in
 the last two checks. They were manual operator actions used only to verify that
 Hubinet observes current guest state. Human0 validates only the scope that is
 actually activated in production; job-owned snapshots, the execution-time plan
-gate, and crash-safe package mutation exist internally but are dark and have
-had no operator Human0 validation, and healthchecks and rollback execution
-remain unimplemented.
+gate, crash-safe package mutation, and same-job rollback execution exist
+internally but are dark and have had no operator Human0 validation, and
+healthchecks remain unimplemented.
 
 ## In-place product update lifecycle
 
@@ -165,7 +172,7 @@ unimplemented future stage.
   single-flight, current-authority revalidation, append-only events, and
   pre-mutation restart interruption.
 - **Not activated:** no HTTP or Home Assistant job control, executor, package
-  mutation, healthcheck, or rollback execution path exists.
+  mutation, rollback, or healthcheck execution path exists.
 
 ## Job-owned snapshot safety
 
@@ -190,10 +197,10 @@ unimplemented future stage.
   dark file that is **not deployed**, no key or `authorized_keys` entry exists
   for it, and no extra PVE privilege (`VM.Snapshot`) is provisioned. The
   package-scan helper remains scan-only.
-- **Deliberately deferred:** rollback *submission*. Only the authorization and
-  selection contract exists; executing a rollback is left to the activation
-  stage rather than shipped to a lower safety bar. There is also no snapshot
-  deletion or retention in this stage, and no workload package mutation.
+- **Rollback submission** is no longer deferred: the authorization and
+  selection contract established here is what "Same-job rollback execution"
+  below builds on, unchanged. There is still no snapshot deletion or
+  retention.
 - **Implemented internal safety/liveness infrastructure:** the two snapshot
   critical sections (`execute_snapshot_submission_if_current`,
   `resolve_pre_submission_block`) correctly hold the authority store's writer
@@ -373,8 +380,8 @@ unimplemented future stage.
   no mutation capability whatsoever. The Version 3 action gate is likewise
   never installed by bootstrap or the updater: it is generated per operation
   and written into one guest's tmpfs only while that operation runs.
-  Healthcheck execution, rollback submission, snapshot retention, and
-  production activation remain later stages. No real package mutation has
+  Healthcheck execution, snapshot retention, and production activation remain
+  later stages. No real package mutation has
   been performed against any live guest; operator Human0 validation of this
   stage has not been done.
 - **Correction completed internally (schema v13).** Three confirmed blockers
@@ -384,12 +391,116 @@ unimplemented future stage.
   invocation can commit and only that invocation can submit with; and every
   guest command, including the detached runner's real package command,
   revalidates its own live PVE target. The stage remains dark, no Human0
-  mutation has been performed, and healthcheck and rollback execution remain
-  future work.
+  mutation has been performed, and healthcheck execution remains future work.
+
+## Same-job rollback execution
+
+- **Implemented internally:** the product's compensation path, at most once
+  per job, crash-safe on both sides. `app/package_update_rollback.py` drives,
+  for one ACTIVE job at either `mutation_may_have_started` OR
+  `mutation_completed`: the exact same-job target proof over a fresh canonical
+  PVE listing, through the SAME
+  `select_package_update_rollback_target` contract PR #67 established; ONE
+  authority transaction (`InventoryAuthority.arm_package_update_rollback`)
+  committing the write-ahead `rollback_may_have_started` checkpoint plus a
+  deterministic, restart-stable `rollback_operation_id`; then a submission only
+  from inside a short critical section
+  (`execute_rollback_submission_if_current`) that re-proves the rollback
+  context while holding the authority store's writer lock.
+- **Both mutation checkpoints are legal entry points, without fabricating
+  anything.** A mutation that failed, was partial, timed out, was killed, or
+  could not be proven complete never reaches `mutation_completed` -- and is
+  exactly the job that most needs compensating. Schema v14 replaces v13's
+  "later rank implies `mutation_completed_at`" implication with per-fact
+  invariants, so that job reaches rollback with `mutation_completed_at` still
+  NULL. `mutation_completed` remains "independently proven complete" and is
+  never a routing flag.
+- **A successful rollback leaves the guest STOPPED.** Verified upstream:
+  `PVE::AbstractConfig::snapshot_rollback` force-stops a running LXC through
+  `PVE::LXC::vm_stop($vmid, 1)`, and the endpoint restarts it only when its own
+  `start` parameter is set. This stage pins `start` to 0 as a code-owned
+  host-side constant that is not a field of the typed request at all.
+  Restarting the guest, and validating it afterwards, are separate future work.
+- **Rollback authority is deliberately narrower than update authority.** It
+  re-proves exact ACTIVE job ownership, the derived rollback identity, the
+  job's own confirmed snapshot, and the exact resource/locator context -- but
+  NOT current package-plan currency, and NOT that the guest is running. A newer
+  scan or a stale approval is expected after an update ran, and must never
+  withdraw the recovery path from a half-upgraded guest; a rollback candidate
+  may legitimately already be stopped.
+- **At-most-once across crashes:** `deploy/hubinet-package-rollback-helper.py`
+  is a separate, deliberately narrower dark boundary exposing three typed
+  operations (`inspect_rollback_state`, `submit_same_job_rollback`,
+  `seal_rollback_never_submitted`), journaling each by operation identity with
+  fsynced atomic renames under a non-blocking per-VMID `flock`
+  (`intent -> sealed_not_submitted | submitted -> task_known -> terminal`).
+  `submitted` is fsynced before `pvesh create` and is never resubmitted from;
+  `sealed_not_submitted` is the only durable release proof; `absent`/`intent`
+  are transient routing evidence. Every pre-flight refusal happens before
+  `submitted`, so an operation PVE was always going to reject never enters the
+  permanently uncertain window: that includes **any** non-empty PVE config
+  lock (upstream `check_lock` dies on a truthy lock of any type, not just the
+  snapshot family) and a final **ownership** proof of the target snapshot from
+  the host's own fresh listing -- a snapshot name is a physical PVE key and is
+  never ownership proof, and PVE state can change between authority's arming
+  proof and the destructive call. Combining rollback into the snapshot helper
+  was considered and rejected: keeping create and rollback in separate
+  forced-command boundaries means one deployed key never carries both.
+- **Completion is proven, never assumed:** `rollback_completed` requires the
+  coherent set -- a terminal non-error PVE task by PVE's own rule, the durable
+  `rollback_task_upid` this job recorded, fresh canonical evidence of exactly
+  one complete job-owned snapshot, and PVE's `current` pseudo-entry reporting
+  `parent` equal to that snapshot. `parent` is corroboration inside that set,
+  never standalone; the source snapshot surviving is treated as no evidence at
+  all, because upstream never deletes it. A `submitted` operation with no
+  captured UPID never recovers into success.
+- **Failure never releases ownership:** a terminal failed task, a running task,
+  a timeout, a lost response, an unreadable status, a corrupt journal, or
+  evidence about a different operation all leave the job ACTIVE at
+  `rollback_may_have_started`, still owning the global destructive slot and its
+  snapshot, and none is ever retried. The single exception is the host's
+  durable `sealed_not_submitted` proof, which releases the job `blocked`. A
+  recorded task identity permanently forbids that seal. A proven rollback
+  terminalizes the job `ROLLED_BACK` -- never `SUCCEEDED`: a rolled-back update
+  is not a successful update.
+- **Not activated:** no HTTP, Home Assistant, scheduler, bootstrap, or updater
+  path can reach any of this. The rollback helper is a separate dark file that
+  is **not deployed**, with no key, no `authorized_keys` entry, and neither PVE
+  snapshot privilege provisioned -- the deployed role stays exactly the
+  audit-only pair. No real rollback has been performed against any live guest;
+  operator Human0 validation of this stage has not been done.
+- **Out of scope here:** healthcheck execution (see below), snapshot deletion
+  and retention, restarting the guest after a rollback, and any automatic
+  compensation policy. This stage ships the internal primitive only: a caller
+  must ask for one exact job to be rolled back.
+
+## The healthcheck contract is an open product decision
+
+Hubinet Ops 0.5 has **no truthful generic workload-health definition**, so no
+healthcheck is implemented and no job can reach `SUCCEEDED`. This is a recorded
+decision, not an oversight:
+
+- guest reachability, an `apt` exit code, and the package-mutation completion
+  proof are each already-meaningful facts, and none of them is a
+  workload-health contract; reusing one as if it were would be untruthful;
+- Hubinet 0.4 answered this question with an operator-declared per-guest
+  contract (required services or Docker health), and explicitly disabled
+  rollback-on-health when no contract was declared -- it never claimed a
+  generic one;
+- 0.5 removed both mechanisms 0.4 depended on (an in-guest agent, and static
+  per-VMID profiles) without replacing them, and static VMID configuration is
+  forbidden outright;
+- the supported managed-guest contract is only "an LXC whose `/etc/os-release`
+  says debian or ubuntu, reachable via `pct exec`", which says nothing about
+  what any guest is *for*.
+
+Any future health contract must therefore attach to **dynamic per-resource
+authority keyed by `resource_id`**, never to a repository or config VMID list.
+Which contract to adopt remains a product decision and is not settled here.
 
 ## Next
 
-- Healthcheck execution and same-job rollback execution.
+- A dynamic per-resource health contract, then healthcheck execution.
 - Production activation of the update lifecycle.
 - Snapshot retention, then lifecycle controls (start/stop/reboot) and manual
   snapshot operations.
@@ -406,7 +517,7 @@ unimplemented future stage.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v13 is incompatible with v12, v11, v10, and v9, and
+- Pre-release: schema v14 is incompatible with v13, v12, v11, v10, and v9, and
   there is no in-place migration path. An existing installation now uses
   `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible authority schema, backs it up, and
   resets only the authority database (see "In-place product updates" below)
