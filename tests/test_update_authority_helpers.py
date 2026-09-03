@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 from types import ModuleType
 
@@ -440,25 +441,40 @@ class TestUpdateProbe:
         finally:
             update_probe.AGENT_ENV_PATH = original
 
-    def test_successful_probe_reports_facts(self, tmp_path, monkeypatch, capsys):
+    @staticmethod
+    def _probe_env(tmp_path, monkeypatch):
         env_file = tmp_path / "agent.env"
         env_file.write_text("HUBINET_OPS_R0_API_TOKEN=abc123\n", encoding="utf-8")
         monkeypatch.setattr(update_probe, "AGENT_ENV_PATH", str(env_file))
 
-        responses = {
+    @staticmethod
+    def _install_responses(monkeypatch, responses):
+        def fake_get_json(path, token):
+            assert token == "abc123"
+            value = responses[path]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        monkeypatch.setattr(update_probe, "get_json", fake_get_json)
+
+    @staticmethod
+    def _base_responses(package_update):
+        return {
             "/backend": {"backend_instance_id": BACKEND_ID},
             "/snapshot": {
                 "sources": [
                     {"last_committed_run_sequence": 5, "health": "healthy", "freshness": "fresh"}
                 ]
             },
+            "/package-update/active": package_update,
         }
 
-        def fake_get_json(path, token):
-            assert token == "abc123"
-            return responses[path]
-
-        monkeypatch.setattr(update_probe, "get_json", fake_get_json)
+    def test_successful_probe_reports_facts(self, tmp_path, monkeypatch, capsys):
+        self._probe_env(tmp_path, monkeypatch)
+        self._install_responses(
+            monkeypatch, self._base_responses({"active": False, "job": None})
+        )
         rc = update_probe.main()
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
@@ -466,6 +482,102 @@ class TestUpdateProbe:
         assert payload["backend_instance_id"] == BACKEND_ID
         assert payload["last_committed_run_sequence"] == 5
         assert payload["health"] == "healthy"
+        assert payload["package_update_active"] is False
+        assert payload["package_update_job_id"] is None
+
+    def test_active_workload_job_is_reported_with_its_identity(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The updater's fence witness. `true` plus enough to name the job."""
+
+        self._probe_env(tmp_path, monkeypatch)
+        self._install_responses(
+            monkeypatch,
+            self._base_responses(
+                {
+                    "active": True,
+                    "job": {
+                        "job_id": "11111111-2222-3333-4444-555555555555",
+                        "checkpoint": "mutation_may_have_started",
+                    },
+                }
+            ),
+        )
+        assert update_probe.main() == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is True
+        assert payload["package_update_active"] is True
+        assert payload["package_update_job_id"] == "11111111-2222-3333-4444-555555555555"
+        assert payload["package_update_checkpoint"] == "mutation_may_have_started"
+
+    def test_absent_route_is_a_pre_activation_backend_not_a_refusal(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A 404 is the ONE failure that means "no job is possible here".
+
+        A backend predating production activation has no update worker and no
+        route, so it cannot own a workload job. That is read from the route's
+        absence, and only from a real 404.
+        """
+
+        self._probe_env(tmp_path, monkeypatch)
+        self._install_responses(
+            monkeypatch,
+            self._base_responses(
+                urllib.error.HTTPError(
+                    "http://127.0.0.1:8787/r0/v1/package-update/active",
+                    404,
+                    "Not Found",
+                    {},
+                    None,
+                )
+            ),
+        )
+        assert update_probe.main() == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is True
+        assert payload["package_update_active"] is None
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            urllib.error.HTTPError(
+                "http://127.0.0.1:8787/r0/v1/package-update/active",
+                503,
+                "Service Unavailable",
+                {},
+                None,
+            ),
+            urllib.error.URLError("connection refused"),
+        ],
+    )
+    def test_unreachable_endpoint_is_never_read_as_no_active_job(
+        self, tmp_path, monkeypatch, capsys, failure
+    ):
+        """"We could not ask" must never be reported as "the answer was no".
+
+        Anything but a 404 makes the whole probe `ok: false`, which the
+        updater treats as a refusal to proceed -- exactly the fail-closed
+        posture an unanswerable safety question deserves.
+        """
+
+        self._probe_env(tmp_path, monkeypatch)
+        self._install_responses(monkeypatch, self._base_responses(failure))
+        assert update_probe.main() == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert "package_update" in payload["reason"]
+        assert "package_update_active" not in payload
+
+    def test_malformed_active_payload_fails_closed(self, tmp_path, monkeypatch, capsys):
+        self._probe_env(tmp_path, monkeypatch)
+        self._install_responses(
+            monkeypatch, self._base_responses({"active": "yes", "job": None})
+        )
+        assert update_probe.main() == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["reason"] == "package_update_active_malformed"
 
 
 class _FakeAcceptClock:

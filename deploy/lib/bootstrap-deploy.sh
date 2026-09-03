@@ -182,6 +182,29 @@ package_scan:
     timeout_seconds: 900
     max_result_bytes: 8388608
 
+# Production activation of the operator-triggered update lifecycle. This is
+# execution-boundary information only: how to reach each privileged forced
+# command on the SOURCE. There is no VMID, no resource id, no per-guest
+# setting, and no managed-resource list here or anywhere else -- adding or
+# removing a PVE guest still never requires a config change.
+#
+# Every stage's timeout stays code-owned. Three of them are load-bearing
+# ceilings on how long a bounded host round trip may hold the authority
+# store's writer lock, and a per-installation override would let them be
+# widened quietly.
+package_update:
+  enabled: true
+  host_control:
+    host: "$(_endpoint_host "${PVE_ENDPOINT}")"
+    port: 22
+    user: root
+    known_hosts_path: "${HOST_CONTROL_CT_KNOWN_HOSTS}"
+    snapshot_private_key_path: "$(update_boundary_ct_private_key snapshot)"
+    execution_private_key_path: "$(update_boundary_ct_private_key execution)"
+    mutation_private_key_path: "$(update_boundary_ct_private_key mutation)"
+    rollback_private_key_path: "$(update_boundary_ct_private_key rollback)"
+    health_private_key_path: "$(update_boundary_ct_private_key health)"
+
 runtime:
   authority_db_path: /var/lib/hubinet-ops/authority.db
   api_token_env: HUBINET_OPS_R0_API_TOKEN

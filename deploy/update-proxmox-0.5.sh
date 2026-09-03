@@ -49,6 +49,8 @@ source "${BOOTSTRAP_SCRIPT_DIR}/lib/update-stage.sh"
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/update-activate.sh"
 # shellcheck source=lib/update-recovery.sh
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/update-recovery.sh"
+# shellcheck source=lib/update-boundaries.sh
+source "${BOOTSTRAP_SCRIPT_DIR}/lib/update-boundaries.sh"
 
 # ---------------------------------------------------------------------------
 # Defaults / CLI contract (AGENTS.md task prompt section 8)

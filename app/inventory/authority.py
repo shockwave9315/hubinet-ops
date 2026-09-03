@@ -72,6 +72,7 @@ from .health_execution import (
     HealthContractExecutionError,
     require_health_contract_execution_eligible,
 )
+from .package_update_issuance import PackageUpdateIssuanceRefused
 from .health_observation import (
     HEALTH_PROBE_REASONS,
     require_health_probe_semantics,
@@ -1504,17 +1505,27 @@ class InventoryAuthority:
                     str(existing["resource_id"]) != canonical_resource_id
                     or str(existing["approval_id"]) != canonical_approval_id
                 ):
-                    raise AuthorityConflict(
-                        "request_id was already used for another package update request"
+                    raise PackageUpdateIssuanceRefused(
+                        "request_id_conflict",
+                        "request_id was already used for another package update request",
                     )
                 result_job_id = str(existing["job_id"])
             else:
-                resource = self._require_package_scan_target(
-                    connection, canonical_resource_id
-                )
+                try:
+                    resource = self._require_package_scan_target(
+                        connection, canonical_resource_id
+                    )
+                except AuthorityConflict as exc:
+                    # `_require_package_scan_target` is shared with package
+                    # scanning and keeps its own message; only the name this
+                    # operator-facing path reports is added here.
+                    raise PackageUpdateIssuanceRefused(
+                        "resource_not_current", str(exc)
+                    ) from exc
                 if str(resource["resource_type"]) != "lxc":
-                    raise AuthorityConflict(
-                        "package update jobs support LXC resources only"
+                    raise PackageUpdateIssuanceRefused(
+                        "resource_unsupported",
+                        "package update jobs support LXC resources only",
                     )
 
                 approval = connection.execute(
@@ -1522,12 +1533,14 @@ class InventoryAuthority:
                     (canonical_resource_id,),
                 ).fetchone()
                 if approval is None:
-                    raise AuthorityConflict(
-                        "package update job requires a current package plan approval"
+                    raise PackageUpdateIssuanceRefused(
+                        "no_current_approval",
+                        "package update job requires a current package plan approval",
                     )
                 if str(approval["approval_id"]) != canonical_approval_id:
-                    raise AuthorityConflict(
-                        "approval_id does not identify the current package plan approval"
+                    raise PackageUpdateIssuanceRefused(
+                        "approval_not_current",
+                        "approval_id does not identify the current package plan approval",
                     )
 
                 reviewed = self._require_package_scan_run_row(
@@ -1566,15 +1579,29 @@ class InventoryAuthority:
                     or str(current["outcome"])
                     != PackageScanOutcome.SUCCESS.value
                 ):
-                    raise AuthorityConflict(
-                        "latest package scan attempt is not a successful exact plan"
+                    # The decision is unchanged -- issuance still refuses.
+                    # A scan that is still RUNNING is the one case where
+                    # current plan authority is undecidable rather than
+                    # proven wrong, exactly as the execution gate already
+                    # distinguishes it, so the operator is told to ask again
+                    # instead of being told their plan drifted.
+                    raise PackageUpdateIssuanceRefused(
+                        (
+                            "source_authority_unavailable"
+                            if current is not None
+                            and str(current["lifecycle"])
+                            == PackageScanLifecycle.RUNNING.value
+                            else "plan_not_approved"
+                        ),
+                        "latest package scan attempt is not a successful exact plan",
                     )
                 current_fingerprint = self._successful_package_scan_fingerprint(
                     connection, current
                 )
                 if current_fingerprint != approved_fingerprint:
-                    raise AuthorityConflict(
-                        "current package plan does not match the approved plan"
+                    raise PackageUpdateIssuanceRefused(
+                        "plan_not_approved",
+                        "current package plan does not match the approved plan",
                     )
 
                 decision_time = self._authority_decision_time()
@@ -1601,8 +1628,9 @@ class InventoryAuthority:
                         (str(current["scan_run_id"]),),
                     ).fetchall()
                     if not packages:
-                        raise AuthorityConflict(
-                            "package update job requires a non-empty exact plan"
+                        raise PackageUpdateIssuanceRefused(
+                            "plan_empty",
+                            "package update job requires a non-empty exact plan",
                         )
                     # The success criterion, frozen in the SAME transaction
                     # as the plan and read through the same fail-closed
@@ -1613,9 +1641,10 @@ class InventoryAuthority:
                         connection, canonical_resource_id
                     )
                     if contract is None:
-                        raise AuthorityConflict(
+                        raise PackageUpdateIssuanceRefused(
+                            "health_contract_unconfigured",
                             "package update job requires a declared resource "
-                            "health contract"
+                            "health contract",
                         )
                     # Configuration deliberately stores bounded opaque
                     # targets.  A package-update job is narrower: every
@@ -1626,9 +1655,10 @@ class InventoryAuthority:
                     try:
                         require_health_contract_execution_eligible(contract.probes)
                     except HealthContractExecutionError as exc:
-                        raise AuthorityConflict(
+                        raise PackageUpdateIssuanceRefused(
+                            "health_contract_not_executable",
                             "resource health contract is not executable for a "
-                            "package update job"
+                            "package update job",
                         ) from exc
                     job_id = _new_uuid()
                     issued_at = _timestamp(decision_time)
@@ -1724,8 +1754,9 @@ class InventoryAuthority:
                             ),
                         )
                     except sqlite3.IntegrityError as exc:
-                        raise AuthorityConflict(
-                            "another active package update job owns the global slot"
+                        raise PackageUpdateIssuanceRefused(
+                            "another_job_active",
+                            "another active package update job owns the global slot",
                         ) from exc
                     self._append_package_update_job_event(
                         connection,
@@ -1755,8 +1786,9 @@ class InventoryAuthority:
                     result_job_id = job_id
 
         if rejected_current_authority:
-            raise AuthorityConflict(
-                "approved package plan or its current authority context is stale"
+            raise PackageUpdateIssuanceRefused(
+                "plan_not_approved",
+                "approved package plan or its current authority context is stale",
             )
         if result_job_id is None:
             raise AuthorityInvariantError("package update job issuance was not captured")

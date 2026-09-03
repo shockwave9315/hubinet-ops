@@ -428,6 +428,47 @@ class InventoryAuthorityStore:
                 raise AuthorityNotFound("package update job does not exist")
             return _package_update_job(connection, row)
 
+    def active_package_update_job(self) -> PackageUpdateJob | None:
+        """Return the ONE globally active package-update job, or ``None``.
+
+        The ``one_active_package_update_job_globally`` unique index makes at
+        most one such row possible, so this is a total read of the durable
+        single-flight slot rather than a "pick the newest" heuristic. The
+        production worker re-reads it before every action: in-memory belief
+        about what is running is never permission to act.
+        """
+
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM package_update_jobs WHERE status='active'"
+            ).fetchall()
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise AuthorityInvariantError(
+                    "more than one active package update job exists"
+                )
+            return _package_update_job(connection, rows[0])
+
+    def latest_package_update_job_for_resource(
+        self, resource_id: str
+    ) -> PackageUpdateJob | None:
+        """Return one resource's most recently issued job, or ``None``.
+
+        Bounded to exactly one row: this is the operator readback's "what is
+        this resource's update doing", not a job history feed. Ordering is
+        ``(issued_at, job_id)`` descending, matching every other job listing
+        in this module, so a tie is still deterministic.
+        """
+
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM package_update_jobs WHERE resource_id=? "
+                "ORDER BY issued_at DESC, job_id DESC LIMIT 1",
+                (resource_id,),
+            ).fetchone()
+            return None if row is None else _package_update_job(connection, row)
+
     def list_package_update_jobs(self) -> tuple[PackageUpdateJob, ...]:
         with self._read_transaction() as connection:
             rows = connection.execute(

@@ -320,6 +320,29 @@ _update_pre_probe() {
     reason="$(_json_field_from_text "${probe_output}" "reason")"
     die "pre-update live probe failed (${reason:-unknown}) -- refusing to update a product that does not currently prove it is live and reachable"
   fi
+  # The ACTIVE WORKLOAD UPDATE JOB FENCE. This runs in Phase U2 --
+  # classification -- which is strictly before staging, before the service
+  # is stopped, and before any helper, key, config file, or systemd unit is
+  # touched. Once workload mutation is live, replacing the backend or its
+  # privileged helpers while a job owns a snapshot, mutation, or rollback
+  # journal can pair a new backend with a half-replaced helper set for an
+  # operation already in flight, so this refuses rather than negotiating.
+  #
+  # There is deliberately NO bypass flag. An operator whose update is
+  # genuinely stuck resolves the job through the product's own explicit
+  # controls (resume, or rollback) and then runs the updater again.
+  local update_active update_job_id update_checkpoint
+  update_active="$(_json_field_from_text "${probe_output}" "package_update_active")"
+  if [[ "${update_active}" == "1" ]]; then
+    update_job_id="$(_json_field_from_text "${probe_output}" "package_update_job_id")"
+    update_checkpoint="$(_json_field_from_text "${probe_output}" "package_update_checkpoint")"
+    die "refusing to update: package update job ${update_job_id:-unknown} is ACTIVE at checkpoint ${update_checkpoint:-unknown} on this installation. Nothing has been changed. Let it finish, or resolve it through the operator controls (resume or roll back), then run this updater again."
+  fi
+  # An empty value is the pre-activation backend whose /package-update/active
+  # route does not exist. That backend has no update worker and no way to
+  # own a workload job, so there is nothing to fence -- and the probe only
+  # reports it for a real HTTP 404, never for an unreachable backend.
+
   UPDATE_PRE_BACKEND_INSTANCE_ID="$(_json_field_from_text "${probe_output}" "backend_instance_id")"
   UPDATE_PRE_COMMITTED_SEQUENCE="$(_json_field_from_text "${probe_output}" "last_committed_run_sequence")"
   [[ -n "${UPDATE_PRE_BACKEND_INSTANCE_ID}" ]] \
@@ -342,6 +365,7 @@ update_plan_classify() {
   _update_classify_requirements
   _update_classify_unit
   _update_classify_helper
+  update_boundaries_classify
   _update_classify_authority
   _update_pre_probe
   _update_capture_plan_fence_from_classification
@@ -369,6 +393,8 @@ Application payload:           replace (tracked files at target commit)
 requirements.txt:              ${requirements_plan}
 systemd unit:                  $( [[ "${UPDATE_UNIT_CHANGED}" == "1" ]] && printf 'changed -- will be replaced during activation' || printf 'unchanged -- left in place' )
 PVE host helper:               $( [[ "${UPDATE_HELPER_CHANGED}" == "1" ]] && printf 'changed -- content will be replaced at the SAME path (%s)' "${UPDATE_HELPER_PATH}" || printf 'unchanged -- left in place' )
+Package-update boundaries:     $(update_boundaries_plan_summary)
+Active workload update job:    none (verified before this plan was printed -- an active job refuses this updater outright)
 Authority schema:              ${UPDATE_CURRENT_SCHEMA_VERSION} -> ${UPDATE_TARGET_SCHEMA_VERSION}
 Authority action:              $( [[ "${UPDATE_AUTHORITY_ACTION}" == "preserve" ]] && printf 'preserve (schema unchanged, database and every stored fact kept as-is)' || printf 'RESET REQUIRED -- no migration exists for this schema transition' )
 Home Assistant re-enrollment:  $( [[ "${UPDATE_HA_REENROLL_REQUIRED}" == "1" ]] && printf 'REQUIRED after this update (backend_instance_id will change)' || printf 'not required (backend_instance_id is preserved)' )

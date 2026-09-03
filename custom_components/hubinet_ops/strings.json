@@ -114,6 +114,20 @@
       },
       "resource_reboot_required": {
         "name": "Reboot required"
+      },
+      "resource_package_update_job": {
+        "name": "Package update job",
+        "state": {
+          "unsupported": "Unsupported",
+          "not_started": "Not started",
+          "active": "Active",
+          "succeeded": "Succeeded",
+          "blocked": "Blocked",
+          "failed": "Failed",
+          "rolled_back": "Rolled back",
+          "interrupted": "Interrupted",
+          "manual_intervention": "Manual intervention"
+        }
       }
     }
   },
@@ -185,6 +199,50 @@
         "expected_revision": {
           "name": "Expected revision",
           "description": "Optional. Refuse the change unless the stored contract is still at this revision."
+        }
+      }
+    },
+    "start_update": {
+      "name": "Start update",
+      "description": "Explicitly start the currently approved package update for one selected Hubinet Ops resource. This is the only way a real package change ever begins; Hubinet Ops never starts one on its own.",
+      "fields": {
+        "device_id": {
+          "name": "Resource",
+          "description": "Select a workload resource managed by Hubinet Ops."
+        }
+      }
+    },
+    "view_update_job": {
+      "name": "View update job",
+      "description": "Read the current or latest package update job for one selected Hubinet Ops resource, with a bounded tail of its events.",
+      "fields": {
+        "device_id": {
+          "name": "Resource",
+          "description": "Select a workload resource managed by Hubinet Ops."
+        },
+        "events": {
+          "name": "Events",
+          "description": "How many recent job events to return (0-200)."
+        }
+      }
+    },
+    "resume_update": {
+      "name": "Resume update",
+      "description": "Ask Hubinet Ops to re-enter an existing recoverable update job after a transient uncertainty. It never resubmits a package change; it re-reads the durable checkpoint and continues only where that is safe.",
+      "fields": {
+        "device_id": {
+          "name": "Resource",
+          "description": "Select a workload resource managed by Hubinet Ops."
+        }
+      }
+    },
+    "rollback_update": {
+      "name": "Roll back update",
+      "description": "Explicitly roll one resource back to the snapshot its own update job created. Hubinet Ops never rolls back on its own, and never to any other snapshot. A successful rollback leaves the guest stopped.",
+      "fields": {
+        "device_id": {
+          "name": "Resource",
+          "description": "Select a workload resource managed by Hubinet Ops."
         }
       }
     }

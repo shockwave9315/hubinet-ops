@@ -29,6 +29,7 @@ from .api import (
     NodeSnapshot,
     PackageScanStatus,
     PackagePlanApprovalStatus,
+    PackageUpdateJobState,
     PresenceState,
     ResourceSnapshot,
 )
@@ -183,6 +184,19 @@ RESOURCE_SENSORS = (
         # through the view_health_contract action, not carried in entity
         # state on every poll.
         value_fn=lambda resource: resource.health_contract.status.value,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="package_update_job",
+        translation_key="resource_package_update_job",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.ENUM,
+        options=[state.value for state in PackageUpdateJobState],
+        # What the resource's current/latest update job IS. Never the event
+        # log, never the frozen package rows, and never the per-probe health
+        # results -- those are response data from the explicit
+        # `view_update_job` action. This entity summarizes; it does not
+        # replicate.
+        value_fn=lambda resource: resource.package_update_job.state.value,
     ),
     HubinetOpsResourceSensorDescription(
         key="pending_updates",
@@ -362,4 +376,21 @@ class HubinetOpsResourceSensor(HubinetOpsResourceEntity, SensorEntity):
             "package_scan_run_id": resource.package_scan.scan_run_id,
             "package_scan_completed_at": resource.package_scan.completed_at,
             "package_plan_fingerprint": resource.package_scan.plan_fingerprint,
+            # Bounded update-job identity only. `checkpoint` and the two
+            # timestamps are the facts an operator glances at; anything
+            # detailed stays behind the explicit action.
+            "package_update_job_id": resource.package_update_job.job_id,
+            "package_update_checkpoint": resource.package_update_job.checkpoint,
+            "package_update_health_outcome": (
+                None
+                if resource.package_update_job.health_outcome is None
+                else resource.package_update_job.health_outcome.value
+            ),
+            "package_update_issued_at": resource.package_update_job.issued_at,
+            "package_update_terminalized_at": (
+                resource.package_update_job.terminalized_at
+            ),
+            "package_update_terminal_reason": (
+                resource.package_update_job.terminal_reason
+            ),
         }

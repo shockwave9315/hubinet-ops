@@ -21,6 +21,10 @@ from .health_contract import (
 from .health_observation import (
     HEALTH_PROBE_REASONS,
 )
+from .package_update_issuance import (
+    PACKAGE_UPDATE_ISSUANCE_REFUSALS,
+    PackageUpdateIssuanceRefused,
+)
 from .contention_policy import (
     AUTHORITY_WRITER_WAIT_BUDGET_MS,
     AUTHORITY_WRITER_WAIT_BUDGET_SECONDS,
@@ -33,6 +37,7 @@ from .contention_policy import (
 )
 from .models import (
     AuthorityConflict,
+    CHECKPOINT_ORDER,
     AuthorityDatabaseRejected,
     AuthorityError,
     AuthorityInvariantError,
@@ -155,6 +160,7 @@ __all__ = [
     "BOUNDED_PROCESS_CLEANUP_SECONDS",
     "BoundaryBaselineResult",
     "CANONICALIZATION_CONTRACT_VERSION",
+    "CHECKPOINT_ORDER",
     "DEFINITIVE_HEALTH_OUTCOMES",
     "DiscoveryRun",
     "DiscoveryRunCompletionEvidence",
@@ -207,6 +213,8 @@ __all__ = [
     "PackageUpdateExecutionOutcome",
     "PackageUpdateHealthContextChanged",
     "PackageUpdateHealthRequest",
+    "PACKAGE_UPDATE_ISSUANCE_REFUSALS",
+    "PackageUpdateIssuanceRefused",
     "PackageUpdateJob",
     "PackageUpdateJobEvent",
     "PackageUpdateJobHealthProbe",

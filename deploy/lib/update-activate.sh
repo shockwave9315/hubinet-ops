@@ -533,6 +533,14 @@ update_activate_and_accept() {
       || die "failed to activate the staged PVE host helper (same-path atomic rename)"
   fi
 
+  # Step 8b -- the five package-update forced-command boundaries, their
+  # root-only operation journals, and the one configuration block that
+  # activates the lifecycle. Every artifact created here is journaled before
+  # it exists, so a failure after this point removes exactly the new
+  # privileged access paths this run created and restores exactly the ones it
+  # replaced. See update-boundaries.sh.
+  update_boundaries_activate
+
   # Step 9 -- authority action: preserve, or backup + reset.
   if [[ "${UPDATE_AUTHORITY_ACTION}" == "reset_required" ]]; then
     _update_perform_authority_reset
@@ -1048,6 +1056,12 @@ update_rollback_on_failure() {
   _update_rollback_authority
 
   _update_rollback_host_helper
+
+  # Removes exactly the privileged access paths THIS run created -- helper,
+  # forced-command authorization, and key -- and restores exactly the ones it
+  # replaced. A failed activation update must not leave a new key that can
+  # reach a root-owned mutation helper behind.
+  update_boundaries_rollback
 
   _update_rollback_unit
   _update_rollback_venv_and_requirements
