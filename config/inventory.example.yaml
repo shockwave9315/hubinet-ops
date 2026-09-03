@@ -75,10 +75,18 @@ package_scan:
 #
 # `enabled: false` (or omitting this section entirely) is the pre-activation
 # shape: the backend builds no update host control, starts no worker, and the
-# three operator control routes answer 503. `enabled: true` requires all five
-# credentials below to be present, absolute, and readable AT STARTUP -- a
-# missing privileged credential fails startup closed rather than being
-# discovered when an operator asks for a real package mutation.
+# three operator control routes answer 503. It is the default HERE because
+# this example is also what deploy/install-0.5.0-fresh.sh copies, and that
+# standalone installer deliberately does not touch the PVE host -- so the
+# five forced-command boundaries below do not exist yet on an installation
+# that started from this file. `deploy/bootstrap-proxmox-0.5.sh` provisions
+# them and generates an ALREADY-ACTIVATED configuration; set this to true by
+# hand only once the boundaries genuinely exist.
+#
+# `enabled: true` requires all five credentials below to be present,
+# absolute, and readable AT STARTUP -- a missing privileged credential fails
+# startup closed rather than being discovered when an operator asks for a
+# real package mutation.
 #
 # Execution-boundary information only. There is no VMID, resource id,
 # per-guest setting, or managed-resource list here, for exactly the reason
@@ -95,7 +103,7 @@ package_scan:
 # trip may hold the authority store's writer lock (see ARCHITECTURE.md,
 # "SQLite writer-contention policy").
 package_update:
-  enabled: true
+  enabled: false
   host_control:
     host: "pve.example.internal"
     port: 22

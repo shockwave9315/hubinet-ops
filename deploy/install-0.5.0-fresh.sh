@@ -103,6 +103,13 @@ Before starting the service:
    The full Proxmox bootstrap provisions that boundary automatically; this
    standalone installer deliberately does not modify the PVE host.
 
+   Operator-triggered package updates ship disabled in that example config
+   for the same reason: they need five further forced-command boundaries on
+   the PVE host, one dedicated key each, which only the full bootstrap
+   provisions. Leave package_update.enabled false unless those boundaries
+   genuinely exist -- with it true, a missing helper credential fails this
+   service's startup closed.
+
 2. Edit /etc/hubinet-ops/agent.env -- set HUBINET_OPS_R0_PVE_TOKEN to
    your Proxmox API token in the exact shape user@realm!tokenid=secret.
    HUBINET_OPS_R0_API_TOKEN has already been generated for you; this is
