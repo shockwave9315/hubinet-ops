@@ -88,9 +88,25 @@ before any mutation:
    and its forced-command path matches the expected Hubinet helper shape;
 4. that helper file exists as an executable, root-owned file;
 5. the PVE user/token comments carry the same run-id;
-6. the token's effective PVE permissions are exactly `Sys.Audit,VM.Audit`.
+6. the token's effective PVE permissions are exactly `Sys.Audit,VM.Audit`;
+7. **no package-update job is ACTIVE.** The updater asks the running
+   installation's own authenticated `GET /r0/v1/package-update/active` route.
+   Once workload mutation is live, replacing the backend or its privileged
+   helpers while a job owns a snapshot, mutation, or rollback journal can pair
+   a new backend with a half-replaced helper set for an operation already in
+   flight, so this refuses outright. There is deliberately **no bypass flag**:
+   let the update finish, or resolve it through the product's own
+   `resume_update` / `rollback_update` controls, then run the updater again.
 
-Any mismatch stops the run before anything is staged or mutated.
+   A backend predating production activation answers 404 for that route. That
+   is a real answer — such a backend has no update worker and cannot own a
+   workload job — and the updater proceeds. Any *other* failure to ask the
+   question stops the run: "we could not ask" is never read as "the answer was
+   no".
+
+Any mismatch stops the run before anything is staged or mutated. All seven
+checks run in Phase U2, which is strictly before staging, before the service
+is stopped, and before any helper, key, config file, or unit is touched.
 
 This whole chain, plus a small bounded fingerprint of the approved plan
 (the installed requirements.txt/unit/PVE-helper content, the authority
@@ -116,6 +132,10 @@ Before staging or mutating anything, the updater prints:
   artifacts are never touched, never rebuilt, never rewritten;
 - the installed and target authority schema versions, and whether the
   authority action is `preserve` or a destructive `reset-required`;
+- what will happen to the five package-update forced-command boundaries:
+  unchanged, replaced in place, or newly provisioned (which is what upgrading
+  a pre-activation installation into the activated lifecycle does);
+- that no workload update job is active — verified before the plan is printed;
 - whether Home Assistant re-enrollment will be required afterward.
 
 ## What is always preserved
@@ -123,9 +143,43 @@ Before staging or mutating anything, the updater prints:
 An ordinary code-only update never touches: the LXC, its VMID, its
 IP/network, the PVE user/role/token, the PVE token secret,
 `/etc/hubinet-ops/inventory.yaml`, `/etc/hubinet-ops/agent.env`, PVE CA
-trust material, the host-control private/public key, pinned `known_hosts`,
-the forced-command `authorized_keys` line, nftables, or the authority
-database (when the schema is unchanged).
+trust material, the host-control private/public keys, pinned `known_hosts`,
+any forced-command `authorized_keys` line, nftables, or the authority
+database (when the schema is unchanged). The package-scan boundary is never
+rotated or rewritten by this updater, and neither is any package-update
+boundary whose helper already matches the target commit.
+
+## Activating the update lifecycle on an existing installation
+
+An installation bootstrapped before production activation has no
+package-update boundaries. Updating it to an activation build provisions
+them, and that is the one thing this updater does which creates NEW
+privileged access paths:
+
+- five root-owned forced-command helpers on the PVE host;
+- five dedicated private keys inside the CT, one per boundary;
+- five `authorized_keys` lines, each naming a different forced command;
+- three root-only (`0700`) operation journals under `/var/lib/hubinet-ops/`;
+- one appended `package_update:` block in `/etc/hubinet-ops/inventory.yaml`.
+
+The configuration block is **appended**, never merged: it is one
+self-contained top-level YAML key, so every other line of your configuration
+stays byte-for-byte as it was.
+
+**A failed activation update leaves no new privileged access path behind.**
+Every artifact above is recorded in the run's durable journal *before* it
+exists, and rollback removes exactly what this run created — helper, key, and
+authorization together, with the authorization removed first so the shortest
+possible window is also the safest ordering. It removes only what this run
+created: an unrelated operator `authorized_keys` entry, and the package-scan
+boundary from the original bootstrap, both survive untouched. A journal
+directory that already existed is never removed either — it may hold another
+operation's durable at-most-once evidence, and destroying that to tidy up
+would be strictly worse than leaving an empty directory.
+
+An already-activated installation whose helper content matches the target
+commit is left completely alone: no key rotation, no re-authorization, no
+rewrite.
 
 ## Destructive authority reset
 
@@ -333,8 +387,14 @@ After activation and service start, the updater proves:
 
 ## First Human0 caveat
 
-The updater has complete automated (hermetic, sandboxed) validation — see
-`STATUS.md`, "In-place product update lifecycle". It has not yet been
-validated against a real Proxmox host and a real existing installation.
-Read this document and the plan output carefully before running it against
-a production installation for the first time.
+The updater's generic (non-workload) in-place behaviour completed its first
+real operator Human0 validation against CT110 — see `STATUS.md`, "In-place
+product update lifecycle".
+
+Its **activation** behaviour has not. Provisioning the five package-update
+boundaries, the active-job fence, and the rollback that removes newly created
+privileged access paths all have complete automated (hermetic, sandboxed)
+validation and no real-host validation. Read this document and the plan output
+carefully the first time you run it against a production installation, and see
+`README.md`'s "Running your first real update" for the operator procedure that
+validates the lifecycle itself.

@@ -144,8 +144,13 @@ On the Proxmox host:
   installed and their presence verified (never assumed present on the
   base template) before the firewall and acceptance phases depend on
   them.
-- On the PVE host: one uniquely named root-owned package-scan helper and one
-  appended Hubinet-owned line in `/root/.ssh/authorized_keys`. That key has a
+- On the PVE host: **six** uniquely named root-owned helpers and six appended
+  Hubinet-owned lines in `/root/.ssh/authorized_keys` — the package-scan
+  boundary, plus one each for the five stages of the update lifecycle
+  (snapshot, plan simulation, mutation, rollback, health). Each line names a
+  different forced command and trusts a different private key, because the key
+  is what selects which command a connection may run: one key that reached two
+  helpers would silently merge two different privileges. Every key has a
   forced command and explicitly disables PTY, port forwarding, agent
   forwarding, and X11 forwarding. Existing authorized-key entries and sshd
   configuration are preserved.
@@ -236,13 +241,42 @@ script from a real, trusted git checkout of this repository.
   `--pve-ca-path` and `--tls-trust` fails closed when no CA is found.
 - No non-git source payload of any kind.
 - No 0.4 migration, import, or coexistence of any kind.
-- No arbitrary SSH or command-string API. The dedicated key can reach only the
-  package-scan forced helper; that helper accepts bounded JSON on stdin and one
-  typed operation, validates the VMID/current node/type/status, and invokes only
-  fixed `pvesh`/`pct exec` argument shapes. It never uses `eval`.
+- No arbitrary SSH or command-string API. Each dedicated key can reach exactly
+  one forced helper, and each helper accepts bounded JSON on stdin and its own
+  small set of typed operations, validates the VMID/current node/type/status,
+  and invokes only fixed `pvesh`/`pct exec` argument shapes. None of them uses
+  `eval`, and none of them accepts command text, an argv, or a caller-supplied
+  operation name.
+- No merged multifunction root helper. "Create a snapshot", "simulate a plan",
+  "mutate packages", "roll a guest back", and "read health" stay five separate
+  files behind five separate keys.
+- No real destructive action during acceptance. Every new boundary is verified
+  with a deliberately malformed typed request that the helper refuses
+  structurally before it can do anything — no snapshot is created, no package
+  changed, nothing rolled back, and no workload probed. There is no generic
+  "ping" operation, because that existing refusal already proves the key
+  reached exactly this forced command.
 - No host mutation of any kind (including `pveam update`/`download`)
   before you have seen and confirmed the full plan (VMID, template,
   source commit).
+
+### Root-only operation journals
+
+Three of the five update boundaries are destructive, and each keeps a durable
+per-operation journal on the PVE host under `/var/lib/hubinet-ops/`
+(`snapshot-operations`, `package-mutation-operations`, `rollback-operations`),
+created root-owned and mode `0700`. Those journals are what make a snapshot,
+a package mutation, and a rollback at-most-once across a crash: the host
+records that an operation crossed its door *before* it does, so a recovering
+backend reattaches to that record instead of guessing. Do not delete them
+while a job is in flight.
+
+### The PVE API role is unchanged
+
+Activating workload mutation broadened no PVE API privilege. The created role
+is still exactly `Sys.Audit,VM.Audit`, and `VM.Snapshot` appears in no
+deployment script at all — every mutation runs host-local behind a root-owned
+forced command rather than through the inventory API identity.
 
 ## Security model
 

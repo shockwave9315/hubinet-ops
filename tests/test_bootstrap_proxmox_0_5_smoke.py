@@ -368,9 +368,17 @@ class TestSourceProvenance:
         (non_git / "app" / "__init__.py").write_text("", encoding="utf-8")
         (non_git / "requirements.txt").write_text("x==1\n", encoding="utf-8")
         (non_git / "deploy" / "install-0.5.0-fresh.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-        (non_git / "deploy" / "hubinet-package-scan-helper.py").write_text(
-            "#!/usr/bin/env python3\n", encoding="utf-8"
-        )
+        for helper in (
+            "hubinet-package-scan-helper.py",
+            "hubinet-package-snapshot-helper.py",
+            "hubinet-package-update-helper.py",
+            "hubinet-package-mutation-helper.py",
+            "hubinet-package-rollback-helper.py",
+            "hubinet-package-health-helper.py",
+        ):
+            (non_git / "deploy" / helper).write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
         result = _run(fake_env.env, _base_args(non_git, **{"--expected-sha": False}), source_dir=non_git)
         assert result.returncode != 0
         assert "is not a git checkout" in result.stderr
@@ -2728,3 +2736,209 @@ class TestContainerCreation:
             scenario_overrides={"local_templates": [], "available_templates": []},
         )
         assert result.returncode != 0
+
+
+class TestPackageUpdateBoundaryProvisioning:
+    """A fresh install provisions five separate privileged boundaries.
+
+    One helper, one dedicated key, and one forced-command entry per stage of
+    the update lifecycle. The separation is the property: the key is what
+    selects which command a connection may run, so one key reaching two
+    helpers would silently merge two different privileges.
+    """
+
+    KINDS = ("snapshot", "execution", "mutation", "rollback", "health")
+
+    def test_success_installs_five_helpers_keys_and_forced_commands(
+        self, tmp_path, source_checkout
+    ):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        host_root = Path(fake_env_obj.env["HUBINET_OPS_TEST_HOST_ROOT"])
+        authorized_path = host_root / "root" / ".ssh" / "authorized_keys"
+        authorized = authorized_path.read_text(encoding="utf-8")
+        helper_dir = host_root / "usr" / "local" / "libexec"
+
+        for kind in self.KINDS:
+            helpers = list(helper_dir.glob(f"hubinet-package-{kind}-boundary-*"))
+            assert len(helpers) == 1, kind
+            # Root-owned and executable: this is a privileged boundary, and
+            # its mode is part of the boundary rather than incidental.
+            assert helpers[0].stat().st_mode & 0o777 == 0o755, kind
+            assert authorized.count(f"hubinet-ops-package-{kind}-vmid-110-") == 1, kind
+            key = fake_env_obj.ct_file(
+                "110", f"/etc/hubinet-ops/host-control/id_ed25519_{kind}"
+            )
+            assert key.exists(), kind
+
+        # Six boundaries in total: the five above plus the unchanged
+        # scan-only one, each on its OWN line with its OWN forced command.
+        lines = [line for line in authorized.splitlines() if line.strip()]
+        assert len(lines) == 6
+        commands = {
+            line.split('command="', 1)[1].split('"', 1)[0] for line in lines
+        }
+        assert len(commands) == 6
+        keys = {line.rsplit(" ", 2)[-2] for line in lines}
+        assert len(keys) == 1, (
+            "the fake emits one deterministic public key value; what must be "
+            "distinct in production is the key FILE per boundary, asserted above"
+        )
+        for option in (
+            "no-port-forwarding",
+            "no-agent-forwarding",
+            "no-X11-forwarding",
+            "no-pty",
+        ):
+            for line in lines:
+                assert option in line
+
+    def test_success_provisions_root_only_operation_journals(
+        self, tmp_path, source_checkout
+    ):
+        """The durable at-most-once evidence lives root-only on the host."""
+
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        host_root = Path(fake_env_obj.env["HUBINET_OPS_TEST_HOST_ROOT"])
+        for journal in (
+            "var/lib/hubinet-ops/snapshot-operations",
+            "var/lib/hubinet-ops/package-mutation-operations",
+            "var/lib/hubinet-ops/rollback-operations",
+        ):
+            path = host_root / journal
+            assert path.is_dir(), journal
+            assert path.stat().st_mode & 0o777 == 0o700, journal
+
+    def test_success_activates_the_lifecycle_without_a_static_resource_list(
+        self, tmp_path, source_checkout
+    ):
+        """Execution-boundary information only, and no timeout knobs."""
+
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        inventory = fake_env_obj.ct_file_text(
+            "110", "/etc/hubinet-ops/inventory.yaml"
+        )
+        assert "package_update:" in inventory
+        assert "enabled: true" in inventory
+        for kind in self.KINDS:
+            assert f"{kind}_private_key_path:" in inventory
+        # No VMID, resource id, guest name, or managed-resource list, and no
+        # per-installation override of a stage's own bound.
+        for forbidden in (
+            "vmid",
+            "resources:",
+            "containers:",
+            "resource_id",
+            "timeout_seconds",
+            "poll",
+        ):
+            assert forbidden not in inventory.split("package_update:", 1)[1], forbidden
+
+    def test_acceptance_invokes_no_destructive_helper_operation(
+        self, tmp_path, source_checkout
+    ):
+        """Acceptance is structural refusal only.
+
+        Bootstrap proves the key, the host-key pin, the sshd policy, and the
+        forced command end to end without creating a snapshot, changing a
+        package, rolling anything back, or probing a workload -- and there is
+        no generic "ping" operation, because each helper's existing refusal
+        of a non-typed request already is the proof.
+        """
+
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        log = "\n".join(fake_env_obj.log_lines())
+        for forbidden in (
+            "ensure_pre_update_snapshot_submitted",
+            "execute_exact_package_mutation",
+            "submit_same_job_rollback",
+            "evaluate_health_contract",
+            "simulate_exact_update_plan",
+            "pvesh create",
+            "pct snapshot",
+            "pct rollback",
+        ):
+            assert forbidden not in log, forbidden
+
+    def test_an_unusable_boundary_fails_closed_and_removes_what_it_created(
+        self, tmp_path, source_checkout
+    ):
+        """A boundary that cannot answer is a refusal, not a warning.
+
+        And the cleanup that follows removes every Hubinet-owned artifact --
+        including the four boundaries that had already been provisioned --
+        while leaving an unrelated operator key exactly as it was.
+        """
+
+        scenario = default_scenario()
+        scenario["fail"] = ["boundary_probe_health"]
+        fake_env_obj = build_fake_pve_environment(tmp_path, scenario)
+        host_root = Path(fake_env_obj.env["HUBINET_OPS_TEST_HOST_ROOT"])
+        ssh_dir = host_root / "root" / ".ssh"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        authorized = ssh_dir / "authorized_keys"
+        unrelated = "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFB unrelated-operator\n"
+        authorized.write_text(unrelated, encoding="utf-8")
+
+        result = _run(
+            fake_env_obj.env,
+            _base_args(source_checkout),
+            source_dir=source_checkout,
+        )
+
+        assert result.returncode != 0
+        assert "did not reject the typed probe as expected" in result.stderr
+        assert authorized.read_text(encoding="utf-8") == unrelated
+        helper_dir = host_root / "usr" / "local" / "libexec"
+        for kind in self.KINDS:
+            assert not list(helper_dir.glob(f"hubinet-package-{kind}-boundary-*")), kind
+        assert not list(helper_dir.glob("hubinet-package-scan-helper-*"))
+
+    def test_failure_removes_every_boundary_helper_and_authorization(
+        self, tmp_path, source_checkout
+    ):
+        """A failed bootstrap leaves behind no new privileged access path."""
+
+        scenario = default_scenario()
+        scenario["fail"] = ["nft_syntax"]
+        fake_env_obj = build_fake_pve_environment(tmp_path, scenario)
+        host_root = Path(fake_env_obj.env["HUBINET_OPS_TEST_HOST_ROOT"])
+
+        result = _run(
+            fake_env_obj.env,
+            _base_args(source_checkout),
+            source_dir=source_checkout,
+        )
+
+        assert result.returncode != 0
+        helper_dir = host_root / "usr" / "local" / "libexec"
+        for kind in self.KINDS:
+            assert not list(helper_dir.glob(f"hubinet-package-{kind}-boundary-*")), kind
+        authorized = host_root / "root" / ".ssh" / "authorized_keys"
+        if authorized.exists():
+            contents = authorized.read_text(encoding="utf-8")
+            for kind in self.KINDS:
+                assert f"hubinet-ops-package-{kind}-vmid-110-" not in contents, kind
+        assert not fake_env_obj.ct_file(
+            "110", "/etc/hubinet-ops/host-control"
+        ).exists()
+
+    def test_the_pve_api_role_is_still_exactly_the_audit_pair(
+        self, tmp_path, source_checkout
+    ):
+        """Activating workload mutation broadened no PVE API privilege.
+
+        Every mutation runs host-local behind a root-owned forced command,
+        so the inventory API identity never needed one.
+        """
+
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        state = json.loads(fake_env_obj.state_path.read_text(encoding="utf-8"))
+        assert state["pve_roles"]["HubinetOpsR0Auditor"] == ["Sys.Audit", "VM.Audit"]
+        log = "\n".join(fake_env_obj.log_lines())
+        for forbidden in ("VM.Snapshot", "VM.Allocate", "VM.Config", "VM.PowerMgmt"):
+            assert forbidden not in log, forbidden

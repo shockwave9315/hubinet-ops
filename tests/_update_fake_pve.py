@@ -45,6 +45,34 @@ FAKE_HELPER_HOST_PATH_TEMPLATE = "/usr/local/libexec/hubinet-package-scan-helper
 FAKE_REQUIRED_SCHEMA_OBJECTS = ("authority_schema", "backend_instance", "one_active_endpoint_per_source")
 
 
+#: The five privileged forced-command boundaries production activation
+#: deploys, as (kind, helper source file). The scan boundary is a sixth,
+#: separate, unchanged one and is deliberately not in this table.
+UPDATE_BOUNDARY_HELPERS = (
+    ("snapshot", "hubinet-package-snapshot-helper.py"),
+    ("execution", "hubinet-package-update-helper.py"),
+    ("mutation", "hubinet-package-mutation-helper.py"),
+    ("rollback", "hubinet-package-rollback-helper.py"),
+    ("health", "hubinet-package-health-helper.py"),
+)
+
+#: The root-only durable operation journals the three destructive boundaries
+#: keep on the PVE host.
+UPDATE_BOUNDARY_JOURNAL_DIRS = (
+    "/var/lib/hubinet-ops/snapshot-operations",
+    "/var/lib/hubinet-ops/package-mutation-operations",
+    "/var/lib/hubinet-ops/rollback-operations",
+)
+
+
+def boundary_helper_host_path(kind: str, run_id: str) -> str:
+    return f"/usr/local/libexec/hubinet-package-{kind}-boundary-{run_id}"
+
+
+def boundary_key_ct_path(kind: str) -> str:
+    return f"/etc/hubinet-ops/host-control/id_ed25519_{kind}"
+
+
 def seed_installed_environment(
     tmp_path: Path,
     *,
@@ -60,7 +88,21 @@ def seed_installed_environment(
     corrupt_authority_db: bool = False,
     missing_authority_db: bool = False,
     schema_objects: list[str] | None = None,
+    activated: bool = True,
+    boundary_helper_text: dict[str, str] | None = None,
 ) -> FakePveEnvironment:
+    """Seed one installed Hubinet CT.
+
+    ``activated`` describes whether this installation has already been
+    activated for operator-triggered package updates. ``True`` is the
+    ordinary case after this release: the five forced-command boundaries,
+    their dedicated keys, their journals, and the `package_update` config
+    block already exist, so an ordinary product update leaves them alone.
+    ``False`` models a PRE-ACTIVATION installation being upgraded into the
+    activated lifecycle -- the one path that creates new privileged access
+    paths, and therefore the one whose rollback matters most.
+    """
+
     scenario = default_scenario()
     scenario["update_probe_backend_instance_id"] = backend_instance_id
     scenario["discovery_backend_instance_id"] = backend_instance_id
@@ -144,11 +186,55 @@ def seed_installed_environment(
         "192.0.2.10 ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\n", encoding="utf-8"
     )
 
+    inventory_text = 'source:\n  display_name: "Home Proxmox"\n  provider_kind: proxmox_ve\n'
+    if activated:
+        repo = Path(__file__).resolve().parents[1]
+        # Five root-owned helpers, five dedicated keys, five forced-command
+        # entries, and three root-only journals -- exactly what an activated
+        # bootstrap leaves behind.
+        for kind, name in UPDATE_BOUNDARY_HELPERS:
+            text = (boundary_helper_text or {}).get(kind)
+            if text is None:
+                text = (repo / "deploy" / name).read_text(encoding="utf-8")
+            boundary_path = host_root / boundary_helper_host_path(kind, run_id).lstrip("/")
+            boundary_path.parent.mkdir(parents=True, exist_ok=True)
+            boundary_path.write_text(text, encoding="utf-8")
+            boundary_path.chmod(0o755)
+            boundary_marker = f"hubinet-ops-package-{kind}-vmid-{vmid}-{run_id}"
+            with authorized_keys.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f'command="{boundary_helper_host_path(kind, run_id)}",'
+                    "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,"
+                    "no-pty ssh-ed25519 "
+                    f"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE= {boundary_marker}\n"
+                )
+            key = ct(boundary_key_ct_path(kind))
+            key.parent.mkdir(parents=True, exist_ok=True)
+            key.write_text("FAKE PRIVATE KEY FOR TEST ONLY\n", encoding="utf-8")
+            key.with_name(key.name + ".pub").write_text(
+                "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE= "
+                f"{boundary_marker}\n",
+                encoding="utf-8",
+            )
+        for journal in UPDATE_BOUNDARY_JOURNAL_DIRS:
+            (host_root / journal.lstrip("/")).mkdir(parents=True, exist_ok=True)
+        inventory_text += (
+            "\npackage_update:\n"
+            "  enabled: true\n"
+            "  host_control:\n"
+            '    host: "192.0.2.10"\n'
+            "    port: 22\n"
+            "    user: root\n"
+            '    known_hosts_path: "/etc/hubinet-ops/host-control/known_hosts"\n'
+            + "".join(
+                f'    {kind}_private_key_path: "{boundary_key_ct_path(kind)}"\n'
+                for kind, _name in UPDATE_BOUNDARY_HELPERS
+            )
+        )
+
     inventory_yaml = ct("/etc/hubinet-ops/inventory.yaml")
     inventory_yaml.parent.mkdir(parents=True, exist_ok=True)
-    inventory_yaml.write_text(
-        'source:\n  display_name: "Home Proxmox"\n  provider_kind: proxmox_ve\n', encoding="utf-8"
-    )
+    inventory_yaml.write_text(inventory_text, encoding="utf-8")
     (ct("/etc/hubinet-ops/agent.env")).write_text(
         "HUBINET_OPS_R0_CONFIG=/etc/hubinet-ops/inventory.yaml\n"
         "HUBINET_OPS_R0_PVE_TOKEN=hubinetops@pve!r0-readonly=00000000-0000-0000-0000-000000000000\n"
@@ -232,6 +318,7 @@ def build_update_target_checkout(
     requirements_text: str = "fastapi==0.116.1\n",
     unit_text: str | None = None,
     helper_text: str | None = None,
+    boundary_helper_text: dict[str, str] | None = None,
     required_schema_objects: list[str] | None = None,
 ) -> Path:
     """A tiny, fast, git-initialized target checkout for --source-dir.
@@ -280,6 +367,14 @@ def build_update_target_checkout(
     if helper_text is None:
         helper_text = (repo_root / "deploy" / "hubinet-package-scan-helper.py").read_text(encoding="utf-8")
     (src / "deploy" / "hubinet-package-scan-helper.py").write_text(helper_text, encoding="utf-8")
+    # The five package-update forced-command helpers the target commit must
+    # carry. `boundary_helper_text` overrides one of them so a test can model
+    # a changed privileged boundary without changing the scan boundary.
+    for kind, name in UPDATE_BOUNDARY_HELPERS:
+        text = (boundary_helper_text or {}).get(kind)
+        if text is None:
+            text = (repo_root / "deploy" / name).read_text(encoding="utf-8")
+        (src / "deploy" / name).write_text(text, encoding="utf-8")
     (src / "deploy" / "install-0.5.0-fresh.sh").write_text(
         (repo_root / "deploy" / "install-0.5.0-fresh.sh").read_text(encoding="utf-8"), encoding="utf-8"
     )

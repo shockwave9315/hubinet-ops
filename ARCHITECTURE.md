@@ -10,6 +10,7 @@ Proxmox VE
   -> Hubinet backend            (app/inventory_runtime.py composition root)
   -> authoritative inventory/scan DB (SQLite, app/inventory/)
   -> package scan scheduler      (typed SSH -> forced PVE helper -> pct exec)
+  -> package update worker       (one worker, woken only by operator action)
   -> HTTP API                   (/r0/v1, bearer auth)
   -> Home Assistant             (custom_components/hubinet_ops/)
 ```
@@ -63,15 +64,17 @@ backed-up authority reset and require Home Assistant re-enrollment.
 `app/inventory_runtime.py` is the production composition root, served via its
 `create_app_from_env` factory
 (`uvicorn app.inventory_runtime:create_app_from_env --factory`). It builds the store, authority,
-publication, PVE transport, and scheduler, and serves `GET /r0/v1/health`,
-`/backend`, `/snapshot`, plus exactly two families of authority-metadata
-mutation: `PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
-`GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`. Bearer
-authentication is required on every endpoint except the deliberately
-unauthenticated minimal `/r0/v1/health` liveness probe, which exposes no
-inventory or credential data. Both families change only the authority
-database and have no host-control path: neither can start a job, mutate a
-package, take or roll back a snapshot, or run a healthcheck.
+publication, PVE transport, the scheduler, and -- when `package_update.enabled`
+is configured true -- the five production update host controls and the one
+`PackageUpdateWorker`. It serves `GET /r0/v1/health`, `/backend`, `/snapshot`,
+two families of authority-metadata mutation
+(`PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
+`GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`), and the
+explicit operator update controls described under "Production update
+activation" below. Bearer authentication is required on every endpoint except
+the deliberately unauthenticated minimal `/r0/v1/health` liveness probe, which
+exposes no inventory or credential data. The two metadata families change only
+the authority database and have no host-control path of their own.
 
 `app/inventory_pve_transport.py` is GET-only with mandatory TLS verification
 and no mutation-verb escape hatch. `app/inventory_scheduler.py` is a thin
@@ -94,33 +97,222 @@ that same fixed `pct exec` shape to the guest's node over root's existing
 Proxmox cluster-member SSH trust rather than executing locally — no per-node
 Hubinet credential. QEMU is published as unsupported.
 
-Package-update job authority is persistence-only in this stage. A directly
-instantiated `InventoryAuthority` can issue and revalidate one globally
-single-flight job from a current exact approval, and startup interrupts any
-pre-package-mutation active job so it cannot auto-run after restart. The
-production HTTP and Home Assistant surfaces cannot issue a job, and there is
-no job consumer or healthcheck execution. Authority revalidation
-is necessary but not sufficient permission for mutation: the execution-time
-equality gate below proves exact fresh APT simulation/equality against the
-job's frozen material, and even a successful pass is not a durable mutation
-permit -- the mutation stage re-runs that exact equality proof itself,
-immediately before it mutates, in the same transaction that commits its
-write-ahead uncertainty boundary (see "Execution-time plan equality" and
-"Crash-safe package mutation" below). Real workload package mutation exists
-internally, is at-most-once and crash-safe, and is likewise unreachable from
-production.
+Package-update job authority owns one globally single-flight job issued from a
+current exact approval, and startup interrupts any pre-package-mutation active
+job so it cannot auto-run after restart. Authority revalidation is necessary
+but not sufficient permission for mutation: the execution-time equality gate
+below proves exact fresh APT simulation/equality against the job's frozen
+material, and even a successful pass is not a durable mutation permit -- the
+mutation stage re-runs that exact equality proof itself, immediately before it
+mutates, in the same transaction that commits its write-ahead uncertainty
+boundary (see "Execution-time plan equality" and "Crash-safe package mutation"
+below).
+
+## Production update activation
+
+The stages below -- job-owned snapshot safety, execution-time plan equality,
+crash-safe package mutation, same-job rollback, and job-bound healthcheck
+execution -- are production-reachable, and this section is the whole of how.
+
+### The two operator entry points, and nothing else
+
+```text
+POST /r0/v1/resources/{resource_id}/package-update
+  -> resolve THIS resource's current durable approval
+  -> InventoryAuthority.issue_package_update_job(resource, approval, request_id)
+  -> 202                                  (the job is already durable)
+  -> wake the worker                      (a hint, never authority)
+
+POST /r0/v1/resources/{resource_id}/package-update/rollback
+  -> resolve the one applicable ACTIVE job
+  -> read a FRESH canonical PVE listing   (read-only inspect_job_snapshot_state)
+  -> InventoryAuthority.arm_package_update_rollback(job, listing)
+  -> 202                                  (the intent is already durable)
+  -> wake the worker
+```
+
+`issue_package_update_job` has exactly one production caller: that POST route.
+`arm_package_update_rollback` has exactly one: the rollback route. Neither
+scheduler calls either, no scan callback does, the approval write does not,
+the Home Assistant coordinator does not, and the worker itself does not.
+`tests/test_r0_architecture_regression.py` proves both statements by AST over
+the composition root rather than by assertion.
+
+The caller-controlled surface of the whole lifecycle is one UUID. The start
+body carries `request_id` and nothing else; the resume and rollback bodies are
+empty. Every request model is `extra="forbid"`, so a body naming a VMID, a
+node, a package, a version, an architecture, a plan fingerprint, a snapshot, a
+probe, a contract revision, a command, an argv, a host, or a helper operation
+is a 422 rather than a field quietly ignored.
+
+Two further routes are read-only and available whether or not activation is
+enabled, because an installation that has switched it off may still own a
+durable job and reporting nothing about it would report a false absence:
+`GET /r0/v1/resources/{resource_id}/package-update` (one job plus a bounded
+event tail) and `GET /r0/v1/package-update/active` (whether ANY job owns the
+global slot -- the product updater's fence witness).
+
+`POST /r0/v1/resources/{resource_id}/package-update/resume` is production
+liveness for the states that deliberately have no retry policy. It wakes the
+worker, which re-reads the durable checkpoint and invokes only the existing
+safe continuation semantics for whatever state that turns out to be. It never
+means "submit the destructive command again", and no stage, checkpoint,
+operation, or target comes from the caller.
+
+### The worker composes; it does not decide
+
+`app/package_update_worker.py` is one bounded worker owning one thread. It
+contains no state machine, no host I/O, no transaction, and no policy. Each
+cycle re-reads the one globally active job from the authority database and
+runs the ONE stage that job's durable checkpoint calls for:
+
+```text
+issued | preflight_passed | snapshot_may_have_started
+                              -> PackageUpdateSnapshotOrchestrator
+snapshot_confirmed            -> run_package_update_execution_gate
+                              -> PackageUpdateMutationOrchestrator (submitting)
+mutation_may_have_started     -> PackageUpdateMutationOrchestrator (recovery)
+mutation_completed | health_started
+                              -> PackageUpdateHealthOrchestrator
+health_completed (failed)     -> stop; ACTIVE and rollback-capable
+rollback_may_have_started     -> PackageUpdateRollbackOrchestrator
+```
+
+The execution gate runs even though the mutation stage re-proves exact
+material itself. That is deliberate: the gate is the cheap, entirely
+non-mutating refusal that keeps a drifted plan from reaching the stage that
+owns the real package command, and a successful pass changes nothing durable
+about the job.
+
+Every stage transition must strictly advance the durable checkpoint or the
+cycle stops, so no checkpoint is ever attempted twice within one cycle. That
+is a termination guarantee, not a retry budget.
+
+**Wake-driven, not polled.** With nothing to do the worker blocks on an
+`Event` with no timeout. Only an explicit operator action or shutdown sets it.
+There is no interval, no backoff, no grace period, no attempt count, and no
+threshold anywhere in the composition: one wake performs at most one attempt
+of the stage the job is at, and a stop leaves the worker idle for that job
+until an operator asks again. Its stop reasons are a closed set
+(`PACKAGE_UPDATE_WORKER_STOP_REASONS`), and none of them names an interval, a
+deadline, or a compensating action.
+
+**Durable single-flight remains the concurrency authority.** The
+`one_active_package_update_job_globally` unique index is what makes at most
+one job possible; the worker's in-process cycle lock only stops one worker
+running two cycles at once and is never the thing that stops two mutations.
+That is also why there is one worker and no per-resource pool: a pool would be
+concurrency this product has already made impossible.
+
+**Error boundary.** An unexpected exception in one cycle is logged bounded and
+redacted -- the exception TYPE and the job id, never a message, never helper
+output, never a credential -- and the worker stays alive. No durable authority
+fact is written, no success is synthesized, and the global slot is never
+cleared merely to regain liveness.
+
+### Restart
+
+The order at startup is exact: `InventoryAuthority.
+recover_interrupted_package_update_jobs()` first, then the worker. Authority
+recovery terminalizes only the provably pre-mutation checkpoints (`issued`,
+`preflight_passed`, `snapshot_confirmed`) as `interrupted`; every durable
+uncertain state is left ACTIVE, fenced, and owning the global slot with its
+evidence intact. The worker then re-observes whatever remains through the
+stage that owns it -- `snapshot_may_have_started` reattaches through the
+host's journal, `mutation_may_have_started` enters the mutation stage's
+recovery-only path which can never submit, `health_started` simply evaluates
+again because health is read-only, and `rollback_may_have_started`
+re-observes the exact task rather than submitting a second rollback.
+
+A restart can therefore never duplicate a destructive submission, and can
+never mark a job `SUCCEEDED`: the only route to that status is a proven
+passing verdict against the job's own frozen contract.
+
+A crash immediately after a 202 is likewise truthful rather than optimistic.
+The start route's acknowledgement means a durable job exists; if the process
+dies before the worker continues it, startup recovery terminalizes a
+still-pre-mutation job as interrupted and the operator asks again. Nothing
+fabricates a success.
+
+### Deployed privilege boundaries
+
+Five separate root-owned forced-command helpers, five separate dedicated
+keys, five separate `authorized_keys` entries:
+
+| Boundary | Helper | Key |
+| --- | --- | --- |
+| snapshot | `hubinet-package-snapshot-helper.py` | `id_ed25519_snapshot` |
+| execution (plan simulation) | `hubinet-package-update-helper.py` | `id_ed25519_execution` |
+| mutation | `hubinet-package-mutation-helper.py` | `id_ed25519_mutation` |
+| rollback | `hubinet-package-rollback-helper.py` | `id_ed25519_rollback` |
+| health | `hubinet-package-health-helper.py` | `id_ed25519_health` |
+
+The separation is the property, not the file count: the key is what selects
+which forced command a connection may run, so one key reaching two helpers
+would silently merge two different privileges. The configuration loader
+refuses a configuration that points two boundaries at one key. The
+package-scan boundary is a sixth, separate, unchanged one, and nothing here
+rotates or reuses it.
+
+Host, port, user, and the pinned `known_hosts` ARE shared, and legitimately:
+they describe the one configured source's SSH endpoint, which is the same
+endpoint for every boundary.
+
+The three destructive boundaries keep root-only (`0700`) durable operation
+journals under `/var/lib/hubinet-ops/` on the PVE host. Those are what make
+them at-most-once across a crash.
+
+**No PVE API privilege was broadened.** Every mutation runs host-local behind
+a root-owned forced command, so the inventory API identity never needs one:
+the provisioned role stays exactly `Sys.Audit,VM.Audit`, and `VM.Snapshot`
+appears in no deployment script at all.
+
+### Runtime configuration
+
+`package_update.enabled` is the whole activation switch. False (or absent)
+means no host control is built, no worker is started, and the three operator
+control routes answer `503 package_update_not_activated`. True means every one
+of the five dedicated credentials must be present, absolute, and readable at
+startup: a missing privileged credential fails startup closed rather than
+being discovered when an operator asks for a real package mutation.
+
+The section carries execution-boundary information only -- no VMID, no
+resource id, no per-guest setting, no managed-resource list -- and no timeout
+knobs. Three of the stage bounds are load-bearing ceilings on how long a
+bounded host round trip may hold the authority store's writer lock (see
+"SQLite writer-contention policy"), and a per-installation override would let
+them be widened quietly.
+
+### The product updater's active-job fence
+
+Replacing the backend or its privileged helpers while a package-update job
+owns a snapshot, mutation, or rollback journal can pair a new backend with a
+half-replaced helper set for an operation already in flight. So
+`deploy/update-proxmox-0.5.sh` reads `GET /r0/v1/package-update/active` during
+Phase U2 -- classification, strictly before staging, before the service is
+stopped, and before any helper, key, config file, or unit is touched -- and
+refuses outright if a job is active. There is no bypass flag: an operator
+whose update is stuck resolves it through the product's own controls and runs
+the updater again.
+
+The witness distinguishes three answers. `true` refuses. `false` proceeds. A
+real HTTP 404 means the route does not exist, so this backend predates
+activation and cannot own a workload job -- there is nothing to fence. Every
+other failure makes the whole probe fail, and the updater refuses: "we could
+not ask" is never read as "the answer was no".
 
 ## Job-owned snapshot safety
 
-The safety primitives for one update job's single pre-update PVE snapshot
-exist internally and are **not production-reachable**. Nothing on the HTTP,
-Home Assistant, scheduler, bootstrap, or updater path can create a PVE
-snapshot, and no snapshot helper, key, or PVE mutation privilege is deployed.
-There is still no workload package mutation anywhere.
+One update job's single pre-update PVE snapshot. Production-reachable through
+the explicit operator start control and the one worker (see "Production update
+activation"), and through nothing else: no scheduler, scan, approval write, or
+Home Assistant poll can create a PVE snapshot. The snapshot helper is deployed
+behind its OWN dedicated key and forced command, and it still needs no PVE API
+mutation privilege -- it runs host-local.
 
 ```text
 issued -> preflight_passed -> snapshot_may_have_started
-       -> snapshot_confirmed -> (mutation, still unimplemented)
+       -> snapshot_confirmed -> execution-time plan equality -> mutation
 ```
 
 **The uncertainty boundary.** `snapshot_may_have_started` is a write-ahead
@@ -2257,14 +2449,20 @@ aggregation, result insertion, and verdict commit all share one
 one definitive completion can commit, and a late result can never overwrite an
 accepted verdict or a rollback that advanced the job.
 
-### Not activated
+### How production reaches it
 
-No HTTP start-update endpoint, no Home Assistant start-update action, no job
-scheduler or worker consuming approved plans, no production job issuance, no
-production snapshot/mutation/rollback/health orchestration, no health-result HA
-sensor, no bootstrap deployment of the health helper, no `authorized_keys`
-entry, no key, and no extra PVE privilege. The full lifecycle remains dark;
-production activation is the next product stage.
+Through the one worker, at `mutation_completed` or `health_started`, and
+through nothing else -- see "Production update activation". One wake performs
+at most one truthful read-only attempt. A PASS terminalizes the job
+`SUCCEEDED`; a FAIL leaves it ACTIVE and rollback-capable and the worker idle;
+an UNKNOWN writes no verdict at all and leaves the evaluation repeatable,
+which an operator asks for through `resume_update`. There is still no retry
+interval, backoff, grace period, attempt count, or threshold, and this stage
+still makes zero calls into the rollback stage.
+
+The health helper is deployed behind its own dedicated key and forced command
+and needs **no new PVE API privilege**: it reads through host-local `pct exec`,
+so the provisioned role stays exactly the audit-only pair.
 
 ## Ordinary safety rules (all layers, now and later)
 

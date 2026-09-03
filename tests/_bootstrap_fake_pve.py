@@ -512,6 +512,36 @@ def _missing_python_script(raw_arg):
     return 2
 
 
+#: Which forced command each dedicated key reaches, and the exact bounded
+#: refusal that helper answers a non-typed request with. Six separate
+#: boundaries: the unchanged scan-only one, plus the five the production
+#: update lifecycle deploys.
+_BOUNDARY_BY_KEY = {
+    "id_ed25519": ("scan", "unknown host-control operation", 2),
+    "id_ed25519_snapshot": (
+        "snapshot",
+        "request must have the exact snapshot-operation shape",
+        2,
+    ),
+    "id_ed25519_execution": ("execution", "unknown host-control operation", 2),
+    "id_ed25519_mutation": (
+        "mutation",
+        "request must have the exact package-mutation shape",
+        2,
+    ),
+    "id_ed25519_rollback": (
+        "rollback",
+        "request does not have the exact expected shape",
+        1,
+    ),
+    "id_ed25519_health": (
+        "health",
+        "request must have the exact health-evaluation shape",
+        2,
+    ),
+}
+
+
 def _exec_inner(vmid, inner, state):
     joined = " ".join(inner)
     ct = str(vmid)
@@ -537,12 +567,34 @@ def _exec_inner(vmid, inner, state):
         return 0
 
     if inner[0] == "runuser" and "ssh" in inner:
+        # The forced-command acceptance probe. Each boundary is reached with
+        # its OWN dedicated key, so the key the probe presents is what
+        # selects which helper answers -- exactly the production property
+        # this fake exists to model. Every answer is that helper's real
+        # structural refusal of a request that is not one of its typed
+        # operations: nothing here creates a snapshot, changes a package,
+        # rolls anything back, or probes a workload.
+        key_path = inner[inner.index("-i") + 1] if "-i" in inner else ""
+        boundary = _BOUNDARY_BY_KEY.get(Path(key_path).name)
+        if boundary is None:
+            sys.stdout.write(
+                '{"response_version":1,"ok":false,'
+                '"error":{"classification":"execution_failed",'
+                '"message":"no forced command is authorized for this key"}}'
+            )
+            return 255
+        kind, message, code = boundary
+        state.setdefault("boundary_probes", []).append(kind)
+        if _fail(f"boundary_probe_{kind}"):
+            # Models an unusable SSH/key/host-key policy: no structured
+            # answer at all, which the acceptance check must refuse.
+            return 255
         sys.stdout.write(
             '{"response_version":1,"ok":false,"context":{},'
             '"error":{"classification":"execution_failed",'
-            '"message":"unknown host-control operation"}}'
+            f'"message":"{message}"}}}}'
         )
-        return 2
+        return code
 
     if inner[0] == "tar" and "-xzf" in inner:
         # The in-place updater's own staging step (unlike the bootstrap
@@ -1052,6 +1104,27 @@ def _exec_update_probe(vmid, state=None):
         counts[key] = counts.get(key, 0) + 1
         sequence = sequence + counts[key] - 1
         _save_state(state)
+    # The ACTIVE WORKLOAD UPDATE JOB witness, modelled with the same three
+    # genuinely different answers the real probe distinguishes:
+    #
+    #   True  -- a job owns the one global destructive slot; the updater
+    #            must refuse before touching anything;
+    #   False -- no job owns it (the ordinary case);
+    #   None  -- the /package-update/active route does not exist, so this
+    #            backend predates production activation and cannot own a
+    #            workload job at all. Read from a real 404, never inferred.
+    #
+    # And a fourth possibility that is NOT an answer: the question could
+    # not be asked, which makes the whole probe `ok: false`.
+    if SCENARIO.get("update_probe_package_update_unavailable"):
+        print(json.dumps({
+            "ok": False,
+            "reason": "package_update_endpoint_unreachable: simulated",
+        }))
+        return 0
+    active = SCENARIO.get("update_probe_package_update_active", False)
+    if SCENARIO.get("update_probe_package_update_absent"):
+        active = None
     print(json.dumps({
         "ok": True,
         "backend_instance_id": backend_id,
@@ -1059,6 +1132,13 @@ def _exec_update_probe(vmid, state=None):
         "last_committed_run_sequence": sequence,
         "health": "healthy",
         "freshness": "fresh",
+        "package_update_active": active,
+        "package_update_job_id": (
+            "3f9a1c2e-4b5d-4e6f-8a91-0b1c2d3e4f50" if active else None
+        ),
+        "package_update_checkpoint": (
+            "mutation_may_have_started" if active else None
+        ),
     }))
     return 0
 
@@ -2380,12 +2460,22 @@ def build_minimal_source_checkout(tmp_path: Path, repo_root: Path) -> Path:
         (repo_root / "deploy" / "install-0.5.0-fresh.sh").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
-    (src / "deploy" / "hubinet-package-scan-helper.py").write_text(
-        (repo_root / "deploy" / "hubinet-package-scan-helper.py").read_text(
-            encoding="utf-8"
-        ),
-        encoding="utf-8",
-    )
+    # The six privileged forced-command helpers a fresh install provisions:
+    # the unchanged scan-only boundary, plus the five the production update
+    # lifecycle deploys. Copied verbatim so `git archive <sha>` stages the
+    # exact bytes a real release checkout would.
+    for helper in (
+        "hubinet-package-scan-helper.py",
+        "hubinet-package-snapshot-helper.py",
+        "hubinet-package-update-helper.py",
+        "hubinet-package-mutation-helper.py",
+        "hubinet-package-rollback-helper.py",
+        "hubinet-package-health-helper.py",
+    ):
+        (src / "deploy" / helper).write_text(
+            (repo_root / "deploy" / helper).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
     (src / "config" / "inventory.example.yaml").write_text(
         "source:\n  display_name: example\n", encoding="utf-8"
     )

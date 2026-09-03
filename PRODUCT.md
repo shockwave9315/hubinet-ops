@@ -62,6 +62,20 @@ back — always and only to the snapshot this job created. No such policy exists
 yet: today a failed healthcheck leaves the job able to roll back and waits to
 be asked.
 
+**Who starts an update, and who continues one.** An update begins for exactly
+one reason: an authenticated operator explicitly asked for this resource's
+currently approved plan to be installed. The operator names a resource;
+everything else — which packages, which versions, which snapshot, which
+health contract — is resolved from durable authority, and no caller can
+supply any of it. Once a job exists, one backend worker continues it through
+the stages above. Continuing a job an operator started is not automatic
+updating; inventing one nobody asked for would be, and nothing can.
+
+Rollback is the same shape. It is an explicit operator request naming a
+resource, and it is durably recorded before the operator is told it was
+accepted. Nothing rolls back on its own — not a failed package operation, not
+an unproven one, not a failed healthcheck, and not an unknown one.
+
 ## What "healthy" means
 
 Hubinet Ops has no generic, inferred definition of a healthy workload, and
@@ -137,20 +151,28 @@ proved the contract false, but something required could not be checked
 truthfully. Unknown is never success and is never recorded as a result — a
 healthcheck only reads, so it is simply run again.
 
+**Retained snapshots.** A job's snapshot is kept. There is no automatic
+deletion after a successful update, no retention count, and no age policy
+yet — see `STATUS.md` for what comes next.
+
 ## Hard rules
 
 These are requirements, not preferences.
 
 1. **NO AUTO-UPDATE.** The application never installs package updates on its
-   own. "99 updates available" is never permission to install them.
+   own. "99 updates available" is never permission to install them, and
+   neither is an approval: approving a plan records what the operator
+   reviewed, and a separate explicit action starts the update. No scheduler,
+   timer, scan, or Home Assistant poll can start one.
 2. **A changed package plan invalidates approval.** If the plan materially
    differs at execution time from the plan that was approved, fail closed and
    ask for approval of the new plan. Never execute a plan the operator did not
    approve.
 3. **Every update job creates its own fresh Hubinet-owned snapshot** on the
    actual current guest, before touching any package.
-4. **Rollback goes only to that same job's snapshot.** Never to an arbitrary
-   older snapshot, and never days later.
+4. **Rollback goes only to that same job's snapshot,** and only when an
+   authenticated operator explicitly asks. Never to an arbitrary older
+   snapshot, never days later, and never automatically.
 5. **Hubinet cleanup never deletes ordinary or manual PVE snapshots.**
    Automatic retention applies only to snapshots Hubinet created and owns.
 6. **A failed or unavailable scan means unknown, never zero updates.** Absence

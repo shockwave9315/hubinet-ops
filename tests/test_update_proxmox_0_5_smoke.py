@@ -29,6 +29,10 @@ from _update_fake_pve import (  # noqa: E402
     FAKE_BACKEND_INSTANCE_ID,
     FAKE_RUN_ID,
     FAKE_VMID,
+    UPDATE_BOUNDARY_HELPERS,
+    UPDATE_BOUNDARY_JOURNAL_DIRS,
+    boundary_helper_host_path,
+    boundary_key_ct_path,
     build_update_target_checkout,
     seed_installed_environment,
 )
@@ -4338,3 +4342,275 @@ class TestRollbackResetsStaleEnablementLinks:
         assert "rollback complete" in result.stderr
         assert "systemctl reenable" not in result.stderr
         assert env.state()["vmids"][FAKE_VMID].get("service_autostart_reenable_calls", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# The five package-update forced-command boundaries.
+#
+# Two paths matter here and are genuinely different. Updating an ALREADY
+# activated installation replaces helper content in place; upgrading a
+# PRE-ACTIVATION one CREATES new privileged access paths, and is therefore
+# the one whose rollback has to remove a key, an authorized_keys entry, and
+# a root-owned mutation helper rather than merely restore a file.
+# ---------------------------------------------------------------------------
+
+
+BOUNDARY_KINDS = tuple(kind for kind, _name in UPDATE_BOUNDARY_HELPERS)
+
+
+def _host_root(env):
+    return Path(env.env["HUBINET_OPS_TEST_HOST_ROOT"])
+
+
+def _authorized_keys_text(env):
+    path = _host_root(env) / "root" / ".ssh" / "authorized_keys"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def _boundary_helper(env, kind, run_id=FAKE_RUN_ID):
+    return _host_root(env) / boundary_helper_host_path(kind, run_id).lstrip("/")
+
+
+class TestActivatedInstallationBoundaries:
+    def test_an_ordinary_update_leaves_every_boundary_untouched(self, tmp_path):
+        """Nothing to do is nothing done: no key rotation, no re-authorization."""
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        before = _authorized_keys_text(env)
+        before_helpers = {
+            kind: _boundary_helper(env, kind).read_text(encoding="utf-8")
+            for kind in BOUNDARY_KINDS
+        }
+        before_keys = {
+            kind: env.ct_file_text(FAKE_VMID, boundary_key_ct_path(kind))
+            for kind in BOUNDARY_KINDS
+        }
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert _authorized_keys_text(env) == before
+        for kind in BOUNDARY_KINDS:
+            assert _boundary_helper(env, kind).read_text(encoding="utf-8") == (
+                before_helpers[kind]
+            ), kind
+            assert env.ct_file_text(FAKE_VMID, boundary_key_ct_path(kind)) == (
+                before_keys[kind]
+            ), kind
+        assert "unchanged -- all five forced-command boundaries" in result.stdout
+
+    def test_a_changed_boundary_helper_is_replaced_at_the_same_path(self, tmp_path):
+        """Content changes; the path, the key, and the authorization do not."""
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            boundary_helper_text={"mutation": "#!/usr/bin/env python3\n# stale\n"},
+        )
+        before_authorized = _authorized_keys_text(env)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        installed = _boundary_helper(env, "mutation").read_text(encoding="utf-8")
+        expected = (
+            REPO_ROOT / "deploy" / "hubinet-package-mutation-helper.py"
+        ).read_text(encoding="utf-8")
+        assert installed == expected
+        assert _authorized_keys_text(env) == before_authorized
+        assert "1 replaced in place" in result.stdout
+
+    def test_a_repeated_update_is_idempotent(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        first = _run(env.env, _base_args(target))
+        assert first.returncode == 0, first.stderr
+        after_first = _authorized_keys_text(env)
+        second = _run(env.env, _base_args(target))
+
+        assert second.returncode == 0, second.stderr
+        assert _authorized_keys_text(env) == after_first
+        helper_dir = _host_root(env) / "usr" / "local" / "libexec"
+        for kind in BOUNDARY_KINDS:
+            assert len(list(helper_dir.glob(f"hubinet-package-{kind}-boundary-*"))) == 1
+
+
+class TestPreActivationInstallationUpgrade:
+    """A pre-activation installation upgraded into the activated lifecycle."""
+
+    def test_the_upgrade_creates_every_boundary_and_activates_the_config(
+        self, tmp_path
+    ):
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        unrelated = "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFB pve-operator\n"
+        authorized_path = _host_root(env) / "root" / ".ssh" / "authorized_keys"
+        authorized_path.write_text(
+            authorized_path.read_text(encoding="utf-8") + unrelated, encoding="utf-8"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        authorized = _authorized_keys_text(env)
+        for kind in BOUNDARY_KINDS:
+            assert _boundary_helper(env, kind).exists(), kind
+            assert env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+            assert f"hubinet-ops-package-{kind}-vmid-{FAKE_VMID}-" in authorized, kind
+        # The scan boundary and the operator's own key both survive intact.
+        assert unrelated in authorized
+        assert f"hubinet-ops-package-scan-vmid-{FAKE_VMID}-{FAKE_RUN_ID}" in authorized
+        inventory = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert "package_update:" in inventory
+        assert "enabled: true" in inventory
+        # And the pre-existing configuration is preserved byte-for-byte above
+        # the appended block.
+        assert inventory.startswith('source:\n  display_name: "Home Proxmox"')
+        for journal in UPDATE_BOUNDARY_JOURNAL_DIRS:
+            assert (_host_root(env) / journal.lstrip("/")).is_dir(), journal
+
+    def test_a_failed_upgrade_leaves_no_new_privileged_access_path(self, tmp_path):
+        """The rule this whole module exists for.
+
+        A product update that created a key, an `authorized_keys` entry, and
+        a root-owned mutation helper and then failed must remove all three --
+        and only those three.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        unrelated = "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFB pve-operator\n"
+        authorized_path = _host_root(env) / "root" / ".ssh" / "authorized_keys"
+        before_authorized = authorized_path.read_text(encoding="utf-8") + unrelated
+        authorized_path.write_text(before_authorized, encoding="utf-8")
+        before_inventory = env.ct_file_text(
+            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        authorized = _authorized_keys_text(env)
+        for kind in BOUNDARY_KINDS:
+            assert not _boundary_helper(env, kind).exists(), kind
+            assert not env.ct_file(
+                FAKE_VMID, boundary_key_ct_path(kind)
+            ).exists(), kind
+            assert f"hubinet-ops-package-{kind}-vmid-{FAKE_VMID}-" not in authorized
+        # Nothing else was disturbed: the operator's key, the scan boundary,
+        # and the pre-activation configuration are all exactly as they were.
+        assert authorized == before_authorized
+        assert env.ct_file_text(
+            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
+        ) == before_inventory
+
+    def test_a_failed_upgrade_preserves_an_existing_journal_directory(
+        self, tmp_path
+    ):
+        """A journal this run did not create is never removed to tidy up.
+
+        It may hold another operation's durable at-most-once evidence, and
+        destroying that would be strictly worse than leaving a directory.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        journal = _host_root(env) / "var/lib/hubinet-ops/rollback-operations"
+        journal.mkdir(parents=True, exist_ok=True)
+        (journal / "evidence.json").write_text("{}", encoding="utf-8")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert (journal / "evidence.json").exists()
+
+
+class TestActiveWorkloadJobRefusesTheUpdater:
+    """The activation invariant: an in-flight workload update fences this."""
+
+    def test_an_active_job_refuses_before_any_mutation(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"update_probe_package_update_active": True},
+        )
+        before_authorized = _authorized_keys_text(env)
+        before_unit = env.ct_file_text(
+            FAKE_VMID, "/etc/systemd/system/hubinet-ops.service"
+        )
+        state_before = env.state()
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "refusing to update: package update job" in result.stderr
+        # Refused in Phase U2, so nothing was staged, stopped, or replaced.
+        assert "Phase U3" not in result.stdout
+        assert _authorized_keys_text(env) == before_authorized
+        assert env.ct_file_text(
+            FAKE_VMID, "/etc/systemd/system/hubinet-ops.service"
+        ) == before_unit
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert state_before["vmids"][FAKE_VMID] == env.state()["vmids"][FAKE_VMID]
+
+    def test_no_active_job_proceeds_normally(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert "Active workload update job:    none" in result.stdout
+
+    def test_an_unanswerable_active_job_question_also_refuses(self, tmp_path):
+        """"We could not ask" is never read as "the answer was no"."""
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "update_probe_package_update_unavailable": True
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "pre-update live probe failed" in result.stderr
+
+    def test_a_pre_activation_backend_without_the_route_is_not_fenced(
+        self, tmp_path
+    ):
+        """A backend that cannot own a workload job has nothing to fence.
+
+        Read from the endpoint's real 404, never from a transport failure.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={"update_probe_package_update_absent": True},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr

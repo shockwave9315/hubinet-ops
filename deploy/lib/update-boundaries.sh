@@ -263,9 +263,11 @@ _update_boundary_create_key() {
   run_logged pct exec "${VMID}" -- install -d -o hubinetops -g hubinetops -m 0700 "${UPDATE_BOUNDARY_CT_DIR}" \
     || die "failed to ensure the host-control directory inside container ${VMID}"
   # Never overwrite an existing private key: a key file already at this path
-  # may be the one an existing authorization trusts.
-  run_logged pct exec "${VMID}" -- test '!' -e "${key_path}" \
-    || die "the ${kind} boundary private key already exists at ${key_path} inside container ${VMID} but its forced-command helper does not -- refusing to overwrite key material; resolve this manually"
+  # may be the one an existing authorization trusts, and replacing it would
+  # silently break that boundary while leaving its authorization in place.
+  if pct exec "${VMID}" -- test -e "${key_path}" >/dev/null 2>&1; then
+    die "the ${kind} boundary private key already exists at ${key_path} inside container ${VMID} but its forced-command helper does not -- refusing to overwrite key material; resolve this manually"
+  fi
   run_logged pct exec "${VMID}" -- ssh-keygen -q -t ed25519 -N '' -C "$(_update_boundary_marker "${kind}")" -f "${key_path}" \
     || die "failed to generate the dedicated ${kind} boundary SSH key inside container ${VMID}"
   run_logged pct exec "${VMID}" -- chown hubinetops:hubinetops "${key_path}" "${key_path}.pub" \
