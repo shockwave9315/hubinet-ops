@@ -263,19 +263,22 @@ def test_r0_production_modules_define_only_authority_metadata_mutations() -> Non
 
     Two `@app.put` (the exact-plan approval and the health-contract
     replacement), one `@app.delete` (the health-contract clear), and exactly
-    three `@app.post` -- start, resume, and roll back one update. Every POST
-    is an explicit operator control over the update lifecycle; none of them
-    is a generic dispatcher, and `@app.patch` stays absent entirely.
+    four `@app.post` -- start, resume, and roll back one update, plus the
+    product updater's own exclusive maintenance fence. The first three are
+    explicit operator controls over the update lifecycle; the fourth performs
+    no workload action at all and exists only to make a product update and a
+    workload update mutually exclusive. None is a generic dispatcher, and
+    `@app.patch` stays absent entirely.
 
     Production activation is what made a destructive verb possible at all, so
-    this list is now the thing that stops a fourth one appearing quietly.
+    this list is now the thing that stops a fifth one appearing quietly.
     """
 
     text = (REPO_ROOT / "app/inventory_runtime.py").read_text(encoding="utf-8")
     assert "@app.patch(" not in text
     assert text.count("@app.put(") == 2
     assert text.count("@app.delete(") == 1
-    assert text.count("@app.post(") == 3
+    assert text.count("@app.post(") == 4
     assert (
         'f"{API_PREFIX}/resources/{{resource_id}}/package-plan-approval"'
         in text
@@ -288,6 +291,7 @@ def test_r0_production_modules_define_only_authority_metadata_mutations() -> Non
         '_PACKAGE_UPDATE_ROUTE = f"{API_PREFIX}/resources/{{resource_id}}/package-update"'
         in text
     )
+    assert f'{{API_PREFIX}}/package-update/maintenance-fence' in text
 
 
 
@@ -397,6 +401,107 @@ def test_only_an_explicit_operator_request_can_issue_an_update_job() -> None:
     for rel_path in _MODULES_THAT_MAY_NEVER_ISSUE_AN_UPDATE_JOB:
         text = _code(REPO_ROOT / rel_path)
         assert "issue_package_update_job" not in text, rel_path
+
+
+def test_the_maintenance_fence_is_read_inside_the_issuance_transaction() -> None:
+    """The synchronization is the writer lock, not the file's existence.
+
+    A product update and a workload update are made mutually exclusive by
+    both sides taking the authority store's single `BEGIN IMMEDIATE` writer
+    lock. That only works if the fence read happens INSIDE issuance's
+    transaction: a read hoisted above the `with` block would be exactly the
+    check-then-act race the fence exists to close.
+    """
+
+    tree = ast.parse((REPO_ROOT / "app/inventory/authority.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.name not in (
+            "issue_package_update_job",
+            "acquire_product_update_maintenance_fence",
+        ):
+            continue
+        transactions = [
+            item for item in ast.walk(node) if isinstance(item, ast.With)
+        ]
+        assert transactions, node.name
+        inside = set()
+        for block in transactions:
+            for statement in block.body:
+                inside |= _called_names(statement)
+        assert "read_product_update_fence" in inside, node.name
+        if node.name == "acquire_product_update_maintenance_fence":
+            # And the fence is made durable BEFORE the commit that releases
+            # the lock, or an issuing transaction could slip in behind it.
+            assert "write_product_update_fence" in inside
+
+
+def test_no_scheduler_worker_or_operator_path_can_take_the_maintenance_fence() -> None:
+    """The fence is the product updater's control, and only its own.
+
+    Nothing in the workload lifecycle may take it: a worker or an operator
+    action that could fence the installation would be able to block workload
+    updates as a side effect of doing ordinary work.
+    """
+
+    for rel_path in (
+        "app/package_update_worker.py",
+        "app/inventory_scheduler.py",
+        "app/package_scan_scheduler.py",
+        "app/package_update_snapshot.py",
+        "app/package_update_execution.py",
+        "app/package_update_mutation.py",
+        "app/package_update_rollback.py",
+        "app/package_update_health.py",
+        "custom_components/hubinet_ops/services.py",
+        "custom_components/hubinet_ops/coordinator.py",
+        "custom_components/hubinet_ops/transport_http.py",
+    ):
+        text = _code(REPO_ROOT / rel_path)
+        for symbol in (
+            "acquire_product_update_maintenance_fence",
+            "write_product_update_fence",
+            "maintenance-fence",
+        ):
+            assert symbol not in text, (rel_path, symbol)
+
+    # And exactly one production caller takes it.
+    runtime = (REPO_ROOT / "app/inventory_runtime.py").read_text(encoding="utf-8")
+    assert _innermost_callers(
+        runtime, "acquire_product_update_maintenance_fence"
+    ) == ["acquire_product_update_maintenance_fence"]
+
+
+def test_the_product_updater_never_releases_a_fence_it_does_not_hold() -> None:
+    """Release is filesystem-only, terminal-only, and keyed to this run.
+
+    It needs no atomicity -- removing a fence only ever widens what is
+    permitted -- but it must never remove one another run holds, and must
+    never happen while this run can still be asked to roll back.
+    """
+
+    activate = (REPO_ROOT / "deploy/lib/update-activate.sh").read_text(encoding="utf-8")
+    assert "_update_release_maintenance_fence" in activate
+    # Guarded by this run's own held-flag or its durable journal marker.
+    assert (
+        '[[ "${UPDATE_FENCE_HELD}" == "1" ]] || ledger_has '
+        'update-maintenance-fence-held "${VMID}" || return 0' in activate
+    )
+    # Acquired after every harmless refusal, immediately before the window.
+    assert (
+        "_update_preflight_ct_sync\n" in activate
+        and activate.index("_update_acquire_maintenance_fence\n}")
+        > activate.index("_update_preflight_ct_sync\n")
+    )
+    # The marker survives a journal reload, so an interrupted run's own
+    # recovery can release exactly its own fence.
+    recovery = (REPO_ROOT / "deploy/lib/update-recovery.sh").read_text(encoding="utf-8")
+    assert "update-maintenance-fence-held) return 0 ;;" in recovery
+    # No bypass anywhere.
+    for text in (activate, recovery, (REPO_ROOT / "deploy/lib/update-plan.sh").read_text(encoding="utf-8")):
+        for forbidden in ("--force-fence", "skip_fence", "SKIP_FENCE", "--no-fence"):
+            assert forbidden not in text, forbidden
 
 
 def test_no_scheduler_timer_or_scan_callback_can_reach_the_update_worker() -> None:

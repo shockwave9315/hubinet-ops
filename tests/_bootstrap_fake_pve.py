@@ -175,6 +175,7 @@ _CT_PATH_ANCHORS = (
     "tmp/hubinet-ops-update-src.tar.gz",
     "tmp/hubinet-ops-authority-tool",  # matches both the fixed and the
     "tmp/hubinet-ops-update-probe",    # run-id-suffixed pushed path shape
+    "tmp/hubinet-ops-update-fence",
     "tmp/hubinet-ops-update-venv-stage.py",
 )
 
@@ -896,6 +897,11 @@ def _exec_inner(vmid, inner, state):
             return _missing_python_script(inner[1])
         return _exec_authority_tool(vmid, inner[2:], state)
 
+    if inner[0] == "python3" and _matches_run_owned_ct_script(
+        inner[1], "hubinet-ops-update-fence"
+    ):
+        return _exec_update_fence(vmid, inner[2:], state)
+
     if inner[0] == "python3" and _matches_run_owned_ct_script(inner[1], "hubinet-ops-update-probe"):
         if not _pushed_ct_script_exists(vmid, inner[1]):
             return _missing_python_script(inner[1])
@@ -1084,6 +1090,71 @@ def _exec_venv_stage(vmid, args):
     return 0
 
 
+#: Where the backend keeps the exclusive product-update maintenance fence,
+#: beside its authority database. The fake models the real durable artifact
+#: rather than an in-memory flag, because surviving the backend restart a
+#: product update performs is the whole point of it being a file.
+_FENCE_CT_PATH = "/var/lib/hubinet-ops/product-update-maintenance.fence"
+
+
+def _exec_update_fence(vmid, args, state=None):
+    """Simulate deploy/lib/hubinet-ops-update-fence.py's JSON contract.
+
+    Models the backend's own atomic acquisition: it refuses while a workload
+    package-update job is ACTIVE, refuses a different holder, is idempotent
+    for the same holder, and otherwise writes the durable fence file that
+    every later workload start reads.
+    """
+
+    holder = args[0] if args else ""
+    if not holder:
+        return 2
+    if SCENARIO.get("fence_route_absent"):
+        # A backend predating production activation has no fence route at
+        # all -- a real 404, never a transport failure.
+        print(json.dumps({"ok": False, "reason": "fence_route_absent", "detail": ""}))
+        return 0
+    if SCENARIO.get("fence_unreachable"):
+        print(json.dumps({
+            "ok": False,
+            "reason": "fence_endpoint_unreachable",
+            "detail": "simulated",
+        }))
+        return 0
+
+    path = _ct_path(vmid, _FENCE_CT_PATH)
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except ValueError:
+            existing = {}
+        if existing.get("holder") != holder:
+            print(json.dumps({
+                "ok": False,
+                "reason": "fence_refused_http_409",
+                "detail": f"another Hubinet product update already holds the maintenance fence (holder {existing.get('holder')})",
+            }))
+            return 0
+        print(json.dumps({"ok": True, "holder": holder, "acquired_at": existing.get("acquired_at", "2026-01-01T00:00:00+00:00")}))
+        return 0
+
+    if SCENARIO.get("workload_job_active"):
+        print(json.dumps({
+            "ok": False,
+            "reason": "fence_refused_http_409",
+            "detail": "a workload package update job is ACTIVE (at checkpoint mutation_may_have_started)",
+        }))
+        return 0
+
+    acquired_at = "2026-01-01T00:00:00+00:00"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"holder": holder, "acquired_at": acquired_at}, sort_keys=True)
+    )
+    print(json.dumps({"ok": True, "holder": holder, "acquired_at": acquired_at}))
+    return 0
+
+
 def _exec_update_probe(vmid, state=None):
     # Simulates deploy/lib/hubinet-ops-update-probe.py's own observable
     # JSON contract -- one bounded, non-waiting read of current state,
@@ -1130,7 +1201,9 @@ def _exec_update_probe(vmid, state=None):
             "reason": "package_update_endpoint_unreachable: simulated",
         }))
         return 0
-    active = SCENARIO.get("update_probe_package_update_active", False)
+    active = SCENARIO.get(
+        "update_probe_package_update_active", SCENARIO.get("workload_job_active", False)
+    )
     if SCENARIO.get("update_probe_package_update_absent"):
         active = None
     print(json.dumps({

@@ -61,6 +61,12 @@ PACKAGE_UPDATE_ISSUANCE_REFUSALS: frozenset[str] = frozenset(
         #: package scan is still running), rather than proven stale.  The
         #: operator may simply ask again once it finishes.
         "source_authority_unavailable",
+        #: A Hubinet PRODUCT update holds the exclusive maintenance fence.
+        #: Starting a workload update now would let a product update replace
+        #: the backend and its privileged helpers underneath an in-flight
+        #: host operation.  Retryable once the product update completes or is
+        #: rolled back -- see `app/inventory/product_update_fence.py`.
+        "product_update_in_progress",
     }
 )
 

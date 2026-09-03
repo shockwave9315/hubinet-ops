@@ -283,23 +283,83 @@ bounded host round trip may hold the authority store's writer lock (see
 "SQLite writer-contention policy"), and a per-installation override would let
 them be widened quietly.
 
-### The product updater's active-job fence
+### The exclusive product-update maintenance fence
 
 Replacing the backend or its privileged helpers while a package-update job
 owns a snapshot, mutation, or rollback journal can pair a new backend with a
-half-replaced helper set for an operation already in flight. So
-`deploy/update-proxmox-0.5.sh` reads `GET /r0/v1/package-update/active` during
-Phase U2 -- classification, strictly before staging, before the service is
-stopped, and before any helper, key, config file, or unit is touched -- and
-refuses outright if a job is active. There is no bypass flag: an operator
-whose update is stuck resolves it through the product's own controls and runs
-the updater again.
+half-replaced helper set for an operation already in flight. A Hubinet PRODUCT
+update and a WORKLOAD update must therefore never overlap.
 
-The witness distinguishes three answers. `true` refuses. `false` proceeds. A
-real HTTP 404 means the route does not exist, so this backend predates
-activation and cannot own a workload job -- there is nothing to fence. Every
-other failure makes the whole probe fail, and the updater refuses: "we could
-not ask" is never read as "the answer was no".
+**Asking is not enough.** `deploy/update-proxmox-0.5.sh` does read
+`GET /r0/v1/package-update/active` during Phase U2 and refuses if a job is
+already active -- but that is a courtesy, not the invariant. It stops the
+operator confirming a plan that is going to be refused and stops the updater
+staging artifacts it will never activate. It cannot make the two exclusive,
+because between that answer and the updater's first mutation an authenticated
+operator may legitimately start an update, and a second, later poll would only
+move the window rather than close it: the update API stays live right up to
+the service stop, and again from the moment the target service starts in Step
+10 until Phase U5 acceptance is terminal.
+
+**The fence is what makes them exclusive.** Immediately before its mutation
+window -- after every check that could still refuse the run harmlessly, so a
+run that declines to proceed never leaves workload updates blocked -- the
+updater calls `POST /r0/v1/package-update/maintenance-fence` with its own run
+id. The backend performs acquisition inside the authority store's single
+`BEGIN IMMEDIATE` writer lock, the same lock `issue_package_update_job` takes:
+
+```text
+ACQUIRE (product updater)                    ISSUE (operator start_update)
+  BEGIN IMMEDIATE  ---------------------------  BEGIN IMMEDIATE
+    is any package-update job ACTIVE?             is the fence present?
+      yes -> refuse, ROLLBACK                       yes -> refuse
+    write + fsync the fence file                  insert the job row
+  COMMIT                                        COMMIT
+```
+
+SQLite permits one writer, so the two critical sections are strictly ordered
+and whichever enters first wins. Acquire first: the fence is durable *before*
+the COMMIT that releases the lock, so no issuing transaction can have missed
+it. Issue first: the job row is durable before acquisition can begin. There is
+no interleaving in which both succeed, and no check-then-act gap -- the
+existence check is a read performed inside the lock, never the lock itself.
+
+The fence is one file beside the authority database
+(`product-update-maintenance.fence`), and it is a file precisely so it
+survives the backend process restart the product update performs: the target
+backend started in Step 10 is a different process, possibly a different build,
+possibly against a freshly reset authority database, and it must still refuse
+workload starts while acceptance is in progress. A fence that exists but
+cannot be read truthfully is treated as held, never as absent.
+
+**Release is deliberately asymmetric.** Removing the fence only ever widens
+what is permitted, so it cannot race anything into existence and needs no
+atomicity. The updater does it directly on the filesystem, which also keeps
+working in the one case an API release could not: a failed activation update
+that has rolled back to a pre-activation backend with no fence route at all.
+It happens only at a terminal point --
+
+- a proven successful product update, after acceptance passed and the
+  `completed` checkpoint is durable; or
+- a proven complete rollback, after the pre-update installation is restored,
+  enabled, running, and healthy; or
+- the equivalent points in startup recovery for an interrupted run.
+
+A crash anywhere before that leaves the fence in place, which is exactly what
+keeps workload issuance refused while the run still owns rollback-capable
+state. The holding run's marker is recovery-relevant, so it survives the
+journal reload and that run's own recovery releases it; a *different* product
+update is refused rather than allowed to steal it.
+
+There is no bypass flag. An operator whose update is stuck resolves the
+workload job through the product's own controls and runs the updater again.
+
+The Phase U2 witness still distinguishes three answers, and that distinction
+carries over to acquisition. `true` refuses. `false` proceeds. A real HTTP 404
+means the route does not exist, so this backend predates activation, has no
+update worker, and cannot own a workload job -- there is nothing to fence.
+Every other failure refuses: "we could not ask" is never read as "the answer
+was no".
 
 ## Job-owned snapshot safety
 

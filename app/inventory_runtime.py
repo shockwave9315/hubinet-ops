@@ -92,6 +92,7 @@ from app.inventory import (
     PackageUpdateIssuanceRefused,
     PackageUpdateJob,
     PackageUpdateJobStatus,
+    ProductUpdateFenceError,
     ResourceHealthContract,
     ResourceHealthProbe,
 )
@@ -207,6 +208,21 @@ class PackageUpdateStartRequest(BaseModel):
     request_id: str = Field(pattern=_CANONICAL_UUID_PATTERN)
 
 
+class ProductUpdateFenceRequest(BaseModel):
+    """The one field a Hubinet PRODUCT update supplies to fence itself in.
+
+    ``holder`` is the product updater's own run id -- an opaque bounded
+    label this backend compares for equality and nothing else. It is not a
+    workload parameter: there is no resource, VMID, package, snapshot, or
+    job anywhere on this surface, and taking the fence performs no workload
+    action of any kind. It only makes future workload starts refuse.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    holder: str = Field(pattern=r"^[0-9A-Za-z-]{1,64}$")
+
+
 class PackageUpdateResumeRequest(BaseModel):
     """A request to re-enter an existing recoverable job. No stage, no target.
 
@@ -250,6 +266,14 @@ def _package_update_error(
     return HTTPException(
         status_code=status_code, detail={"error": error, "message": message}
     )
+
+
+#: Issuance refusals that mean "not right now" rather than "not like this".
+#: Rendered as 503 so a caller can tell a transient condition from a plan or
+#: authority problem it has to do something about.
+_RETRYABLE_ISSUANCE_REFUSALS = frozenset(
+    {"source_authority_unavailable", "product_update_in_progress"}
+)
 
 
 def _package_update_job_body(job: PackageUpdateJob) -> dict[str, Any]:
@@ -780,9 +804,11 @@ def create_read_only_app(
             ) from exc
         except PackageUpdateIssuanceRefused as exc:
             # The authority already decided AND named the refusal; this
-            # renders it. `source_authority_unavailable` is the one retryable
-            # member of that set, so it gets 503 rather than 409.
-            status = 503 if exc.reason == "source_authority_unavailable" else 409
+            # renders it. Two members of that set are genuinely retryable --
+            # a package scan that is still running, and a Hubinet product
+            # update holding the maintenance fence -- and both say "ask again
+            # shortly" rather than "your plan is wrong", so they get 503.
+            status = 503 if exc.reason in _RETRYABLE_ISSUANCE_REFUSALS else 409
             raise _package_update_error(status, exc.reason, str(exc)) from exc
         except AuthorityConflict as exc:
             raise _package_update_error(
@@ -843,6 +869,65 @@ def create_read_only_app(
         return {
             "active": job is not None,
             "job": None if job is None else _package_update_job_body(job),
+        }
+
+    @app.post(
+        f"{API_PREFIX}/package-update/maintenance-fence",
+        dependencies=[Depends(_require_bearer_token)],
+    )
+    def acquire_product_update_maintenance_fence(
+        body: ProductUpdateFenceRequest,
+    ) -> dict[str, Any]:
+        """Make a Hubinet PRODUCT update and a WORKLOAD update exclusive.
+
+        This is the product updater's own control, not an operator one, and
+        it is the load-bearing half of that exclusion. Asking "is a job
+        active?" and then proceeding is a check-then-act race: between the
+        answer and the updater's first mutation an operator can legitimately
+        start an update, and a second, later check only moves the window
+        rather than closing it.
+
+        So acquisition and workload issuance take the SAME
+        ``BEGIN IMMEDIATE`` writer lock, and the fence is made durable inside
+        that critical section. Exactly one of them wins: either a job is
+        already ACTIVE and this refuses before the updater has mutated
+        anything, or the fence exists before any issuing transaction can
+        begin and every subsequent ``start_update`` refuses.
+
+        Deliberately available whether or not execution is activated: an
+        installation with the lifecycle switched off can still be
+        product-updated, and fencing it costs nothing. There is no release
+        route -- the updater removes the fence file directly at a terminal
+        point, which needs no atomicity and works even when a rolled-back
+        pre-activation backend has no such route at all.
+        """
+
+        try:
+            fence = authority.acquire_product_update_maintenance_fence(
+                body.holder
+            )
+        except AuthorityConflict as exc:
+            raise _package_update_error(
+                409, "product_update_fence_unavailable", str(exc)
+            ) from exc
+        except ProductUpdateFenceError as exc:
+            raise _package_update_error(
+                503, "product_update_fence_unwritable", str(exc)
+            ) from exc
+        return {"holder": fence.holder, "acquired_at": fence.acquired_at}
+
+    @app.get(
+        f"{API_PREFIX}/package-update/maintenance-fence",
+        dependencies=[Depends(_require_bearer_token)],
+    )
+    def read_product_update_maintenance_fence() -> dict[str, Any]:
+        """Report whether a product update currently holds the fence."""
+
+        fence = authority.product_update_maintenance_fence()
+        return {
+            "held": fence is not None,
+            "holder": None if fence is None else fence.holder,
+            "acquired_at": None if fence is None else fence.acquired_at,
         }
 
     @app.post(

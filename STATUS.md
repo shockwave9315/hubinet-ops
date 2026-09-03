@@ -751,13 +751,21 @@ The operator-triggered update lifecycle is production reachable.
 - **No PVE API privilege was broadened.** Every mutation runs host-local, so
   the provisioned role stays exactly `Sys.Audit,VM.Audit` and `VM.Snapshot`
   appears in no deployment script.
-- **The product updater fences an active job.** It reads
-  `GET /r0/v1/package-update/active` during classification -- before staging,
-  before stopping the service, before touching any file -- and refuses if a
-  job is active. There is no bypass flag. A backend predating activation
-  answers 404, which means it cannot own a workload job and needs no fence;
-  any other failure refuses, because "we could not ask" is never "the answer
-  was no".
+- **Product update and workload update are mutually exclusive.** The Phase U2
+  active-job read is a courtesy that refuses early and avoids pointless
+  staging; it is not the invariant, because an operator may legitimately start
+  an update between that answer and the first mutation. Immediately before its
+  mutation window the updater takes an exclusive maintenance fence, and the
+  backend acquires it inside the same `BEGIN IMMEDIATE` writer lock
+  `issue_package_update_job` takes -- so exactly one of the two can win, with
+  no check-then-act gap. The fence is a durable file beside the authority
+  database, so it survives the backend restart the product update performs and
+  keeps refusing workload starts throughout Phase U5 acceptance. It is
+  released only at a terminal point: a proven successful update, or a proven
+  complete rollback/recovery. There is no bypass flag. A backend predating
+  activation has no fence route, which means it cannot own a workload job and
+  needs no fence; any other failure refuses, because "we could not ask" is
+  never "the answer was no".
 - **Schema is unchanged at v16.** The durable job is the execution queue and
   the recovery authority; a worker wakeup is an in-memory hint and needed no
   second durable queue. No authority migration and no reset is caused by this

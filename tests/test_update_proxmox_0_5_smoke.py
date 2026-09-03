@@ -4661,3 +4661,257 @@ class TestActiveWorkloadJobRefusesTheUpdater:
         result = _run(env.env, _base_args(target))
 
         assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# The exclusive product-update maintenance fence.
+#
+# The U2 probe answer is a courtesy. It cannot make a product update and a
+# workload update exclusive, because an operator may legitimately start one
+# between that answer and the first mutation. These tests pin the primitive
+# that does: the fence taken immediately before the mutation window, held
+# across the target service restart, and released only at a terminal point.
+# ---------------------------------------------------------------------------
+
+
+FENCE_CT_PATH = "/var/lib/hubinet-ops/product-update-maintenance.fence"
+
+
+def _fence_file(env):
+    return env.ct_file(FAKE_VMID, FENCE_CT_PATH)
+
+
+class TestProductUpdateMaintenanceFence:
+    def test_a_successful_update_takes_the_fence_and_releases_it(self, tmp_path):
+        """Witness E. Held across the whole mutation window, gone afterwards.
+
+        Release is terminal: only after acceptance passed and the `completed`
+        checkpoint is durable does workload issuance become legal again.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert "acquired the exclusive product-update maintenance fence" in result.stderr
+        assert "released the exclusive product-update maintenance fence" in result.stderr
+        assert not _fence_file(env).exists()
+
+    def test_the_fence_is_taken_only_after_every_harmless_refusal_has_passed(
+        self, tmp_path
+    ):
+        """A run that declines to proceed must not leave workload updates blocked.
+
+        The plan fence, the ownership recheck, and the CT durability preflight
+        can all still refuse harmlessly. Taking the maintenance fence before
+        them would block operator updates on behalf of a product update that
+        then did nothing at all.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"fail": ["ct_sync_preflight"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "acquired the exclusive product-update maintenance fence" not in result.stderr
+        assert not _fence_file(env).exists()
+
+    def test_a_workload_job_that_appears_before_the_mutation_window_refuses(
+        self, tmp_path
+    ):
+        """Witness C. The gap between the U2 answer and the first mutation.
+
+        The probe answered "no active job" at classification, and a workload
+        job exists by the time the updater reaches its mutation window. The
+        fence refuses, and it refuses BEFORE autostart is disabled or the
+        service is stopped -- so the existing installation is untouched.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                # The U2 courtesy check sees nothing...
+                "update_probe_package_update_active": False,
+                # ...and the atomic fence acquisition finds a job.
+                "workload_job_active": True,
+            },
+        )
+        before_unit = env.ct_file_text(
+            FAKE_VMID, "/etc/systemd/system/hubinet-ops.service"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not take the exclusive product-update maintenance fence" in result.stderr
+        assert "Nothing has been changed" in result.stderr
+        # Refused before the first managed mutation: autostart never disabled,
+        # service never stopped, unit never replaced.
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert env.ct_file_text(
+            FAKE_VMID, "/etc/systemd/system/hubinet-ops.service"
+        ) == before_unit
+        assert not _fence_file(env).exists()
+
+    def test_a_failed_update_keeps_the_fence_until_rollback_is_proven(
+        self, tmp_path
+    ):
+        """Witness D/F. Fenced through the U5 window, released after rollback.
+
+        The target service is started in Step 10 and Phase U5 acceptance runs
+        afterwards, so the production update route is live in that window.
+        The fence is what stops a workload job being issued into it -- and it
+        is released only once the pre-update installation is restored,
+        running, and proven.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        # The acceptance failure came after the target started, so the fence
+        # was genuinely held across that window.
+        assert "acquired the exclusive product-update maintenance fence" in result.stderr
+        assert "rollback complete" in result.stderr
+        assert "released the exclusive product-update maintenance fence" in result.stderr
+        assert not _fence_file(env).exists()
+
+    def test_a_pre_activation_backend_needs_no_fence(self, tmp_path):
+        """A backend with no fence route cannot own a workload job either.
+
+        Read from the endpoint's own 404, never from a transport failure --
+        so this is a real answer rather than an unanswerable question.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={
+                "fence_route_absent": True,
+                "update_probe_package_update_absent": True,
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert "predates operator-triggered package updates" in result.stderr
+        assert not _fence_file(env).exists()
+
+    def test_an_unanswerable_fence_request_refuses_before_any_mutation(
+        self, tmp_path
+    ):
+        """The positive control for the acquisition hard-fail path.
+
+        "We could not take the fence" is never "the fence was not needed".
+        An unreachable backend refuses the whole run, untouched.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"fence_unreachable": True},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not take the exclusive product-update maintenance fence" in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert not _fence_file(env).exists()
+
+    def test_a_foreign_fence_holder_refuses_rather_than_being_stolen(
+        self, tmp_path
+    ):
+        """One product update at a time.
+
+        A fence left by a crashed run is released by that run's own recovery,
+        never silently taken over by the next one.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        fence = _fence_file(env)
+        fence.parent.mkdir(parents=True, exist_ok=True)
+        fence.write_text(
+            json.dumps({"holder": "someone-else", "acquired_at": "2026-01-01T00:00:00+00:00"}),
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not take the exclusive product-update maintenance fence" in result.stderr
+        # Untouched: another run's fence is never removed by this one.
+        assert json.loads(fence.read_text())["holder"] == "someone-else"
+
+    def test_an_interrupted_fenced_run_keeps_the_fence_until_recovery_proves_it(
+        self, tmp_path
+    ):
+        """Witness G. A crash must not strand the fence, or release it early.
+
+        A run that fails and then hard-stops part-way through its own
+        rollback still owns rollback-capable state, so the fence MUST stay --
+        releasing it there would let a workload update start against an
+        installation the updater is still going to touch. The fence marker is
+        recovery-relevant, so it survives the journal reload, and the next
+        invocation's recovery releases exactly that run's fence only after
+        the pre-update installation is restored and proven.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+
+        assert interrupted.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in interrupted.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        # Still fenced: this run can still be asked to replace backend and
+        # helper material, so workload issuance must stay refused.
+        assert _fence_file(env).exists()
+        assert "released the exclusive product-update maintenance fence" not in (
+            interrupted.stderr
+        )
+
+        # The transient restore failure clears; the next invocation recovers.
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert "rollback complete" in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" in (
+            recovery.stderr
+        )
+        assert not journal.exists()
+        assert not _fence_file(env).exists()

@@ -41,6 +41,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.inventory import (
+    AuthorityConflict,
     HealthOutcome,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -49,7 +50,10 @@ from app.inventory import (
     HostSubmissionState,
     ObservedSnapshot,
     PackageUpdateCheckpoint,
+    PackageUpdateIssuanceRefused,
     PackageUpdateJobStatus,
+    ProductUpdateFenceError,
+    product_update_fence_path,
 )
 from app.inventory_runtime import PackageUpdateRuntime, create_read_only_app
 from app.inventory_runtime_config import parse_r0_runtime_config
@@ -1634,3 +1638,317 @@ def test_the_update_routes_report_not_activated_when_the_switch_is_off(
         assert system.store.active_package_update_job() is None
     finally:
         system.close()
+
+
+# ===========================================================================
+# J. THE EXCLUSIVE PRODUCT-UPDATE MAINTENANCE FENCE
+#
+# A Hubinet PRODUCT update replaces the backend and its privileged helpers; a
+# WORKLOAD update mutates packages through those helpers. The two must never
+# overlap, and a poll cannot make them exclusive -- between any "is a job
+# active?" answer and the updater's first mutation an operator may
+# legitimately start one, and a later poll only moves that window.
+#
+# So both sides take the SAME authority writer lock, and the fence is durable
+# before acquisition commits. These tests pin that: exactly one side wins,
+# never both, and the fence survives the process restart a product update
+# performs.
+# ===========================================================================
+
+
+def _fence_path(system) -> Path:
+    return product_update_fence_path(system.store.path)
+
+
+def test_acquiring_the_fence_refuses_while_a_workload_job_is_active(
+    tmp_path: Path,
+) -> None:
+    """Witness A. An ACTIVE job refuses the product updater outright.
+
+    And it refuses at acquisition -- which the updater performs immediately
+    before its first mutation -- so nothing has been staged, stopped, or
+    replaced by the time it is told no.
+    """
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.job(job.job_id).status is PackageUpdateJobStatus.ACTIVE
+
+    with pytest.raises(AuthorityConflict) as refusal:
+        system.authority.acquire_product_update_maintenance_fence("run-a")
+
+    assert "ACTIVE" in str(refusal.value)
+    assert job.job_id in str(refusal.value)
+    # Refused means NOT taken: no fence exists to strand workload updates.
+    assert not _fence_path(system).exists()
+    assert system.authority.product_update_maintenance_fence() is None
+
+
+def test_a_held_fence_refuses_every_new_workload_start(tmp_path: Path) -> None:
+    """Witness C/D. Once the fence is held, `start_update` fails closed.
+
+    This is the whole point of the primitive, and it is what covers both the
+    "between U2 and U4" window and the Phase U5 window in which the target
+    backend is already running while product-update acceptance is not yet
+    terminal.
+    """
+
+    system = _system(tmp_path)
+    fence = system.authority.acquire_product_update_maintenance_fence("run-a")
+    assert fence.holder == "run-a"
+
+    with pytest.raises(PackageUpdateIssuanceRefused) as refusal:
+        _issue(system.authority, system.resource, system.approval)
+
+    assert refusal.value.reason == "product_update_in_progress"
+    assert "run-a" in str(refusal.value)
+    assert system.store.active_package_update_job() is None
+    # Nothing about the workload authority was touched by refusing.
+    assert system.store.list_package_update_jobs() == ()
+
+
+def test_the_fence_survives_a_backend_restart(tmp_path: Path) -> None:
+    """Witness G. The product update restarts the backend; the fence persists.
+
+    A newly started target backend -- a different process, possibly a
+    different build, possibly against a freshly reset authority database --
+    must still refuse workload starts while product-update acceptance is in
+    progress. That is why the durable fact is a file beside the database
+    rather than in-process state.
+    """
+
+    system = _system(tmp_path)
+    system.authority.acquire_product_update_maintenance_fence("run-a")
+
+    # Exactly what a product update does in its Step 10: a different process
+    # opens the same installation. No job exists, so nothing else is rebuilt.
+    path = system.store.path
+    system.store.close()
+    system.store = InventoryAuthorityStore(path, now=system.clock)
+    system.authority = InventoryAuthority(system.store, now=system.clock)
+    system.authority.recover_interrupted_package_update_jobs()
+
+    held = system.authority.product_update_maintenance_fence()
+    assert held is not None and held.holder == "run-a"
+    with pytest.raises(PackageUpdateIssuanceRefused) as refusal:
+        _issue(system.authority, system.resource, system.approval)
+    assert refusal.value.reason == "product_update_in_progress"
+
+
+def test_releasing_the_fence_restores_ordinary_workload_semantics(
+    tmp_path: Path,
+) -> None:
+    """Witnesses E and F. Release -- success or proven rollback -- re-opens it.
+
+    Release is a plain filesystem removal, exactly as the product updater
+    performs it at a terminal point. It needs no atomicity: removing a fence
+    only ever widens what is permitted.
+    """
+
+    system = _system(tmp_path)
+    system.authority.acquire_product_update_maintenance_fence("run-a")
+    with pytest.raises(PackageUpdateIssuanceRefused):
+        _issue(system.authority, system.resource, system.approval)
+
+    _fence_path(system).unlink()
+
+    assert system.authority.product_update_maintenance_fence() is None
+    job = _issue(system.authority, system.resource, system.approval)
+    assert job.status is PackageUpdateJobStatus.ACTIVE
+
+
+def test_exactly_one_of_fence_acquisition_and_workload_start_can_win(
+    tmp_path: Path,
+) -> None:
+    """Witness B, the race itself. Never both.
+
+    Both sides take the authority store's single `BEGIN IMMEDIATE` writer
+    lock, and acquisition makes the fence durable inside that critical
+    section. So whichever enters first wins and the other observes its
+    result -- there is no interleaving that produces both a durable ACTIVE
+    job and a held fence.
+
+    Run repeatedly with a barrier so the two transactions genuinely contend
+    rather than happening to serialize.
+    """
+
+    for attempt in range(12):
+        system = _system(tmp_path / f"race-{attempt}")
+        barrier = Barrier(2)
+
+        def _acquire():
+            barrier.wait(timeout=5)
+            try:
+                return ("fence", system.authority.acquire_product_update_maintenance_fence("run-a"))
+            except AuthorityConflict as exc:
+                return ("fence_refused", exc)
+
+        def _start_job():
+            barrier.wait(timeout=5)
+            try:
+                return ("job", _issue(system.authority, system.resource, system.approval))
+            except AuthorityConflict as exc:
+                return ("job_refused", exc)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = dict(
+                future.result()
+                for future in (pool.submit(_acquire), pool.submit(_start_job))
+            )
+
+        fence_held = system.authority.product_update_maintenance_fence() is not None
+        job_active = system.store.active_package_update_job() is not None
+
+        # The invariant, stated as directly as it can be stated.
+        assert not (fence_held and job_active), (
+            f"attempt {attempt}: a product update fenced the installation "
+            "while a workload job was ACTIVE"
+        )
+        # And exactly one side succeeded -- neither is allowed to vanish.
+        assert fence_held != job_active, (attempt, sorted(outcomes))
+        if fence_held:
+            assert "job_refused" in outcomes
+            assert outcomes["job_refused"].reason == "product_update_in_progress"
+        else:
+            assert "fence_refused" in outcomes
+            assert "ACTIVE" in str(outcomes["fence_refused"])
+
+
+def test_re_acquiring_is_idempotent_for_the_same_run_and_refused_for_another(
+    tmp_path: Path,
+) -> None:
+    """A run that re-enters through its own recovery must not deadlock itself.
+
+    And a DIFFERENT product update must never silently steal a fence: one at
+    a time, and a fence left by a crashed run is released by that run's own
+    recovery.
+    """
+
+    system = _system(tmp_path)
+    first = system.authority.acquire_product_update_maintenance_fence("run-a")
+    again = system.authority.acquire_product_update_maintenance_fence("run-a")
+    assert again == first
+
+    with pytest.raises(AuthorityConflict) as refusal:
+        system.authority.acquire_product_update_maintenance_fence("run-b")
+    assert "run-a" in str(refusal.value)
+    assert system.authority.product_update_maintenance_fence().holder == "run-a"
+
+
+def test_a_corrupt_fence_file_fails_closed_rather_than_opening_issuance(
+    tmp_path: Path,
+) -> None:
+    """The positive control for the fence's own hard-fail path.
+
+    A fence file that exists but cannot be read truthfully is treated as a
+    held fence, not an absent one: the alternative is letting a corrupt byte
+    on disk re-open workload issuance during a product update.
+    """
+
+    system = _system(tmp_path)
+    system.authority.acquire_product_update_maintenance_fence("run-a")
+    _fence_path(system).write_text("not json at all", encoding="utf-8")
+
+    with pytest.raises(ProductUpdateFenceError):
+        system.authority.product_update_maintenance_fence()
+    with pytest.raises(ProductUpdateFenceError):
+        _issue(system.authority, system.resource, system.approval)
+    assert system.store.active_package_update_job() is None
+
+
+def test_the_fence_does_not_change_workload_semantics_when_absent(
+    tmp_path: Path,
+) -> None:
+    """The legal positive control: no product update, nothing changes.
+
+    An ordinary start, an ordinary full lifecycle, and an ordinary explicit
+    rollback all behave exactly as they did before the fence existed.
+    """
+
+    system = _system(tmp_path, health=["failed"])
+    assert system.authority.product_update_maintenance_fence() is None
+    job = _start(system)
+    assert system.worker.run_once().stop_reason == "health_failed"
+    system.authority.arm_package_update_rollback(
+        job.job_id, _canonical(system.ownership, system.identity)
+    )
+    system.complete_pve_rollback()
+    system.worker.run_once()
+    assert system.job(job.job_id).status is PackageUpdateJobStatus.ROLLED_BACK
+    assert not _fence_path(system).exists()
+
+
+def test_the_fence_never_blocks_an_idempotent_replay_of_an_existing_request(
+    tmp_path: Path,
+) -> None:
+    """The fence refuses NEW workload jobs, which a replay is not.
+
+    A request_id whose job already exists returns that job, exactly as it
+    always did. Refusing here would report a job that demonstrably exists as
+    though it had never been created.
+    """
+
+    system = _system(tmp_path)
+    request_id = str(uuid.uuid4())
+    job = _issue(system.authority, system.resource, system.approval, request_id)
+    system.bind_hosts(job.job_id)
+    system.build_worker()
+    system.worker.run_once()
+    assert system.job(job.job_id).status is PackageUpdateJobStatus.SUCCEEDED
+
+    system.authority.acquire_product_update_maintenance_fence("run-a")
+
+    replay = _issue(system.authority, system.resource, system.approval, request_id)
+    assert replay.job_id == job.job_id
+
+
+def test_the_fence_route_is_authenticated_and_takes_only_a_holder(
+    api,
+) -> None:
+    """The HTTP surface: bearer-authenticated, one opaque field, no workload."""
+
+    unauthenticated = api.client.post(
+        "/r0/v1/package-update/maintenance-fence", json={"holder": "run-a"}
+    )
+    assert unauthenticated.status_code == 401
+
+    for extra in (
+        {"resource_id": "x"},
+        {"vmid": 110},
+        {"job_id": "x"},
+        {"snapshot_name": "x"},
+        {"command": "apt-get upgrade"},
+    ):
+        response = api.post(
+            "/r0/v1/package-update/maintenance-fence",
+            json={"holder": "run-a", **extra},
+        )
+        assert response.status_code == 422, extra
+
+    acquired = api.post(
+        "/r0/v1/package-update/maintenance-fence", json={"holder": "run-a"}
+    )
+    assert acquired.status_code == 200
+    assert acquired.json()["holder"] == "run-a"
+    assert api.get("/r0/v1/package-update/maintenance-fence").json()["held"] is True
+
+    # And from that moment the operator start control fails closed.
+    refused = api.start()
+    assert refused.status_code == 503
+    assert refused.json()["detail"]["error"] == "product_update_in_progress"
+    assert api.store.active_package_update_job() is None
+
+
+def test_the_fence_route_refuses_while_a_workload_job_is_active(api) -> None:
+    """Witness A at the HTTP boundary, as the updater actually sees it."""
+
+    started = api.start()
+    assert started.status_code == 202
+
+    response = api.post(
+        "/r0/v1/package-update/maintenance-fence", json={"holder": "run-a"}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "product_update_fence_unavailable"
+    assert api.get("/r0/v1/package-update/maintenance-fence").json()["held"] is False

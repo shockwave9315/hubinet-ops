@@ -73,6 +73,12 @@ from .health_execution import (
     require_health_contract_execution_eligible,
 )
 from .package_update_issuance import PackageUpdateIssuanceRefused
+from .product_update_fence import (
+    ProductUpdateMaintenanceFence,
+    read_product_update_fence,
+    require_fence_holder,
+    write_product_update_fence,
+)
 from .health_observation import (
     HEALTH_PROBE_REASONS,
     require_health_probe_semantics,
@@ -1511,6 +1517,27 @@ class InventoryAuthority:
                     )
                 result_job_id = str(existing["job_id"])
             else:
+                # The exclusive product-update maintenance fence, read INSIDE
+                # this transaction. A Hubinet product update that holds it is
+                # about to replace this backend and its privileged helpers,
+                # and a workload job issued now could be mid-snapshot or
+                # mid-mutation when that happens.
+                #
+                # This read is not the synchronization -- the store's single
+                # `BEGIN IMMEDIATE` writer lock is. Fence acquisition takes
+                # that same lock and makes the fence durable before it
+                # commits, so there is no interleaving in which acquisition
+                # and issuance both succeed. See
+                # `app/inventory/product_update_fence.py`.
+                fence = read_product_update_fence(self._store.path)
+                if fence is not None:
+                    raise PackageUpdateIssuanceRefused(
+                        "product_update_in_progress",
+                        "a Hubinet product update holds the exclusive "
+                        f"maintenance fence (holder {fence.holder}, acquired "
+                        f"{fence.acquired_at}); no workload update may start "
+                        "until it completes or is rolled back",
+                    )
                 try:
                     resource = self._require_package_scan_target(
                         connection, canonical_resource_id
@@ -1793,6 +1820,79 @@ class InventoryAuthority:
         if result_job_id is None:
             raise AuthorityInvariantError("package update job issuance was not captured")
         return self._store.package_update_job(result_job_id)
+
+    def acquire_product_update_maintenance_fence(
+        self, holder: str
+    ) -> ProductUpdateMaintenanceFence:
+        """Take the exclusive product-update maintenance fence, or refuse.
+
+        The one operation that makes a Hubinet PRODUCT update and a WORKLOAD
+        package-update job mutually exclusive. It runs inside the authority
+        store's single ``BEGIN IMMEDIATE`` writer lock -- the same lock
+        :meth:`issue_package_update_job` takes -- and makes the fence durable
+        BEFORE that transaction commits. Those two facts together are the
+        whole invariant:
+
+        - an ACTIVE job proved here means the product update is refused, and
+          it is refused before the updater has mutated anything;
+        - a fence made durable here is visible to every issuing transaction
+          that could possibly start afterwards, because none of them can
+          enter its critical section until this one commits.
+
+        There is deliberately no check-then-act gap and no bypass. Releasing
+        is a separate, deliberately un-synchronized filesystem operation the
+        product updater performs at a terminal point; see
+        `app/inventory/product_update_fence.py` for why the asymmetry is
+        correct.
+
+        Idempotent for the SAME holder, so a product-update run that retries
+        or re-enters through its own recovery does not deadlock itself. A
+        DIFFERENT holder is refused rather than allowed to steal the fence:
+        one product update at a time, and a fence left by a crashed run is
+        released by that run's own recovery, never silently taken over.
+        """
+
+        canonical_holder = require_fence_holder(holder)
+        with self._store._transaction() as connection:
+            existing = read_product_update_fence(self._store.path)
+            if existing is not None:
+                if existing.holder != canonical_holder:
+                    raise AuthorityConflict(
+                        "another Hubinet product update already holds the "
+                        f"maintenance fence (holder {existing.holder}, "
+                        f"acquired {existing.acquired_at})"
+                    )
+                return existing
+            active = connection.execute(
+                "SELECT job_id, checkpoint FROM package_update_jobs "
+                "WHERE status='active'"
+            ).fetchall()
+            if active:
+                row = active[0]
+                raise AuthorityConflict(
+                    "a workload package update job is ACTIVE "
+                    f"({row['job_id']} at checkpoint {row['checkpoint']}); "
+                    "a Hubinet product update may not begin until it "
+                    "completes or is rolled back"
+                )
+            fence = ProductUpdateMaintenanceFence(
+                holder=canonical_holder,
+                acquired_at=_timestamp(self._now()),
+            )
+            # Durable BEFORE the commit that releases the writer lock. A
+            # crash between these two lines leaves the fence present with no
+            # committed claim, which is the safe direction: workload starts
+            # refuse and the product updater never entered its mutation
+            # window, because this call did not return.
+            write_product_update_fence(self._store.path, fence)
+            return fence
+
+    def product_update_maintenance_fence(
+        self,
+    ) -> ProductUpdateMaintenanceFence | None:
+        """Report the currently held fence, if any. Pure read."""
+
+        return read_product_update_fence(self._store.path)
 
     def revalidate_package_update_job(self, job_id: str) -> PackageUpdateJob:
         """Revalidate the current authority half of future mutation safety.

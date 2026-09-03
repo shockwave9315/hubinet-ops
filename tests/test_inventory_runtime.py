@@ -187,6 +187,13 @@ def test_2_only_reads_and_exact_authority_metadata_writes_exist(tmp_path: Path) 
     resume a recoverable one, and roll one back. Everything else this API
     exposes still changes authority metadata only.
 
+    The fourth POST is not an operator control at all: it is the exclusive
+    product-update maintenance fence, which the Hubinet product updater takes
+    on itself so a product update and a workload update cannot overlap. It
+    carries one opaque holder label, performs no workload action, and is
+    listed here for the same reason as the rest -- so a later route cannot
+    quietly join this set.
+
     What this test is really pinning is the *shape* of that addition. There
     is one POST per operator verb, and no verb that could become a generic
     dispatcher; the update routes hang off the same
@@ -217,6 +224,7 @@ def test_2_only_reads_and_exact_authority_metadata_writes_exist(tmp_path: Path) 
         "/r0/v1/resources/{resource_id}/package-update/resume": {"POST"},
         "/r0/v1/resources/{resource_id}/package-update/rollback": {"POST"},
         "/r0/v1/package-update/active": {"GET"},
+        "/r0/v1/package-update/maintenance-fence": {"GET", "POST"},
     }
     assert app.docs_url is None
     assert app.redoc_url is None

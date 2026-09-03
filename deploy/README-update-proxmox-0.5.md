@@ -98,6 +98,9 @@ before any mutation:
    let the update finish, or resolve it through the product's own
    `resume_update` / `rollback_update` controls, then run the updater again.
 
+   This check is an early courtesy, not the guarantee -- see "The exclusive
+   maintenance fence" below.
+
    A backend predating production activation answers 404 for that route. That
    is a real answer — such a backend has no update worker and cannot own a
    workload job — and the updater proceeds. Any *other* failure to ask the
@@ -148,6 +151,39 @@ any forced-command `authorized_keys` line, nftables, or the authority
 database (when the schema is unchanged). The package-scan boundary is never
 rotated or rewritten by this updater, and neither is any package-update
 boundary whose helper already matches the target commit.
+
+## The exclusive maintenance fence
+
+An operator can legitimately start a workload package update at any moment,
+including between the check above and the first thing this updater changes.
+A check alone therefore cannot make the two exclusive, and a second, later
+check would only move that window: the update API stays live right up to the
+service stop, and again from the moment the new service starts until
+acceptance finishes.
+
+So immediately before its mutation window -- and only after every check that
+could still refuse the run harmlessly, so a run that declines to proceed never
+leaves your workload updates blocked -- this updater takes an **exclusive
+maintenance fence**. The backend takes it inside the same database
+transaction a workload update would have to take to start, so exactly one of
+the two can win: either a workload update is already running and this updater
+refuses without changing anything, or the fence is held and every new
+`start_update` is refused until this run finishes.
+
+The fence is a small file beside the authority database, which is what lets it
+survive the service restart this updater performs. Your workload updates stay
+refused throughout the new service's acceptance checks, and the fence is
+released only when the run reaches a terminal, proven state: a successful
+update, or a completed rollback.
+
+**If this updater is interrupted, the fence stays.** That is deliberate: an
+interrupted run may still be asked to replace backend or helper material, and
+letting a workload update start into that would be exactly the overlap the
+fence exists to prevent. Run the updater again -- its startup recovery
+finishes the interrupted run and releases the fence once the installation is
+proven. If you ever need to clear it by hand, it is
+`/var/lib/hubinet-ops/product-update-maintenance.fence` inside the CT; do that
+only when you are certain no product update is in progress.
 
 ## Activating the update lifecycle on an existing installation
 

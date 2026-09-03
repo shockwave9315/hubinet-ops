@@ -134,6 +134,7 @@ _update_set_run_paths() {
   [[ -n "${UPDATE_RUN_ID}" ]] || die "internal error: cannot derive updater paths without UPDATE_RUN_ID"
   UPDATE_TOOL_CT_PATH="/tmp/hubinet-ops-authority-tool-${UPDATE_RUN_ID}.py"
   UPDATE_PROBE_CT_PATH="/tmp/hubinet-ops-update-probe-${UPDATE_RUN_ID}.py"
+  UPDATE_FENCE_CT_PATH="/tmp/hubinet-ops-update-fence-${UPDATE_RUN_ID}.py"
   UPDATE_CT_SOURCE_TARBALL="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}.tar.gz"
   UPDATE_CT_SOURCE_DIR="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}"
   UPDATE_APP_STAGED_PATH="/opt/hubinet-ops/app.staged-${UPDATE_RUN_ID}"
@@ -192,7 +193,8 @@ _update_journal_marker_is_recovery_relevant() {
     update-authority-restored|\
     update-marker-activation-attempted|\
     update-marker-precondition-exists|\
-    update-marker-precondition-absent) return 0 ;;
+    update-marker-precondition-absent|\
+    update-maintenance-fence-held) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -504,6 +506,11 @@ update_startup_recovery_gate() {
     _update_prove_service_enabled_active_and_healthy \
       || _update_rollback_hard_stop "run ${UPDATE_RUN_ID} was durably marked ${UPDATE_JOURNAL_STATE}, but VMID ${VMID} does not now prove enabled + active + healthy within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (enabled: ${_UPDATE_SERVICE_ENABLED_DETAIL}; readiness: ${_UPDATE_SERVICE_READINESS_DETAIL})"
     update_journal_resolve "${UPDATE_JOURNAL_STATE}"
+    # The interrupted run was already terminal and the installation now
+    # proves enabled + active + healthy, so nothing can still replace
+    # backend or helper material on its behalf. Release the fence it may
+    # have been holding when it was interrupted.
+    _update_release_maintenance_fence
     _UPDATE_STARTUP_RECOVERY_IN_PROGRESS="0"
     log_warn "previous updater run ${UPDATE_RUN_ID} was already ${detected_state}; final cleanup is complete. Rerun the requested update."
     exit 0
@@ -523,6 +530,10 @@ update_startup_recovery_gate() {
       || _update_rollback_hard_stop "interrupted run ${UPDATE_RUN_ID} had not armed rollback, but the existing service does not prove enabled + active + healthy"
     update_journal_checkpoint recovered
     _update_journal_clear
+    # Released only AFTER the untouched installation has been positively
+    # proven, not merely because this branch never armed rollback: an
+    # unproven service is not a released fence.
+    _update_release_maintenance_fence
   fi
 
   _UPDATE_STARTUP_RECOVERY_IN_PROGRESS="0"

@@ -25,6 +25,13 @@ from .package_update_issuance import (
     PACKAGE_UPDATE_ISSUANCE_REFUSALS,
     PackageUpdateIssuanceRefused,
 )
+from .product_update_fence import (
+    PRODUCT_UPDATE_FENCE_FILENAME,
+    ProductUpdateFenceError,
+    ProductUpdateMaintenanceFence,
+    product_update_fence_path,
+    read_product_update_fence,
+)
 from .contention_policy import (
     AUTHORITY_WRITER_WAIT_BUDGET_MS,
     AUTHORITY_WRITER_WAIT_BUDGET_SECONDS,
@@ -215,6 +222,11 @@ __all__ = [
     "PackageUpdateHealthRequest",
     "PACKAGE_UPDATE_ISSUANCE_REFUSALS",
     "PackageUpdateIssuanceRefused",
+    "PRODUCT_UPDATE_FENCE_FILENAME",
+    "ProductUpdateFenceError",
+    "ProductUpdateMaintenanceFence",
+    "product_update_fence_path",
+    "read_product_update_fence",
     "PackageUpdateJob",
     "PackageUpdateJobEvent",
     "PackageUpdateJobHealthProbe",

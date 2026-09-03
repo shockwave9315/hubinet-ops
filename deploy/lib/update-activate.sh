@@ -417,10 +417,83 @@ _update_recheck_source_commit() {
     || die "SOURCE_DIR became dirty between confirmation and activation -- refusing to activate"
 }
 
+# _update_acquire_maintenance_fence: the EXCLUSIVE product-update
+# maintenance fence, taken immediately before the mutation window.
+#
+# This is what actually makes a Hubinet PRODUCT update and a WORKLOAD
+# package-update job mutually exclusive. The Phase U2 probe answer is a poll,
+# and a poll cannot: between it and the first mutation an authenticated
+# operator may legitimately start a workload update, and a second, later poll
+# would only move that window rather than close it -- the update API stays
+# live right up to the service stop.
+#
+# So the backend does it inside its OWN authority writer transaction: it
+# proves no workload job is ACTIVE and makes the fence durable in the same
+# critical section a workload `start_update` would have to enter to create
+# one. Exactly one of the two wins. From the moment this returns, every new
+# workload start refuses -- including against the TARGET backend started in
+# Step 10, which reads the same durable fence -- until this run releases it.
+#
+# Released only at a terminal point: a proven successful product update, or a
+# proven complete rollback/recovery. A crash anywhere in between leaves the
+# fence in place, which is exactly what keeps workload issuance refused while
+# this run still owns rollback-capable mutation state.
+_update_acquire_maintenance_fence() {
+  local output status reason detail
+  output="$(pct exec "${VMID}" -- python3 "${UPDATE_FENCE_CT_PATH}" "${UPDATE_RUN_ID}" 2>/dev/null)" \
+    && status=0 || status=$?
+  (( status == 0 )) && [[ -n "${output}" ]] \
+    || die "could not run the product-update maintenance fence tool inside container ${VMID} -- refusing to mutate"
+
+  if _json_bool_field_is_true "${output}" "ok"; then
+    UPDATE_FENCE_HELD="1"
+    update_journal_record update-maintenance-fence-held "${VMID}"
+    log_info "acquired the exclusive product-update maintenance fence (holder ${UPDATE_RUN_ID}); workload package updates are refused until this run completes or is rolled back"
+    return 0
+  fi
+
+  reason="$(_json_field_from_text "${output}" "reason")"
+  detail="$(_json_field_from_text "${output}" "detail")"
+  if [[ "${reason}" == "fence_route_absent" ]]; then
+    # A backend predating production activation has no fence route and no
+    # update worker: it cannot own a workload package-update job at all, so
+    # there is nothing to make exclusive. Read from the endpoint's own 404,
+    # never from a transport failure.
+    log_info "this installation predates operator-triggered package updates; no maintenance fence is required"
+    return 0
+  fi
+  die "refusing to mutate: could not take the exclusive product-update maintenance fence (${reason:-unknown}${detail:+: ${detail}}). Nothing has been changed. Let any active workload package update finish, or resolve it through the operator controls (resume or roll back), then run this updater again."
+}
+
+# _update_release_maintenance_fence: remove the fence THIS run holds.
+#
+# Deliberately a plain filesystem removal rather than another authority
+# transaction. Releasing only ever widens what is permitted, so it cannot
+# race anything into existence and needs no atomicity -- and it must keep
+# working in the one case where an API release could not: a failed activation
+# update that has rolled back to a pre-activation backend, which has no
+# maintenance-fence route at all.
+#
+# Keyed off UPDATE_FENCE_HELD/the journal marker, so a run that never
+# acquired the fence never removes one another run may hold.
+_update_release_maintenance_fence() {
+  [[ "${UPDATE_FENCE_HELD}" == "1" ]] || ledger_has update-maintenance-fence-held "${VMID}" || return 0
+  pct exec "${VMID}" -- rm -f /var/lib/hubinet-ops/product-update-maintenance.fence >/dev/null 2>&1 \
+    || log_warn "could not remove the product-update maintenance fence inside container ${VMID}; workload package updates will keep refusing until it is removed by hand"
+  pct exec "${VMID}" -- sync -f /var/lib/hubinet-ops >/dev/null 2>&1 || true
+  UPDATE_FENCE_HELD="0"
+  log_info "released the exclusive product-update maintenance fence; workload package updates are permitted again"
+}
+
 _update_revalidate_before_mutation() {
   update_ownership_verify "${VMID}" revalidate "${UPDATE_INSTALLATION_RUN_ID}"
   _update_revalidate_plan_fence
   _update_preflight_ct_sync
+  # LAST, and immediately before the first mutation: everything above may
+  # still refuse this run harmlessly, and taking the fence before those
+  # checks would leave workload updates blocked by a run that then declined
+  # to proceed.
+  _update_acquire_maintenance_fence
 }
 
 update_activate_and_accept() {
@@ -979,6 +1052,11 @@ _update_finish_summary() {
   # these two steps is cleanup-only on the next invocation, never a false
   # request to roll an already-accepted target back.
   update_journal_checkpoint completed
+  # Terminal and proven: acceptance passed, the marker is coherent, and the
+  # `completed` checkpoint is durable. Only now may workload package updates
+  # start again -- releasing any earlier would re-open issuance while this
+  # run could still be asked to roll back.
+  _update_release_maintenance_fence
   # Test-only (correction pass 13, P1): exercise a real TERM here, after
   # the completed checkpoint is durable but before any rollback artifact
   # is removed -- see _update_test_term_checkpoint's own docstring.
@@ -1110,6 +1188,10 @@ update_rollback_on_failure() {
     || _update_rollback_hard_stop "restored the pre-update installation's files, but it did not prove active AND answer its own unauthenticated health probe within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (${_UPDATE_SERVICE_READINESS_DETAIL})"
 
   update_journal_resolve recovered
+  # The pre-update installation is fully restored, enabled, running, and
+  # healthy, and this run owns no rollback-capable state any more. Only now
+  # is it truthful to let workload package updates start again.
+  _update_release_maintenance_fence
   log_warn "rollback complete -- the pre-update installation is enabled, running again, and healthy (exit ${exit_code})"
 }
 
