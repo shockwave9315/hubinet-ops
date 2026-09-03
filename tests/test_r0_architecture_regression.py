@@ -766,8 +766,18 @@ def test_a_failed_activation_update_leaves_no_new_privileged_access_path() -> No
     # The journal marker is written BEFORE the artifact exists, so a crash in
     # between still leaves rollback a record of what to undo.
     assert "update_journal_record update-boundary-created" in text
-    # Removal is filtered by this run's exact marker, never by a broad match.
-    assert 'awk -v marker=" ${marker}" \'index($0, marker) == 0 { print }\'' in text
+    # Family 2 correction pass: removal now goes through the one shared
+    # atomic authorized_keys primitive (bootstrap-host-control.sh) rather
+    # than a hand-written awk/cat pair here -- it is that shared primitive
+    # whose own filter is pinned to this run's exact marker, never a broad
+    # match.
+    assert "_host_control_authorized_keys_remove" in text
+    host_control = (REPO_ROOT / "deploy/lib/bootstrap-host-control.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'awk -v marker=" ${marker}" \'index($0, marker) == 0 { print }\'' in (
+        host_control
+    )
     # An existing journal directory is never destroyed to tidy up: it may
     # hold another operation's durable at-most-once evidence.
     assert "update-boundary-journal-created" in text

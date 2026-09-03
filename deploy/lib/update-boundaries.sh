@@ -296,7 +296,7 @@ _update_boundary_create_key() {
 }
 
 _update_boundary_authorize() {
-  local kind="$1" marker authorized_keys_path public_key_tmp
+  local kind="$1" marker authorized_keys_path public_key_tmp line
   local key_type key_data key_comment extra
   marker="$(_update_boundary_marker "${kind}")"
   authorized_keys_path="$(_host_control_host_path "${HOST_CONTROL_AUTHORIZED_KEYS}")"
@@ -306,15 +306,13 @@ _update_boundary_authorize() {
   read -r key_type key_data key_comment extra <"${public_key_tmp}" || true
   [[ "${key_type}" == "ssh-ed25519" && "${key_data}" =~ ^[A-Za-z0-9+/]+={0,2}$ && "${key_comment}" == "${marker}" && -z "${extra:-}" ]] \
     || die "generated ${kind} boundary public key has an unexpected shape"
-  _host_control_validate_authorized_keys "${authorized_keys_path}"
-  if grep -qF " ${marker}" "${authorized_keys_path}" 2>/dev/null; then
-    die "the ${kind} forced-command authorization marker already exists unexpectedly"
-  fi
-  printf 'command="%s",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty %s %s %s\n' \
-    "$(_update_boundary_path "${kind}")" "${key_type}" "${key_data}" "${marker}" \
-    >>"${authorized_keys_path}" \
-    || die "failed to append the Hubinet-owned ${kind} forced-command authorization"
-  _update_durability_barrier_host "${authorized_keys_path}"
+  # Family 2 correction pass: one shared atomic/durable/idempotent
+  # add-or-reprove-durable primitive -- see bootstrap-host-control.sh's
+  # own module header for the full contract this replaces.
+  line="$(printf 'command="%s",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty %s %s %s' \
+    "$(_update_boundary_path "${kind}")" "${key_type}" "${key_data}" "${marker}")"
+  _host_control_authorized_keys_add "${authorized_keys_path}" "${marker}" "${line}" \
+    || die "failed to durably add the ${kind} forced-command authorization to ${HOST_CONTROL_AUTHORIZED_KEYS}"
 }
 
 # Read one scalar out of the installation's OWN existing
@@ -535,24 +533,14 @@ update_boundaries_rollback() {
 }
 
 _update_boundary_deauthorize() {
-  local kind="$1" marker authorized_keys_path filtered root_ssh_dir_path
+  local kind="$1" marker authorized_keys_path
   marker="$(_update_boundary_marker "${kind}")"
   authorized_keys_path="$(_host_control_host_path "${HOST_CONTROL_AUTHORIZED_KEYS}")"
-  [[ -f "${authorized_keys_path}" ]] || return 0
-  grep -qF " ${marker}" "${authorized_keys_path}" || return 0
-  root_ssh_dir_path="$(_host_control_host_path /root/.ssh)"
-  filtered="$(mktemp "${root_ssh_dir_path}/hubinet-ops-authorized-keys.XXXXXX")" \
-    || _update_rollback_hard_stop "could not allocate a temporary authorized_keys cleanup file while removing the ${kind} boundary authorization"
-  # Filtered by this run's EXACT marker. Every other line -- an unrelated
-  # operator key, or a Hubinet entry this run did not create -- is copied
-  # through byte-for-byte.
-  if awk -v marker=" ${marker}" 'index($0, marker) == 0 { print }' \
-    "${authorized_keys_path}" >"${filtered}" \
-    && cat "${filtered}" >"${authorized_keys_path}"; then
-    rm -f "${filtered}" || log_warn "could not remove the temporary authorized_keys cleanup file"
-    _update_durability_barrier_host_or_hard_stop "${authorized_keys_path}" "removing the ${kind} boundary authorization"
-  else
-    rm -f "${filtered}" >/dev/null 2>&1 || true
-    _update_rollback_hard_stop "could not remove the newly created ${kind} forced-command authorization from ${HOST_CONTROL_AUTHORIZED_KEYS}"
-  fi
+  # Family 2 correction pass: one shared atomic/durable/idempotent
+  # remove-or-reprove-durable primitive -- see bootstrap-host-control.sh's
+  # own module header for the full contract this replaces. Every other
+  # line -- an unrelated operator key, or a Hubinet entry this run did not
+  # create -- is copied through byte-for-byte.
+  _host_control_authorized_keys_remove "${authorized_keys_path}" "${marker}" \
+    || _update_rollback_hard_stop "could not durably remove the newly created ${kind} forced-command authorization from ${HOST_CONTROL_AUTHORIZED_KEYS}"
 }

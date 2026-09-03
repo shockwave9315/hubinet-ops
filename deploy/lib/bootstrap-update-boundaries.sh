@@ -149,14 +149,14 @@ phase8d_provision_update_boundaries() {
     [[ "${key_type}" == "ssh-ed25519" && "${key_data}" =~ ^[A-Za-z0-9+/]+={0,2}$ && "${key_comment}" == "${marker}" && -z "${extra:-}" ]] \
       || die "generated ${kind} boundary public key has an unexpected shape"
 
-    _host_control_validate_authorized_keys "${authorized_keys_path}"
-    if grep -qF " ${marker}" "${authorized_keys_path}"; then
-      die "the ${kind} forced-command authorization marker already exists unexpectedly"
-    fi
-    printf 'command="%s",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty %s %s %s\n' \
-      "${helper_path}" "${key_type}" "${key_data}" "${marker}" \
-      >>"${authorized_keys_path}" \
-      || die "failed to append the Hubinet-owned ${kind} forced-command authorization"
+    # Family 2 correction pass: one shared atomic/durable/idempotent
+    # add-or-reprove-durable primitive -- see bootstrap-host-control.sh's
+    # own module header for the full contract this replaces.
+    local line
+    line="$(printf 'command="%s",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty %s %s %s' \
+      "${helper_path}" "${key_type}" "${key_data}" "${marker}")"
+    _host_control_authorized_keys_add "${authorized_keys_path}" "${marker}" "${line}" \
+      || die "failed to durably add the ${kind} forced-command authorization to ${HOST_CONTROL_AUTHORIZED_KEYS}"
     ledger_record update-boundary-authorization "${marker}"
   done
 
@@ -191,30 +191,18 @@ _accept_update_boundaries() {
 }
 
 rollback_update_boundaries() {
-  local authorized_keys_path helper_path marker kind journal_dir journal_path filtered
+  local authorized_keys_path helper_path marker kind journal_dir journal_path
   authorized_keys_path="$(_host_control_host_path "${HOST_CONTROL_AUTHORIZED_KEYS}")"
-  local root_ssh_dir_path
-  root_ssh_dir_path="$(_host_control_host_path /root/.ssh)"
 
   for kind in ${UPDATE_BOUNDARY_KINDS}; do
     marker="$(update_boundary_marker "${kind}")"
-    if ledger_has update-boundary-authorization "${marker}" && [[ -f "${authorized_keys_path}" ]]; then
-      # Filter by this run's exact marker only. An unrelated operator
-      # authorized_keys line is never rewritten or removed.
-      filtered="$(mktemp "${root_ssh_dir_path}/hubinet-ops-authorized-keys.XXXXXX")" || {
-        log_warn "could not allocate a temporary authorized_keys cleanup file"
-        filtered=""
-      }
-      if [[ -n "${filtered}" ]]; then
-        if awk -v marker=" ${marker}" 'index($0, marker) == 0 { print }' \
-          "${authorized_keys_path}" >"${filtered}" \
-          && cat "${filtered}" >"${authorized_keys_path}"; then
-          rm -f "${filtered}" || log_warn "could not remove the temporary authorized_keys cleanup file"
-        else
-          log_warn "could not remove the Hubinet-owned ${kind} forced-command authorization"
-          rm -f "${filtered}" >/dev/null 2>&1 || true
-        fi
-      fi
+    if ledger_has update-boundary-authorization "${marker}"; then
+      # Family 2 correction pass: one shared atomic/durable/idempotent
+      # remove-or-reprove-durable primitive -- see bootstrap-host-control.sh's
+      # own module header. Filtered by this run's exact marker only: an
+      # unrelated operator authorized_keys line is never rewritten or removed.
+      _host_control_authorized_keys_remove "${authorized_keys_path}" "${marker}" \
+        || log_warn "could not remove the Hubinet-owned ${kind} forced-command authorization"
     fi
     helper_path="$(_host_control_host_path "$(update_boundary_helper_path "${kind}")")"
     if ledger_has update-boundary-helper-attempted "${helper_path}"; then

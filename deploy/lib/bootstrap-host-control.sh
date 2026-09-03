@@ -50,6 +50,212 @@ _host_control_validate_authorized_keys() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Family 2 (correction pass) -- ONE atomic, durable, idempotent
+# authorized_keys mutation contract, shared by every production path that
+# adds or removes a Hubinet-owned forced-command entry:
+#
+#   - the package-update boundaries' own runtime authorize/deauthorize
+#     (deploy/lib/update-boundaries.sh);
+#   - bootstrap's package-update boundary provisioning/rollback
+#     (deploy/lib/bootstrap-update-boundaries.sh);
+#   - bootstrap's package-scan boundary provisioning/rollback (this file).
+#
+# The bug this replaces: `awk ... >"${filtered}"; cat "${filtered}" >
+# "${authorized_keys_path}"` TRUNCATES the live file before the filtered
+# replacement is fully written back -- a crash mid-truncate can leave
+# authorized_keys empty or half-rewritten -- and `printf ... >>"${
+# authorized_keys_path}"` silently assumes the existing last line already
+# ends in a newline. A hand-managed operator key with no final newline,
+# followed by an appended Hubinet entry, concatenates the two into one
+# invalid line; a later marker-based removal can then delete that whole
+# concatenated line, destroying the unrelated operator key.
+#
+# Both functions below therefore only ever construct a COMPLETE
+# replacement in a temp file in the SAME directory as the live file, fsync
+# it, atomically rename it onto the live path, and fsync the containing
+# directory -- exactly the write/fsync/rename/dir-fsync discipline already
+# used for the maintenance fence and every other rollback-critical
+# artifact in this codebase. A crash before the rename leaves the OLD file
+# completely untouched; a crash after leaves the COMPLETE new file. Never
+# an intermediate.
+#
+# Retry safety mirrors the exact fix already applied to the maintenance
+# fence: a rename that already succeeded, with only ITS OWN following
+# durability barrier having failed, must be re-proven on the next call
+# rather than silently reported "nothing to do" from content alone -- see
+# _host_control_authorized_keys_barrier's callers below.
+#
+# HUBINET_OPS_TEST_FAIL_HOST_SYNC (consulted only when HUBINET_OPS_TEST_
+# MODE=1) is the same narrow substring fault-injection seam already used
+# by deploy/lib/update-recovery.sh's own host-side durability barriers,
+# reused here unmodified so one test suite covers both.
+# HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_RENAME (same substring-match
+# convention) is this module's own seam for the write/rename half: no fake
+# command layer intercepts these direct filesystem calls the way `pct
+# exec` mutations are intercepted, so a dedicated seam is needed to model
+# a realistic ENOSPC/EIO-style failure before the atomic rename commits.
+_host_control_authorized_keys_barrier() {
+  local path="$1" dir needle
+  dir="$(dirname -- "${path}")"
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]]; then
+    for needle in ${HUBINET_OPS_TEST_FAIL_HOST_SYNC:-}; do
+      [[ -n "${needle}" && "${path}" == *"${needle}"* ]] && return 1
+    done
+  fi
+  sync -f "${dir}"
+}
+
+_host_control_authorized_keys_rename_should_fail() {
+  local path="$1" needle
+  [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]] || return 1
+  for needle in ${HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_RENAME:-}; do
+    [[ -n "${needle}" && "${path}" == *"${needle}"* ]] && return 0
+  done
+  return 1
+}
+
+# _host_control_authorized_keys_real_path <path>: the real regular-file
+# location a mutation must stage and rename onto. A live authorized_keys
+# is commonly a symlink -- PVE's own /root/.ssh/authorized_keys is
+# conventionally -> /etc/pve/priv/authorized_keys -- and `mv`/`rename()`
+# replaces whatever is named at its DESTINATION argument's own directory
+# entry; renaming a staged file directly onto a symlink location would
+# delete the symlink and put a plain regular file in its place, breaking
+# whatever the symlink was for (cluster-wide sync, in PVE's case).
+# Resolving to the real target first, and staging/renaming there instead,
+# replaces the target's content atomically while leaving the symlink
+# itself completely untouched. A path that does not exist yet, or is not
+# a symlink, resolves to itself.
+_host_control_authorized_keys_real_path() {
+  local path="$1" resolved
+  if [[ -L "${path}" ]]; then
+    resolved="$(readlink -f -- "${path}")" && [[ -n "${resolved}" ]] || resolved="${path}"
+  else
+    resolved="${path}"
+  fi
+  printf '%s' "${resolved}"
+}
+
+# _host_control_authorized_keys_add <path> <marker> <line>: idempotently
+# and atomically ensure exactly one forced-command entry -- <line>,
+# identified by the space-delimited <marker> comment field it ends with --
+# exists in the authorized_keys file at <path>. Never truncates the live
+# file; never assumes it ends in a newline.
+#
+# Returns 0 once the marker is present AND its presence has been durably
+# proven, whether THIS call just added it or an earlier, interrupted call
+# already did.
+_host_control_authorized_keys_add() {
+  local path="$1" marker="$2" line="$3"
+  local real_path dir tmp count
+
+  _host_control_validate_authorized_keys "${path}"
+  real_path="$(_host_control_authorized_keys_real_path "${path}")"
+  dir="$(dirname -- "${real_path}")"
+
+  count=0
+  if [[ -f "${real_path}" ]]; then
+    count="$(grep -cF " ${marker}" "${real_path}" 2>/dev/null)" || count=0
+  fi
+  case "${count}" in
+    0) : ;;
+    1)
+      # Idempotent replay: the entry is already there. Re-prove durability
+      # rather than trusting that an earlier attempt's own barrier
+      # succeeded -- see this module's header. `if` (not a bare statement
+      # followed by `return $?`) so this is correct under `set -e`
+      # regardless of how the caller wraps this function.
+      if _host_control_authorized_keys_barrier "${real_path}"; then
+        return 0
+      else
+        return 1
+      fi
+      ;;
+    *)
+      log_warn "authorized_keys at ${path} already has ${count} entries for marker '${marker}'; refusing to add another"
+      return 1
+      ;;
+  esac
+
+  tmp="$(mktemp "${dir}/hubinet-ops-authorized-keys.XXXXXX")" || return 1
+  if [[ -f "${real_path}" ]]; then
+    chmod --reference="${real_path}" "${tmp}" 2>/dev/null || chmod 0600 "${tmp}"
+    if [[ -s "${real_path}" ]]; then
+      cat "${real_path}" >"${tmp}"
+      # Preserve every existing byte, but never let this run's own
+      # appended entry land on the same physical line as a hand-managed
+      # key that does not itself end in a newline.
+      [[ -z "$(tail -c1 "${real_path}")" ]] || printf '\n' >>"${tmp}"
+    fi
+  else
+    chmod 0600 "${tmp}"
+  fi
+  printf '%s\n' "${line}" >>"${tmp}"
+  sync -f "${tmp}" \
+    || { rm -f -- "${tmp}"; log_warn "could not flush the staged authorized_keys replacement for ${path}"; return 1; }
+  if _host_control_authorized_keys_rename_should_fail "${real_path}"; then
+    rm -f -- "${tmp}"
+    log_warn "could not atomically replace ${path} (simulated test failure)"
+    return 1
+  fi
+  mv -f -- "${tmp}" "${real_path}" \
+    || { rm -f -- "${tmp}" 2>/dev/null || true; log_warn "could not atomically replace ${path}"; return 1; }
+  if _host_control_authorized_keys_barrier "${real_path}"; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# _host_control_authorized_keys_remove <path> <marker>: idempotently and
+# atomically remove every line containing " <marker>" from the
+# authorized_keys file at <path>. Every other line -- an unrelated
+# operator key, or a Hubinet entry a DIFFERENT run/marker owns -- is
+# copied through byte-for-byte. A live path that does not exist, or that
+# already has no such line, is a true no-op EXCEPT for re-proving the
+# durability barrier (see this module's header: an earlier attempt's
+# rename may already have removed it while its own following barrier
+# failed).
+_host_control_authorized_keys_remove() {
+  local path="$1" marker="$2" real_path dir tmp
+
+  [[ -e "${path}" ]] || return 0
+  _host_control_validate_authorized_keys "${path}"
+  real_path="$(_host_control_authorized_keys_real_path "${path}")"
+  dir="$(dirname -- "${real_path}")"
+
+  if ! grep -qF " ${marker}" "${real_path}" 2>/dev/null; then
+    if _host_control_authorized_keys_barrier "${real_path}"; then
+      return 0
+    else
+      return 1
+    fi
+  fi
+
+  tmp="$(mktemp "${dir}/hubinet-ops-authorized-keys.XXXXXX")" || return 1
+  chmod --reference="${real_path}" "${tmp}" 2>/dev/null || chmod 0600 "${tmp}"
+  if ! awk -v marker=" ${marker}" 'index($0, marker) == 0 { print }' "${real_path}" >"${tmp}"; then
+    rm -f -- "${tmp}" 2>/dev/null || true
+    log_warn "could not filter the Hubinet-owned entry for marker '${marker}' out of ${path}"
+    return 1
+  fi
+  sync -f "${tmp}" \
+    || { rm -f -- "${tmp}"; log_warn "could not flush the staged authorized_keys replacement for ${path}"; return 1; }
+  if _host_control_authorized_keys_rename_should_fail "${real_path}"; then
+    rm -f -- "${tmp}"
+    log_warn "could not atomically replace ${path} (simulated test failure)"
+    return 1
+  fi
+  mv -f -- "${tmp}" "${real_path}" \
+    || { rm -f -- "${tmp}" 2>/dev/null || true; log_warn "could not atomically replace ${path}"; return 1; }
+  if _host_control_authorized_keys_barrier "${real_path}"; then
+    return 0
+  else
+    return 1
+  fi
+}
+
 phase2c_plan_host_control() {
   [[ -f "${SOURCE_DIR}/deploy/hubinet-package-scan-helper.py" ]] \
     || die "SOURCE_DIR (${SOURCE_DIR}) is missing deploy/hubinet-package-scan-helper.py"
@@ -124,14 +330,14 @@ phase8c_provision_host_control() {
       || die "failed to create ${HOST_CONTROL_AUTHORIZED_KEYS}"
     ledger_record host-control-authorized-keys-file "${authorized_keys_path}"
   fi
-  _host_control_validate_authorized_keys "${authorized_keys_path}"
-  if grep -qF " ${HOST_CONTROL_AUTH_MARKER}" "${authorized_keys_path}"; then
-    die "forced-command authorization marker already exists unexpectedly"
-  fi
-  printf 'command="%s",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty %s %s %s\n' \
-    "${HOST_CONTROL_HELPER_PATH}" "${key_type}" "${key_data}" "${HOST_CONTROL_AUTH_MARKER}" \
-    >>"${authorized_keys_path}" \
-    || die "failed to append the Hubinet-owned forced-command authorization"
+  # Family 2 correction pass: one shared atomic/durable/idempotent
+  # add-or-reprove-durable primitive -- see this module's own header above
+  # for the full contract this replaces.
+  local line
+  line="$(printf 'command="%s",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty %s %s %s' \
+    "${HOST_CONTROL_HELPER_PATH}" "${key_type}" "${key_data}" "${HOST_CONTROL_AUTH_MARKER}")"
+  _host_control_authorized_keys_add "${authorized_keys_path}" "${HOST_CONTROL_AUTH_MARKER}" "${line}" \
+    || die "failed to durably add the Hubinet-owned forced-command authorization to ${HOST_CONTROL_AUTHORIZED_KEYS}"
   ledger_record host-control-authorization "${HOST_CONTROL_AUTH_MARKER}"
 
   local host_key_tmp known_hosts_tmp host_key_type host_key_data host_key_comment
@@ -179,23 +385,13 @@ rollback_host_control() {
   helper_path="$(_host_control_host_path "${HOST_CONTROL_HELPER_PATH}")"
   helper_dir_path="$(_host_control_host_path /usr/local/libexec)"
   root_ssh_dir_path="$(_host_control_host_path /root/.ssh)"
-  if [[ -n "${HOST_CONTROL_AUTH_MARKER:-}" && -f "${authorized_keys_path}" ]]; then
-    local filtered
-    filtered="$(mktemp "${root_ssh_dir_path}/hubinet-ops-authorized-keys.XXXXXX")" || {
-      log_warn "could not allocate a temporary authorized_keys cleanup file"
-      filtered=""
-    }
-    if [[ -n "${filtered}" ]]; then
-      if awk -v marker=" ${HOST_CONTROL_AUTH_MARKER}" 'index($0, marker) == 0 { print }' \
-        "${authorized_keys_path}" >"${filtered}" \
-        && cat "${filtered}" >"${authorized_keys_path}"; then
-        rm -f "${filtered}" \
-          || log_warn "could not remove the temporary authorized_keys cleanup file"
-      else
-        log_warn "could not remove the Hubinet-owned forced-command authorization"
-        rm -f "${filtered}" >/dev/null 2>&1 || true
-      fi
-    fi
+  if [[ -n "${HOST_CONTROL_AUTH_MARKER:-}" ]]; then
+    # Family 2 correction pass: one shared atomic/durable/idempotent
+    # remove-or-reprove-durable primitive -- see this module's own header
+    # above. Filtered by the exact marker only: an unrelated operator
+    # authorized_keys line is never rewritten or removed.
+    _host_control_authorized_keys_remove "${authorized_keys_path}" "${HOST_CONTROL_AUTH_MARKER}" \
+      || log_warn "could not remove the Hubinet-owned forced-command authorization"
   fi
   if ledger_has host-control-authorized-keys-file "${authorized_keys_path}" \
     && [[ -f "${authorized_keys_path}" && ! -s "${authorized_keys_path}" ]]; then

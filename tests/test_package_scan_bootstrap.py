@@ -49,7 +49,14 @@ def test_rollback_filters_only_unique_hubinet_authorization_and_artifacts() -> N
     assert "index($0, marker) == 0" in host_control
     assert "HOST_CONTROL_AUTH_MARKER" in host_control
     assert 'rm -f "${helper_path}"' in host_control
-    assert 'cat "${filtered}" >"${authorized_keys_path}"' in host_control
+    # Family 2 correction pass: authorized_keys add/remove now goes through
+    # one shared atomic (stage in a temp file, fsync, atomic rename, fsync
+    # the containing directory) primitive rather than truncating the live
+    # file in place -- the truncate-then-replace pattern this used to pin
+    # is exactly the bug that primitive replaces.
+    assert "_host_control_authorized_keys_add" in host_control
+    assert "_host_control_authorized_keys_remove" in host_control
+    assert 'cat "${filtered}" >"${authorized_keys_path}"' not in host_control
     assert 'mv "${filtered}" "${authorized_keys_path}"' not in host_control
     assert '_host_control_secure_root_file "${authorized_keys_path}"' not in host_control
     assert 'chown root:root "${authorized_keys_path}"' not in host_control
