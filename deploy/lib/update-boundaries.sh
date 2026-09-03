@@ -34,7 +34,6 @@
 # it: an installation being activated keeps scanning exactly as it did.
 
 UPDATE_BOUNDARY_CT_DIR="/etc/hubinet-ops/host-control"
-UPDATE_BOUNDARY_KNOWN_HOSTS="${UPDATE_BOUNDARY_CT_DIR}/known_hosts"
 UPDATE_BOUNDARY_CONFIG_PATH="/etc/hubinet-ops/inventory.yaml"
 UPDATE_BOUNDARY_JOURNAL_DIRS="/var/lib/hubinet-ops/snapshot-operations /var/lib/hubinet-ops/package-mutation-operations /var/lib/hubinet-ops/rollback-operations"
 
@@ -212,9 +211,8 @@ update_boundaries_stage_cleanup() {
 # ---------------------------------------------------------------------------
 
 update_boundaries_activate() {
-  local kind plan live staged rollback_copy
+  local kind plan live staged rollback_copy journal_dir journal_path
   for journal_dir in ${UPDATE_BOUNDARY_JOURNAL_DIRS}; do
-    local journal_path
     journal_path="$(_host_control_host_path "${journal_dir}")"
     if [[ ! -d "${journal_path}" ]]; then
       update_journal_record update-boundary-journal-created "${journal_path}"
@@ -300,6 +298,57 @@ _update_boundary_authorize() {
   _update_durability_barrier_host "${authorized_keys_path}"
 }
 
+# Read one scalar out of the installation's OWN existing
+# `package_scan.host_control` block.
+#
+# The update boundaries reach the SAME PVE SSH endpoint the scan boundary
+# already reaches -- it is the one configured source -- so the endpoint facts
+# are taken from the running installation rather than re-derived from a flag
+# this updater does not have. That also means an operator who moved their
+# endpoint has moved it for every boundary at once, instead of leaving the new
+# ones pointed somewhere the old one is not.
+_update_boundary_scan_host_control_field() {
+  local field="$1" config_file="$2" value
+  # Standard library only. PyYAML is not guaranteed present on a Proxmox
+  # host, and every other static read this updater performs is likewise a
+  # bounded scan rather than an import -- see _update_target_authority_schema.
+  # This walks indentation to find exactly `package_scan:` ->
+  # `host_control:` -> `<field>:`, so a same-named key under any other
+  # section can never be mistaken for it.
+  value="$(python3 -c '
+import re
+import sys
+
+field = sys.argv[1]
+wanted = ("package_scan", "host_control", field)
+depth = 0
+with open(sys.argv[2], encoding="utf-8") as handle:
+    for raw in handle:
+        line = raw.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        match = re.match(r"([A-Za-z0-9_]+):\s*(.*)$", line.strip())
+        if match is None:
+            continue
+        key, inline = match.groups()
+        # Two spaces per level, exactly as bootstrap generates it.
+        if indent != depth * 2:
+            if indent > depth * 2:
+                continue
+            depth = indent // 2
+        if key != wanted[depth]:
+            continue
+        if depth == len(wanted) - 1:
+            print(inline.strip().strip("\"" + chr(39)))
+            break
+        depth += 1
+' "${field}" "${config_file}" 2>/dev/null)"
+  [[ -n "${value}" ]] \
+    || die "cannot activate the package-update lifecycle: ${UPDATE_BOUNDARY_CONFIG_PATH} has no package_scan.host_control.${field} to reuse for the update boundaries"
+  printf '%s' "${value}"
+}
+
 # The activation block is APPENDED, never merged: it is one self-contained
 # top-level YAML key, and appending it leaves every other line of the
 # operator's configuration byte-for-byte as it was. The updater still never
@@ -307,15 +356,25 @@ _update_boundary_authorize() {
 _update_boundary_activate_config() {
   local backup_ct_path="${UPDATE_BOUNDARY_CONFIG_PATH}.rollback-${UPDATE_RUN_ID}"
   local block_tmp merged_tmp current_tmp
+  local endpoint_host endpoint_port endpoint_user endpoint_known_hosts
+
+  current_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-config-read.XXXXXX")"
+  pct exec "${VMID}" -- cat "${UPDATE_BOUNDARY_CONFIG_PATH}" >"${current_tmp}" \
+    || die "failed to read ${UPDATE_BOUNDARY_CONFIG_PATH} from container ${VMID}"
+  # Resolved BEFORE anything is preserved or written: a configuration this
+  # updater cannot read the endpoint out of must fail before it has changed
+  # a byte, not halfway through appending a block.
+  endpoint_host="$(_update_boundary_scan_host_control_field host "${current_tmp}")"
+  endpoint_port="$(_update_boundary_scan_host_control_field port "${current_tmp}")"
+  endpoint_user="$(_update_boundary_scan_host_control_field user "${current_tmp}")"
+  endpoint_known_hosts="$(_update_boundary_scan_host_control_field known_hosts_path "${current_tmp}")"
+
   run_logged pct exec "${VMID}" -- cp "${UPDATE_BOUNDARY_CONFIG_PATH}" "${backup_ct_path}" \
     || die "failed to preserve ${UPDATE_BOUNDARY_CONFIG_PATH} before activating the update lifecycle"
   _update_durability_barrier_ct "${backup_ct_path}"
   update_journal_record update-boundary-config-activated "${VMID}"
 
-  current_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-config-read.XXXXXX")"
   merged_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-config-write.XXXXXX")"
-  pct exec "${VMID}" -- cat "${UPDATE_BOUNDARY_CONFIG_PATH}" >"${current_tmp}" \
-    || die "failed to read ${UPDATE_BOUNDARY_CONFIG_PATH} from container ${VMID}"
   cat "${current_tmp}" >"${merged_tmp}"
   block_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-config-block.XXXXXX")"
   cat >"${block_tmp}" <<YAML
@@ -324,13 +383,18 @@ _update_boundary_activate_config() {
 # for operator-triggered package updates. Execution-boundary information
 # only: no VMID, no resource id, no per-guest setting, and no managed-resource
 # list. Every stage's timeout stays code-owned.
+#
+# The host, port, user, and pinned known_hosts are the SAME ones the existing
+# package-scan boundary uses -- one configured source, one SSH endpoint. Only
+# the private keys differ, because the key is what selects which forced
+# command a connection may run.
 package_update:
   enabled: true
   host_control:
-    host: "$(_endpoint_host "${PVE_ENDPOINT}")"
-    port: 22
-    user: root
-    known_hosts_path: "${UPDATE_BOUNDARY_KNOWN_HOSTS}"
+    host: "${endpoint_host}"
+    port: ${endpoint_port}
+    user: "${endpoint_user}"
+    known_hosts_path: "${endpoint_known_hosts}"
     snapshot_private_key_path: "$(_update_boundary_key_path snapshot)"
     execution_private_key_path: "$(_update_boundary_key_path execution)"
     mutation_private_key_path: "$(_update_boundary_key_path mutation)"

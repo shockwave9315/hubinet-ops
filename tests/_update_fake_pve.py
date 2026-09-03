@@ -186,7 +186,27 @@ def seed_installed_environment(
         "192.0.2.10 ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\n", encoding="utf-8"
     )
 
-    inventory_text = 'source:\n  display_name: "Home Proxmox"\n  provider_kind: proxmox_ve\n'
+    # Every real installation carries the package-scan host-control block --
+    # bootstrap always writes it. The updater reuses its endpoint facts when
+    # it activates the update lifecycle, so a pre-activation fixture must have
+    # it too or the fixture would be describing an installation that cannot
+    # exist.
+    inventory_text = (
+        'source:\n'
+        '  display_name: "Home Proxmox"\n'
+        '  provider_kind: proxmox_ve\n'
+        "\npackage_scan:\n"
+        "  interval_seconds: 21600\n"
+        "  initial_delay_seconds: 30\n"
+        "  host_control:\n"
+        '    host: "192.0.2.10"\n'
+        "    port: 22\n"
+        "    user: root\n"
+        '    private_key_path: "/etc/hubinet-ops/host-control/id_ed25519"\n'
+        '    known_hosts_path: "/etc/hubinet-ops/host-control/known_hosts"\n'
+        "    timeout_seconds: 900\n"
+        "    max_result_bytes: 8388608\n"
+    )
     if activated:
         repo = Path(__file__).resolve().parents[1]
         # Five root-owned helpers, five dedicated keys, five forced-command

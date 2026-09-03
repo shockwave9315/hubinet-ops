@@ -4471,6 +4471,15 @@ class TestPreActivationInstallationUpgrade:
         # And the pre-existing configuration is preserved byte-for-byte above
         # the appended block.
         assert inventory.startswith('source:\n  display_name: "Home Proxmox"')
+        assert "package_scan:" in inventory.split("package_update:", 1)[0]
+        # The five boundaries reach the SAME endpoint the scan boundary
+        # already reaches -- one configured source, one SSH endpoint. Only
+        # the private keys differ.
+        activation = inventory.split("package_update:", 1)[1]
+        assert 'host: "192.0.2.10"' in activation
+        assert 'known_hosts_path: "/etc/hubinet-ops/host-control/known_hosts"' in activation
+        for kind in BOUNDARY_KINDS:
+            assert f'{kind}_private_key_path: "{boundary_key_ct_path(kind)}"' in activation
         for journal in UPDATE_BOUNDARY_JOURNAL_DIRS:
             assert (_host_root(env) / journal.lstrip("/")).is_dir(), journal
 
