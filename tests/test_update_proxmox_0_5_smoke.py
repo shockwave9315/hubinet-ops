@@ -4587,6 +4587,239 @@ class TestPreActivationInstallationUpgrade:
         assert (journal / "evidence.json").exists()
 
 
+# ---------------------------------------------------------------------------
+# Family 1 (correction pass) -- durable run ownership for package-update
+# boundary artifacts. update_journal_checkpoint used to persist a ledger
+# marker only when its id matched VMID exactly, silently dropping every
+# "update-boundary-created <kind>", "update-boundary-activated <kind>", and
+# "update-boundary-journal-created <path>" marker from the ON-DISK journal
+# even though update_journal_record was called for each -- so a real
+# process/PVE restart mid-activation could not reconstruct which boundary
+# artifacts the interrupted run owned. HUBINET_OPS_TEST_KILL_AT delivers a
+# genuine, untrappable SIGKILL (see _update_test_kill_checkpoint's own
+# docstring) so these tests exercise a REAL restart -- a fresh second
+# invocation reloading the journal from disk -- rather than the EXIT trap's
+# own in-process rollback (which already had the ephemeral ledger intact
+# and would mask this bug).
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryRecoveryOwnershipAcrossRestart:
+    def test_a_restart_after_helper_install_still_removes_the_orphaned_helper(
+        self, tmp_path
+    ):
+        """F1-A/F1-B. Helper installed, no key or authorization yet, then a
+        genuine crash and restart. The durable "update-boundary-created"
+        marker must survive to let recovery know this helper belongs to the
+        interrupted run -- and remove it -- rather than leaving a root-owned
+        helper with no key/authorization behind forever, or (worse) later
+        being misread as an already-healthy, unchanged boundary.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        env_with_kill = dict(
+            env.env, HUBINET_OPS_TEST_KILL_AT="boundary-helper-installed-snapshot"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(env_with_kill, _base_args(target))
+        assert crashed.returncode < 0, crashed.stderr  # killed by a real signal
+
+        helper = _boundary_helper(env, "snapshot")
+        assert helper.exists(), "the fixture: helper installed before the kill"
+        assert not env.ct_file(FAKE_VMID, boundary_key_ct_path("snapshot")).exists()
+
+        recovery = _run(env.env, _base_args(target))
+
+        # A genuine restart's own recovery invocation exits 0 once the
+        # PREVIOUS run's rollback is proven complete -- it is this new
+        # invocation that succeeds at recovering, not a failing update.
+        assert recovery.returncode == 0, recovery.stderr
+        assert "rollback complete" in recovery.stderr
+        # The orphaned helper -- installed by the interrupted run, with no
+        # key or authorization -- is gone.
+        assert not helper.exists()
+        for kind in BOUNDARY_KINDS:
+            assert not env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+        assert f"hubinet-ops-package-snapshot-vmid-{FAKE_VMID}-" not in (
+            _authorized_keys_text(env)
+        )
+        # And nothing this run never touched (kinds after "snapshot" in
+        # iteration order were never even attempted) was disturbed either.
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert not journal.exists()
+
+    def test_a_restart_after_replacement_restores_the_exact_old_helper(
+        self, tmp_path
+    ):
+        """F1-D. Old helper preserved, staged target moved live, then a
+        genuine crash and restart. The durable "update-boundary-activated"
+        marker for a REPLACED (not newly created) boundary must survive so
+        recovery restores the exact preserved pre-update content rather than
+        leaving the NEW target content live with no rollback ever having run
+        against it.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            boundary_helper_text={"mutation": "#!/usr/bin/env python3\n# stale\n"},
+        )
+        env_with_kill = dict(
+            env.env, HUBINET_OPS_TEST_KILL_AT="boundary-replaced-mutation"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(env_with_kill, _base_args(target))
+        assert crashed.returncode < 0, crashed.stderr
+
+        helper = _boundary_helper(env, "mutation")
+        target_content = (
+            REPO_ROOT / "deploy" / "hubinet-package-mutation-helper.py"
+        ).read_text(encoding="utf-8")
+        assert helper.read_text(encoding="utf-8") == target_content, (
+            "the fixture: the new content is already live before the kill"
+        )
+
+        recovery = _run(env.env, _base_args(target))
+
+        # A genuine restart's own recovery invocation exits 0 once the
+        # PREVIOUS run's rollback is proven complete -- it is this new
+        # invocation that succeeds at recovering, not a failing update.
+        assert recovery.returncode == 0, recovery.stderr
+        assert "rollback complete" in recovery.stderr
+        assert helper.read_text(encoding="utf-8") == "#!/usr/bin/env python3\n# stale\n"
+        for kind, source_name in UPDATE_BOUNDARY_HELPERS:
+            if kind == "mutation":
+                continue
+            assert _boundary_helper(env, kind).read_text(encoding="utf-8") == (
+                REPO_ROOT / "deploy" / source_name
+            ).read_text(encoding="utf-8"), kind
+
+    def test_a_restart_after_config_write_restores_it_before_deleting_keys(
+        self, tmp_path
+    ):
+        """F1-C. Every boundary fully created (helper + key + authorization),
+        the pre-activation config preserved and durable, and the NEW
+        activated config already live -- then a genuine crash and restart.
+        Recovery must restore the pre-activation configuration AND remove
+        every created boundary's helper, key, and authorization: the
+        "update-boundary-created"/"update-boundary-activated" markers for
+        all five kinds, and the "update-boundary-config-activated" marker,
+        must all have survived the restart for this to be possible at all.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        before_inventory = env.ct_file_text(
+            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
+        )
+        env_with_kill = dict(
+            env.env, HUBINET_OPS_TEST_KILL_AT="boundary-config-written"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(env_with_kill, _base_args(target))
+        assert crashed.returncode < 0, crashed.stderr
+
+        inventory_after_crash = env.ct_file_text(
+            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
+        )
+        assert "package_update:" in inventory_after_crash, (
+            "the fixture: the new config is already live before the kill"
+        )
+        for kind in BOUNDARY_KINDS:
+            assert _boundary_helper(env, kind).exists(), kind
+            assert env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+
+        recovery = _run(env.env, _base_args(target))
+
+        # A genuine restart's own recovery invocation exits 0 once the
+        # PREVIOUS run's rollback is proven complete -- it is this new
+        # invocation that succeeds at recovering, not a failing update.
+        assert recovery.returncode == 0, recovery.stderr
+        assert "rollback complete" in recovery.stderr
+        restored = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert restored == before_inventory
+        assert "package_update:" not in restored
+        authorized = _authorized_keys_text(env)
+        for kind in BOUNDARY_KINDS:
+            assert not _boundary_helper(env, kind).exists(), kind
+            assert not env.ct_file(
+                FAKE_VMID, boundary_key_ct_path(kind)
+            ).exists(), kind
+            assert f"hubinet-ops-package-{kind}-vmid-{FAKE_VMID}-" not in authorized
+
+    def test_a_successful_upgrade_leaves_no_run_owned_staging_residue(
+        self, tmp_path
+    ):
+        """F1-E. Terminal cleanup sibling: after a successful upgrade, no
+        run-owned `.staged-<run>` / `.rollback-<run>` / `.restore-tmp-<run>`
+        boundary artifact remains on the PVE host filesystem.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        helper_dir = _host_root(env) / "usr" / "local" / "libexec"
+        residue = [
+            path
+            for path in helper_dir.glob("hubinet-package-*-boundary-*")
+            if ".staged-" in path.name
+            or ".rollback-" in path.name
+            or ".restore-tmp-" in path.name
+        ]
+        assert residue == []
+
+    def test_an_invalid_boundary_marker_id_fails_journal_load_closed(
+        self, tmp_path
+    ):
+        """Regression pin for the shared read/write validator itself: an
+        on-disk journal ledger line naming an id outside the closed set a
+        marker kind can legally carry must fail journal load closed,
+        exactly like any other malformed journal content -- never silently
+        accepted as a fifth, unknown boundary kind.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+
+        text = journal.read_text(encoding="utf-8")
+        assert "ledger=update-boundary-created snapshot" in text
+        corrupted = text.replace(
+            "ledger=update-boundary-created snapshot",
+            "ledger=update-boundary-created not-a-real-kind",
+        )
+        journal.write_text(corrupted, encoding="utf-8")
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "invalid rollback marker" in result.stderr
+        assert journal.exists()
+
+
 class TestActiveWorkloadJobRefusesTheUpdater:
     """The activation invariant: an in-flight workload update fences this."""
 

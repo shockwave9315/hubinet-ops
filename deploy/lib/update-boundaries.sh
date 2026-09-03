@@ -216,6 +216,10 @@ update_boundaries_activate() {
     journal_path="$(_host_control_host_path "${journal_dir}")"
     if [[ ! -d "${journal_path}" ]]; then
       update_journal_record update-boundary-journal-created "${journal_path}"
+      # Test-only (Family 1 correction pass): the journal-created marker is
+      # now durable, but the directory it describes does not exist yet --
+      # proves a restart can reconstruct that this run owns creating it.
+      _update_test_kill_checkpoint "boundary-journal-created-${journal_dir##*/}"
       _host_control_install_dir 0700 "${journal_path}" \
         || die "failed to create the Hubinet operation journal ${journal_dir}"
     fi
@@ -233,8 +237,15 @@ update_boundaries_activate() {
         || die "failed to preserve the active ${kind} boundary helper before activation"
       _update_durability_barrier_host "${rollback_copy}"
       update_journal_record update-boundary-activated "${kind}"
+      # Test-only (Family 1 correction pass, F1-D): the pre-update helper
+      # is preserved and the "activated" (replaced) marker is durable, but
+      # the staged target has not been moved live yet.
+      _update_test_kill_checkpoint "boundary-activated-${kind}"
       mv "${staged}" "${live}" \
         || die "failed to activate the staged ${kind} boundary helper (same-path atomic rename)"
+      # Test-only (Family 1 correction pass, F1-D): the replacement is
+      # live. Recovery must restore the exact preserved pre-update helper.
+      _update_test_kill_checkpoint "boundary-replaced-${kind}"
       continue
     fi
 
@@ -242,9 +253,17 @@ update_boundaries_activate() {
     # helper, the key, and the authorization exist, so a crash at any point
     # after this line leaves a durable record that rollback must undo them.
     update_journal_record update-boundary-created "${kind}"
+    # Test-only (Family 1 correction pass, F1-A): the created marker is
+    # durable, but the helper itself does not exist at this live path yet.
+    _update_test_kill_checkpoint "boundary-created-${kind}"
     mv "${staged}" "${live}" \
       || die "failed to install the new ${kind} boundary helper"
     _update_durability_barrier_host "${live}"
+    # Test-only (Family 1 correction pass, F1-B): the helper is installed,
+    # but its dedicated key and forced-command authorization do not exist
+    # yet -- recovery must remove the helper it finds here, not treat its
+    # mere presence as a fully provisioned boundary.
+    _update_test_kill_checkpoint "boundary-helper-installed-${kind}"
     _update_boundary_create_key "${kind}"
     _update_boundary_authorize "${kind}"
     ledger_record update-boundary-activated "${kind}"
@@ -373,6 +392,13 @@ _update_boundary_activate_config() {
     || die "failed to preserve ${UPDATE_BOUNDARY_CONFIG_PATH} before activating the update lifecycle"
   _update_durability_barrier_ct "${backup_ct_path}"
   update_journal_record update-boundary-config-activated "${VMID}"
+  # Test-only (Family 1 correction pass, F1-C): the pre-activation
+  # configuration is preserved and durable, and the config-activated
+  # marker is durable, but the live configuration still has NOT been
+  # overwritten yet -- recovery's rollback must restore from the
+  # preserved backup, which at this point is identical to the still-live
+  # content anyway.
+  _update_test_kill_checkpoint "boundary-config-marker-before-write"
 
   merged_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-config-write.XXXXXX")"
   cat "${current_tmp}" >"${merged_tmp}"
@@ -411,6 +437,12 @@ YAML
   run_logged pct exec "${VMID}" -- chmod 0640 "${UPDATE_BOUNDARY_CONFIG_PATH}" \
     || die "failed to restore ${UPDATE_BOUNDARY_CONFIG_PATH} mode inside container ${VMID}"
   _update_durability_barrier_ct "${UPDATE_BOUNDARY_CONFIG_PATH}"
+  # Test-only (Family 1 correction pass, F1-C): the NEW activated
+  # configuration is now durably live. Recovery must still restore the
+  # preserved pre-activation content from the durable backup path BEFORE
+  # any created boundary's credentials are deleted (see update_boundaries_
+  # rollback's own config-first ordering).
+  _update_test_kill_checkpoint "boundary-config-written"
 }
 
 # ---------------------------------------------------------------------------

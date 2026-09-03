@@ -85,6 +85,35 @@ _update_test_term_checkpoint() {
   return 0
 }
 
+# _update_test_kill_checkpoint <name>: test-only self-SIGKILL injection
+# point (Family 1 correction pass). Unlike _update_test_term_checkpoint
+# above -- which delivers a real SIGTERM that this script's own `trap
+# 'exit 143' TERM` still catches, still running _update_exit_trap's
+# rollback machinery synchronously in THIS SAME process, with the
+# ephemeral in-process BOOTSTRAP_LEDGER still fully intact -- some Family
+# 1 witnesses need to prove what a GENUINE crash (SIGKILL, or a real
+# PVE/CT host power loss) leaves behind: no EXIT trap, no rollback call,
+# no in-memory ledger surviving into the next invocation. Only the
+# durable on-disk journal (update_journal_checkpoint) is left for the
+# NEXT invocation's own update_startup_recovery_gate to reconstruct from
+# -- exactly the same untrappable-death shape the fake CT-mediated `mv`
+# hook (tests/_bootstrap_fake_pve.py's kill_updater_after_move) already
+# exercises for CT-side mutations. The package-update boundary helpers'
+# mv/cp run directly on the PVE HOST filesystem, never through `pct exec`,
+# so no fake command layer can intercept them the same way -- this is the
+# equivalent seam for those. Inert whenever HUBINET_OPS_TEST_MODE is not
+# "1", so production behavior never calls this at all.
+_update_test_kill_checkpoint() {
+  local name="$1" needle
+  [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]] || return 0
+  for needle in ${HUBINET_OPS_TEST_KILL_AT:-}; do
+    if [[ "${needle}" == "${name}" ]]; then
+      kill -KILL $$
+    fi
+  done
+  return 0
+}
+
 # Three-valued service-state probe. Return 0 means the service is active
 # or transitioning and therefore MUST be treated as potentially running;
 # return 1 means systemd positively reported a non-running state; return 2

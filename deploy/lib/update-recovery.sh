@@ -195,6 +195,69 @@ _update_journal_marker_is_recovery_relevant() {
     update-marker-precondition-exists|\
     update-marker-precondition-absent|\
     update-maintenance-fence-held) return 0 ;;
+    # Family 1 correction pass: the four package-update boundary markers,
+    # kept as their own arm (rather than chained onto the legacy list
+    # above) so each existing marker's own line is untouched.
+    update-boundary-created|\
+    update-boundary-activated|\
+    update-boundary-config-activated|\
+    update-boundary-journal-created) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _update_journal_marker_id_is_valid <kind> <id>: typed per-kind id
+# validation for every durable journal ledger marker, shared identically by
+# update_journal_checkpoint (write) and _update_journal_load (read) so the
+# two can never drift (Family 1 correction pass, P1).
+#
+# The legacy VMID-scoped markers keep requiring id == VMID exactly as
+# before -- that is unchanged and never weakened. The package-update
+# boundary markers instead validate against the fixed, closed set of ids
+# update-boundaries.sh can ever actually record for that SPECIFIC marker
+# kind: a bare "id == VMID" would have silently accepted only the
+# config-activation marker (whose id genuinely is the VMID) while dropping
+# "update-boundary-created snapshot", "update-boundary-activated
+# execution", and "update-boundary-journal-created <path>" -- exactly the
+# confirmed P1 (a durable-looking update_journal_record call whose marker
+# never actually survives to the on-disk journal, so a restart cannot
+# reconstruct which boundary artifacts the interrupted run owns).
+#
+# "update-boundary-staged" is deliberately NOT here and never durable --
+# see update-boundaries.sh's own module header for why: its cleanup is
+# deterministic from the live path plus the loaded UPDATE_RUN_ID alone, so
+# giving it durable journal identity would only grow the journal format
+# for no rollback-correctness benefit.
+_update_journal_marker_id_is_valid() {
+  local kind="$1" id="$2" candidate
+  case "${kind}" in
+    update-service-autostart-disable-attempted|\
+    update-service-stop-attempted|\
+    update-app-activation-attempted|\
+    update-venv-activation-attempted|\
+    update-unit-activation-attempted|\
+    update-helper-activated|\
+    update-authority-reset-attempted|\
+    update-authority-restored|\
+    update-marker-activation-attempted|\
+    update-marker-precondition-exists|\
+    update-marker-precondition-absent|\
+    update-maintenance-fence-held|\
+    update-boundary-config-activated)
+      [[ "${id}" == "${VMID}" ]]
+      ;;
+    update-boundary-created|update-boundary-activated)
+      case "${id}" in
+        snapshot|execution|mutation|rollback|health) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    update-boundary-journal-created)
+      for candidate in ${UPDATE_BOUNDARY_JOURNAL_DIRS}; do
+        [[ "${id}" == "$(_host_control_host_path "${candidate}")" ]] && return 0
+      done
+      return 1
+      ;;
     *) return 1 ;;
   esac
 }
@@ -224,7 +287,8 @@ update_journal_checkpoint() {
     printf 'db_backup_path=%s\n' "${UPDATE_DB_BACKUP_PATH:-}"
     if [[ -f "${BOOTSTRAP_LEDGER}" ]]; then
       while read -r kind id; do
-        if _update_journal_marker_is_recovery_relevant "${kind}" && [[ "${id}" == "${VMID}" ]]; then
+        if _update_journal_marker_is_recovery_relevant "${kind}" \
+          && _update_journal_marker_id_is_valid "${kind}" "${id}"; then
           printf 'ledger=%s %s\n' "${kind}" "${id}"
         fi
       done <"${BOOTSTRAP_LEDGER}"
@@ -292,7 +356,8 @@ _update_journal_load() {
       ledger)
         kind="${value%% *}"
         id="${value#* }"
-        if ! _update_journal_marker_is_recovery_relevant "${kind}" || [[ "${id}" != "${VMID}" ]]; then
+        if ! _update_journal_marker_is_recovery_relevant "${kind}" \
+          || ! _update_journal_marker_id_is_valid "${kind}" "${id}"; then
           die "interrupted-update journal ${UPDATE_JOURNAL_PATH} has an invalid rollback marker; preserve it and recover manually"
         fi
         ledger_record "${kind}" "${id}"
@@ -428,9 +493,36 @@ _update_cleanup_recovered_run_artifacts() {
   if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" && "${HUBINET_OPS_TEST_FAIL_HOST_CLEANUP:-0}" == "1" ]]; then
     _update_rollback_hard_stop "could not remove host-side run-owned helper artifacts for interrupted run ${UPDATE_RUN_ID} (simulated test failure)"
   fi
+  # Family 1 correction pass, required cleanup sibling: the five package-
+  # update forced-command boundary helpers (deploy/lib/update-boundaries.sh)
+  # stage and roll back through the exact same run-owned
+  # <live>.staged-${UPDATE_RUN_ID} / <live>.rollback-${UPDATE_RUN_ID} /
+  # <live>.restore-tmp-${UPDATE_RUN_ID} host-side naming convention as the
+  # package-scan helper immediately below, on the SAME PVE host
+  # filesystem. The staged filename is deterministically derived from
+  # each boundary's own live path plus this run's own loaded
+  # UPDATE_RUN_ID, so this cleanup needs no additional durable journal
+  # identity for "staged" itself (see update-boundaries.sh's own module
+  # header for why "update-boundary-staged" stays out of the durable
+  # journal). Reached from every terminal path that calls this function --
+  # forward success (_update_finish_summary), in-process rollback
+  # (update_rollback_on_failure), and restart recovery
+  # (update_startup_recovery_gate) alike -- so a leftover boundary staging/
+  # rollback artifact cannot survive any of the three.
+  local _cleanup_boundary_kind _cleanup_boundary_live
+  local -a _cleanup_boundary_paths=()
+  for _cleanup_boundary_kind in $(_update_boundary_kinds); do
+    _cleanup_boundary_live="$(_update_boundary_host_path "${_cleanup_boundary_kind}")"
+    _cleanup_boundary_paths+=(
+      "${_cleanup_boundary_live}.staged-${UPDATE_RUN_ID}"
+      "${_cleanup_boundary_live}.rollback-${UPDATE_RUN_ID}"
+      "${_cleanup_boundary_live}.restore-tmp-${UPDATE_RUN_ID}"
+    )
+  done
   rm -f -- "${UPDATE_HELPER_STAGED_HOST_PATH}" \
     "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" \
     "${UPDATE_HELPER_HOST_PATH}.restore-tmp-${UPDATE_RUN_ID}" \
+    "${_cleanup_boundary_paths[@]}" \
     || _update_rollback_hard_stop "could not remove host-side run-owned helper artifacts for interrupted run ${UPDATE_RUN_ID}"
 }
 
