@@ -9,6 +9,7 @@ import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
+import uuid
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
@@ -60,6 +61,11 @@ from custom_components.hubinet_ops.api import (
     PackageScanStatus,
     PackagePlanApprovalSnapshot,
     PackagePlanApprovalStatus,
+    PackageUpdateHealthOutcome,
+    PackageUpdateJobEvent,
+    PackageUpdateJobState,
+    PackageUpdateJobSummary,
+    PackageUpdateJobView,
     PresenceState,
     ResourceHealthContract,
     ResourceSnapshot,
@@ -82,8 +88,12 @@ from custom_components.hubinet_ops.const import (
     MODEL_LXC,
     SERVICE_APPROVE_UPDATE_PLAN,
     SERVICE_CLEAR_HEALTH_CONTRACT,
+    SERVICE_RESUME_UPDATE,
+    SERVICE_ROLLBACK_UPDATE,
     SERVICE_SET_HEALTH_CONTRACT,
+    SERVICE_START_UPDATE,
     SERVICE_VIEW_HEALTH_CONTRACT,
+    SERVICE_VIEW_UPDATE_JOB,
     SERVICE_VIEW_UPDATE_PLAN,
 )
 from custom_components.hubinet_ops.coordinator import (
@@ -283,6 +293,7 @@ def resource(
     package_scan: PackageScanSnapshot | None = None,
     package_plan_approval: PackagePlanApprovalSnapshot | None = None,
     health_contract: HealthContractSummary | None = None,
+    package_update_job: PackageUpdateJobSummary | None = None,
 ) -> ResourceSnapshot:
     if active_binding_id is None and presence in {
         PresenceState.PRESENT,
@@ -327,6 +338,17 @@ def resource(
                     HealthContractStatus.UNCONFIGURED
                     if resource_type is ResourceType.LXC
                     else HealthContractStatus.UNSUPPORTED
+                )
+            )
+        ),
+        package_update_job=(
+            package_update_job
+            if package_update_job is not None
+            else PackageUpdateJobSummary(
+                state=(
+                    PackageUpdateJobState.NOT_STARTED
+                    if resource_type is ResourceType.LXC
+                    else PackageUpdateJobState.UNSUPPORTED
                 )
             )
         ),
@@ -417,6 +439,8 @@ class FakeTransport:
         approval_error: Exception | None = None,
         health_contracts: dict[str, ResourceHealthContract] | None = None,
         health_contract_error: Exception | None = None,
+        package_update_jobs: dict[str, PackageUpdateJobView] | None = None,
+        package_update_error: Exception | None = None,
     ) -> None:
         self._snapshots = list(snapshots)
         self._index = 0
@@ -437,6 +461,18 @@ class FakeTransport:
         self.health_contract_reads: list[str] = []
         self.health_contract_writes: list[tuple[str, tuple, int | None]] = []
         self.health_contract_clears: list[tuple[str, int | None]] = []
+        # Stands in for the backend's durable job authority. Every operator
+        # update control records what it was asked and returns the job it
+        # acted on, so a test can assert exactly what crossed the boundary --
+        # and, more importantly, what did not.
+        self.package_update_jobs: dict[str, PackageUpdateJobView] = dict(
+            package_update_jobs or {}
+        )
+        self.package_update_error = package_update_error
+        self.package_update_starts: list[tuple[str, str]] = []
+        self.package_update_reads: list[tuple[str, int]] = []
+        self.package_update_resumes: list[str] = []
+        self.package_update_rollbacks: list[str] = []
 
     async def validate_connection(self) -> BackendInformation:
         self.validate_calls += 1
@@ -508,6 +544,37 @@ class FakeTransport:
         if self.health_contract_error is not None:
             raise self.health_contract_error
         self.health_contracts.pop(resource_id, None)
+
+    def _package_update_job(self, resource_id: str) -> PackageUpdateJobView:
+        if self.package_update_error is not None:
+            raise self.package_update_error
+        job = self.package_update_jobs.get(resource_id)
+        if job is None:
+            raise HubinetOpsConflict(
+                "Hubinet Ops refused the package update request "
+                "(no_package_update_job)"
+            )
+        return job
+
+    async def start_package_update(
+        self, resource_id: str, request_id: str
+    ) -> PackageUpdateJobView:
+        self.package_update_starts.append((resource_id, request_id))
+        return self._package_update_job(resource_id)
+
+    async def fetch_package_update(
+        self, resource_id: str, events: int
+    ) -> PackageUpdateJobView:
+        self.package_update_reads.append((resource_id, events))
+        return self._package_update_job(resource_id)
+
+    async def resume_package_update(self, resource_id: str) -> PackageUpdateJobView:
+        self.package_update_resumes.append(resource_id)
+        return self._package_update_job(resource_id)
+
+    async def rollback_package_update(self, resource_id: str) -> PackageUpdateJobView:
+        self.package_update_rollbacks.append(resource_id)
+        return self._package_update_job(resource_id)
 
 
 class FakeApiFactory:
@@ -853,6 +920,7 @@ async def test_devices_and_entities_are_keyed_by_backend_resource_id(
             "package_scan_status",
             "package_plan_approval",
             "health_contract",
+            "package_update_job",
             "pending_updates",
             "last_package_scan",
             "reboot_required",
@@ -1094,6 +1162,7 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
         "package_scan_status",
         "package_plan_approval",
         "health_contract",
+        "package_update_job",
         "pending_updates",
         "last_package_scan",
         "reboot_required",
@@ -1406,7 +1475,7 @@ async def test_view_update_plan_reads_fresh_snapshot_and_returns_exact_rows(
         )
         if item.unique_id.startswith(f"{resource_key}:")
     ]
-    assert len(resource_entities) == 14
+    assert len(resource_entities) == 15
     for item in resource_entities:
         state = hass.states.get(item.entity_id)
         assert state is not None
@@ -1713,6 +1782,10 @@ def test_update_plan_action_metadata_and_polish_translations_are_structural() ->
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
         SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_START_UPDATE,
+        SERVICE_VIEW_UPDATE_JOB,
+        SERVICE_RESUME_UPDATE,
+        SERVICE_ROLLBACK_UPDATE,
     }
     assert polish["services"][SERVICE_VIEW_UPDATE_PLAN]["name"] == (
         "Wyświetl plan aktualizacji"
@@ -4187,3 +4260,515 @@ async def test_diagnostics_still_redact_recursively_with_health_contracts_presen
     # field must not quietly widen that surface.
     assert "health_contract" not in published
     assert "d" * 64 not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Operator update controls.
+#
+# Four actions over the same dynamic resource-device selector every other
+# action uses. Three of them are the only way a real workload package change
+# can begin, continue, or be compensated -- and none of them is reachable
+# from the coordinator's polling path.
+# ---------------------------------------------------------------------------
+
+JOB_ID = "9c4f4d1e-0f6a-4c62-9e51-1a2b3c4d5e6f"
+REQUEST_ID = "1f2e3d4c-5b6a-4978-8867-556677889900"
+
+
+def job_view(
+    *,
+    resource_id: str = RESOURCE_CT,
+    status: PackageUpdateJobState = PackageUpdateJobState.ACTIVE,
+    checkpoint: str = "mutation_completed",
+    health_outcome: PackageUpdateHealthOutcome | None = None,
+    rollback_available: bool = False,
+    terminalized_at: str | None = None,
+    events: tuple[PackageUpdateJobEvent, ...] = (),
+) -> PackageUpdateJobView:
+    return PackageUpdateJobView(
+        job_id=JOB_ID,
+        request_id=REQUEST_ID,
+        resource_id=resource_id,
+        status=status,
+        checkpoint=checkpoint,
+        issued_at="2026-08-08T11:00:00+00:00",
+        approved_plan_fingerprint="b" * 64,
+        package_count=24,
+        snapshot_name="hubinet-pre-update-0001",
+        snapshot_confirmed_at="2026-08-08T11:01:00+00:00",
+        mutation_may_have_started_at="2026-08-08T11:02:00+00:00",
+        mutation_completed_at="2026-08-08T11:09:00+00:00",
+        health_contract_revision=3,
+        health_started_at=None,
+        health_completed_at=None,
+        health_outcome=health_outcome,
+        rollback_available=rollback_available,
+        terminalized_at=terminalized_at,
+        events=events,
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_actions_are_registered_and_removed_with_the_domain(
+    hass: HomeAssistant,
+) -> None:
+    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    for service in (
+        SERVICE_START_UPDATE,
+        SERVICE_VIEW_UPDATE_JOB,
+        SERVICE_RESUME_UPDATE,
+        SERVICE_ROLLBACK_UPDATE,
+    ):
+        assert hass.services.has_service(DOMAIN, service)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    for service in (
+        SERVICE_START_UPDATE,
+        SERVICE_VIEW_UPDATE_JOB,
+        SERVICE_RESUME_UPDATE,
+        SERVICE_ROLLBACK_UPDATE,
+    ):
+        assert not hass.services.has_service(DOMAIN, service)
+
+
+@pytest.mark.asyncio
+async def test_start_update_sends_only_a_generated_request_id(
+    hass: HomeAssistant,
+) -> None:
+    """Home Assistant chooses nothing about what gets installed.
+
+    It generates one idempotency key and names the resource. The plan, the
+    packages, the snapshot, and the frozen health contract are all resolved
+    by backend authority.
+    """
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_jobs={RESOURCE_CT: job_view(checkpoint="issued")},
+    )
+    await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_START_UPDATE,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert len(transport.package_update_starts) == 1
+    resource_id, request_id = transport.package_update_starts[0]
+    assert resource_id == RESOURCE_CT
+    uuid.UUID(request_id)  # a real UUID, generated per invocation
+    assert response["job_id"] == JOB_ID
+    assert response["resource_id"] == RESOURCE_CT
+    assert response["resource_name"] == "CT101 Cloudflared"
+    assert response["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_two_start_invocations_use_two_different_request_ids(
+    hass: HomeAssistant,
+) -> None:
+    """One idempotency key per invocation, not one per integration."""
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_jobs={RESOURCE_CT: job_view(checkpoint="issued")},
+    )
+    await setup_entry(hass, transport)
+    device_id = resource_device_id(hass, RESOURCE_CT)
+
+    for _ in range(2):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_START_UPDATE,
+            {"device_id": device_id},
+            blocking=True,
+            return_response=True,
+        )
+
+    first, second = (call[1] for call in transport.package_update_starts)
+    assert first != second
+
+
+@pytest.mark.asyncio
+async def test_view_update_job_returns_bounded_facts_as_response_data(
+    hass: HomeAssistant,
+) -> None:
+    """A job an operator asked about, never entity state.
+
+    The bounded event tail belongs here for the same reason the package rows
+    and the probe list do: it is exact material read on request, not
+    something every coordinator poll should carry.
+    """
+
+    events = (
+        PackageUpdateJobEvent(
+            sequence=1,
+            created_at="2026-08-08T11:00:00+00:00",
+            level="info",
+            stage="issued",
+            event_type="job_issued",
+            message="package update job authority issued",
+        ),
+    )
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_jobs={RESOURCE_CT: job_view(events=events)},
+    )
+    entry = await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_JOB,
+        {"device_id": resource_device_id(hass, RESOURCE_CT), "events": 5},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert transport.package_update_reads == [(RESOURCE_CT, 5)]
+    assert response["job_id"] == JOB_ID
+    assert response["package_count"] == 24
+    assert response["events"] == [
+        {
+            "sequence": 1,
+            "created_at": "2026-08-08T11:00:00+00:00",
+            "level": "info",
+            "stage": "issued",
+            "event_type": "job_issued",
+            "message": "package update job authority issued",
+        }
+    ]
+    # None of it leaked into entity attributes.
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    for item in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id):
+        if not item.unique_id.startswith(f"{key}:"):
+            continue
+        state = hass.states.get(item.entity_id)
+        assert state is not None
+        assert "events" not in state.attributes
+        assert "job_issued" not in str(state.attributes)
+        assert "hubinet-pre-update-0001" not in str(state.attributes)
+
+
+@pytest.mark.asyncio
+async def test_resume_and_rollback_name_only_the_resource(
+    hass: HomeAssistant,
+) -> None:
+    """No stage, checkpoint, operation, snapshot, or target crosses the line."""
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_jobs={
+            RESOURCE_CT: job_view(
+                checkpoint="health_completed",
+                health_outcome=PackageUpdateHealthOutcome.FAILED,
+                rollback_available=True,
+            )
+        },
+    )
+    await setup_entry(hass, transport)
+    device_id = resource_device_id(hass, RESOURCE_CT)
+
+    resumed = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_RESUME_UPDATE,
+        {"device_id": device_id},
+        blocking=True,
+        return_response=True,
+    )
+    rolled_back = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_ROLLBACK_UPDATE,
+        {"device_id": device_id},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert transport.package_update_resumes == [RESOURCE_CT]
+    assert transport.package_update_rollbacks == [RESOURCE_CT]
+    assert resumed["rollback_available"] is True
+    assert rolled_back["health_outcome"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_update_actions_use_the_dynamic_resource_device_selector(
+    hass: HomeAssistant,
+) -> None:
+    """The existing device model, and no second resource-selection system."""
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_jobs={RESOURCE_CT: job_view()},
+    )
+    await setup_entry(hass, transport)
+
+    for service, extra in (
+        (SERVICE_START_UPDATE, {}),
+        (SERVICE_VIEW_UPDATE_JOB, {}),
+        (SERVICE_RESUME_UPDATE, {}),
+        (SERVICE_ROLLBACK_UPDATE, {}),
+    ):
+        # A device that is not a Hubinet resource is refused outright.
+        with pytest.raises(HomeAssistantError):
+            await hass.services.async_call(
+                DOMAIN,
+                service,
+                {"device_id": "not-a-real-device", **extra},
+                blocking=True,
+                return_response=True,
+            )
+        # And no action accepts a resource_id, a VMID, or a snapshot.
+        for forbidden in (
+            {"resource_id": RESOURCE_CT},
+            {"vmid": 101},
+            {"snapshot_name": "x"},
+            {"command": "apt-get upgrade"},
+        ):
+            with pytest.raises(vol.Invalid):
+                await hass.services.async_call(
+                    DOMAIN,
+                    service,
+                    {"device_id": resource_device_id(hass, RESOURCE_CT), **forbidden},
+                    blocking=True,
+                    return_response=True,
+                )
+
+    assert transport.package_update_starts == []
+    assert transport.package_update_rollbacks == []
+
+
+@pytest.mark.asyncio
+async def test_a_stale_or_replaced_resource_cannot_be_updated(
+    hass: HomeAssistant,
+) -> None:
+    """A device whose resource is no longer current resolves to nothing."""
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_jobs={RESOURCE_CT: job_view()},
+    )
+    await setup_entry(hass, transport)
+
+    # A device that identifies no currently-loaded Hubinet resource -- the
+    # shape a replaced or retired incarnation leaves behind -- resolves to
+    # nothing, and every operator control refuses rather than guessing.
+    registry = dr.async_get(hass)
+    stranded = registry.async_get_or_create(
+        config_entry_id=next(iter(hass.config_entries.async_entries(DOMAIN))).entry_id,
+        identifiers={(DOMAIN, "resource:00000000-0000-0000-0000-000000000000")},
+        name="A resource that is no longer current",
+    )
+
+    for service in (
+        SERVICE_START_UPDATE,
+        SERVICE_RESUME_UPDATE,
+        SERVICE_ROLLBACK_UPDATE,
+    ):
+        with pytest.raises(HomeAssistantError):
+            await hass.services.async_call(
+                DOMAIN,
+                service,
+                {"device_id": stranded.id},
+                blocking=True,
+                return_response=True,
+            )
+    assert transport.package_update_starts == []
+    assert transport.package_update_rollbacks == []
+
+
+@pytest.mark.asyncio
+async def test_a_backend_refusal_surfaces_as_an_error_not_a_silent_success(
+    hass: HomeAssistant,
+) -> None:
+    """A refused start is never reported as an update that began."""
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_error=HubinetOpsConflict(
+            "Hubinet Ops refused the package update request (no_current_approval)"
+        ),
+    )
+    await setup_entry(hass, transport)
+    device_id = resource_device_id(hass, RESOURCE_CT)
+
+    for service in (
+        SERVICE_START_UPDATE,
+        SERVICE_VIEW_UPDATE_JOB,
+        SERVICE_RESUME_UPDATE,
+        SERVICE_ROLLBACK_UPDATE,
+    ):
+        with pytest.raises(HomeAssistantError):
+            await hass.services.async_call(
+                DOMAIN,
+                service,
+                {"device_id": device_id},
+                blocking=True,
+                return_response=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_polling_never_initiates_or_advances_an_update(
+    hass: HomeAssistant,
+) -> None:
+    """HA is presentation and controlled input; never an authority.
+
+    Refreshing the coordinator repeatedly reads the published snapshot and
+    nothing else. No start, resume, or rollback is ever sent, however many
+    times it polls -- which is the whole reason an update cannot begin as a
+    side effect of Home Assistant being alive.
+    """
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_jobs={RESOURCE_CT: job_view()},
+    )
+    entry = await setup_entry(hass, transport)
+    coordinator = hass.data[DOMAIN][DATA_COORDINATORS][entry.entry_id]
+
+    for _ in range(5):
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert transport.snapshot_calls >= 5
+    assert transport.package_update_starts == []
+    assert transport.package_update_resumes == []
+    assert transport.package_update_rollbacks == []
+    assert transport.package_update_reads == []
+
+
+@pytest.mark.asyncio
+async def test_the_update_job_sensor_summarizes_without_replicating(
+    hass: HomeAssistant,
+) -> None:
+    """One concise state, and bounded identity attributes beside it."""
+
+    resources = [
+        resource(
+            RESOURCE_CT,
+            ResourceType.LXC,
+            101,
+            "CT101 Cloudflared",
+            package_update_job=PackageUpdateJobSummary(
+                state=PackageUpdateJobState.ACTIVE,
+                job_id=JOB_ID,
+                checkpoint="health_started",
+                issued_at="2026-08-08T11:00:00+00:00",
+                snapshot_confirmed_at="2026-08-08T11:01:00+00:00",
+                mutation_completed_at="2026-08-08T11:09:00+00:00",
+            ),
+        ),
+        *[item for item in INITIAL_RESOURCES if item.resource_id != RESOURCE_CT],
+    ]
+    entry = await setup_entry(hass, FakeTransport([snapshot(resources)]))
+
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    entity_id = next(
+        item.entity_id
+        for item in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
+        if item.unique_id == f"{key}:package_update_job"
+    )
+    state = hass.states.get(entity_id)
+
+    assert state is not None
+    assert state.state == "active"
+    assert state.attributes["package_update_job_id"] == JOB_ID
+    assert state.attributes["package_update_checkpoint"] == "health_started"
+    # No verdict has been recorded, and `None` is emphatically not a pass.
+    assert state.attributes["package_update_health_outcome"] is None
+    assert "events" not in state.attributes
+    assert "probes" not in state.attributes
+
+
+@pytest.mark.asyncio
+async def test_a_qemu_resource_reports_the_update_lifecycle_as_unsupported(
+    hass: HomeAssistant,
+) -> None:
+    """"We do not update this" is a different answer from "not started"."""
+
+    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    key = resource_registry_key(BACKEND_ID, RESOURCE_VM)
+    entity_id = next(
+        item.entity_id
+        for item in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
+        if item.unique_id == f"{key}:package_update_job"
+    )
+    assert hass.states.get(entity_id).state == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_update_action_metadata_and_translations_are_structural(
+    hass: HomeAssistant,
+) -> None:
+    """Every declared field is described, in every shipped language."""
+
+    await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    descriptions = await service_helper.async_get_all_descriptions(hass)
+    translations = await async_get_translations(
+        hass, "en", "services", integrations={DOMAIN}
+    )
+    polish = await async_get_translations(
+        hass, "pl", "services", integrations={DOMAIN}
+    )
+
+    for service, expected_fields in (
+        (SERVICE_START_UPDATE, {"device_id"}),
+        (SERVICE_VIEW_UPDATE_JOB, {"device_id", "events"}),
+        (SERVICE_RESUME_UPDATE, {"device_id"}),
+        (SERVICE_ROLLBACK_UPDATE, {"device_id"}),
+    ):
+        description = descriptions[DOMAIN][service]
+        assert set(description["fields"]) == expected_fields, service
+        assert translations[f"component.{DOMAIN}.services.{service}.name"]
+        assert translations[f"component.{DOMAIN}.services.{service}.description"]
+        assert polish[f"component.{DOMAIN}.services.{service}.name"]
+        for field in expected_fields:
+            assert translations[
+                f"component.{DOMAIN}.services.{service}.fields.{field}.name"
+            ]
+            assert polish[
+                f"component.{DOMAIN}.services.{service}.fields.{field}.name"
+            ]
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_stay_bounded_and_redacting_with_update_jobs_present(
+    hass: HomeAssistant,
+) -> None:
+    """Adding a job summary to the snapshot changed no diagnostics rule.
+
+    Diagnostics carry resource identity and state and deliberately not the
+    package scan, the health contract, or the update job -- the same bound
+    those two already sit outside. Redaction is unchanged either way.
+    """
+
+    resources = [
+        resource(
+            RESOURCE_CT,
+            ResourceType.LXC,
+            101,
+            "CT101 Cloudflared",
+            package_update_job=PackageUpdateJobSummary(
+                state=PackageUpdateJobState.ACTIVE,
+                job_id=JOB_ID,
+                checkpoint="mutation_completed",
+                issued_at="2026-08-08T11:00:00+00:00",
+            ),
+            state={"api_token": "super-secret", "nested": {"password": "hunter2"}},
+        ),
+        *[item for item in INITIAL_RESOURCES if item.resource_id != RESOURCE_CT],
+    ]
+    entry = await setup_entry(hass, FakeTransport([snapshot(resources)]))
+
+    payload = await async_get_config_entry_diagnostics(hass, entry)
+
+    rendered = str(payload)
+    assert "super-secret" not in rendered
+    assert "hunter2" not in rendered
+    # Bounded on purpose: job material is read through the explicit action.
+    assert JOB_ID not in rendered
+    assert "package_update_job" not in rendered
+    assert "hubinet-pre-update" not in rendered
