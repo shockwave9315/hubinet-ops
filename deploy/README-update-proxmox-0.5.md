@@ -176,6 +176,13 @@ refused throughout the new service's acceptance checks, and the fence is
 released only when the run reaches a terminal, proven state: a successful
 update, or a completed rollback.
 
+**An installation that predates the update lifecycle is fenced too.** Its
+backend has no fence route to ask, but the very next thing this updater does
+is activate the new backend and start it — and that one *can* accept workload
+updates while acceptance is still running. So the updater writes the same
+fence directly, before it changes anything, and the newly activated backend
+finds it already there.
+
 **If this updater is interrupted, the fence stays.** That is deliberate: an
 interrupted run may still be asked to replace backend or helper material, and
 letting a workload update start into that would be exactly the overlap the
@@ -183,7 +190,9 @@ fence exists to prevent. Run the updater again -- its startup recovery
 finishes the interrupted run and releases the fence once the installation is
 proven. If you ever need to clear it by hand, it is
 `/var/lib/hubinet-ops/product-update-maintenance.fence` inside the CT; do that
-only when you are certain no product update is in progress.
+only when you are certain no product update is in progress. The updater only
+ever removes a fence recorded as its own run — one left by a different
+product update is reported and left alone.
 
 ## Activating the update lifecycle on an existing installation
 

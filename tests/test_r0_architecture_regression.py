@@ -483,11 +483,11 @@ def test_the_product_updater_never_releases_a_fence_it_does_not_hold() -> None:
 
     activate = (REPO_ROOT / "deploy/lib/update-activate.sh").read_text(encoding="utf-8")
     assert "_update_release_maintenance_fence" in activate
-    # Guarded by this run's own held-flag or its durable journal marker.
-    assert (
-        '[[ "${UPDATE_FENCE_HELD}" == "1" ]] || ledger_has '
-        'update-maintenance-fence-held "${VMID}" || return 0' in activate
-    )
+    # Keyed off the fence's OWN recorded holder, not this process's memory --
+    # that is what makes a crash between "the fence is durable" and "this run
+    # recorded that it holds it" recoverable rather than orphaning it.
+    assert '"${holder}" != "${UPDATE_RUN_ID}"' in activate
+    assert "is held by another product update" in activate
     # Acquired after every harmless refusal, immediately before the window.
     assert (
         "_update_preflight_ct_sync\n" in activate

@@ -4792,29 +4792,239 @@ class TestProductUpdateMaintenanceFence:
         assert "released the exclusive product-update maintenance fence" in result.stderr
         assert not _fence_file(env).exists()
 
-    def test_a_pre_activation_backend_needs_no_fence(self, tmp_path):
-        """A backend with no fence route cannot own a workload job either.
+    def _pre_activation_env(self, tmp_path, **overrides):
+        """An installation whose backend has no fence route and no worker."""
 
-        Read from the endpoint's own 404, never from a transport failure --
-        so this is a real answer rather than an unanswerable question.
-        """
-
-        env = seed_installed_environment(
+        scenario = {
+            "fence_route_absent": True,
+            "update_probe_package_update_absent": True,
+        }
+        scenario.update(overrides)
+        return seed_installed_environment(
             tmp_path,
             installed_source_sha="1" * 40,
             activated=False,
-            scenario_overrides={
-                "fence_route_absent": True,
-                "update_probe_package_update_absent": True,
-            },
+            scenario_overrides=scenario,
         )
+
+    def test_a_pre_activation_update_still_establishes_the_durable_fence(
+        self, tmp_path
+    ):
+        """Witness B. The old backend has no fence route -- the fence is still taken.
+
+        "No race with the OLD backend" is not "no fence required for this
+        run". Step 10 starts the ACTIVATED target backend, whose
+        `/package-update` route is live while Phase U5 acceptance is still
+        running, so the fence has to exist before the mutation window and be
+        found already present the moment that target comes up.
+        """
+
+        env = self._pre_activation_env(tmp_path)
         target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
 
         result = _run(env.env, _base_args(target))
 
         assert result.returncode == 0, result.stderr
         assert "predates operator-triggered package updates" in result.stderr
+        assert "established the exclusive product-update maintenance fence directly" in (
+            result.stderr
+        )
+        # Witness D: released only after terminal success, and gone afterwards.
+        assert "released the exclusive product-update maintenance fence" in result.stderr
         assert not _fence_file(env).exists()
+
+    def test_the_pre_activation_fence_exists_before_the_target_backend_starts(
+        self, tmp_path
+    ):
+        """Witness B/C, the ordering that makes the U5 window safe.
+
+        Interrupt the run after the target service has been started but
+        before acceptance is terminal, and assert the fence is already on
+        disk. That is precisely the window in which the activated backend's
+        update route is live and product rollback is still possible.
+        """
+
+        env = self._pre_activation_env(tmp_path, discovery_result="backend_unreachable")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        # Fail the rollback part-way so the run stops with the fence still
+        # held, letting the test observe the state that existed during U5.
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["ct_sync_app_restore"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "established the exclusive product-update maintenance fence directly" in (
+            result.stderr
+        )
+        # The service was started for acceptance, acceptance failed, and the
+        # fence was on disk throughout -- and still is, because this run can
+        # still be asked to roll back.
+        fence = _fence_file(env)
+        assert fence.exists()
+        assert "released the exclusive product-update maintenance fence" not in (
+            result.stderr
+        )
+
+    def test_a_failed_pre_activation_update_releases_only_after_proven_rollback(
+        self, tmp_path
+    ):
+        """Witness C. Rollback completes, and only then does the fence go."""
+
+        env = self._pre_activation_env(tmp_path, discovery_result="backend_unreachable")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "established the exclusive product-update maintenance fence directly" in (
+            result.stderr
+        )
+        assert "rollback complete" in result.stderr
+        assert "released the exclusive product-update maintenance fence" in result.stderr
+        assert not _fence_file(env).exists()
+
+    def test_a_pre_activation_run_never_steals_another_runs_fence(self, tmp_path):
+        """One product update at a time, on the direct path too."""
+
+        env = self._pre_activation_env(tmp_path)
+        fence = _fence_file(env)
+        fence.parent.mkdir(parents=True, exist_ok=True)
+        fence.write_text(
+            json.dumps({"acquired_at": "2026-01-01T00:00:00+00:00", "holder": "someone-else"}),
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not establish the exclusive product-update maintenance fence" in (
+            result.stderr
+        )
+        assert json.loads(fence.read_text())["holder"] == "someone-else"
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_an_unwritable_pre_activation_fence_refuses_before_any_mutation(
+        self, tmp_path
+    ):
+        """The positive control for the direct path's hard-fail.
+
+        Same fail-closed expectation as the backend-created fence: if it
+        cannot be made durable, the run refuses rather than proceeding
+        unfenced.
+        """
+
+        env = self._pre_activation_env(
+            tmp_path, **{"fail": ["pre_activation_fence_write"]}
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not establish the exclusive product-update maintenance fence" in (
+            result.stderr
+        )
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert not _fence_file(env).exists()
+
+    def test_a_foreign_fence_is_never_removed_by_a_terminal_run(self, tmp_path):
+        """Witness E, the half that must never happen.
+
+        Release is keyed off the fence's own recorded holder, so a run that
+        reaches a terminal point while some OTHER product update holds the
+        fence leaves it exactly where it is.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+        fence = _fence_file(env)
+
+        # A successful run acquires and releases its own fence...
+        first = _run(env.env, _base_args(target))
+        assert first.returncode == 0, first.stderr
+        assert not fence.exists()
+
+        # ...and a later run that finds a foreign fence refuses to take it,
+        # and never removes it either.
+        fence.parent.mkdir(parents=True, exist_ok=True)
+        fence.write_text(
+            json.dumps({"acquired_at": "2026-01-01T00:00:00+00:00", "holder": "someone-else"}),
+            encoding="utf-8",
+        )
+        second_target = build_update_target_checkout(tmp_path / "target2", REPO_ROOT)
+        second = _run(env.env, _base_args(second_target))
+
+        assert second.returncode != 0
+        assert json.loads(fence.read_text())["holder"] == "someone-else"
+
+    def test_a_fence_durable_before_its_bookkeeping_is_still_recoverable(
+        self, tmp_path
+    ):
+        """Witness E. The crash edge adjacent to acquisition.
+
+        The fence becomes durable before the acquiring call returns, so a
+        crash between "the fence exists" and "this run recorded that it holds
+        it" is reachable. Release is therefore keyed off the fence's OWN
+        recorded holder rather than this process's memory: the interrupted
+        run's journal carries the same run id, so its own recovery matches
+        them and releases it -- with no new durable state at all.
+
+        Modelled exactly: interrupt a run with its fence durable, then STRIP
+        the ownership marker from its journal before recovery runs. That is
+        the on-disk state such a crash leaves -- a fence that exists and a
+        journal that never recorded it -- and recovery must still release it.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
+        assert json.loads(fence.read_text())["holder"] == run_id
+
+        # The crash edge: the fence is durable, but this run never recorded
+        # that it owns it.
+        journal.write_text(
+            "\n".join(
+                line
+                for line in journal.read_text(encoding="utf-8").splitlines()
+                if "update-maintenance-fence-held" not in line
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        assert "update-maintenance-fence-held" not in journal.read_text(encoding="utf-8")
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        # Recovered by matching the fence's own recorded holder against the
+        # journal's run id -- no marker, no in-memory flag, no new state.
+        assert recovery.returncode == 0, recovery.stderr
+        assert "released the exclusive product-update maintenance fence" in (
+            recovery.stderr
+        )
+        assert not fence.exists()
+        assert not journal.exists()
 
     def test_an_unanswerable_fence_request_refuses_before_any_mutation(
         self, tmp_path

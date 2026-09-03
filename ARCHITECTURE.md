@@ -354,12 +354,39 @@ update is refused rather than allowed to steal it.
 There is no bypass flag. An operator whose update is stuck resolves the
 workload job through the product's own controls and runs the updater again.
 
-The Phase U2 witness still distinguishes three answers, and that distinction
-carries over to acquisition. `true` refuses. `false` proceeds. A real HTTP 404
-means the route does not exist, so this backend predates activation, has no
-update worker, and cannot own a workload job -- there is nothing to fence.
+**A pre-activation installation is fenced too, directly.** A backend that
+predates activation answers 404 at the fence route: it has no fence route and
+no workload update route, so no race handshake with it is possible or needed.
+But "no race with the OLD backend" is not "no fence required for this run" --
+Step 10 starts the ACTIVATED target backend, whose `/package-update` route is
+live while Phase U5 acceptance is still running, and an acceptance failure
+there rolls product backend and helper material back underneath any workload
+job issued into that window.
+
+So on that 404 the updater writes the SAME durable fence artifact directly,
+with the same holder semantics and the same fail-closed durability (fsync,
+atomic rename, directory fsync), before entering the mutation window. There is
+exactly one fence file whichever side created it, and the activated target
+backend reads it the same way -- so it refuses workload starts from the moment
+it comes up. A fence another product update holds is still never stolen, and
+an unwritable fence refuses the run rather than letting it proceed unfenced.
+
+The Phase U2 witness still distinguishes three answers. `true` refuses.
+`false` proceeds. A real HTTP 404 means this backend cannot itself own a
+workload job -- which changes how the fence is taken, not whether it is taken.
 Every other failure refuses: "we could not ask" is never read as "the answer
 was no".
+
+**Release is keyed off the fence's own recorded holder**, not off the
+updater's in-memory state or a journal marker. The fence becomes durable
+before the acquiring call returns, so a crash between "the fence exists" and
+"this run recorded that it holds it" is reachable; a flag or marker written
+afterwards would miss exactly that window and orphan the fence. The fence file
+already carries the run id that created it and the interrupted run's journal
+already carries the same run id, so recovery matches them with no new durable
+state at all. Absent means nothing to release; this run's holder means release
+it, at a terminal point only; another run's holder is never touched; and an
+unreadable fence is left in place and reported.
 
 ## Job-owned snapshot safety
 

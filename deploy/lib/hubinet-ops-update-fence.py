@@ -31,6 +31,25 @@ widens what is permitted) and it must keep working when a failed activation
 update has rolled back to a pre-activation backend that has no fence route at
 all.
 
+Pre-activation installations
+----------------------------
+
+A backend that predates production activation answers 404 here: it has no
+fence route, and no workload update route either, so no race handshake with
+it is possible or needed. But "no race with the OLD backend" is not "no fence
+required for this run". The very next thing the updater does is activate the
+new configuration and helpers and start the TARGET backend, whose
+`/package-update` route IS live while Phase U5 acceptance is still running --
+and an acceptance failure there rolls product backend and helper material back
+underneath any workload job issued into that window.
+
+So `--pre-activation` writes exactly the same durable fence artifact directly,
+with the same holder semantics and the same fail-closed durability, before the
+updater enters its mutation window. The target backend therefore finds the
+fence already present the moment it starts, and refuses workload starts
+throughout acceptance. It still never steals a fence another product update
+holds.
+
 Secret handling: the R0 API bearer token is read directly from
 /etc/hubinet-ops/agent.env inside this script, exactly like
 hubinet-ops-update-probe.py -- it never appears in this process's own
@@ -42,13 +61,19 @@ it.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
+import os
 import re
 import sys
 import urllib.error
 import urllib.request
 
 AGENT_ENV_PATH = "/etc/hubinet-ops/agent.env"
+#: The one durable fence artifact. Identical to the path the backend derives
+#: from its own authority database directory -- there is exactly one fence,
+#: whichever side created it.
+FENCE_FILE = "/var/lib/hubinet-ops/product-update-maintenance.fence"
 BASE_URL = "http://127.0.0.1:8787/r0/v1"
 FENCE_PATH = "/package-update/maintenance-fence"
 TOKEN_ENV_KEY = "HUBINET_OPS_R0_API_TOKEN"
@@ -119,10 +144,109 @@ def acquire(holder: str, token: str) -> dict:
     return {"ok": True, "holder": holder_out, "acquired_at": acquired_at}
 
 
+def _read_existing_fence() -> dict | None:
+    """Read the durable fence, or None. Malformed content is NOT absence."""
+
+    try:
+        with open(FENCE_FILE, "rb") as handle:
+            raw = handle.read(4097)
+    except FileNotFoundError:
+        return None
+    if len(raw) > 4096:
+        raise ValueError("fence exceeds its structural bound")
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("holder"), str):
+        raise ValueError("fence does not name a holder")
+    return payload
+
+
+def acquire_pre_activation(holder: str) -> dict:
+    """Create the fence directly, for a backend that has no fence route.
+
+    Same artifact, same holder semantics, same fail-closed durability as the
+    backend-created fence: fsynced, renamed atomically into place, and the
+    directory fsynced, so it is on disk before this returns success and is
+    therefore already present when the target backend starts.
+
+    No workload-job handshake is attempted or needed -- a pre-activation
+    backend has no issuance route and no worker, so nothing can be racing
+    this. A fence another product update already holds is still never
+    stolen, and re-running for the same holder is idempotent.
+    """
+
+    try:
+        existing = _read_existing_fence()
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "reason": "fence_unreadable",
+            "detail": str(exc)[:500],
+        }
+    if existing is not None:
+        if existing["holder"] != holder:
+            return {
+                "ok": False,
+                "reason": "fence_held_by_another_run",
+                "detail": (
+                    "another Hubinet product update already holds the "
+                    f"maintenance fence (holder {existing['holder']})"
+                ),
+            }
+        return {
+            "ok": True,
+            "holder": holder,
+            "acquired_at": str(existing.get("acquired_at", "")),
+        }
+
+    acquired_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    payload = json.dumps(
+        {"holder": holder, "acquired_at": acquired_at},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    temporary = f"{FENCE_FILE}.tmp-{os.getpid()}"
+    try:
+        with open(temporary, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, FENCE_FILE)
+        directory = os.open(os.path.dirname(FENCE_FILE), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return {
+            "ok": False,
+            "reason": "fence_not_writable",
+            "detail": str(exc)[:500],
+        }
+    return {"ok": True, "holder": holder, "acquired_at": acquired_at}
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or not _HOLDER_RE.fullmatch(argv[1]):
-        print("usage: hubinet-ops-update-fence.py <holder>", file=sys.stderr)
+    arguments = argv[1:]
+    pre_activation = False
+    if arguments and arguments[-1] == "--pre-activation":
+        pre_activation = True
+        arguments = arguments[:-1]
+    if len(arguments) != 1 or not _HOLDER_RE.fullmatch(arguments[0]):
+        print(
+            "usage: hubinet-ops-update-fence.py <holder> [--pre-activation]",
+            file=sys.stderr,
+        )
         return 2
+    holder = arguments[0]
+
+    if pre_activation:
+        return _emit(acquire_pre_activation(holder))
+
     try:
         token = read_bearer_token()
     except (OSError, RuntimeError) as exc:
@@ -133,7 +257,7 @@ def main(argv: list[str]) -> int:
                 "detail": str(exc)[:500],
             }
         )
-    return _emit(acquire(argv[1], token))
+    return _emit(acquire(holder, token))
 
 
 if __name__ == "__main__":

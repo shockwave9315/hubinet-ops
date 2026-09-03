@@ -456,13 +456,47 @@ _update_acquire_maintenance_fence() {
   detail="$(_json_field_from_text "${output}" "detail")"
   if [[ "${reason}" == "fence_route_absent" ]]; then
     # A backend predating production activation has no fence route and no
-    # update worker: it cannot own a workload package-update job at all, so
-    # there is nothing to make exclusive. Read from the endpoint's own 404,
-    # never from a transport failure.
-    log_info "this installation predates operator-triggered package updates; no maintenance fence is required"
+    # update worker, so no race handshake with it is possible or needed --
+    # read from the endpoint's own 404, never from a transport failure.
+    #
+    # But "no race with the OLD backend" is NOT "no fence required". The very
+    # next thing this run does is activate the new configuration and helpers
+    # and start the TARGET backend in Step 10, whose /package-update route is
+    # live while Phase U5 acceptance is still running -- and an acceptance
+    # failure there rolls product backend and helper material back underneath
+    # any workload job issued into that window. So this run establishes the
+    # SAME durable fence artifact directly, before the mutation window, and
+    # the target backend finds it already present the moment it starts.
+    _update_acquire_pre_activation_fence
     return 0
   fi
   die "refusing to mutate: could not take the exclusive product-update maintenance fence (${reason:-unknown}${detail:+: ${detail}}). Nothing has been changed. Let any active workload package update finish, or resolve it through the operator controls (resume or roll back), then run this updater again."
+}
+
+# _update_acquire_pre_activation_fence: the same durable artifact, written
+# directly, for an installation whose backend has no fence route yet.
+#
+# Same holder semantics, same fail-closed durability (fsync, atomic rename,
+# directory fsync) as the backend-created fence -- there is exactly one fence
+# file, whichever side created it, and the activated target backend reads it
+# the same way. A fence another product update already holds is still never
+# stolen, and re-running for the same holder is idempotent.
+_update_acquire_pre_activation_fence() {
+  local output status reason detail
+  output="$(pct exec "${VMID}" -- python3 "${UPDATE_FENCE_CT_PATH}" "${UPDATE_RUN_ID}" --pre-activation 2>/dev/null)" \
+    && status=0 || status=$?
+  (( status == 0 )) && [[ -n "${output}" ]] \
+    || die "refusing to mutate: could not establish the product-update maintenance fence on this pre-activation installation. Nothing has been changed."
+
+  if _json_bool_field_is_true "${output}" "ok"; then
+    UPDATE_FENCE_HELD="1"
+    update_journal_record update-maintenance-fence-held "${VMID}"
+    log_info "established the exclusive product-update maintenance fence directly (holder ${UPDATE_RUN_ID}); this installation predates operator-triggered package updates, and the activated target backend will refuse workload starts from the moment it comes up"
+    return 0
+  fi
+  reason="$(_json_field_from_text "${output}" "reason")"
+  detail="$(_json_field_from_text "${output}" "detail")"
+  die "refusing to mutate: could not establish the exclusive product-update maintenance fence on this pre-activation installation (${reason:-unknown}${detail:+: ${detail}}). Nothing has been changed."
 }
 
 # _update_release_maintenance_fence: remove the fence THIS run holds.
@@ -474,11 +508,40 @@ _update_acquire_maintenance_fence() {
 # update that has rolled back to a pre-activation backend, which has no
 # maintenance-fence route at all.
 #
-# Keyed off UPDATE_FENCE_HELD/the journal marker, so a run that never
-# acquired the fence never removes one another run may hold.
+# Keyed off the FENCE'''s OWN RECORDED HOLDER, not off this process's memory.
+#
+# That is deliberately the smallest mechanism that closes the crash edge
+# around acquisition. The fence becomes durable before the acquiring call
+# returns, so a crash between "the fence exists" and "this run recorded that
+# it holds it" is reachable -- and an in-memory flag or a journal marker
+# written afterwards would both miss it, orphaning a fence nobody would ever
+# release. The fence file already carries the run id that created it, and the
+# interrupted run'''s journal already carries the same run id, so recovery can
+# match them without any new durable state at all.
+#
+# The four required behaviours fall straight out of that comparison:
+#   absent          -> nothing to release;
+#   this run'''s      -> release it (at a terminal point only);
+#   another run'''s   -> never touched;
+#   unreadable      -> fail closed, left in place, reported.
 _update_release_maintenance_fence() {
-  [[ "${UPDATE_FENCE_HELD}" == "1" ]] || ledger_has update-maintenance-fence-held "${VMID}" || return 0
-  pct exec "${VMID}" -- rm -f /var/lib/hubinet-ops/product-update-maintenance.fence >/dev/null 2>&1 \
+  local fence_path="/var/lib/hubinet-ops/product-update-maintenance.fence"
+  local raw holder
+  raw="$(pct exec "${VMID}" -- cat "${fence_path}" 2>/dev/null)" || raw=""
+  if [[ -z "${raw}" ]]; then
+    UPDATE_FENCE_HELD="0"
+    return 0
+  fi
+  holder="$(_json_field_from_text "${raw}" "holder")"
+  if [[ -z "${holder}" ]]; then
+    log_warn "the product-update maintenance fence inside container ${VMID} is unreadable; leaving it in place. Workload package updates will keep refusing until it is resolved by hand."
+    return 0
+  fi
+  if [[ "${holder}" != "${UPDATE_RUN_ID}" ]]; then
+    log_warn "the product-update maintenance fence inside container ${VMID} is held by another product update (holder ${holder}); leaving it untouched"
+    return 0
+  fi
+  pct exec "${VMID}" -- rm -f "${fence_path}" >/dev/null 2>&1 \
     || log_warn "could not remove the product-update maintenance fence inside container ${VMID}; workload package updates will keep refusing until it is removed by hand"
   pct exec "${VMID}" -- sync -f /var/lib/hubinet-ops >/dev/null 2>&1 || true
   UPDATE_FENCE_HELD="0"

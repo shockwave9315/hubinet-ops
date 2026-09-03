@@ -1106,9 +1106,52 @@ def _exec_update_fence(vmid, args, state=None):
     every later workload start reads.
     """
 
-    holder = args[0] if args else ""
+    pre_activation = "--pre-activation" in args
+    positional = [a for a in args if a != "--pre-activation"]
+    holder = positional[0] if positional else ""
     if not holder:
         return 2
+
+    path = _ct_path(vmid, _FENCE_CT_PATH)
+    if pre_activation:
+        # The direct path a pre-activation installation takes: no backend
+        # handshake is possible, but the SAME durable artifact must exist
+        # before the mutation window so the activated target backend finds it
+        # already present when it starts.
+        if _fail("pre_activation_fence_write"):
+            print(json.dumps({
+                "ok": False,
+                "reason": "fence_not_writable",
+                "detail": "simulated",
+            }))
+            return 0
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text())
+            except ValueError:
+                print(json.dumps({
+                    "ok": False,
+                    "reason": "fence_unreadable",
+                    "detail": "simulated",
+                }))
+                return 0
+            if existing.get("holder") != holder:
+                print(json.dumps({
+                    "ok": False,
+                    "reason": "fence_held_by_another_run",
+                    "detail": f"holder {existing.get('holder')}",
+                }))
+                return 0
+            print(json.dumps({"ok": True, "holder": holder, "acquired_at": existing.get("acquired_at", "")}))
+            return 0
+        acquired_at = "2026-01-01T00:00:00+00:00"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"acquired_at": acquired_at, "holder": holder}, sort_keys=True)
+        )
+        print(json.dumps({"ok": True, "holder": holder, "acquired_at": acquired_at}))
+        return 0
+
     if SCENARIO.get("fence_route_absent"):
         # A backend predating production activation has no fence route at
         # all -- a real 404, never a transport failure.
@@ -1122,7 +1165,6 @@ def _exec_update_fence(vmid, args, state=None):
         }))
         return 0
 
-    path = _ct_path(vmid, _FENCE_CT_PATH)
     if path.exists():
         try:
             existing = json.loads(path.read_text())

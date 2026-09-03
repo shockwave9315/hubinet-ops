@@ -762,10 +762,13 @@ The operator-triggered update lifecycle is production reachable.
   database, so it survives the backend restart the product update performs and
   keeps refusing workload starts throughout Phase U5 acceptance. It is
   released only at a terminal point: a proven successful update, or a proven
-  complete rollback/recovery. There is no bypass flag. A backend predating
-  activation has no fence route, which means it cannot own a workload job and
-  needs no fence; any other failure refuses, because "we could not ask" is
-  never "the answer was no".
+  complete rollback/recovery, and only when the fence's own recorded holder is
+  this run -- which is also what makes a crash around acquisition recoverable
+  rather than orphaning it. A pre-activation installation, whose backend has
+  no fence route to ask, gets the same durable fence written directly before
+  the mutation window, so the activated target backend refuses workload starts
+  from the moment it comes up. There is no bypass flag, and a fence another
+  product update holds is never stolen or removed.
 - **Schema is unchanged at v16.** The durable job is the execution queue and
   the recovery authority; a worker wakeup is an in-memory hint and needed no
   second durable queue. No authority migration and no reset is caused by this
