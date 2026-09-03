@@ -18,12 +18,13 @@ The three rules that shape everything below:
   An empty probe set is therefore not a contract, it is a malformed one, and
   is rejected here rather than stored.
 
-A probe target is DATA. The future executor will use fixed argv operations
-(`systemctl is-active <unit>`, `docker inspect <container>`), so a target is
-never command text and this module deliberately does not implement systemd or
-Docker grammar. What it does enforce is that a target cannot carry anything
-that would stop being one bounded opaque argument: no NUL, no control
-character, no whitespace, no unbounded length.
+A probe target is DATA. The executor uses fixed argv operations, so a target is
+never command text and this configuration module deliberately does not
+implement systemd or Docker execution grammar. Structural execution
+eligibility is a separate pure check in ``health_execution.py`` at package-job
+issuance. This layer only enforces that a target cannot stop being one bounded
+opaque argument: no NUL, no control character, no whitespace, no unbounded
+length.
 """
 
 from __future__ import annotations

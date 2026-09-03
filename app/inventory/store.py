@@ -25,7 +25,9 @@ from .models import (
     DiscoveryRun,
     DiscoveryRunLifecycle,
     EndpointLifecycle,
+    HealthOutcome,
     HealthProbeKind,
+    HealthProbeOutcome,
     InventorySource,
     InventorySourceState,
     InventoryNode,
@@ -40,6 +42,8 @@ from .models import (
     PackageUpdateEventType,
     PackageUpdateJob,
     PackageUpdateJobEvent,
+    PackageUpdateJobHealthProbe,
+    PackageUpdateJobHealthProbeResult,
     PackageUpdateJobPackage,
     PackageUpdateJobStatus,
     PersistentSourceFreshness,
@@ -56,7 +60,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 15
+AUTHORITY_SCHEMA_VERSION = 16
 
 #: Every authority connection's writer wait policy -- both `PRAGMA
 #: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
@@ -86,6 +90,8 @@ _REQUIRED_TABLES = frozenset(
         "package_update_jobs",
         "package_update_job_packages",
         "package_update_job_events",
+        "package_update_job_health_probes",
+        "package_update_job_health_probe_results",
         "resource_health_contracts",
         "resource_health_contract_probes",
         "resource_health_contract_revision_state",
@@ -137,6 +143,18 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "one_package_update_job_snapshot_operation",
         "one_package_update_job_mutation_operation",
         "one_package_update_job_rollback_operation",
+        "package_update_job_health_contract_immutable",
+        "package_update_job_health_start_immutable",
+        "package_update_job_health_completion_immutable",
+        "package_update_job_health_pass_requires_every_probe_proven",
+        "package_update_job_health_failure_requires_a_proven_failure",
+        "package_update_job_health_verdict_insert_needs_evidence",
+        "package_update_job_health_probe_insert_during_issuance",
+        "package_update_job_health_probe_update_immutable",
+        "package_update_job_health_probe_delete_immutable",
+        "package_update_job_health_probe_result_needs_health_started",
+        "package_update_job_health_probe_result_update_immutable",
+        "package_update_job_health_probe_result_delete_immutable",
         "resource_health_contract_update_immutable",
         "resource_health_contract_revision_never_regresses",
         "resource_health_contract_revision_state_no_delete",
@@ -153,15 +171,23 @@ _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
 # can never drift between copies. Rank 3 is snapshot_may_have_started (the
 # write-ahead PVE snapshot uncertainty boundary), rank 4 snapshot_confirmed,
 # rank 5 mutation_may_have_started (the write-ahead workload package
-# mutation uncertainty boundary), rank 6 mutation_completed, rank 8
-# rollback_may_have_started (the write-ahead PVE rollback uncertainty
-# boundary), and rank 9 rollback_completed.
+# mutation uncertainty boundary), rank 6 mutation_completed, rank 7
+# health_started, rank 8 health_completed, rank 9 rollback_may_have_started
+# (the write-ahead PVE rollback uncertainty boundary), and rank 10
+# rollback_completed.
 #
 # This is a monotonic no-regression fence, not a chain of implied successes:
 # see models.CHECKPOINT_ORDER. A job whose mutation failed, was partial, or
 # could not be proven complete stays at rank 5 and must still be able to
-# reach rank 8, so no constraint below may make a later rank imply an
+# reach rank 9, so no constraint below may make a later rank imply an
 # earlier stage's SUCCESS fact.
+#
+# Schema v16 inserts rank 8, health_completed, under exactly that rule.
+# health_completed means "this job's frozen health contract reached a
+# DEFINITIVE verdict", never "the workload is healthy": the verdict lives in
+# health_outcome, and rollback stays reachable from ranks 5, 6, 7 and a
+# FAILED rank 8 alike, so ranks 9 and 10 must not imply a health fact any
+# more than they imply mutation_completed_at.
 _CHECKPOINT_RANK_SQL = """(CASE {column}
         WHEN 'issued' THEN 1
         WHEN 'preflight_passed' THEN 2
@@ -170,8 +196,9 @@ _CHECKPOINT_RANK_SQL = """(CASE {column}
         WHEN 'mutation_may_have_started' THEN 5
         WHEN 'mutation_completed' THEN 6
         WHEN 'health_started' THEN 7
-        WHEN 'rollback_may_have_started' THEN 8
-        WHEN 'rollback_completed' THEN 9
+        WHEN 'health_completed' THEN 8
+        WHEN 'rollback_may_have_started' THEN 9
+        WHEN 'rollback_completed' THEN 10
     END
     )"""
 
@@ -1065,6 +1092,7 @@ def _package_update_job(
         raise AuthorityInvariantError(
             "package update job package count does not match immutable rows"
         )
+    health_probes, health_results = _package_update_job_health(connection, row)
     return PackageUpdateJob(
         job_id=str(row["job_id"]),
         request_id=str(row["request_id"]),
@@ -1100,6 +1128,9 @@ def _package_update_job(
         expected_node_id=str(row["expected_node_id"]),
         expected_node_name=str(row["expected_node_name"]),
         package_count=int(row["package_count"]),
+        health_contract_revision=int(row["health_contract_revision"]),
+        health_contract_fingerprint=str(row["health_contract_fingerprint"]),
+        health_contract_probe_count=int(row["health_contract_probe_count"]),
         status=PackageUpdateJobStatus(str(row["status"])),
         checkpoint=PackageUpdateCheckpoint(str(row["checkpoint"])),
         snapshot_operation_id=row["snapshot_operation_id"],
@@ -1112,6 +1143,12 @@ def _package_update_job(
         accepted_prepared_evidence_digest=row["accepted_prepared_evidence_digest"],
         mutation_completed_at=row["mutation_completed_at"],
         health_started_at=row["health_started_at"],
+        health_completed_at=row["health_completed_at"],
+        health_outcome=(
+            None
+            if row["health_outcome"] is None
+            else HealthOutcome(str(row["health_outcome"]))
+        ),
         rollback_operation_id=row["rollback_operation_id"],
         rollback_may_have_started_at=row["rollback_may_have_started_at"],
         rollback_task_upid=row["rollback_task_upid"],
@@ -1119,7 +1156,125 @@ def _package_update_job(
         terminalized_at=row["terminalized_at"],
         terminal_reason=row["terminal_reason"],
         packages=packages,
+        health_probes=health_probes,
+        health_probe_results=health_results,
     )
+
+
+def _package_update_job_health(
+    connection: sqlite3.Connection, row: sqlite3.Row
+) -> tuple[
+    tuple[PackageUpdateJobHealthProbe, ...],
+    tuple[PackageUpdateJobHealthProbeResult, ...],
+]:
+    """Assemble one job's frozen health contract, or refuse the whole job.
+
+    The second, independent line under the schema, exactly as
+    :func:`_resource_health_contract` is for the live contract. The triggers
+    constrain what an ordinary statement can express; they are not a claim
+    that a trusted administrator with direct SQL cannot rebuild an incoherent
+    row set, and per ``AGENTS.md`` that administrator is trusted rather than
+    defended against. So every read re-derives the facts that decide whether
+    this job may be called successful, and fails closed rather than
+    understating what the operator required:
+
+    - the frozen probe rows are exactly ``health_contract_probe_count`` long,
+      contiguous from index 0, and recompute to the frozen fingerprint;
+    - a job with no durable verdict has no result rows at all;
+    - a job with a verdict has exactly one result per frozen probe;
+    - a PASSED verdict has no non-passing result, and a FAILED verdict has at
+      least one proven failure;
+    - the lifecycle combination is possible at all.
+    """
+
+    job_id = str(row["job_id"])
+    probe_rows = connection.execute(
+        "SELECT probe_index, kind, target FROM package_update_job_health_probes "
+        "WHERE job_id=? ORDER BY probe_index",
+        (job_id,),
+    ).fetchall()
+    probes = tuple(
+        PackageUpdateJobHealthProbe(
+            probe_index=int(probe["probe_index"]),
+            kind=HealthProbeKind(str(probe["kind"])),
+            target=str(probe["target"]),
+        )
+        for probe in probe_rows
+    )
+    probe_count = int(row["health_contract_probe_count"])
+    if len(probes) != probe_count or [
+        probe.probe_index for probe in probes
+    ] != list(range(probe_count)):
+        raise AuthorityInvariantError(
+            "package update job frozen health probes do not match its "
+            "declared contract probe count"
+        )
+    if health_contract_fingerprint(
+        ResourceHealthProbe(kind=probe.kind, target=probe.target)
+        for probe in probes
+    ) != str(row["health_contract_fingerprint"]):
+        raise AuthorityInvariantError(
+            "package update job frozen health probes do not match its "
+            "frozen contract fingerprint"
+        )
+
+    result_rows = connection.execute(
+        "SELECT probe_index, outcome, checked_at, reason "
+        "FROM package_update_job_health_probe_results WHERE job_id=? "
+        "ORDER BY probe_index",
+        (job_id,),
+    ).fetchall()
+    results = tuple(
+        PackageUpdateJobHealthProbeResult(
+            probe_index=int(result["probe_index"]),
+            outcome=HealthProbeOutcome(str(result["outcome"])),
+            checked_at=str(result["checked_at"]),
+            reason=str(result["reason"]),
+        )
+        for result in result_rows
+    )
+    outcome = (
+        None
+        if row["health_outcome"] is None
+        else HealthOutcome(str(row["health_outcome"]))
+    )
+    if outcome is None:
+        if results:
+            raise AuthorityInvariantError(
+                "package update job carries health probe results without a "
+                "durable health verdict"
+            )
+        if row["health_completed_at"] is not None:
+            raise AuthorityInvariantError(
+                "package update job claims a health completion with no verdict"
+            )
+        return probes, results
+
+    if [result.probe_index for result in results] != list(range(probe_count)):
+        raise AuthorityInvariantError(
+            "package update job health verdict is not backed by exactly one "
+            "result per frozen probe"
+        )
+    if row["health_started_at"] is None or row["health_completed_at"] is None:
+        raise AuthorityInvariantError(
+            "package update job health verdict is missing its own lifecycle "
+            "timestamps"
+        )
+    if outcome is HealthOutcome.PASSED and any(
+        result.outcome is not HealthProbeOutcome.PASSED for result in results
+    ):
+        raise AuthorityInvariantError(
+            "package update job claims a passing health verdict with a probe "
+            "that did not pass"
+        )
+    if outcome is HealthOutcome.FAILED and not any(
+        result.outcome is HealthProbeOutcome.FAILED for result in results
+    ):
+        raise AuthorityInvariantError(
+            "package update job claims a failing health verdict with no proven "
+            "failing probe"
+        )
+    return probes, results
 
 
 def _resource_health_contract(
@@ -1775,6 +1930,30 @@ _SCHEMA_STATEMENTS = (
         expected_node_name TEXT NOT NULL CHECK(length(trim(expected_node_name)) > 0),
         package_count INTEGER NOT NULL
             CHECK(typeof(package_count) = 'integer' AND package_count > 0),
+        -- The exact operator-declared health contract GENERATION this job
+        -- froze at issuance, copied from the live contract while no PVE or
+        -- workload mutation had yet occurred. NOT NULL, in all three parts:
+        -- a job issued without a declared meaning of "healthy" could never
+        -- be called successful, so the schema makes such a job unstorable
+        -- rather than leaving the check to whichever validator ran.
+        --
+        -- Revisions are never reused (schema v15), so `revision` alone
+        -- distinguishes a clear/recreate of byte-identical material as a NEW
+        -- generation, while `fingerprint` pins the material itself. Both are
+        -- kept, because neither is sufficient: a revision without material
+        -- cannot detect an incoherent durable row set, and a fingerprint
+        -- without a revision cannot detect a new generation.
+        health_contract_revision INTEGER NOT NULL
+            CHECK(typeof(health_contract_revision) = 'integer' AND
+                  health_contract_revision > 0),
+        health_contract_fingerprint TEXT NOT NULL
+            CHECK(length(health_contract_fingerprint) = 64 AND
+                  health_contract_fingerprint GLOB '[0-9a-f]*' AND
+                  NOT health_contract_fingerprint GLOB '*[^0-9a-f]*'),
+        health_contract_probe_count INTEGER NOT NULL
+            CHECK(typeof(health_contract_probe_count) = 'integer' AND
+                  health_contract_probe_count BETWEEN
+                  {MIN_HEALTH_PROBES} AND {MAX_HEALTH_PROBES}),
         status TEXT NOT NULL CHECK(status IN (
             'active', 'succeeded', 'blocked', 'failed', 'rolled_back',
             'interrupted', 'manual_intervention')),
@@ -1782,6 +1961,7 @@ _SCHEMA_STATEMENTS = (
             'issued', 'preflight_passed', 'snapshot_may_have_started',
             'snapshot_confirmed',
             'mutation_may_have_started', 'mutation_completed', 'health_started',
+            'health_completed',
             'rollback_may_have_started', 'rollback_completed')),
         -- One job owns exactly one pre-update snapshot operation. The
         -- identity is derived from immutable job facts, so it is stable
@@ -1825,6 +2005,13 @@ _SCHEMA_STATEMENTS = (
                    NOT accepted_prepared_evidence_digest GLOB '*[^0-9a-f]*')),
         mutation_completed_at TEXT,
         health_started_at TEXT,
+        health_completed_at TEXT,
+        -- Only ever a DEFINITIVE verdict. 'unknown' is deliberately not a
+        -- storable value: health execution is a read-only evaluation that is
+        -- safe to repeat, so "I could not tell" must stay a retryable
+        -- non-answer rather than becoming a durable one.
+        health_outcome TEXT CHECK(health_outcome IS NULL OR
+            health_outcome IN ('passed', 'failed')),
         -- One job may cause AT MOST ONE PVE snapshot rollback, and only to
         -- the snapshot that exact job created and confirmed. The identity is
         -- derived from immutable authority INCLUDING that confirmed snapshot
@@ -1907,25 +2094,49 @@ _SCHEMA_STATEMENTS = (
               (mutation_may_have_started_at IS NOT NULL AND
                mutation_operation_id IS NOT NULL AND
                accepted_prepared_evidence_digest IS NOT NULL)),
-        -- Rank 7 is health_started. Unlike ranks 8/9 (rollback), health
+        -- Rank 7 is health_started. Unlike the rollback ranks below, health
         -- validation is never compensation for an uncertain mutation -- it
         -- is the next stage of a mutation that already succeeded. So,
-        -- deliberately UNLIKE the rollback ranks below, health_started may
-        -- NOT be reached from an unproven mutation: a job stuck at rank 5
-        -- with mutation_completed_at NULL must route to rollback, never to
+        -- deliberately UNLIKE those ranks, health_started may NOT be reached
+        -- from an unproven mutation: a job stuck at rank 5 with
+        -- mutation_completed_at NULL must route to rollback, never to
         -- health. This is intentionally narrower than the old v13 form
         -- "rank >= 6 IMPLIES completed" -- it binds ONLY health_started, so
-        -- ranks 8 and 9 remain reachable without mutation_completed_at.
+        -- ranks 9 and 10 remain reachable without mutation_completed_at.
         CHECK(checkpoint != 'health_started' OR
-              mutation_completed_at IS NOT NULL),
-        -- Rank 8 is rollback_may_have_started -- the write-ahead PVE
+              (mutation_completed_at IS NOT NULL AND
+               health_started_at IS NOT NULL)),
+        -- ...and the same fact in the other direction, still bound to its
+        -- OWN precondition rather than to a rank implication: a health
+        -- evaluation cannot exist before a proven package mutation, and
+        -- cannot exist below the checkpoint that records it starting.
+        CHECK(health_started_at IS NULL OR
+              (mutation_completed_at IS NOT NULL AND
+               {_checkpoint_rank_sql('checkpoint')} >= 7)),
+        -- Rank 8 is health_completed: the frozen contract reached a
+        -- DEFINITIVE verdict. It is NOT "the workload is healthy" -- that is
+        -- health_outcome, and a FAILED verdict sits at exactly this rank
+        -- while the job stays active and rollback-capable.
+        CHECK(checkpoint != 'health_completed' OR
+              (health_completed_at IS NOT NULL AND
+               health_outcome IS NOT NULL AND
+               health_started_at IS NOT NULL)),
+        -- The completion timestamp and the verdict are ONE fact, written by
+        -- one statement, so neither may exist without the other...
+        CHECK((health_completed_at IS NULL) = (health_outcome IS NULL)),
+        -- ...and neither may exist without the health evaluation that must
+        -- precede it, nor below the checkpoint that records it.
+        CHECK(health_completed_at IS NULL OR
+              (health_started_at IS NOT NULL AND
+               {_checkpoint_rank_sql('checkpoint')} >= 8)),
+        -- Rank 9 is rollback_may_have_started -- the write-ahead PVE
         -- rollback uncertainty boundary. Both directions, so neither the
         -- checkpoint nor the durable rollback facts can be forged
         -- independently of the other.
-        CHECK({_checkpoint_rank_sql('checkpoint')} < 8 OR
+        CHECK({_checkpoint_rank_sql('checkpoint')} < 9 OR
               (rollback_operation_id IS NOT NULL AND
                rollback_may_have_started_at IS NOT NULL)),
-        CHECK({_checkpoint_rank_sql('checkpoint')} >= 8 OR
+        CHECK({_checkpoint_rank_sql('checkpoint')} >= 9 OR
               (rollback_operation_id IS NULL AND
                rollback_may_have_started_at IS NULL AND
                rollback_task_upid IS NULL AND
@@ -1935,10 +2146,10 @@ _SCHEMA_STATEMENTS = (
               (rollback_may_have_started_at IS NULL)),
         -- A PVE task may only be recorded for an operation that exists.
         CHECK(rollback_task_upid IS NULL OR rollback_operation_id IS NOT NULL),
-        -- Rank 9 is rollback_completed, in both directions.
-        CHECK({_checkpoint_rank_sql('checkpoint')} < 9 OR
+        -- Rank 10 is rollback_completed, in both directions.
+        CHECK({_checkpoint_rank_sql('checkpoint')} < 10 OR
               rollback_completed_at IS NOT NULL),
-        CHECK({_checkpoint_rank_sql('checkpoint')} >= 9 OR
+        CHECK({_checkpoint_rank_sql('checkpoint')} >= 10 OR
               rollback_completed_at IS NULL),
         -- Rollback completion is impossible without the write-ahead
         -- uncertainty boundary that must precede it.
@@ -1966,19 +2177,43 @@ _SCHEMA_STATEMENTS = (
         CHECK(rollback_operation_id IS NULL OR
               mutation_may_have_started_at IS NOT NULL),
         -- Terminal-status invariants. ROLLED_BACK is impossible without
-        -- proven exact rollback completion. SUCCEEDED is impossible without
-        -- proven package mutation completion -- the healthcheck gate that
-        -- must ALSO hold before a job may succeed is a later stage, and this
-        -- schema version deliberately ships no transition to 'succeeded' at
-        -- all.
+        -- proven exact rollback completion.
         CHECK(status != 'rolled_back' OR rollback_completed_at IS NOT NULL),
-        CHECK(status != 'succeeded' OR mutation_completed_at IS NOT NULL),
+        -- SUCCEEDED is the one terminal status this product may only reach
+        -- by proving something POSITIVE about the workload, so v16 states
+        -- the complete set here rather than the single mutation fact v15
+        -- could. Every member is required:
+        --
+        --   * the exact approved package mutation was independently proven
+        --     complete (an apt exit code was never enough, and still is not);
+        --   * this job's frozen health contract was actually evaluated --
+        --     health_started_at exists;
+        --   * that evaluation reached a durable verdict -- health_completed_at
+        --     exists and the checkpoint says so;
+        --   * and the verdict is PASSED.
+        --
+        -- Nothing else -- guest reachability, a zero exit code, a completed
+        -- mutation, or merely the absence of an observed failure -- can
+        -- independently produce SUCCEEDED.
+        CHECK(status != 'succeeded' OR
+              (mutation_completed_at IS NOT NULL AND
+               health_started_at IS NOT NULL AND
+               health_completed_at IS NOT NULL AND
+               health_outcome = 'passed' AND
+               checkpoint = 'health_completed')),
+        -- The other direction, so there is EXACTLY ONE legal success
+        -- transition rather than two facts that can drift apart: a passing
+        -- health verdict and a succeeded job are the same durable event,
+        -- written by one statement. A FAILED verdict is deliberately not
+        -- constrained this way -- it leaves the job active, still owning its
+        -- snapshot and its rollback authority.
+        CHECK(health_outcome IS NOT 'passed' OR status = 'succeeded'),
         -- The completion checkpoint and the terminal status are one fact and
         -- must agree in BOTH directions. The reverse implication
         -- (rolled_back => rollback_completed) already follows transitively:
-        -- rolled_back requires rollback_completed_at, which requires rank 9.
+        -- rolled_back requires rollback_completed_at, which requires rank 10.
         -- This is the forward half, which nothing else covered -- a job left
-        -- at rank 9 while still `active` would claim a completed rollback
+        -- at rank 10 while still `active` would claim a completed rollback
         -- yet keep holding the one global destructive slot forever. The one
         -- legal transition writes both in the same atomic statement.
         CHECK(checkpoint != 'rollback_completed' OR status = 'rolled_back')
@@ -2028,6 +2263,68 @@ _SCHEMA_STATEMENTS = (
             DEFERRABLE INITIALLY DEFERRED
     )
     """,
+    f"""
+    -- The COMPLETE frozen health contract material this job must satisfy,
+    -- copied at issuance in the same canonical (kind, target) order the
+    -- contract's fingerprint covers.
+    --
+    -- A copy, deliberately, not a foreign key to the live contract. The
+    -- operator may replace or clear `resource_health_contracts` at any
+    -- moment, including while this job is half way through mutating the
+    -- workload -- and the success criterion of an update that has already
+    -- begun must not move with it. Before the mutation boundary the live
+    -- contract drifting away from this copy makes the job stale and forbids
+    -- mutation; from that boundary onward this copy is the only authority.
+    --
+    -- `target` is DATA, under exactly the bounds v15 applies to the live
+    -- contract, and the executor builds fixed argv around it. Nothing here
+    -- is, or may become, command text.
+    --
+    -- The parent FK is DEFERRABLE for the same reason the package rows' is:
+    -- the immutable child rows are written before the parent job row that
+    -- seals them, inside one atomic issuance transaction.
+    CREATE TABLE package_update_job_health_probes (
+        job_id TEXT NOT NULL,
+        probe_index INTEGER NOT NULL
+            CHECK(typeof(probe_index) = 'integer' AND
+                  probe_index >= 0 AND probe_index < {MAX_HEALTH_PROBES}),
+        kind TEXT NOT NULL CHECK(kind IN ({_HEALTH_PROBE_KIND_SQL})),
+        target TEXT NOT NULL CHECK({_HEALTH_PROBE_TARGET_CHECK_SQL}),
+        PRIMARY KEY(job_id, probe_index),
+        UNIQUE(job_id, kind, target),
+        FOREIGN KEY(job_id) REFERENCES package_update_jobs(job_id)
+            DEFERRABLE INITIALLY DEFERRED
+    )
+    """,
+    """
+    -- The durable, definitive per-probe evidence behind one health verdict.
+    --
+    -- Written ONLY by the single definitive finalization boundary, and only
+    -- as one complete set covering every frozen probe, so a job can never
+    -- claim a verdict backed by a partial evaluation. An individual row may
+    -- be `unknown` -- an unevaluable probe beside a proven failure is
+    -- truthful history -- but the triggers below make a PASSED verdict
+    -- impossible unless every one of these rows is `passed`.
+    --
+    -- `reason` is a bounded token from a closed taxonomy the executor owns.
+    -- Raw stdout, stderr, command text, and guest output never reach it.
+    CREATE TABLE package_update_job_health_probe_results (
+        job_id TEXT NOT NULL,
+        probe_index INTEGER NOT NULL
+            CHECK(typeof(probe_index) = 'integer' AND probe_index >= 0),
+        outcome TEXT NOT NULL
+            CHECK(outcome IN ('passed', 'failed', 'unknown')),
+        checked_at TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK(length(trim(reason)) > 0 AND
+            length(reason) <= 100 AND
+            NOT reason GLOB '*[^a-z0-9_]*'),
+        PRIMARY KEY(job_id, probe_index),
+        -- Bound to the exact frozen probe it reports on, so a result can
+        -- never describe an index this job never froze.
+        FOREIGN KEY(job_id, probe_index)
+            REFERENCES package_update_job_health_probes(job_id, probe_index)
+    )
+    """,
     """
     CREATE TABLE package_update_job_events (
         job_id TEXT NOT NULL,
@@ -2039,6 +2336,7 @@ _SCHEMA_STATEMENTS = (
             'issued', 'preflight_passed', 'snapshot_may_have_started',
             'snapshot_confirmed',
             'mutation_may_have_started', 'mutation_completed', 'health_started',
+            'health_completed',
             'rollback_may_have_started', 'rollback_completed')),
         event_type TEXT NOT NULL CHECK(length(trim(event_type)) > 0 AND
             length(event_type) <= 100),
@@ -2329,6 +2627,156 @@ _SCHEMA_STATEMENTS = (
      AND NEW.rollback_completed_at IS NOT OLD.rollback_completed_at
     BEGIN SELECT RAISE(ABORT,
         'package update job rollback completion is write-once'
+    ); END
+    """,
+    """
+    -- The frozen health contract identity is written once, during atomic
+    -- issuance, and can never be edited afterwards. This is what makes "the
+    -- job's success criterion cannot move after the workload may have been
+    -- mutated" a durable property rather than an application convention.
+    CREATE TRIGGER package_update_job_health_contract_immutable
+    BEFORE UPDATE OF health_contract_revision, health_contract_fingerprint,
+        health_contract_probe_count ON package_update_jobs
+    BEGIN SELECT RAISE(ABORT,
+        'a package update job health contract is frozen at issuance'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_health_start_immutable
+    BEFORE UPDATE OF health_started_at ON package_update_jobs
+    WHEN OLD.health_started_at IS NOT NULL
+     AND NEW.health_started_at IS NOT OLD.health_started_at
+    BEGIN SELECT RAISE(ABORT,
+        'package update job health start is write-once'
+    ); END
+    """,
+    """
+    -- A definitive verdict is recorded exactly once. A late host result
+    -- arriving after the job already completed health -- or after a rollback
+    -- moved it on -- can never overwrite what was accepted.
+    CREATE TRIGGER package_update_job_health_completion_immutable
+    BEFORE UPDATE OF health_completed_at, health_outcome ON package_update_jobs
+    WHEN OLD.health_completed_at IS NOT NULL
+     AND (NEW.health_completed_at IS NOT OLD.health_completed_at
+          OR NEW.health_outcome IS NOT OLD.health_outcome)
+    BEGIN SELECT RAISE(ABORT,
+        'package update job health completion is write-once'
+    ); END
+    """,
+    """
+    -- A PASSED verdict requires EVERY frozen probe to carry its own durable
+    -- `passed` result row. Absence of a failure is not a pass, and neither
+    -- is a short result set: this is the SQL half of the ALL-OF rule, and it
+    -- is what makes a "succeeded" job with a missing or non-passing probe
+    -- result unstorable rather than merely unlikely.
+    CREATE TRIGGER package_update_job_health_pass_requires_every_probe_proven
+    BEFORE UPDATE OF health_outcome ON package_update_jobs
+    WHEN NEW.health_outcome = 'passed'
+     AND ((SELECT COUNT(*) FROM package_update_job_health_probe_results result
+           WHERE result.job_id = NEW.job_id AND result.outcome = 'passed')
+          != NEW.health_contract_probe_count
+          OR EXISTS (SELECT 1 FROM package_update_job_health_probe_results result
+                     WHERE result.job_id = NEW.job_id
+                       AND result.outcome != 'passed'))
+    BEGIN SELECT RAISE(ABORT,
+        'a passing health verdict requires every frozen probe to have passed'
+    ); END
+    """,
+    """
+    -- The mirror: a FAILED verdict requires at least one probe that was
+    -- positively observed to fail, over a complete result set. "Some probe
+    -- was unknown" is not a failure -- it is the UNKNOWN verdict, which is
+    -- deliberately not durable at all.
+    CREATE TRIGGER package_update_job_health_failure_requires_a_proven_failure
+    BEFORE UPDATE OF health_outcome ON package_update_jobs
+    WHEN NEW.health_outcome = 'failed'
+     AND ((SELECT COUNT(*) FROM package_update_job_health_probe_results result
+           WHERE result.job_id = NEW.job_id)
+          != NEW.health_contract_probe_count
+          OR NOT EXISTS (SELECT 1 FROM package_update_job_health_probe_results result
+                         WHERE result.job_id = NEW.job_id
+                           AND result.outcome = 'failed'))
+    BEGIN SELECT RAISE(ABORT,
+        'a failing health verdict requires a proven failing probe'
+    ); END
+    """,
+    """
+    -- The same two rules on INSERT. A job row is only ever inserted with a
+    -- NULL verdict by the authority, so this exists to close the last way a
+    -- statement could express a success it has no evidence for: writing the
+    -- whole row at once instead of transitioning into it.
+    CREATE TRIGGER package_update_job_health_verdict_insert_needs_evidence
+    BEFORE INSERT ON package_update_jobs
+    WHEN NEW.health_outcome IS NOT NULL
+     AND ((SELECT COUNT(*) FROM package_update_job_health_probe_results result
+           WHERE result.job_id = NEW.job_id)
+          != NEW.health_contract_probe_count
+          OR (NEW.health_outcome = 'passed'
+              AND EXISTS (SELECT 1 FROM package_update_job_health_probe_results result
+                          WHERE result.job_id = NEW.job_id
+                            AND result.outcome != 'passed'))
+          OR (NEW.health_outcome = 'failed'
+              AND NOT EXISTS (SELECT 1 FROM package_update_job_health_probe_results result
+                              WHERE result.job_id = NEW.job_id
+                                AND result.outcome = 'failed')))
+    BEGIN SELECT RAISE(ABORT,
+        'a health verdict requires its complete durable probe evidence'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_health_probe_insert_during_issuance
+    BEFORE INSERT ON package_update_job_health_probes
+    WHEN EXISTS (
+        SELECT 1 FROM package_update_jobs WHERE job_id=NEW.job_id
+    ) OR NEW.probe_index != (
+        SELECT COUNT(*) FROM package_update_job_health_probes existing
+        WHERE existing.job_id = NEW.job_id
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'frozen health probes are inserted contiguously during atomic issuance'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_health_probe_update_immutable
+    BEFORE UPDATE ON package_update_job_health_probes
+    BEGIN SELECT RAISE(ABORT,
+        'frozen health probe rows are immutable'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_health_probe_delete_immutable
+    BEFORE DELETE ON package_update_job_health_probes
+    BEGIN SELECT RAISE(ABORT,
+        'frozen health probe rows are immutable'
+    ); END
+    """,
+    """
+    -- A definitive per-probe result may only be recorded for a job that has
+    -- actually begun evaluating its frozen contract, and only once.
+    CREATE TRIGGER package_update_job_health_probe_result_needs_health_started
+    BEFORE INSERT ON package_update_job_health_probe_results
+    WHEN NOT EXISTS (
+        SELECT 1 FROM package_update_jobs job
+        WHERE job.job_id = NEW.job_id
+          AND job.health_started_at IS NOT NULL
+          AND job.health_completed_at IS NULL
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'a health probe result requires a started, uncompleted health evaluation'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_health_probe_result_update_immutable
+    BEFORE UPDATE ON package_update_job_health_probe_results
+    BEGIN SELECT RAISE(ABORT,
+        'durable health probe results are immutable'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_health_probe_result_delete_immutable
+    BEFORE DELETE ON package_update_job_health_probe_results
+    BEGIN SELECT RAISE(ABORT,
+        'durable health probe results are immutable'
     ); END
     """,
     f"""

@@ -56,9 +56,11 @@ its own fresh pre-update snapshot first, then runs the update with live output
 the operator can watch.
 
 **Healthcheck and rollback.** After the update, the job health-checks the guest
-against that resource's health contract (below). On failure the operator may
-roll back, or a configured same-job compensation policy may roll back — always
-and only to the snapshot this job created.
+against the health contract it froze when it was issued (below). On failure the
+operator may roll back, or a configured same-job compensation policy may roll
+back — always and only to the snapshot this job created. No such policy exists
+yet: today a failed healthcheck leaves the job able to roll back and waits to
+be asked.
 
 ## What "healthy" means
 
@@ -90,13 +92,50 @@ read at 3am. A probe names a target; it never carries a command, a script, or
 a shell fragment, and no caller-supplied text ever becomes command text (see
 "Arbitrary remote shell" under "Not the product").
 
+**Configuration and execution eligibility are separate.** The configuration
+layer keeps probe targets as bounded opaque data; it does not guess, append a
+systemd suffix, or silently rewrite a Docker name. A package-update job is
+narrower: before it is issued, every probe must be structurally representable
+by the exact executor. A bare or pattern systemd target, or a non-exact Docker
+name, may remain stored configuration but cannot authorize snapshot or package
+mutation for an update whose frozen success criterion could never pass.
+
 **No contract means unconfigured, and unconfigured is never success.** A
 resource with no declared contract cannot be health-checked, so its update job
 cannot be called successful and no automatic health-triggered rollback can be
 justified for it. Unconfigured is not "healthy", "passed", or "nothing to
 check" — it is the absence of a statement, and Hubinet Ops reports it as such.
 An empty contract is invalid for the same reason: a list of zero required
-things is not a definition of health.
+things is not a definition of health. A resource that has declared nothing
+therefore cannot be given an update job at all: a job whose success criterion
+does not exist could never truthfully be called successful.
+
+**A job's success criterion is frozen when the job is issued.** The contract
+is a live thing an operator may edit at any moment, and an update that has
+already begun must not have its goalposts moved. So the job copies the exact
+contract *generation* — its revision, its fingerprint, and its complete probe
+set — at issuance, before any snapshot or package change exists.
+
+Which of the two contracts wins depends on one boundary, and only that one:
+
+- **Before the update may touch a package**, the two must agree. If the
+  operator has changed or withdrawn the contract in the meantime, the job's
+  frozen copy is no longer what the operator requires, and the update is
+  refused rather than run against a definition of healthy nobody holds any
+  more. Re-declaring the identical probes after clearing them counts as a
+  change: it is a new statement, not a continuation of the deleted one.
+- **From the moment packages may have changed**, the frozen copy is the only
+  authority. The operator may edit or clear the live contract freely; this job
+  is still judged by what it was issued to satisfy.
+
+**The verdict is all-of, and there are three of them.** *Passed* means every
+declared probe was positively proven — absence of an observed failure is not a
+pass, and neither is a probe that could not be checked. *Failed* means at least
+one probe was positively proven false; one false requirement is enough, even if
+another probe could not be checked at all. *Unknown* is everything else: nothing
+proved the contract false, but something required could not be checked
+truthfully. Unknown is never success and is never recorded as a result — a
+healthcheck only reads, so it is simply run again.
 
 ## Hard rules
 
@@ -196,7 +235,11 @@ only case that releases the job is a durable proof from the host that no
 package operation ever started, and could never start.
 
 **Package mutation succeeding is not the job succeeding.** The job is not
-complete until it has been health-checked.
+complete until it has been health-checked. That is a hard property, not a
+convention: a package command's exit code, a proven mutation, a guest that
+answers, and the absence of any observed failure cannot, separately or
+together, make an update job successful. The only thing that can is every
+probe of the contract that job froze being positively proven.
 
 ## Not the product
 

@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v15):
+  SQLite authority database (schema v16):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -38,6 +38,12 @@
   an unsupported probe kind, an unbounded target, a duplicate probe, an
   orphaned probe row, an edited or shrunken live contract, and a reused or
   unallocated revision (see "Dynamic per-resource health contract" below).
+  Schema v16 binds a package-update job to the exact health contract
+  generation it froze at issuance -- revision, fingerprint, and immutable
+  copied probe rows -- adds the durable definitive per-probe result rows and
+  the `health_completed` checkpoint, and states the terminal `succeeded`
+  contract in both directions, so a job can reach it only by proving every
+  frozen probe passed (see "Job-bound healthcheck execution" below).
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus
   authority-metadata-only mutations:
   `PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
@@ -91,15 +97,17 @@
 The PVE API inventory surface remains read-only. The backend's sole mutation
 route records Hubinet approval authority state only. Internal update-job
 issuance, job-owned snapshot safety, the execution-time plan equality gate,
-crash-safe package mutation, and same-job rollback execution are not
-production-reachable: there is no HTTP/HA creation control and no worker or
-scheduler consuming jobs, and no snapshot helper, execution helper, mutation
-helper, rollback helper, key, or PVE mutation privilege is deployed. Package scanning may write APT index/cache metadata
-but never changes workload packages, and neither does the execution-time
-gate's or the mutation stage's own metadata refresh and simulation. There is
-no production-reachable workload package mutation and no production-reachable
-rollback, and no healthcheck execution, snapshot deletion, lifecycle mutation,
-policy, or endpoint failover anywhere.
+crash-safe package mutation, same-job rollback execution, and job-bound
+healthcheck execution are not production-reachable: there is no HTTP/HA
+creation control and no worker or scheduler consuming jobs, and no snapshot
+helper, execution helper, mutation helper, rollback helper, health helper,
+key, or PVE mutation privilege is deployed. Package scanning may write APT
+index/cache metadata but never changes workload packages, and neither does the
+execution-time gate's or the mutation stage's own metadata refresh and
+simulation. There is no production-reachable workload package mutation, no
+production-reachable rollback, and no production-reachable healthcheck
+execution, and no snapshot deletion, lifecycle mutation, compensation policy,
+or endpoint failover anywhere.
 
 ## Human0 validation
 
@@ -137,9 +145,11 @@ the last two checks. They were manual operator actions used only to verify that
 Hubinet observes current guest state. Human0 validates only the scope that is
 actually activated in production; job-owned snapshots, the execution-time plan
 gate, crash-safe package mutation, and same-job rollback execution exist
-internally but are dark and have had no operator Human0 validation. The
-per-resource health contract is implemented and production reachable, but it
-is configuration only: healthcheck execution remains unimplemented.
+internally but are dark and have had no operator Human0 validation, and so
+does job-bound healthcheck execution. The per-resource health contract itself
+is implemented and production reachable, because it is configuration only; the
+execution that evaluates one is dark. No health probe has been run against any
+live guest.
 
 ## In-place product update lifecycle
 
@@ -181,7 +191,9 @@ unimplemented future stage.
   single-flight, current-authority revalidation, append-only events, and
   pre-mutation restart interruption.
 - **Not activated:** no HTTP or Home Assistant job control, executor, package
-  mutation, rollback, or healthcheck execution path exists.
+  mutation, rollback, or healthcheck execution path exists. Issuance now also
+  requires and freezes a declared health contract; see "Job-bound healthcheck
+  execution" below.
 
 ## Job-owned snapshot safety
 
@@ -400,7 +412,8 @@ unimplemented future stage.
   invocation can commit and only that invocation can submit with; and every
   guest command, including the detached runner's real package command,
   revalidates its own live PVE target. The stage remains dark, no Human0
-  mutation has been performed, and healthcheck execution remains future work.
+  mutation has been performed. Healthcheck execution now exists internally;
+  see "Job-bound healthcheck execution" below.
 
 ## Same-job rollback execution
 
@@ -478,10 +491,18 @@ unimplemented future stage.
   snapshot privilege provisioned -- the deployed role stays exactly the
   audit-only pair. No real rollback has been performed against any live guest;
   operator Human0 validation of this stage has not been done.
-- **Out of scope here:** healthcheck execution (see below), snapshot deletion
-  and retention, restarting the guest after a rollback, and any automatic
-  compensation policy. This stage ships the internal primitive only: a caller
-  must ask for one exact job to be rolled back.
+- **Extended by schema v16.** Same-job rollback now has four legal entry
+  points rather than two: `mutation_may_have_started`, `mutation_completed`,
+  `health_started` (an interrupted or unresolved health evaluation), and
+  `health_completed` with `health_outcome='failed'` (a proven health failure).
+  This is exactly the v14 rule applied to a second branch -- requiring health
+  SUCCESS before allowing compensation would fence exactly the guests that
+  need it. A passing verdict is inseparable from `SUCCEEDED`, so a rollback
+  after one is refused as terminal. Nothing else about rollback changed.
+- **Out of scope here:** snapshot deletion and retention, restarting the guest
+  after a rollback, and any automatic compensation policy. This stage ships
+  the internal primitive only: a caller must ask for one exact job to be
+  rolled back, and health execution never asks.
 
 ## Dynamic per-resource health contract (implemented)
 
@@ -490,8 +511,8 @@ built. Hubinet Ops still has **no generic inferred workload-health
 definition** and will not invent one; instead the operator declares, per
 resource, what healthy means. `PRODUCT.md`, "What healthy means", is the
 durable statement; `ARCHITECTURE.md`, "Dynamic per-resource health contracts",
-is how it is built. This stage ships **configuration authority only** — there
-is still no healthcheck execution.
+is how it is built. This stage shipped **configuration authority only**;
+"Job-bound healthcheck execution" below is the stage that evaluates one.
 
 - **Operator-declared, per `resource_id`.** Never a VMID, hostname, node, or a
   list in a repository or config file. A VMID-reused replacement is a different
@@ -537,23 +558,113 @@ is still no healthcheck execution.
   carries a concise `unsupported | unconfigured | configured` summary and its
   identity; the probe list is response data from an explicitly invoked action,
   never entity attributes.
-- **Out of scope here, deliberately:** every part of health *execution*. There
-  is no probe executor, scheduler, worker, task journal, or host-control
-  boundary, and nothing runs `systemctl`, `docker`, `pct`, or SSH. A contract
-  is not required to issue a package-update job, is not copied into one, and no
-  job is bound to a contract revision — job binding is health-execution work,
-  and the durable shape is designed so that stage can reference a specific
-  revision/fingerprint truthfully without a redesign. `health_started` remains
-  unreachable, `SUCCEEDED` still has no transition, and no automatic
-  health-triggered rollback, threshold, retry count, grace period, or
-  compensation policy exists or is decided here.
+- **Out of scope in this stage, and now built in the next one:** every part
+  of health *execution*. The contract layer itself still runs nothing — no
+  `systemctl`, `docker`, `pct`, or SSH lives in it, and declaring what healthy
+  means stays a different file from checking it. What changed is that a
+  contract is now **required** to issue a package-update job and is copied
+  into it: see "Job-bound healthcheck execution" below. The durable shape here
+  needed no redesign for that, which is what the never-reused revision was
+  for.
 - **Production reachability:** health-contract configuration is production
   reachable, because it is authority metadata only. The update *execution*
   lifecycle stays exactly as dark as it was.
 
+## Job-bound healthcheck execution (implemented internally)
+
+The last missing half of the update lifecycle: proving whether the workload an
+update job changed actually came back. `PRODUCT.md`, "What healthy means", is
+the durable product statement; `ARCHITECTURE.md`, "Job-bound healthcheck
+execution", is how it is built. This stage ships **internal execution only**.
+The full lifecycle is still dark.
+
+- **The success criterion is frozen at issuance.** Issuance already freezes
+  resource identity, source/transport authority, approval provenance, and the
+  exact package plan, and at that moment nothing has been mutated -- so it
+  also copies the resource's current health contract *generation* (revision,
+  fingerprint, and the complete canonical probe set) into immutable job-owned
+  rows. **A resource with no declared contract cannot be issued a job**:
+  absence is not health, so a job whose success criterion does not exist could
+  never truthfully be called successful. Configuration remains bounded opaque
+  data, but issuance now separately requires every stored probe to be
+  structurally representable by the exact executor; a bare/pattern systemd
+  target or invalid Docker execution name produces no job and cannot reach
+  snapshot or package mutation.
+- **One boundary decides which contract applies.** While the job is still
+  pre-mutation, the live contract drifting away from the frozen copy makes the
+  job stale and forbids the real package mutation, exactly as a changed
+  package plan does. Because revisions are never reused, clearing and
+  re-declaring byte-identical probes is correctly a NEW generation even though
+  the fingerprint is unchanged. From `mutation_may_have_started` onward the
+  check stops applying and the frozen copy is the only authority -- packages
+  have already changed, and re-deciding success against a contract edited
+  afterwards would be moving the goalposts.
+- **PASS, FAIL, UNKNOWN are three different answers.** A contract is an
+  ALL-OF. PASS requires every frozen probe positively proven -- absence of an
+  observed failure is not a pass. FAIL needs one probe proven false; one false
+  conjunct proves an ALL-OF false, so a deterministic failure beside an
+  unevaluable probe is still a failure, and it leaves the job ACTIVE with its
+  snapshot and its rollback authority intact. UNKNOWN is never success and is
+  never durable: nothing is written but a bounded event, and the evaluation
+  may simply be repeated.
+- **Exactly one legal success transition.** Schema v16 makes `succeeded`
+  impossible without a proven mutation, a started evaluation, a durable
+  completion, `health_outcome='passed'`, and the `health_completed`
+  checkpoint -- and, in the other direction, makes a passing verdict
+  inseparable from `succeeded`. Triggers make a passing verdict impossible
+  unless every frozen probe carries its own durable `passed` result row, and a
+  failing one impossible without a complete result set containing a proven
+  failure. No package command exit code, proven mutation, reachable guest, or
+  absence of observed failures can produce `SUCCEEDED` on its own.
+- **Read-only, and that shapes the whole stage.** It runs `systemctl show` and
+  `docker inspect` and changes nothing, so there is deliberately no host
+  operation journal, no write-ahead uncertainty checkpoint, no lease, and no
+  at-most-once submission fence -- inventing one would mimic the destructive
+  stages without their reason for existing. What is kept is at-most-once
+  *acceptance*: one definitive completion can commit, and write-once triggers
+  stop a late result overwriting an accepted verdict or a rollback that moved
+  the job on. A restart leaves a `health_started` job ACTIVE and fenced and
+  never marks it succeeded; the evaluation is then simply run again.
+- **Fixed argv, verified against the real tools** (systemd 257, Docker 26.1.5)
+  rather than assumed. `systemctl is-active` expands globs and succeeds if ANY
+  match is active, and `--` does not stop it, so it is not used; `systemctl
+  show` plus a glob-free target charset plus an exactly-one-block rule is what
+  names one unit (a glob can match exactly one, so the block rule alone is not
+  enough), and an explicit unit-type suffix is required rather than guessed.
+  `docker inspect` resolves by ID prefix, so the returned `.Name` must equal
+  the requested container. Timeout and overflow are classified before the
+  killed process's non-zero return code, and a generic non-zero is never
+  absence merely because the daemon answers. Only a successful bounded fixed
+  listing of every complete container name that omits the requested exact name
+  proves absence. `docker_container_healthy` is never downgraded to
+  "running": not running, `unhealthy`, `starting`, and no HEALTHCHECK at all
+  are each a definitive failure.
+- **Atomic final live-target proof.** The backend re-proves the exact
+  resource/locator context before the host call and once as an early rejection
+  after it; the helper's single guest dispatcher revalidates before every `pct
+  exec`. The load-bearing proof is inside the same `BEGIN IMMEDIATE` that
+  validates the complete observation set, aggregates it, inserts every result,
+  and commits PASS/FAIL. A guest replaced in the former post-check/pre-commit
+  gap yields UNKNOWN with zero result or verdict rows. The same acceptance
+  boundary also independently enforces the shared probe-kind/outcome/reason
+  semantic matrix rather than trusting the orchestrator to have done so.
+- **No automatic compensation.** A failing verdict reports and stops. Health
+  execution makes zero calls into the rollback host control and arms nothing,
+  and there is no retry count, grace period, delayed-health policy, threshold,
+  majority, or OR logic anywhere in the stage. Same-job rollback did gain two
+  entry points (`health_started`, and `health_completed` with a failed
+  verdict) so a job that needs compensating is not fenced out -- but an
+  operator, not this stage, asks for it.
+- **Not activated:** no HTTP endpoint, Home Assistant action, scheduler,
+  worker, production job issuance, or health-result sensor. The health helper
+  is a separate dark file that is **not deployed**, with no key and no
+  `authorized_keys` entry, and it needs **no new PVE privilege** at all -- it
+  reads through host-local `pct exec`, so the provisioned role stays exactly
+  the audit-only pair. No health probe has been run against any live guest;
+  operator Human0 validation of this stage has not been done.
+
 ## Next
 
-- Healthcheck execution.
 - Production activation of the update lifecycle.
 - Snapshot retention, then lifecycle controls (start/stop/reboot) and manual
   snapshot operations.
@@ -570,7 +681,7 @@ is still no healthcheck execution.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v15 is incompatible with v14 and every earlier version, and
+- Pre-release: schema v16 is incompatible with v15 and every earlier version, and
   there is no in-place migration path. An existing installation now uses
   `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible authority schema, backs it up, and
   resets only the authority database (see "In-place product updates" below)

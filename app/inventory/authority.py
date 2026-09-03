@@ -21,11 +21,16 @@ from .models import (
     AuthorityConflict,
     AuthorityInvariantError,
     AuthorityNotFound,
+    DEFINITIVE_HEALTH_OUTCOMES,
     DiscoveryRun,
     DiscoveryRunLifecycle,
+    HealthOutcome,
+    HealthProbeKind,
+    HealthProbeOutcome,
     HostMutationState,
     HostSubmissionState,
     InventorySourceState,
+    aggregate_health_outcome,
     ObservedSnapshot,
     PackageScanFailure,
     PackageScanLifecycle,
@@ -37,7 +42,9 @@ from .models import (
     PackageUpdateEventLevel,
     PackageUpdateEventType,
     PackageUpdateExecutionOutcome,
+    PackageUpdateHealthRequest,
     PackageUpdateJob,
+    PackageUpdateJobHealthProbe,
     PackageUpdateJobStatus,
     MutationSubmissionRefusedBeforeCallback,
     PackageMutationArmOutcome,
@@ -61,6 +68,14 @@ from .health_contract import (
     canonical_health_probes,
     health_contract_fingerprint,
 )
+from .health_execution import (
+    HealthContractExecutionError,
+    require_health_contract_execution_eligible,
+)
+from .health_observation import (
+    HEALTH_PROBE_REASONS,
+    require_health_probe_semantics,
+)
 from .mutation_completion import (
     PackageMutationPostState,
     prove_package_mutation_completion,
@@ -82,7 +97,11 @@ from .reconciliation import InventoryReconciler, ReconciliationSummary
 # directly because a contract read has to happen INSIDE the caller's
 # transaction (a read that opened its own would race a concurrent replace and
 # could return probes from one revision beside another revision's header).
-from .store import InventoryAuthorityStore, _resource_health_contract
+from .store import (
+    InventoryAuthorityStore,
+    _package_update_job_health,
+    _resource_health_contract,
+)
 
 
 _T = TypeVar("_T")
@@ -90,6 +109,116 @@ _T = TypeVar("_T")
 
 class PackageUpdateExecutionAuthorityTemporarilyUnavailable(AuthorityConflict):
     """Current execution authority cannot be decided while a scan is running."""
+
+
+class PackageUpdateHealthContextChanged(AuthorityConflict):
+    """Final health acceptance found the job's live target context stale."""
+
+
+@dataclass(frozen=True, slots=True)
+class HealthProbeObservation:
+    """What ONE frozen probe of a job's health contract was observed to be.
+
+    Typed evidence handed to the authority, never a verdict: it names the
+    exact frozen probe it reports on -- by index, kind AND target, all three
+    of which are re-proved against the job's own immutable rows -- plus what
+    was observed and a bounded reason token. A caller cannot report about a
+    probe this job did not freeze, and cannot report a contract-level
+    "healthy" at all.
+    """
+
+    probe_index: int
+    kind: HealthProbeKind
+    target: str
+    outcome: HealthProbeOutcome
+    reason: str
+
+
+#: Every checkpoint a job may legally enter same-job rollback from. Each is a
+#: state a job that may need compensating can genuinely be in, and NONE of
+#: them is a claim that an earlier stage succeeded -- that is the v14 lesson,
+#: extended to the health branch in v16. ``health_completed`` is admitted only
+#: with a FAILED verdict; a PASSED one is inseparable from ``succeeded``, and
+#: a terminal job is refused before this set is consulted.
+_ROLLBACK_ELIGIBLE_CHECKPOINTS: tuple[PackageUpdateCheckpoint, ...] = (
+    PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+    PackageUpdateCheckpoint.MUTATION_COMPLETED,
+    PackageUpdateCheckpoint.HEALTH_STARTED,
+    PackageUpdateCheckpoint.HEALTH_COMPLETED,
+)
+
+
+def _require_health_probe_reason(value: object) -> str:
+    if not isinstance(value, str) or value not in HEALTH_PROBE_REASONS:
+        raise AuthorityConflict("health probe reason is not a known bounded token")
+    return value
+
+
+def _match_health_observations_to_frozen_probes(
+    probes: tuple[PackageUpdateJobHealthProbe, ...],
+    observations: tuple[HealthProbeObservation, ...],
+) -> tuple[HealthProbeObservation, ...]:
+    """Prove one observation set describes EXACTLY this frozen contract.
+
+    Returns the observations reordered to the frozen canonical order, or
+    raises. Everything checked here is a way a host answer could be about a
+    different contract than the one this job must satisfy, and every one of
+    them is refused outright rather than partially believed -- a health
+    answer that is not about this exact frozen set has told us nothing about
+    it, and "nothing" is never a pass.
+    """
+
+    if len(observations) != len(probes):
+        raise AuthorityConflict(
+            "health observations do not cover exactly the frozen probe set"
+        )
+    by_index: dict[int, HealthProbeObservation] = {}
+    for observation in observations:
+        if not isinstance(observation, HealthProbeObservation):
+            raise AuthorityConflict("a typed health probe observation is required")
+        if observation.probe_index in by_index:
+            raise AuthorityConflict(
+                "health observations contain a duplicate probe index"
+            )
+        by_index[observation.probe_index] = observation
+    ordered: list[HealthProbeObservation] = []
+    for probe in probes:
+        observation = by_index.get(probe.probe_index)
+        if observation is None:
+            raise AuthorityConflict(
+                "health observations are missing a frozen probe"
+            )
+        if (
+            HealthProbeKind(observation.kind) is not probe.kind
+            or observation.target != probe.target
+        ):
+            raise AuthorityConflict(
+                "a health observation does not describe the frozen probe at "
+                "its index"
+            )
+        ordered.append(
+            _coherent_health_observation(probe, observation)
+        )
+    return tuple(ordered)
+
+
+def _coherent_health_observation(
+    probe: PackageUpdateJobHealthProbe, observation: HealthProbeObservation
+) -> HealthProbeObservation:
+    try:
+        outcome = HealthProbeOutcome(observation.outcome)
+        reason = require_health_probe_semantics(
+            probe.kind, outcome, observation.reason
+        )
+    except ValueError as exc:
+        raise AuthorityConflict(str(exc)) from exc
+    return HealthProbeObservation(
+        probe_index=probe.probe_index,
+        kind=probe.kind,
+        target=probe.target,
+        outcome=outcome,
+        reason=reason,
+    )
 
 
 class _PackageUpdateJobAuthorityState(StrEnum):
@@ -1336,11 +1465,26 @@ class InventoryAuthority:
     def issue_package_update_job(
         self, resource_id: str, approval_id: str, request_id: str
     ) -> PackageUpdateJob:
-        """Atomically freeze one approved, current, non-empty package plan.
+        """Atomically freeze one approved plan AND one health contract.
 
         This is an internal authority operation in this stage. Production has
         no route, scheduler, or worker that calls it, and issuance itself
         performs no PVE, snapshot, or workload mutation.
+
+        Issuance is where the job's SUCCESS CRITERION is frozen, and it is
+        the right place precisely because nothing has been mutated yet. The
+        same transaction that already freezes resource identity, source and
+        transport authority, approval provenance, and the exact package plan
+        also copies the resource's exact current health contract generation
+        -- ``revision``, ``fingerprint``, and the complete canonical probe
+        set -- into immutable job-owned rows.
+
+        **A resource with no declared health contract cannot be issued a
+        job.** `PRODUCT.md` says absence is not health, so a job whose
+        success criterion does not exist could never be truthfully called
+        successful, and would reach the mutation boundary with nothing to
+        validate against afterwards. That is refused here rather than
+        discovered later, before any snapshot or package mutation exists.
         """
 
         canonical_resource_id = _require_uuid(resource_id, "resource_id")
@@ -1460,6 +1604,32 @@ class InventoryAuthority:
                         raise AuthorityConflict(
                             "package update job requires a non-empty exact plan"
                         )
+                    # The success criterion, frozen in the SAME transaction
+                    # as the plan and read through the same fail-closed
+                    # verification the live contract API uses. No contract
+                    # means unconfigured, and unconfigured is never a job:
+                    # see PRODUCT.md, "What healthy means".
+                    contract = _resource_health_contract(
+                        connection, canonical_resource_id
+                    )
+                    if contract is None:
+                        raise AuthorityConflict(
+                            "package update job requires a declared resource "
+                            "health contract"
+                        )
+                    # Configuration deliberately stores bounded opaque
+                    # targets.  A package-update job is narrower: every
+                    # frozen probe must be structurally representable by the
+                    # exact executor before this transaction may issue it.
+                    # This is pure validation -- no systemctl, Docker, pct,
+                    # SSH, or PVE call occurs here.
+                    try:
+                        require_health_contract_execution_eligible(contract.probes)
+                    except HealthContractExecutionError as exc:
+                        raise AuthorityConflict(
+                            "resource health contract is not executable for a "
+                            "package update job"
+                        ) from exc
                     job_id = _new_uuid()
                     issued_at = _timestamp(decision_time)
 
@@ -1467,6 +1637,18 @@ class InventoryAuthority:
                     # package rows can be inserted before their parent. The
                     # parent insert seals that exact set against later INSERT,
                     # UPDATE, or DELETE in the same atomic transaction.
+                    # Same deferred-FK ordering as the package rows below:
+                    # the immutable child rows are written before the parent
+                    # job row that seals them, all inside this one atomic
+                    # transaction.
+                    connection.executemany(
+                        "INSERT INTO package_update_job_health_probes("
+                        "job_id, probe_index, kind, target) VALUES(?, ?, ?, ?)",
+                        [
+                            (job_id, index, probe.kind.value, probe.target)
+                            for index, probe in enumerate(contract.probes)
+                        ],
+                    )
                     connection.executemany(
                         "INSERT INTO package_update_job_packages("
                         "job_id, package_index, package_name, architecture, "
@@ -1501,9 +1683,12 @@ class InventoryAuthority:
                             "expected_locator_generation, "
                             "expected_resource_continuity_revision, expected_vmid, "
                             "expected_node_id, expected_node_name, package_count, "
+                            "health_contract_revision, "
+                            "health_contract_fingerprint, "
+                            "health_contract_probe_count, "
                             "status, checkpoint) "
                             "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                            "?, ?, ?, ?, ?, ?, ?, ?, 'active', 'issued')",
+                            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'issued')",
                             (
                                 job_id,
                                 canonical_request_id,
@@ -1533,6 +1718,9 @@ class InventoryAuthority:
                                 str(current["expected_node_id"]),
                                 str(current["expected_node_name"]),
                                 len(packages),
+                                contract.revision,
+                                contract.fingerprint,
+                                len(contract.probes),
                             ),
                         )
                     except sqlite3.IntegrityError as exc:
@@ -1552,6 +1740,13 @@ class InventoryAuthority:
                                 approval["reviewed_scan_run_id"]
                             ),
                             "current_plan_scan_run_id": str(current["scan_run_id"]),
+                            # The exact health contract generation this job
+                            # must satisfy, named the way the contract names
+                            # itself. Bounded identity only; the probe
+                            # material lives in its own immutable rows.
+                            "health_contract_revision": contract.revision,
+                            "health_contract_fingerprint": contract.fingerprint,
+                            "health_contract_probe_count": len(contract.probes),
                         },
                     )
                     self._after_package_update_job_issuance(
@@ -1694,7 +1889,76 @@ class InventoryAuthority:
                 _PackageUpdateJobAuthorityState.STALE,
                 "current exact package material does not match the job",
             )
+        drift = self._frozen_health_contract_drift(connection, job)
+        if drift is not None:
+            return _PackageUpdateJobAuthorityState.STALE, drift
         return _PackageUpdateJobAuthorityState.CURRENT, None
+
+    def _frozen_health_contract_drift(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> str | None:
+        """Prove the live contract still IS the generation this job froze.
+
+        Applied **only while the job is still pre-mutation**, and that bound
+        is the entire design, not an optimization:
+
+        - *Before* the write-ahead package-mutation boundary, the operator
+          editing or clearing the contract means the job would be validated
+          against a definition of healthy its operator has since withdrawn.
+          Nothing has been mutated yet, so the honest answer is to make the
+          job stale and refuse the mutation, exactly as a changed package
+          plan does.
+        - *From* ``mutation_may_have_started`` onward, packages may already
+          have changed, and re-deciding success against a mutable contract
+          would be moving the goalposts after the fact. The job's frozen copy
+          is the only authority there, so this check deliberately stops
+          applying -- the checkpoint rank gate below is what stops it.
+
+        Comparison is over the complete generation, never the revision alone:
+        the same ``resource_id``, the same never-reused ``revision``, the
+        same fingerprint, the same probe count, and the same exact canonical
+        probe material. A clear-and-recreate of byte-identical probes is a
+        NEW generation because schema v15 never reuses a revision, so it is
+        correctly detected here even though the fingerprint is unchanged; and
+        an incoherent durable row set is caught by the material comparison
+        even if the revision still matches.
+
+        Returns ``None`` when the frozen generation is still current, or a
+        bounded reason string when it is not.
+        """
+
+        if _checkpoint_rank(
+            PackageUpdateCheckpoint(str(job["checkpoint"]))
+        ) >= _checkpoint_rank(PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED):
+            # Past the write-ahead mutation boundary: the frozen copy wins,
+            # and the live contract has no say at all from here on.
+            return None
+        contract = _resource_health_contract(connection, str(job["resource_id"]))
+        if contract is None:
+            return "resource health contract is no longer declared"
+        if (
+            contract.revision != int(job["health_contract_revision"])
+            or contract.fingerprint != str(job["health_contract_fingerprint"])
+            or len(contract.probes) != int(job["health_contract_probe_count"])
+        ):
+            return "current resource health contract is a newer generation"
+        frozen = connection.execute(
+            "SELECT probe_index, kind, target "
+            "FROM package_update_job_health_probes WHERE job_id=? "
+            "ORDER BY probe_index",
+            (str(job["job_id"]),),
+        ).fetchall()
+        frozen_material = [
+            (int(row["probe_index"]), str(row["kind"]), str(row["target"]))
+            for row in frozen
+        ]
+        current_material = [
+            (index, probe.kind.value, probe.target)
+            for index, probe in enumerate(contract.probes)
+        ]
+        if frozen_material != current_material:
+            return "current resource health contract material does not match the job"
+        return None
 
     def _package_update_job_authority_is_current(
         self, connection: sqlite3.Connection, job: sqlite3.Row
@@ -3626,6 +3890,426 @@ class InventoryAuthority:
             )
         return self._store.package_update_job(canonical_job_id)
 
+    # -- job-bound healthcheck execution ---------------------------------
+    #
+    # Two authority boundaries and one truthful non-answer. Neither performs
+    # host I/O of its own, and neither is reachable from production: they
+    # record durable facts about an evaluation another component performs
+    # entirely OUTSIDE this store's writer lock.
+    # --------------------------------------------------------------------
+
+    def package_update_health_contract(
+        self, job_id: str
+    ) -> tuple[PackageUpdateJobHealthProbe, ...]:
+        """Return the exact frozen probe set one job must satisfy.
+
+        Read through the job read path, so a job whose frozen probes no
+        longer match their own count or fingerprint fails closed here rather
+        than handing an executor a contract that is not the one the operator
+        declared.
+        """
+
+        return self.package_update_job(job_id).health_probes
+
+    def package_update_health_request(
+        self, job_id: str
+    ) -> PackageUpdateHealthRequest:
+        """Assemble the exact typed health request, re-proving live context.
+
+        Two jobs in one transaction, and both matter:
+
+        1. **It is the live-target proof.** A read-only probe is harmless to
+           the guest, but a PASS recorded against a REPLACEMENT guest that
+           happens to occupy this job's VMID would be a serious authority
+           failure -- a false statement that this job's workload is healthy.
+           So this re-proves the exact resource/locator context through the
+           SAME narrow predicate the rollback path uses: same source, an LXC,
+           present and active, with this job's exact VMID, binding, locator
+           generation, continuity revision, node, and an available node.
+
+           Deliberately NOT current package-plan currency: packages have
+           legitimately changed by now, and a newer scan must never withdraw
+           the ability to validate the update that changed them. And
+           deliberately NOT the current health contract: the job's frozen
+           generation is the authority from the mutation boundary onward.
+
+        2. **It assembles the request entirely from durable job authority.**
+           Every field is read from the job row and its immutable frozen
+           probe rows. There is no parameter a caller could use to name a
+           different VMID, node, contract, or probe.
+
+        The orchestrator calls this BEFORE the host round trip and AGAIN
+        after it, so a guest replaced while the round trip was in flight
+        stops the answer from being accepted either way.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        with self._store._read_transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if not self._post_mutation_job_context_is_current(connection, job):
+                raise AuthorityConflict(
+                    "package update job resource or locator context is stale"
+                )
+            probes = self._require_coherent_frozen_health_contract(
+                connection, canonical_job_id
+            )
+            backend_instance_id = str(
+                connection.execute(
+                    "SELECT backend_instance_id FROM backend_instance"
+                ).fetchone()["backend_instance_id"]
+            )
+            return PackageUpdateHealthRequest(
+                job_id=canonical_job_id,
+                backend_instance_id=backend_instance_id,
+                resource_id=str(job["resource_id"]),
+                binding_id=str(job["expected_binding_id"]),
+                locator_generation=int(job["expected_locator_generation"]),
+                resource_continuity_revision=int(
+                    job["expected_resource_continuity_revision"]
+                ),
+                vmid=int(job["expected_vmid"]),
+                expected_node=str(job["expected_node_name"]),
+                health_contract_revision=int(job["health_contract_revision"]),
+                health_contract_fingerprint=str(
+                    job["health_contract_fingerprint"]
+                ),
+                probes=probes,
+            )
+
+    def start_package_update_health(self, job_id: str) -> PackageUpdateJob:
+        """Move one job from ``mutation_completed`` to ``health_started``.
+
+        The only transition that may put a job at ``health_started``, and
+        deliberately the narrowest one in this stage:
+
+        - the job must be ACTIVE at exactly ``mutation_completed``. Health
+          validation is the next stage of a mutation that already
+          SUCCEEDED, never compensation for one that did not: a job at
+          ``mutation_may_have_started`` with ``mutation_completed_at`` NULL
+          must route to rollback, and the schema refuses this checkpoint for
+          it in any case.
+        - the job's OWN frozen contract must be coherent -- the probe rows
+          must match their frozen count and recompute to the frozen
+          fingerprint -- which is proved by reading the job through the
+          verifying read path before anything is written.
+        - the *current* resource health contract is deliberately NOT
+          consulted. By this point packages have already changed; the frozen
+          copy is the authority, and an operator who edits or clears the
+          contract now changes nothing about what this job must satisfy.
+
+        Idempotent: a job already at ``health_started`` re-proves its frozen
+        contract and returns the existing boundary rather than a second one.
+        Health execution is read-only, so re-entering it after a crash or a
+        backend restart is safe and is exactly what recovery does.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+            if checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED:
+                self._require_coherent_frozen_health_contract(
+                    connection, canonical_job_id
+                )
+                return self._store.package_update_job(canonical_job_id)
+            if checkpoint is not PackageUpdateCheckpoint.MUTATION_COMPLETED:
+                raise AuthorityConflict(
+                    "package update job is not ready for health evaluation"
+                )
+            probes = self._require_coherent_frozen_health_contract(
+                connection, canonical_job_id
+            )
+            # ONE statement, so the checkpoint and its timestamp are a single
+            # coherent fact. The `mutation_completed_at IS NOT NULL` guard is
+            # redundant with the schema and kept anyway: this transition must
+            # never be the thing that makes an unproven mutation look proven.
+            updated = connection.execute(
+                "UPDATE package_update_jobs SET checkpoint='health_started', "
+                "health_started_at=? "
+                "WHERE job_id=? AND status='active' "
+                "AND checkpoint='mutation_completed' "
+                "AND mutation_completed_at IS NOT NULL "
+                "AND health_started_at IS NULL",
+                (recorded_at, canonical_job_id),
+            )
+            if updated.rowcount != 1:
+                raise AuthorityConflict(
+                    "package update job health start lost durable ownership"
+                )
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.INFO,
+                stage=PackageUpdateCheckpoint.HEALTH_STARTED,
+                event_type=PackageUpdateEventType.HEALTH_STARTED,
+                message=(
+                    "evaluating this job's own frozen health contract "
+                    "generation; the live contract no longer applies"
+                ),
+                details={
+                    "health_contract_revision": int(
+                        job["health_contract_revision"]
+                    ),
+                    "health_contract_fingerprint": str(
+                        job["health_contract_fingerprint"]
+                    ),
+                    "probe_count": len(probes),
+                },
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def complete_package_update_health(
+        self, job_id: str, observations: Sequence[HealthProbeObservation]
+    ) -> PackageUpdateJob:
+        """Record one DEFINITIVE verdict over this job's frozen contract.
+
+        ``observations`` are typed per-probe observations, never a verdict
+        and never a boolean: the caller reports what each frozen probe was
+        observed to be, and the ALL-OF aggregation happens HERE, inside the
+        same transaction that would commit it, against the job's own
+        immutable frozen rows read in that transaction. There is deliberately
+        no parameter through which a caller can assert "healthy".
+
+        Every observation is matched against the frozen set before anything
+        is aggregated: exactly one per frozen probe, the exact index set, the
+        exact kind, the exact target, no duplicate, and nothing extra. A
+        mismatched set is refused outright rather than partially believed --
+        a host that answered about a different contract has told us nothing
+        about this one.
+
+        Two verdicts may be committed, and they are different events:
+
+        - ``PASSED`` -- every frozen probe positively proven. Atomically
+          writes ``health_completed_at``, ``health_outcome='passed'``, the
+          ``health_completed`` checkpoint, the complete durable result set,
+          ``status='succeeded'`` and its terminal facts. This is the ONE
+          legal success transition in this product, and the schema makes
+          ``succeeded`` unreachable any other way.
+        - ``FAILED`` -- at least one frozen probe positively proven false.
+          Writes the same completion facts with ``health_outcome='failed'``
+          and leaves the job ACTIVE, still owning the one global destructive
+          slot, its confirmed snapshot, and its same-job rollback authority.
+          Nothing here triggers a rollback: this stage ships no automatic
+          compensation policy at all (`PRODUCT.md`, `STATUS.md`).
+
+        An UNKNOWN aggregate is refused. It is not a verdict, it must never
+        become durable, and health execution is a read-only evaluation that
+        is safe to repeat -- see
+        :meth:`record_package_update_health_outcome_unknown`, which records
+        it as bounded history while keeping the job at ``health_started``.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        reported = tuple(observations)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+            if checkpoint is PackageUpdateCheckpoint.HEALTH_COMPLETED:
+                # At most one definitive completion can ever commit. A late
+                # result arriving after one was accepted is refused here, and
+                # the write-once trigger refuses it in the schema too.
+                raise AuthorityConflict(
+                    "package update job health was already completed"
+                )
+            if checkpoint is not PackageUpdateCheckpoint.HEALTH_STARTED:
+                raise AuthorityConflict(
+                    "package update job is not inside a health evaluation"
+                )
+            probes = self._require_coherent_frozen_health_contract(
+                connection, canonical_job_id
+            )
+            # This is the load-bearing post-host proof.  It runs inside the
+            # SAME BEGIN IMMEDIATE transaction that validates and inserts the
+            # exact observation set and commits the durable verdict.  Once
+            # this transaction begins, discovery/reconciliation and rollback
+            # arming cannot interleave before commit.
+            if not self._post_mutation_job_context_is_current(connection, job):
+                raise PackageUpdateHealthContextChanged(
+                    "package update job resource or locator context is stale"
+                )
+            ordered = _match_health_observations_to_frozen_probes(probes, reported)
+            outcome = aggregate_health_outcome(
+                observation.outcome for observation in ordered
+            )
+            if outcome not in DEFINITIVE_HEALTH_OUTCOMES:
+                raise AuthorityConflict(
+                    "an unknown health outcome is never a durable verdict"
+                )
+            # Results first, then the verdict: the schema triggers that make
+            # a passing verdict impossible without a complete passing result
+            # set evaluate on the job UPDATE, so the evidence must already be
+            # in place when it runs.
+            connection.executemany(
+                "INSERT INTO package_update_job_health_probe_results("
+                "job_id, probe_index, outcome, checked_at, reason) "
+                "VALUES(?, ?, ?, ?, ?)",
+                [
+                    (
+                        canonical_job_id,
+                        probe.probe_index,
+                        observation.outcome.value,
+                        recorded_at,
+                        observation.reason,
+                    )
+                    for probe, observation in zip(probes, ordered, strict=True)
+                ],
+            )
+            if outcome is HealthOutcome.PASSED:
+                terminal_reason = (
+                    "every probe of this job's frozen health contract "
+                    "generation was positively proven"
+                )
+                updated = connection.execute(
+                    "UPDATE package_update_jobs "
+                    "SET checkpoint='health_completed', health_completed_at=?, "
+                    "health_outcome='passed', status='succeeded', "
+                    "terminalized_at=?, terminal_reason=? "
+                    "WHERE job_id=? AND status='active' "
+                    "AND checkpoint='health_started' "
+                    "AND health_completed_at IS NULL",
+                    (recorded_at, recorded_at, terminal_reason, canonical_job_id),
+                )
+            else:
+                updated = connection.execute(
+                    "UPDATE package_update_jobs "
+                    "SET checkpoint='health_completed', health_completed_at=?, "
+                    "health_outcome='failed' "
+                    "WHERE job_id=? AND status='active' "
+                    "AND checkpoint='health_started' "
+                    "AND health_completed_at IS NULL",
+                    (recorded_at, canonical_job_id),
+                )
+            if updated.rowcount != 1:
+                raise AuthorityConflict(
+                    "package update job health completion lost durable ownership"
+                )
+            failed_indexes = [
+                probe.probe_index
+                for probe, observation in zip(probes, ordered, strict=True)
+                if observation.outcome is HealthProbeOutcome.FAILED
+            ]
+            unknown_indexes = [
+                probe.probe_index
+                for probe, observation in zip(probes, ordered, strict=True)
+                if observation.outcome is HealthProbeOutcome.UNKNOWN
+            ]
+            passed = outcome is HealthOutcome.PASSED
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=(
+                    PackageUpdateEventLevel.INFO
+                    if passed
+                    else PackageUpdateEventLevel.ERROR
+                ),
+                stage=PackageUpdateCheckpoint.HEALTH_COMPLETED,
+                event_type=(
+                    PackageUpdateEventType.HEALTH_PASSED
+                    if passed
+                    else PackageUpdateEventType.HEALTH_FAILED
+                ),
+                message=(
+                    "every frozen health probe passed; this update job "
+                    "succeeded"
+                    if passed
+                    else (
+                        "at least one frozen health probe was proven to "
+                        "fail; this job stays active and rollback-capable"
+                    )
+                ),
+                details={
+                    "health_contract_revision": int(
+                        job["health_contract_revision"]
+                    ),
+                    "health_contract_fingerprint": str(
+                        job["health_contract_fingerprint"]
+                    ),
+                    "probe_count": len(probes),
+                    # Bounded indexes and counts only. No command output, no
+                    # stderr, no guest text of any kind reaches durable
+                    # events.
+                    "failed_probe_indexes": failed_indexes,
+                    "unknown_probe_indexes": unknown_indexes,
+                },
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def record_package_update_health_outcome_unknown(
+        self, job_id: str, reason: str
+    ) -> PackageUpdateJob:
+        """Record that a health evaluation could not reach a verdict.
+
+        Truthful history, never a result. It writes NO health completion, NO
+        verdict, and NO probe result rows; the job stays ACTIVE at
+        ``health_started``, still owning the one global destructive slot, its
+        confirmed snapshot, and its same-job rollback authority.
+
+        That is safe precisely because health execution is READ-ONLY: unlike
+        a snapshot, a package mutation, or a rollback, repeating it cannot
+        cause a second destructive action, so an unresolved evaluation needs
+        no uncertainty fence and no host journal -- it simply may be run
+        again.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        bounded_reason = _require_health_probe_reason(reason)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if (
+                PackageUpdateCheckpoint(str(job["checkpoint"]))
+                is not PackageUpdateCheckpoint.HEALTH_STARTED
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a health evaluation"
+                )
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.WARNING,
+                stage=PackageUpdateCheckpoint.HEALTH_STARTED,
+                event_type=PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN,
+                message=(
+                    "this job's frozen health contract could not be "
+                    "evaluated truthfully; no verdict was recorded"
+                ),
+                details={"reason": bounded_reason},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def _require_coherent_frozen_health_contract(
+        self, connection: sqlite3.Connection, job_id: str
+    ) -> tuple[PackageUpdateJobHealthProbe, ...]:
+        """Read one job's frozen probe set, in-transaction, fail-closed.
+
+        Re-derives the frozen contract through the SAME verification the job
+        read path applies -- exact probe count, contiguous canonical indexes,
+        and a recomputed fingerprint -- so no health transition can ever
+        commit against a frozen row set that no longer describes the
+        generation the job actually froze.
+        """
+
+        row = self._require_package_update_job_row(connection, job_id)
+        probes, _ = _package_update_job_health(connection, row)
+        if not probes:
+            raise AuthorityInvariantError(
+                "package update job has no frozen health contract"
+            )
+        return probes
+
     # -- same-job rollback execution -------------------------------------
 
     def _rollback_identity_in_transaction(
@@ -3729,10 +4413,16 @@ class InventoryAuthority:
             )
 
     @staticmethod
-    def _rollback_resource_context_is_current(
+    def _post_mutation_job_context_is_current(
         connection: sqlite3.Connection, job: sqlite3.Row
     ) -> bool:
-        """Prove the exact resource/locator context a rollback is aimed at.
+        """Prove the exact resource/locator context a POST-MUTATION job names.
+
+        Shared by the two stages that act on a job whose workload may already
+        have changed -- same-job rollback arming and health evaluation -- for
+        the same reason and with the same narrowness. Both need to know they
+        are still pointed at the intended guest; neither may re-decide the
+        job on facts that legitimately moved on when the packages did.
 
         Deliberately NARROWER than
         :meth:`_package_update_job_current_authority_detail`, in two exact
@@ -3754,11 +4444,18 @@ class InventoryAuthority:
            force-stops it anyway as its own first step. Requiring `running`
            would fence exactly the guests that most need recovery.
 
-        What it DOES prove is the identity of the thing about to be rolled
-        back: the same source, an LXC, present and active, with this job's
-        exact VMID, binding, locator generation, continuity revision, node,
-        and an available node. That is what stops a rollback landing on a
-        replaced guest at a reused VMID.
+        3. **No current health contract.** From the mutation boundary onward
+           the job's own frozen contract generation is the authority, so the
+           live contract may change or disappear without affecting either
+           stage. (Before that boundary it is checked, and drift there makes
+           the job stale -- see :meth:`_frozen_health_contract_drift`.)
+
+        What it DOES prove is the identity of the thing being acted on: the
+        same source, an LXC, present and active, with this job's exact VMID,
+        binding, locator generation, continuity revision, node, and an
+        available node. That is what stops a rollback landing on -- or a
+        health PASS being recorded about -- a replaced guest at a reused
+        VMID.
         """
 
         current = connection.execute(
@@ -3813,15 +4510,29 @@ class InventoryAuthority:
         Every proof and the checkpoint it authorizes share ONE ``BEGIN
         IMMEDIATE`` transaction, in this order:
 
-        - the job is ACTIVE, and at ``mutation_may_have_started`` or
-          ``mutation_completed``. **Both** are legal entry points, and that
-          is the whole point of schema v14: a mutation that failed, was
-          partial, or could not be proven complete never reaches
-          ``mutation_completed``, and it is exactly that job which needs
-          compensating. Nothing here writes ``mutation_completed_at``;
-          nothing here even reads it as permission.
+        - the job is ACTIVE at one of FOUR legal entry points, and no
+          other. Each is a real state a job that may need compensating can
+          be in, and none of them is a success claim:
+
+          * ``mutation_may_have_started`` -- a package mutation that failed,
+            was partial, timed out, was killed, or could not be proven
+            complete. It never reaches ``mutation_completed``, and it is
+            exactly the job that most needs compensating. That is the whole
+            point of schema v14: nothing here writes ``mutation_completed_at``
+            and nothing here reads it as permission.
+          * ``mutation_completed`` -- an operator rolling back before, or
+            without, any completed health evaluation.
+          * ``health_started`` -- health execution that was uncertain,
+            interrupted, or could not reach a verdict. Schema v16's
+            equivalent of the v14 lesson: rollback after unknown health must
+            NOT require health success, for the same reason rollback after
+            an uncertain mutation must not require mutation success.
+          * ``health_completed`` with ``health_outcome='failed'`` -- a
+            deterministic health failure. A PASSED verdict is unreachable
+            here because it is inseparable from ``status='succeeded'``, and
+            a terminal job is refused by the ACTIVE guard above.
         - the exact resource/locator context still holds
-          (:meth:`_rollback_resource_context_is_current`) -- deliberately not
+          (:meth:`_post_mutation_job_context_is_current`) -- deliberately not
           package-plan currency;
         - ``observed`` -- a FRESH canonical PVE snapshot listing -- proves,
           through the existing
@@ -3848,14 +4559,23 @@ class InventoryAuthority:
                 # Already past the boundary. Never re-decide eligibility for
                 # a job whose guest may already be being rolled back.
                 return self._store.package_update_job(canonical_job_id)
-            if checkpoint not in (
-                PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
-                PackageUpdateCheckpoint.MUTATION_COMPLETED,
-            ):
+            if checkpoint not in _ROLLBACK_ELIGIBLE_CHECKPOINTS:
                 raise AuthorityConflict(
                     "package update job is not eligible for same-job rollback"
                 )
-            if not self._rollback_resource_context_is_current(connection, job):
+            if (
+                checkpoint is PackageUpdateCheckpoint.HEALTH_COMPLETED
+                and str(job["health_outcome"]) != HealthOutcome.FAILED.value
+            ):
+                # Belt and braces under the schema: a PASSED verdict and
+                # `status='succeeded'` are one indivisible fact, so this is
+                # already unreachable through the ACTIVE guard. Stated
+                # anyway, because "rollback is refused after a successful
+                # health verdict" is a product rule, not an emergent one.
+                raise AuthorityConflict(
+                    "package update job is not eligible for same-job rollback"
+                )
+            if not self._post_mutation_job_context_is_current(connection, job):
                 raise RollbackSubmissionRefusedBeforeCallback(
                     "package update job resource or locator context is stale"
                 )
@@ -3879,6 +4599,12 @@ class InventoryAuthority:
                 recorded_at=recorded_at,
                 snapshot_name=str(job["snapshot_name"]),
                 mutation_was_proven_complete=job["mutation_completed_at"] is not None,
+                entered_from=checkpoint,
+                health_outcome=(
+                    None
+                    if job["health_outcome"] is None
+                    else str(job["health_outcome"])
+                ),
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -3891,6 +4617,8 @@ class InventoryAuthority:
         recorded_at: str,
         snapshot_name: str,
         mutation_was_proven_complete: bool,
+        entered_from: PackageUpdateCheckpoint,
+        health_outcome: str | None,
     ) -> None:
         # ONE statement, so the checkpoint, the operation identity, and the
         # timestamp are a single coherent write-ahead fact. The `IS NULL`
@@ -3902,7 +4630,9 @@ class InventoryAuthority:
             "SET checkpoint='rollback_may_have_started', "
             "rollback_operation_id=?, rollback_may_have_started_at=? "
             "WHERE job_id=? AND status='active' "
-            "AND checkpoint IN ('mutation_may_have_started', 'mutation_completed') "
+            "AND checkpoint IN ('mutation_may_have_started', "
+            "'mutation_completed', 'health_started', 'health_completed') "
+            "AND (health_outcome IS NULL OR health_outcome = 'failed') "
             "AND rollback_operation_id IS NULL "
             "AND rollback_may_have_started_at IS NULL",
             (identity.rollback_operation_id, recorded_at, job_id),
@@ -3926,8 +4656,12 @@ class InventoryAuthority:
                 "rollback_operation_id": identity.rollback_operation_id,
                 "snapshot_name": snapshot_name,
                 # Recorded as truthful history, never as permission: a
-                # rollback is equally legal from an unproven mutation.
+                # rollback is equally legal from an unproven mutation, from
+                # an unresolved health evaluation, and from a proven health
+                # failure.
                 "mutation_was_proven_complete": mutation_was_proven_complete,
+                "entered_from_checkpoint": entered_from.value,
+                "health_outcome": health_outcome,
             },
         )
 
@@ -3966,7 +4700,7 @@ class InventoryAuthority:
         ``rollback_may_have_started``, the job's derived rollback identity
         against its persisted one, and the exact resource/locator context.
         Package-plan currency is NOT re-proved -- see
-        :meth:`_rollback_resource_context_is_current` for why re-approving an
+        :meth:`_post_mutation_job_context_is_current` for why re-approving an
         already-run update must never gate its compensation.
 
         ``submit`` MUST be the host's submission-only rollback operation and
@@ -3991,7 +4725,7 @@ class InventoryAuthority:
             self._require_armed_rollback_job(job)
             # Re-derive and re-prove the identity against the persisted one.
             self._rollback_identity_in_transaction(connection, job)
-            context_holds = self._rollback_resource_context_is_current(
+            context_holds = self._post_mutation_job_context_is_current(
                 connection, job
             )
             self._after_rollback_authority_proof(

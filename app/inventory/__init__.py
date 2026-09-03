@@ -1,6 +1,11 @@
 """Hubinet Ops 0.5 persistent inventory authority core."""
 
-from .authority import InventoryAuthority, package_plan_fingerprint
+from .authority import (
+    HealthProbeObservation,
+    InventoryAuthority,
+    PackageUpdateHealthContextChanged,
+    package_plan_fingerprint,
+)
 from .canonicalization import (
     CANONICALIZATION_CONTRACT_VERSION,
     canonicalize_transport_locator,
@@ -12,6 +17,9 @@ from .health_contract import (
     MIN_HEALTH_PROBES,
     canonical_health_probes,
     health_contract_fingerprint,
+)
+from .health_observation import (
+    HEALTH_PROBE_REASONS,
 )
 from .contention_policy import (
     AUTHORITY_WRITER_WAIT_BUDGET_MS,
@@ -32,9 +40,12 @@ from .models import (
     BackendInstance,
     DiscoveryRun,
     DiscoveryRunLifecycle,
+    DEFINITIVE_HEALTH_OUTCOMES,
     EndpointLifecycle,
     HealthContractRevisionConflict,
+    HealthOutcome,
     HealthProbeKind,
+    HealthProbeOutcome,
     InventorySource,
     InventorySourceState,
     InventoryNode,
@@ -58,8 +69,11 @@ from .models import (
     PackageUpdateEventLevel,
     PackageUpdateEventType,
     PackageUpdateExecutionOutcome,
+    PackageUpdateHealthRequest,
     PackageUpdateJob,
     PackageUpdateJobEvent,
+    PackageUpdateJobHealthProbe,
+    PackageUpdateJobHealthProbeResult,
     PackageUpdateJobPackage,
     PackageUpdateJobStatus,
     PackageUpdateRollbackTarget,
@@ -79,6 +93,7 @@ from .models import (
     SourceRuntimeHealth,
     ResourceIncarnation,
     ResourceLocatorBinding,
+    aggregate_health_outcome,
 )
 from .discovery import (
     BaselineCompleteness,
@@ -140,6 +155,7 @@ __all__ = [
     "BOUNDED_PROCESS_CLEANUP_SECONDS",
     "BoundaryBaselineResult",
     "CANONICALIZATION_CONTRACT_VERSION",
+    "DEFINITIVE_HEALTH_OUTCOMES",
     "DiscoveryRun",
     "DiscoveryRunCompletionEvidence",
     "DiscoveryRunLifecycle",
@@ -148,9 +164,13 @@ __all__ = [
     "DiscoveredResource",
     "ENDPOINT_ACL_MATRIX",
     "EndpointLifecycle",
+    "HEALTH_PROBE_REASONS",
     "HealthContractError",
     "HealthContractRevisionConflict",
+    "HealthOutcome",
     "HealthProbeKind",
+    "HealthProbeObservation",
+    "HealthProbeOutcome",
     "InventoryAuthority",
     "InventoryAuthorityStore",
     "InventorySource",
@@ -185,8 +205,12 @@ __all__ = [
     "PackageUpdateEventLevel",
     "PackageUpdateEventType",
     "PackageUpdateExecutionOutcome",
+    "PackageUpdateHealthContextChanged",
+    "PackageUpdateHealthRequest",
     "PackageUpdateJob",
     "PackageUpdateJobEvent",
+    "PackageUpdateJobHealthProbe",
+    "PackageUpdateJobHealthProbeResult",
     "PackageUpdateJobPackage",
     "PackageUpdateJobStatus",
     "PackageUpdateRollbackTarget",
@@ -222,6 +246,7 @@ __all__ = [
     "SourceEndpoint",
     "SourceRuntimeHealth",
     "WRITER_SCHEDULING_MARGIN_SECONDS",
+    "aggregate_health_outcome",
     "build_snapshot_ownership",
     "canonical_health_probes",
     "canonicalize_transport_locator",

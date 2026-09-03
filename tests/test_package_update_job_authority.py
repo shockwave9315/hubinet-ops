@@ -10,6 +10,7 @@ import pytest
 
 from app.inventory import (
     AuthorityConflict,
+    HealthProbeKind,
     InventoryAuthority,
     InventoryAuthorityStore,
     PackageScanFailure,
@@ -17,12 +18,38 @@ from app.inventory import (
     PackageUpdateCheckpoint,
     PackageUpdateEventType,
     PackageUpdateJobStatus,
+    ResourceHealthProbe,
 )
 from tests.test_package_plan_approval import _successful_plan
 from tests.test_package_scan_authority import START, _packages, _reconcile, _system
 
 
-def _approved_system(tmp_path: Path, *, packages=None, resource_type: str = "lxc"):
+#: The health contract every fixture below declares before issuing a job.
+#: Issuance freezes a contract generation and refuses a resource that has
+#: none (schema v16), so "an approved system" now means one that has said
+#: what healthy means -- see `test_issuance_refuses_a_resource_with_no_health_contract`
+#: in tests/test_package_update_health.py for the refusal itself.
+HEALTH_PROBES = (
+    ResourceHealthProbe(kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"),
+    ResourceHealthProbe(
+        kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING, target="web"
+    ),
+)
+
+
+def _declare_health_contract(authority, resource, probes=None):
+    return authority.replace_resource_health_contract(
+        resource.resource_id, probes if probes is not None else HEALTH_PROBES
+    )
+
+
+def _approved_system(
+    tmp_path: Path,
+    *,
+    packages=None,
+    resource_type: str = "lxc",
+    health_probes=None,
+):
     clock, store, authority, resource = _system(
         tmp_path, resource_type=resource_type
     )
@@ -32,6 +59,7 @@ def _approved_system(tmp_path: Path, *, packages=None, resource_type: str = "lxc
     approval = authority.approve_package_plan(
         resource.resource_id, scan.scan_run_id, scan.plan_fingerprint
     )
+    _declare_health_contract(authority, resource, health_probes)
     return clock, store, authority, resource, scan, approval
 
 
@@ -52,6 +80,7 @@ def _add_approved_resource(store, authority):
     approval = authority.approve_package_plan(
         resource.resource_id, scan.scan_run_id, scan.plan_fingerprint
     )
+    _declare_health_contract(authority, resource)
     return resource, scan, approval
 
 

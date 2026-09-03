@@ -966,26 +966,264 @@ def test_no_snapshot_deletion_exists_anywhere_in_the_product() -> None:
             assert forbidden not in text, (rel_path, forbidden)
 
 
-def test_no_health_execution_exists_anywhere() -> None:
-    """Healthcheck execution is deliberately NOT part of this stage.
+def test_only_the_authority_may_write_a_health_verdict() -> None:
+    """Health execution exists now, so the invariant changes shape.
 
-    Health is now DEFINED per resource (an operator-declared contract), but
-    nothing evaluates one, so no code may claim a verdict: nothing writes
-    `health_started_at`, advances to the `health_started` checkpoint, or
-    terminalizes a job `succeeded`.
+    Nothing may claim a verdict except the ONE authority boundary that proves
+    it: no other module -- including the dark health orchestrator, its host
+    control, and every other dark stage -- may write `health_started_at`,
+    `health_outcome`, `health_completed_at`, the health checkpoints, or
+    `status='succeeded'`. Those are transitions the authority owns, and a
+    caller supplies typed observations to it, never a verdict.
     """
 
+    verdict_writes = (
+        "health_started_at=",
+        "health_completed_at=",
+        "health_outcome=",
+        "status='succeeded'",
+        "checkpoint='health_started'",
+        "checkpoint='health_completed'",
+    )
     for rel_path in (
-        "app/inventory/authority.py",
+        "app/package_update_health.py",
+        "app/package_update_health_host_control.py",
         "app/package_update_rollback.py",
         "app/package_update_mutation.py",
         "app/package_update_snapshot.py",
         "app/package_update_execution.py",
+        "app/inventory_runtime.py",
+        "custom_components/hubinet_ops/services.py",
+        "custom_components/hubinet_ops/transport_http.py",
+        "deploy/hubinet-package-health-helper.py",
+    ):
+        text = _executable_source(REPO_ROOT / rel_path)
+        for forbidden in verdict_writes:
+            assert forbidden not in text, (rel_path, forbidden)
+
+
+# ---------------------------------------------------------------------------
+# Job-bound healthcheck execution stays dark.
+# ---------------------------------------------------------------------------
+
+
+def test_health_execution_is_not_production_reachable() -> None:
+    """The last dark stage of the update lifecycle stays unreachable.
+
+    Nothing on the production HTTP, Home Assistant, scheduler, bootstrap, or
+    updater paths -- nor any other dark stage -- may construct or call the
+    health orchestrator, its host control, or the authority's health
+    transitions.
+    """
+
+    health_symbols = (
+        "app.package_update_health",
+        "app.package_update_health_host_control",
+        "PackageUpdateHealthHostControl",
+        "SshPackageUpdateHealthHostControl",
+        "PackageUpdateHealthOrchestrator",
+        "evaluate_job_health",
+        "start_package_update_health",
+        "complete_package_update_health",
+        "record_package_update_health_outcome_unknown",
+        "package_update_health_request",
+        "evaluate_health_contract",
+        "hubinet-package-health-helper",
+    )
+    for rel_path in (
+        "app/inventory_runtime.py",
+        "app/inventory_scheduler.py",
+        "app/package_scan_scheduler.py",
+        "app/package_scan.py",
+        "app/package_scan_host_control.py",
+        "app/package_update_snapshot.py",
+        "app/package_update_snapshot_host_control.py",
+        "app/package_update_execution.py",
+        "app/package_update_execution_host_control.py",
+        "app/package_update_mutation.py",
+        "app/package_update_mutation_host_control.py",
+        "app/package_update_rollback.py",
+        "app/package_update_rollback_host_control.py",
+        "app/inventory_runtime_config.py",
+        "custom_components/hubinet_ops/services.py",
+        "custom_components/hubinet_ops/transport_http.py",
+        "custom_components/hubinet_ops/coordinator.py",
+        "deploy/bootstrap-proxmox-0.5.sh",
+        "deploy/update-proxmox-0.5.sh",
+        "deploy/install-0.5.0-fresh.sh",
     ):
         text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
-        assert "health_started_at=" not in text, rel_path
-        assert "status='succeeded'" not in text, rel_path
-        assert "checkpoint='health_started'" not in text, rel_path
+        for symbol in health_symbols:
+            assert symbol not in text, (rel_path, symbol)
+
+
+def test_bootstrap_and_updater_deploy_no_health_helper_key_or_privilege() -> None:
+    """No health helper, forced-command line, key, or PVE privilege ships.
+
+    Health evaluation needs NO new PVE API privilege: it reads through
+    host-local `pct exec` behind its own forced-command boundary, so the
+    provisioned role stays exactly the audit-only pair.
+    """
+
+    for rel_path in ("deploy", "deploy/lib"):
+        directory = REPO_ROOT / rel_path
+        for path in sorted(directory.glob("*.sh")):
+            text = path.read_text(encoding="utf-8")
+            assert "hubinet-package-health" not in text, path
+            assert "health-operations" not in text, path
+
+
+def test_health_execution_never_calls_the_rollback_stage() -> None:
+    """No automatic health-triggered compensation, at the source level.
+
+    This product has made no compensation policy, so a failing health verdict
+    reports and stops. Nothing in the health stage may arm, submit, seal, or
+    even inspect a rollback -- and there is no retry count, grace period,
+    threshold, majority, or OR logic anywhere in it either.
+    """
+
+    forbidden = (
+        "arm_package_update_rollback",
+        "roll_back_to_job_snapshot",
+        "submit_same_job_rollback",
+        "seal_rollback_never_submitted",
+        "inspect_rollback_state",
+        "execute_rollback_submission_if_current",
+        "PackageUpdateRollbackOrchestrator",
+        "app.package_update_rollback",
+        "retry_count",
+        "grace_period",
+        "health_threshold",
+    )
+    for rel_path in (
+        "app/package_update_health.py",
+        "app/package_update_health_host_control.py",
+        "deploy/hubinet-package-health-helper.py",
+    ):
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        for symbol in forbidden:
+            assert symbol not in text, (rel_path, symbol)
+
+
+def test_the_health_helper_exposes_exactly_one_read_only_operation() -> None:
+    """One typed operation, and nothing that can change anything.
+
+    It is deliberately the narrowest helper in this repository: no journal,
+    no lease, no seal, no submission -- because a read has no at-most-once
+    property to protect.
+    """
+
+    text = (REPO_ROOT / "deploy/hubinet-package-health-helper.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"evaluate_health_contract"' in text
+    executable = _executable_source(REPO_ROOT / "deploy/hubinet-package-health-helper.py")
+    for forbidden in (
+        "shell=True",
+        "os.system",
+        "sh -c",
+        "apt-get",
+        "dpkg",
+        "pct destroy",
+        "pct start",
+        "pct stop",
+        "pct rollback",
+        "snapshot",
+        "pvesh create",
+        "pvesh delete",
+        "pvesh set",
+        "systemctl start",
+        "systemctl stop",
+        "systemctl restart",
+        "is-active",
+        "docker start",
+        "docker stop",
+        "docker restart",
+        "docker rm",
+        "docker exec",
+        "docker run",
+    ):
+        assert forbidden not in executable, forbidden
+
+
+def test_the_health_helper_builds_only_fixed_argv_around_a_data_target() -> None:
+    """A probe target is DATA, and the commands around it are constants.
+
+    Asserted structurally over the AST rather than by substring: every string
+    inside the three probe evaluators must be a literal this file owns, so a
+    target can never be concatenated, formatted, or templated into command
+    text. The one interpolation allowed anywhere near Docker is the exact
+    `/`-prefixed name comparison, which is a CHECK on the answer, not part of
+    a command.
+    """
+
+    path = REPO_ROOT / "deploy/hubinet-package-health-helper.py"
+    module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    evaluators = {
+        node.name: node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name.startswith("evaluate_")
+    }
+    assert set(evaluators) == {
+        "evaluate_systemd_unit_active",
+        "evaluate_docker_container_running",
+        "evaluate_docker_container_healthy",
+    }
+    for name, node in evaluators.items():
+        for inner in ast.walk(node):
+            # An f-string or a `%`/`.format()` call building a command would
+            # be exactly the interpolation this stage forbids.
+            assert not isinstance(inner, ast.JoinedStr) or name.startswith(
+                "evaluate_docker"
+            ), name
+            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                assert inner.func.attr != "format", name
+
+    # The Docker template is a module-level constant, not built anywhere.
+    constants = {
+        target.id: node
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    template = constants["DOCKER_INSPECT_FORMAT"]
+    assert isinstance(template.value, (ast.Constant, ast.JoinedStr, ast.BinOp))
+    assert "{{.Name}}" in _load_health_helper().DOCKER_INSPECT_FORMAT
+
+
+def _load_health_helper():
+    spec = importlib.util.spec_from_file_location(
+        "hubinet_package_health_helper_r0",
+        REPO_ROOT / "deploy" / "hubinet-package-health-helper.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_health_helper_is_the_only_file_that_can_probe_a_workload() -> None:
+    """Every other helper keeps its own, unrelated promise."""
+
+    health = REPO_ROOT / "deploy/hubinet-package-health-helper.py"
+    assert health.exists()
+    for other in (
+        "deploy/hubinet-package-scan-helper.py",
+        "deploy/hubinet-package-snapshot-helper.py",
+        "deploy/hubinet-package-update-helper.py",
+        "deploy/hubinet-package-mutation-helper.py",
+        "deploy/hubinet-package-rollback-helper.py",
+    ):
+        text = (REPO_ROOT / other).read_text(encoding="utf-8")
+        for forbidden in (
+            "evaluate_health_contract",
+            "systemctl",
+            "docker",
+        ):
+            assert forbidden not in text, (other, forbidden)
 
 
 def _executable_source(path) -> str:
@@ -1084,24 +1322,28 @@ def test_health_contracts_are_configuration_and_never_execution() -> None:
             assert forbidden not in text, (rel_path, forbidden)
 
 
-def test_no_health_executor_module_or_scheduler_exists() -> None:
-    """There is no health worker, scheduler, or host-control boundary yet."""
+def test_no_health_scheduler_or_worker_exists() -> None:
+    """Health EXECUTION exists; automatic health OPERATION does not.
+
+    The internal primitive is built, but nothing schedules it, polls it, or
+    consumes approved plans to run it. A caller must ask for one exact job to
+    be evaluated, exactly as a caller must ask for one exact job to be rolled
+    back.
+    """
 
     existing = {path.name for path in (REPO_ROOT / "app").glob("*.py")}
     for forbidden in (
-        "health_execution.py",
         "health_scheduler.py",
         "health_worker.py",
-        "health_host_control.py",
-        "package_update_health.py",
+        "package_update_health_scheduler.py",
     ):
         assert forbidden not in existing, forbidden
-    for forbidden in (
-        "hubinet-health-helper.py",
-        "hubinet-package-health-helper.py",
-    ):
-        assert not (REPO_ROOT / "deploy" / forbidden).exists(), forbidden
 
     runtime = (REPO_ROOT / "app/inventory_runtime.py").read_text(encoding="utf-8")
-    for forbidden in ("HealthScheduler", "health_scheduler", "evaluate_health"):
+    for forbidden in (
+        "HealthScheduler",
+        "health_scheduler",
+        "evaluate_health",
+        "PackageUpdateHealthOrchestrator",
+    ):
         assert forbidden not in runtime, forbidden
