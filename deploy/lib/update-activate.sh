@@ -520,8 +520,11 @@ _update_acquire_pre_activation_fence() {
 # match them without any new durable state at all.
 #
 # The four required behaviours fall straight out of that comparison:
-#   absent          -> nothing to release (success -- there is nothing this
-#                       run still owes);
+#   absent          -> nothing to REMOVE, but still not automatically
+#                       "released": the removal (this run'''s or an earlier
+#                       attempt'''s) must positively cross the same
+#                       durability barrier before success is reported --
+#                       see the durability-retry correction pass below;
 #   this run'''s      -> release it (at a terminal point only), and the
 #                       result is TRUTHFUL: success is returned only once
 #                       removal AND its durability barrier are both proven,
@@ -539,11 +542,40 @@ _update_acquire_pre_activation_fence() {
 # own release obligation was NOT positively discharged, and every caller
 # below is ordered so that failure propagates (via `set -e`) BEFORE the
 # journal carrying this run's recovery identity is ever cleared.
+#
+# Correction pass, durability-retry sibling: the ABSENT branch used to
+# report success from mere absence alone. That missed a reachable
+# sequence -- `rm` succeeds, the FOLLOWING durability barrier then fails,
+# this function correctly returns failure and the journal survives, the
+# process exits -- and on the very next invocation the fence now reads as
+# absent. Reporting success there without re-proving the barrier would let
+# the journal clear before the earlier `rm` was ever durably committed, so
+# a later power loss could resurrect the "removed" fence with no journal
+# left to reconnect it to. The absent branch below therefore performs the
+# SAME `sync -f /var/lib/hubinet-ops` barrier every other branch already
+# required before it may report success.
 _update_release_maintenance_fence() {
   local fence_path="/var/lib/hubinet-ops/product-update-maintenance.fence"
   local raw holder
   raw="$(pct exec "${VMID}" -- cat "${fence_path}" 2>/dev/null)" || raw=""
   if [[ -z "${raw}" ]]; then
+    # Absent is not sufficient by itself (correction pass, the same
+    # review finding's durability-retry sibling). A prior invocation's
+    # `rm` can have succeeded while ITS OWN following durability barrier
+    # then failed -- that invocation correctly returned failure and kept
+    # the journal, but the directory-entry removal itself was never
+    # durably proven. Without re-proving it here, THIS invocation would
+    # report success from mere absence, the caller would clear the
+    # journal, and a subsequent power loss could resurrect the removed
+    # fence with no journal left to reconnect it to. So an absent fence
+    # still must positively cross the SAME durability barrier -- proving
+    # whichever removal (this run's or an earlier attempt's) is truly
+    # committed -- before release may ever be reported, and therefore
+    # before the caller may discard the journal.
+    if ! pct exec "${VMID}" -- sync -f /var/lib/hubinet-ops >/dev/null 2>&1; then
+      log_warn "the product-update maintenance fence inside container ${VMID} is absent, but its removal could not be durably proven; NOT recording it as released. The next updater invocation will retry."
+      return 1
+    fi
     UPDATE_FENCE_HELD="0"
     return 0
   fi

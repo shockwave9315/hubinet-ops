@@ -5287,33 +5287,81 @@ class TestFenceReleasedBeforeJournalDisposal:
     def test_a_failed_durability_proof_never_rolls_back_and_retains_both_artifacts(
         self, tmp_path
     ):
-        """Required test 6: the barrier itself, not just the `rm`, must be
-        proven before release is ever claimed.
+        """Required test 6, tightened for the durability-retry sibling: the
+        barrier itself, not just the `rm`, must be proven before release is
+        ever claimed -- and that stays true even once the `rm` has already
+        succeeded and the fence has already vanished from disk, across
+        however many retries the barrier itself keeps failing.
+
+        Witnesses, in order:
+
+        1. same-run fence exists, `rm` succeeds, the barrier fails: the
+           fence is already gone from disk, but release is NOT reported,
+           and the journal survives;
+        2. a second invocation, with the SAME fault still active, finds the
+           fence already ABSENT -- and must still positively perform (not
+           skip) the same durability barrier, fail it again, and again
+           preserve the journal without a false release;
+        3. only once the fault clears does a third invocation's barrier
+           finally succeed and the journal clear.
         """
+
+        SYNC_LINE = f"pct exec {FAKE_VMID} -- sync -f /var/lib/hubinet-ops"
 
         env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
         scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
         scenario["fail"] = ["ct_sync_final_authority_dir"]
         env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
 
-        failed = _run(env.env, _base_args(target))
+        # --- 1: rm succeeds, the barrier that must follow it fails -------
+        first = _run(env.env, _base_args(target))
 
-        assert failed.returncode != 0
-        assert "ROLLBACK COULD NOT BE COMPLETED" not in failed.stderr
+        assert first.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in first.stderr
         assert "released the exclusive product-update maintenance fence" not in (
-            failed.stderr
+            first.stderr
         )
         assert journal.exists()
-        # The `rm` itself succeeded here -- only the barrier failed -- but
-        # a fence removed-but-unproven must still not be reported released,
-        # and the file itself may legitimately already be gone from disk.
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+        # The `rm` itself already succeeded -- the fence is genuinely gone
+        # from disk -- even though the barrier that must follow it before
+        # release may be CLAIMED has not yet been proven.
+        assert not fence.exists()
+        sync_calls_after_first = env.log_lines().count(SYNC_LINE)
+        assert sync_calls_after_first >= 1
 
+        # --- 2: fence now reads ABSENT; the barrier must still run, and --
+        # --- still fails (same fault, still active) ----------------------
+        second = _run(env.env, _base_args(target))
+
+        assert second.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in second.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            second.stderr
+        )
+        assert "durably proven" in second.stderr
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+        assert not fence.exists()
+        # The load-bearing witness: an ABSENT fence must not short-circuit
+        # release without re-attempting the barrier. A second, genuinely
+        # NEW `sync -f /var/lib/hubinet-ops` call was issued this
+        # invocation -- the fix is not merely returning success for
+        # "nothing to remove".
+        sync_calls_after_second = env.log_lines().count(SYNC_LINE)
+        assert sync_calls_after_second > sync_calls_after_first
+
+        # --- 3: fault clears; the (still-absent-fence) barrier finally ---
+        # --- succeeds, and only then does the journal clear --------------
         scenario["fail"] = []
         env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
         recovery = _run(env.env, _base_args(target))
 
         assert recovery.returncode == 0, recovery.stderr
         assert not journal.exists()
+        assert not fence.exists()
+        sync_calls_after_recovery = env.log_lines().count(SYNC_LINE)
+        assert sync_calls_after_recovery > sync_calls_after_second
         assert not fence.exists()
 
     def test_a_malformed_fence_fails_closed_without_a_false_release(self, tmp_path):
