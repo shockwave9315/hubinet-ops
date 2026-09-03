@@ -1810,6 +1810,15 @@ class InventoryAuthority:
                     self._after_package_update_job_issuance(
                         connection, job_id=job_id
                     )
+                    # Issuance is the first moment a resource's published
+                    # `package_update_job` summary exists at all -- from
+                    # `not_started` to the job's own issued state. Every
+                    # later transition that changes that same summary bumps
+                    # this the same way; see the sibling calls throughout
+                    # this stage.
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
                     result_job_id = job_id
 
         if rejected_current_authority:
@@ -2231,6 +2240,9 @@ class InventoryAuthority:
                         message="package update job preflight authority revalidated",
                         details={},
                     )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
                 elif checkpoint is not PackageUpdateCheckpoint.PREFLIGHT_PASSED:
                     raise AuthorityConflict(
                         "package update job has already advanced past preflight"
@@ -2359,6 +2371,9 @@ class InventoryAuthority:
                 "snapshot_operation_id": identity.snapshot_operation_id,
                 "snapshot_name": identity.snapshot_name,
             },
+        )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
         )
 
     def execute_snapshot_submission_if_current(
@@ -2563,6 +2578,9 @@ class InventoryAuthority:
                         message="job-owned pre-update snapshot confirmed canonically",
                         details={"snapshot_name": snapshot_name},
                     )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
                 elif checkpoint is not PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED:
                     raise AuthorityConflict(
                         "package update job is not inside a snapshot operation"
@@ -2654,6 +2672,9 @@ class InventoryAuthority:
                     ),
                     message=reason,
                     details={"snapshot_name": str(job["snapshot_name"])},
+                )
+                self._bump_global_revisions(
+                    connection, inventory_changed=False, published_changed=True
                 )
                 blocked = True
         return blocked, self._store.package_update_job(canonical_job_id)
@@ -2757,6 +2778,9 @@ class InventoryAuthority:
                 event_type=PackageUpdateEventType.SNAPSHOT_FAILED,
                 message=canonical_reason,
                 details={},
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -2882,6 +2906,9 @@ class InventoryAuthority:
             ),
             message=reason,
             details={},
+        )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
         )
 
     def select_package_update_rollback_target(
@@ -3124,6 +3151,9 @@ class InventoryAuthority:
             message=reason,
             details={},
         )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
+        )
         return True
 
     def revalidate_or_release_stale_package_update_execution(
@@ -3301,6 +3331,9 @@ class InventoryAuthority:
                             "job_package_count": len(job_material),
                             "fresh_package_count": len(fresh_material),
                         },
+                    )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
                     )
 
         if outcome is None:
@@ -3570,6 +3603,9 @@ class InventoryAuthority:
                             "fresh_package_count": len(fresh_material),
                         },
                     )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
 
         if outcome is None:
             raise AuthorityInvariantError(
@@ -3629,6 +3665,9 @@ class InventoryAuthority:
                 "package_count": package_count,
                 "accepted_prepared_evidence_digest": accepted_evidence_digest,
             },
+        )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
         )
 
     def execute_package_mutation_submission_if_current(
@@ -3932,6 +3971,9 @@ class InventoryAuthority:
             message=reason,
             details={},
         )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
+        )
 
     def complete_package_update_mutation(
         self, job_id: str, post_state: PackageMutationPostState
@@ -4019,6 +4061,9 @@ class InventoryAuthority:
                     "package mutation is complete"
                 ),
                 details={"package_count": len(job_material)},
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -4193,6 +4238,9 @@ class InventoryAuthority:
                     ),
                     "probe_count": len(probes),
                 },
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -4373,6 +4421,9 @@ class InventoryAuthority:
                     "failed_probe_indexes": failed_indexes,
                     "unknown_probe_indexes": unknown_indexes,
                 },
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -4796,6 +4847,9 @@ class InventoryAuthority:
                 "health_outcome": health_outcome,
             },
         )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
+        )
 
     @staticmethod
     def _require_armed_rollback_job(job: sqlite3.Row) -> None:
@@ -5113,6 +5167,9 @@ class InventoryAuthority:
             message=reason,
             details={},
         )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
+        )
 
     def complete_package_update_rollback(
         self,
@@ -5236,6 +5293,9 @@ class InventoryAuthority:
                     "guest_left_stopped": True,
                 },
             )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
         return self._store.package_update_job(canonical_job_id)
 
     @staticmethod
@@ -5342,6 +5402,14 @@ class InventoryAuthority:
                     event_type=PackageUpdateEventType.RESTART_INTERRUPTED,
                     message=reason,
                     details={},
+                )
+            if recovered:
+                # One bump for the whole pass, not one per job: every
+                # recovered job's published summary changed, but the
+                # published revision is a single global counter, not a
+                # per-resource one.
+                self._bump_global_revisions(
+                    connection, inventory_changed=False, published_changed=True
                 )
         return recovered
 

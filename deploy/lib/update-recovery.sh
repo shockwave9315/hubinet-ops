@@ -505,12 +505,36 @@ update_startup_recovery_gate() {
   if [[ "${UPDATE_JOURNAL_STATE}" == "completed" || "${UPDATE_JOURNAL_STATE}" == "recovered" ]]; then
     _update_prove_service_enabled_active_and_healthy \
       || _update_rollback_hard_stop "run ${UPDATE_RUN_ID} was durably marked ${UPDATE_JOURNAL_STATE}, but VMID ${VMID} does not now prove enabled + active + healthy within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (enabled: ${_UPDATE_SERVICE_ENABLED_DETAIL}; readiness: ${_UPDATE_SERVICE_READINESS_DETAIL})"
-    update_journal_resolve "${UPDATE_JOURNAL_STATE}"
+    # Terminal product state is already durable (this journal's own
+    # recorded state), so run-owned cleanup may proceed. Deliberately NOT
+    # `update_journal_resolve` here (correction pass, review finding on PR
+    # #74): that helper clears the journal itself, and this run's journal
+    # is the ONLY durable record carrying its recovery identity
+    # (UPDATE_RUN_ID) that a later invocation could match the maintenance
+    # fence's own recorded holder against. Releasing the fence THIS run may
+    # still hold and clearing that journal must therefore happen in this
+    # exact order -- release proven first, journal discarded only after --
+    # never the reverse: a crash between "journal cleared" and "fence
+    # released" would otherwise leave a durable fence with no journal left
+    # to reconnect it to, permanently refusing every future workload update.
+    _update_cleanup_recovered_run_artifacts
+    # Test-only (PR #74 review finding 2): exercise a real TERM here, after
+    # cleanup but before the fence release this journal still owes.
+    _update_test_term_checkpoint before_recovery_fence_release
     # The interrupted run was already terminal and the installation now
     # proves enabled + active + healthy, so nothing can still replace
     # backend or helper material on its behalf. Release the fence it may
-    # have been holding when it was interrupted.
+    # have been holding when it was interrupted -- a release failure
+    # propagates (`set -e`, `_UPDATE_STARTUP_RECOVERY_IN_PROGRESS` is still
+    # "1" here) straight to the EXIT trap's preserve-and-report path,
+    # leaving this journal exactly as it was for the next invocation to
+    # retry, rather than falsely reporting cleanup complete.
     _update_release_maintenance_fence
+    # Test-only: exercise a real TERM here, after the fence release this
+    # journal owed is durably proven but before the journal carrying that
+    # proof is discarded -- the exact edge this correction pass closes.
+    _update_test_term_checkpoint after_recovery_fence_release
+    _update_journal_clear
     _UPDATE_STARTUP_RECOVERY_IN_PROGRESS="0"
     log_warn "previous updater run ${UPDATE_RUN_ID} was already ${detected_state}; final cleanup is complete. Rerun the requested update."
     exit 0
@@ -529,11 +553,15 @@ update_startup_recovery_gate() {
     _update_prove_service_enabled_active_and_healthy \
       || _update_rollback_hard_stop "interrupted run ${UPDATE_RUN_ID} had not armed rollback, but the existing service does not prove enabled + active + healthy"
     update_journal_checkpoint recovered
-    _update_journal_clear
+    _update_test_term_checkpoint before_recovery_fence_release
     # Released only AFTER the untouched installation has been positively
     # proven, not merely because this branch never armed rollback: an
-    # unproven service is not a released fence.
+    # unproven service is not a released fence. And -- same ordering as
+    # the completed/recovered branch above -- released BEFORE the journal
+    # carrying this run's recovery identity is cleared, never after.
     _update_release_maintenance_fence
+    _update_test_term_checkpoint after_recovery_fence_release
+    _update_journal_clear
   fi
 
   _UPDATE_STARTUP_RECOVERY_IN_PROGRESS="0"

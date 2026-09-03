@@ -5125,3 +5125,272 @@ class TestProductUpdateMaintenanceFence:
         )
         assert not journal.exists()
         assert not _fence_file(env).exists()
+
+
+# ---------------------------------------------------------------------------
+# PR #74 review finding 2 -- the maintenance fence must be positively
+# released BEFORE the recovery journal carrying this run's identity is
+# ever discarded, in every terminal/recovered ordering, and
+# `_update_release_maintenance_fence` itself must report a TRUTHFUL result
+# (never a warn-and-continue "released" claim over a failed `rm` or a
+# skipped durability barrier).
+#
+# The crash edge under test: journal cleared before the fence it still
+# names is released would leave a durable fence with no journal left to
+# reconnect it to (the fence's own recorded holder becomes unmatchable),
+# permanently refusing every future workload package update. These tests
+# pin the fixed ordering directly at the two new test-only TERM
+# checkpoints (`before_recovery_fence_release`, `after_recovery_fence_
+# release`) that bracket the release call in every terminal recovery path,
+# plus the release function's own truthful failure modes.
+# ---------------------------------------------------------------------------
+
+
+class TestFenceReleasedBeforeJournalDisposal:
+    def _completed_but_uncleaned(self, tmp_path):
+        """One run TERMed immediately after `completed` is durable, before
+        its own fence release even starts.
+
+        The checkpoint is durable, but this run's cleanup, fence release,
+        and journal clear never ran. The fence this run acquired before
+        mutation is therefore still on disk, unreleased, and the journal
+        still names this run's own id -- the fixture every test below
+        recovers from via `update_startup_recovery_gate`'s own completed/
+        recovered branch.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="before_completed_fence_release")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+        interrupted = _run(env_with_term, _base_args(target))
+        assert interrupted.returncode == 143
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and "state=completed" in journal.read_text(encoding="utf-8")
+        assert fence.exists()
+        return env, target, journal, fence
+
+    def test_recovery_releases_the_fence_before_clearing_its_journal(self, tmp_path):
+        """Positive control: the fixed order completes cleanly.
+
+        No fault, no interruption -- ordinary recovery of a leftover
+        `completed` journal releases the fence and only then clears the
+        journal, ending with neither artifact on disk.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert "released the exclusive product-update maintenance fence" in recovery.stderr
+        assert "was already completed" in recovery.stderr
+        assert not fence.exists()
+        assert not journal.exists()
+
+    def test_crash_after_fence_release_but_before_journal_clear_still_recovers(
+        self, tmp_path
+    ):
+        """Witness for the finding itself: interrupt EXACTLY the closed edge.
+
+        A real crash landing between "fence release is durably proven" and
+        "the journal is cleared" must leave the journal on disk (it is the
+        only record of this run's identity), but the fence must already be
+        gone -- and a THIRD invocation must still complete cleanly: the
+        fence is already absent (a legitimate no-op release), so only the
+        journal is left to clear.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_recovery_fence_release")
+
+        crashed = _run(env_with_term, _base_args(target))
+
+        assert crashed.returncode == 143
+        assert "released the exclusive product-update maintenance fence" in crashed.stderr
+        # The fix: the fence is gone, but the journal -- the only durable
+        # record of this run's identity -- was deliberately NOT yet
+        # cleared when the crash landed.
+        assert not fence.exists()
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not journal.exists()
+
+    def test_crash_before_fence_release_leaves_both_fence_and_journal(self, tmp_path):
+        """The other side of the same edge: interrupted before release even
+        starts. Both artifacts must survive, exactly as they would have
+        under the OLD buggy ordering too -- this is the ordering the fix
+        must not regress, not the one it corrects.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="before_recovery_fence_release")
+
+        crashed = _run(env_with_term, _base_args(target))
+
+        assert crashed.returncode == 143
+        assert "released the exclusive product-update maintenance fence" not in (
+            crashed.stderr
+        )
+        assert fence.exists()
+        assert journal.exists()
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not fence.exists()
+        assert not journal.exists()
+
+    def test_a_failed_fence_removal_never_rolls_back_and_retains_both_artifacts(
+        self, tmp_path
+    ):
+        """Required test 5/6 (rm failure): truthful release, not a warning.
+
+        `_update_release_maintenance_fence` must not claim success over a
+        failed `rm`. The already-proven `completed` installation is never
+        rolled back, the journal and the (untouched, still valid) fence
+        both survive, and the next invocation -- once the fault clears --
+        completes normally.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        fence_content_before = fence.read_text(encoding="utf-8")
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_release_rm"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        failed = _run(env.env, _base_args(target))
+
+        assert failed.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in failed.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            failed.stderr
+        )
+        assert journal.exists() and "state=completed" in journal.read_text(encoding="utf-8")
+        assert fence.exists()
+        # Untouched, not merely present -- a corrupted-but-present fence
+        # could never be retried successfully.
+        assert fence.read_text(encoding="utf-8") == fence_content_before
+
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not fence.exists()
+        assert not journal.exists()
+
+    def test_a_failed_durability_proof_never_rolls_back_and_retains_both_artifacts(
+        self, tmp_path
+    ):
+        """Required test 6: the barrier itself, not just the `rm`, must be
+        proven before release is ever claimed.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["ct_sync_final_authority_dir"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        failed = _run(env.env, _base_args(target))
+
+        assert failed.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in failed.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            failed.stderr
+        )
+        assert journal.exists()
+        # The `rm` itself succeeded here -- only the barrier failed -- but
+        # a fence removed-but-unproven must still not be reported released,
+        # and the file itself may legitimately already be gone from disk.
+
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+
+    def test_a_malformed_fence_fails_closed_without_a_false_release(self, tmp_path):
+        """Required test 8: unreadable/malformed content is never read as
+        "nothing to release" -- it fails closed, exactly like a real
+        removal or durability failure, never a silent successful no-op.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        fence.write_text("not valid json at all", encoding="utf-8")
+
+        failed = _run(env.env, _base_args(target))
+
+        assert failed.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in failed.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            failed.stderr
+        )
+        assert "unreadable" in failed.stderr
+        assert journal.exists()
+        assert fence.exists()
+        assert fence.read_text(encoding="utf-8") == "not valid json at all"
+
+    def test_a_foreign_fence_found_during_recovery_is_never_removed(self, tmp_path):
+        """Required test 7: a fence some OTHER product update now holds is
+        never deleted on this run's behalf, and this run's own recovery
+        still completes -- it owes nothing to a fence that is not its own.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        fence.write_text(
+            json.dumps(
+                {"acquired_at": "2026-01-01T00:00:00+00:00", "holder": "someone-else"}
+            ),
+            encoding="utf-8",
+        )
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert "held by another product update" in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        # Never removed, never overwritten.
+        assert json.loads(fence.read_text(encoding="utf-8"))["holder"] == "someone-else"
+        # This run owed nothing to a fence it never held -- its OWN
+        # recovery still completes and its own journal is still cleared.
+        assert not journal.exists()
+
+    def test_rollback_recovery_also_releases_the_fence_before_clearing_its_journal(
+        self, tmp_path
+    ):
+        """The same ordering fix, on `update_rollback_on_failure`'s own
+        terminal path (reached directly from a failed forward update, and
+        from startup recovery's rollback-armed branch alike).
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_recovery_fence_release")
+
+        crashed = _run(env_with_term, _base_args(target))
+
+        assert crashed.returncode == 143
+        assert "released the exclusive product-update maintenance fence" in crashed.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert not fence.exists()
+        assert journal.exists()
+        assert "state=recovered" in journal.read_text(encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not journal.exists()

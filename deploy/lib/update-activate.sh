@@ -520,10 +520,25 @@ _update_acquire_pre_activation_fence() {
 # match them without any new durable state at all.
 #
 # The four required behaviours fall straight out of that comparison:
-#   absent          -> nothing to release;
-#   this run'''s      -> release it (at a terminal point only);
-#   another run'''s   -> never touched;
-#   unreadable      -> fail closed, left in place, reported.
+#   absent          -> nothing to release (success -- there is nothing this
+#                       run still owes);
+#   this run'''s      -> release it (at a terminal point only), and the
+#                       result is TRUTHFUL: success is returned only once
+#                       removal AND its durability barrier are both proven,
+#                       never merely attempted;
+#   another run'''s   -> never touched (success -- not this run'''s to
+#                       release);
+#   unreadable      -> fail closed: FAILURE, left in place, reported.
+#
+# Correction pass (review finding on PR #74): this used to warn-and-continue
+# on a failed `rm` or a skipped durability barrier, and to treat an
+# unreadable fence as a successful release -- so a caller could clear its
+# own recovery journal believing release had happened when it truthfully had
+# not, orphaning the fence (see the caller-side ordering fix at every call
+# site below). This now returns non-zero for every case in which this run's
+# own release obligation was NOT positively discharged, and every caller
+# below is ordered so that failure propagates (via `set -e`) BEFORE the
+# journal carrying this run's recovery identity is ever cleared.
 _update_release_maintenance_fence() {
   local fence_path="/var/lib/hubinet-ops/product-update-maintenance.fence"
   local raw holder
@@ -532,20 +547,26 @@ _update_release_maintenance_fence() {
     UPDATE_FENCE_HELD="0"
     return 0
   fi
-  holder="$(_json_field_from_text "${raw}" "holder")"
+  holder="$(_json_field_from_text "${raw}" "holder")" || holder=""
   if [[ -z "${holder}" ]]; then
     log_warn "the product-update maintenance fence inside container ${VMID} is unreadable; leaving it in place. Workload package updates will keep refusing until it is resolved by hand."
-    return 0
+    return 1
   fi
   if [[ "${holder}" != "${UPDATE_RUN_ID}" ]]; then
     log_warn "the product-update maintenance fence inside container ${VMID} is held by another product update (holder ${holder}); leaving it untouched"
     return 0
   fi
-  pct exec "${VMID}" -- rm -f "${fence_path}" >/dev/null 2>&1 \
-    || log_warn "could not remove the product-update maintenance fence inside container ${VMID}; workload package updates will keep refusing until it is removed by hand"
-  pct exec "${VMID}" -- sync -f /var/lib/hubinet-ops >/dev/null 2>&1 || true
+  if ! pct exec "${VMID}" -- rm -f "${fence_path}" >/dev/null 2>&1; then
+    log_warn "could not remove the product-update maintenance fence inside container ${VMID}; NOT recording it as released. Workload package updates will keep refusing until the next updater invocation retries."
+    return 1
+  fi
+  if ! pct exec "${VMID}" -- sync -f /var/lib/hubinet-ops >/dev/null 2>&1; then
+    log_warn "removed the product-update maintenance fence inside container ${VMID} but could not durably prove that removal; NOT recording it as released. The next updater invocation will retry."
+    return 1
+  fi
   UPDATE_FENCE_HELD="0"
   log_info "released the exclusive product-update maintenance fence; workload package updates are permitted again"
+  return 0
 }
 
 _update_revalidate_before_mutation() {
@@ -1115,6 +1136,12 @@ _update_finish_summary() {
   # these two steps is cleanup-only on the next invocation, never a false
   # request to roll an already-accepted target back.
   update_journal_checkpoint completed
+  # Test-only (PR #74 review finding 2): exercise a real TERM here, after
+  # the completed checkpoint is durable but before the fence release this
+  # journal still owes -- the fixture a later invocation's own
+  # `update_startup_recovery_gate` completed/recovered branch then recovers
+  # through.
+  _update_test_term_checkpoint before_completed_fence_release
   # Terminal and proven: acceptance passed, the marker is coherent, and the
   # `completed` checkpoint is durable. Only now may workload package updates
   # start again -- releasing any earlier would re-open issuance while this
@@ -1250,11 +1277,25 @@ update_rollback_on_failure() {
   _update_wait_until_service_active_and_healthy \
     || _update_rollback_hard_stop "restored the pre-update installation's files, but it did not prove active AND answer its own unauthenticated health probe within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (${_UPDATE_SERVICE_READINESS_DETAIL})"
 
-  update_journal_resolve recovered
+  # Terminal state first, durable and provably retained -- so a crash
+  # anywhere below is cleanup-only on the next invocation, never a false
+  # request to roll an already-restored installation back again.
+  update_journal_checkpoint recovered
+  _update_cleanup_recovered_run_artifacts
+  _update_test_term_checkpoint before_recovery_fence_release
   # The pre-update installation is fully restored, enabled, running, and
   # healthy, and this run owns no rollback-capable state any more. Only now
-  # is it truthful to let workload package updates start again.
+  # is it truthful to let workload package updates start again -- and this
+  # run's own journal, the only durable record carrying its recovery
+  # identity (UPDATE_RUN_ID) that a later invocation could match the fence's
+  # recorded holder against, MUST NOT be discarded before that release is
+  # positively proven. A release failure here propagates (`set -e`) with the
+  # `recovered` journal still on disk, never re-interpreted as permission to
+  # roll back (see update-proxmox-0.5.sh's own EXIT-trap terminal-checkpoint
+  # rule) -- the next updater invocation retries release and then clears it.
   _update_release_maintenance_fence
+  _update_test_term_checkpoint after_recovery_fence_release
+  _update_journal_clear
   log_warn "rollback complete -- the pre-update installation is enabled, running again, and healthy (exit ${exit_code})"
 }
 

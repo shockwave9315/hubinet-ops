@@ -16,6 +16,7 @@ fixture.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -23,6 +24,8 @@ import pytest
 pytest.importorskip("homeassistant", reason="isolated HA test dependencies not installed")
 
 import aiohttp
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -782,3 +785,231 @@ def test_http_api_factory_binds_hass_and_matches_protocol_shape() -> None:
 
     factory = http_api_factory(FakeHass())
     assert callable(factory)
+
+
+# ---------------------------------------------------------------------------
+# PR #74 review finding 3 -- the rollback request must not report a
+# transport timeout before the backend's own durable pre-ACK boundary can
+# legitimately complete.
+#
+# `aioclient_mock` (used throughout this file) replaces aiohttp's real
+# `ClientSession._request` outright, so it never applies whatever `timeout=`
+# a caller passes -- it cannot exercise genuine timeout ENFORCEMENT, only
+# what request was attempted. These tests instead run a real local aiohttp
+# server on the loopback interface (this file's own `auto_enable_custom_
+# integrations` fixture already opts into real sockets via `socket_enabled`)
+# and monkeypatch transport_http's module-level timeout CONSTANTS down to
+# small, test-scaled values -- never any request/response code path itself
+# -- so the suite proves the actual `aiohttp.ClientTimeout` mechanics the
+# production code relies on without waiting out real production durations.
+# ---------------------------------------------------------------------------
+
+from custom_components.hubinet_ops import transport_http as _transport_http_module
+
+
+def _rollback_job_payload(resource_id: str) -> dict[str, Any]:
+    """The minimum complete, contract-valid rollback response body."""
+
+    return {
+        "resource_id": resource_id,
+        "job_id": "11111111-1111-4111-8111-111111111111",
+        "request_id": "22222222-2222-4222-8222-222222222222",
+        "status": "active",
+        "checkpoint": "rollback_may_have_started",
+        "issued_at": "2026-01-01T00:00:00+00:00",
+        "approved_plan_fingerprint": "fingerprint",
+        "package_count": 1,
+        "snapshot": {"name": "hubinet-pre-update", "confirmed_at": "2026-01-01T00:00:00+00:00"},
+        "mutation": {},
+        "health": {},
+        "rollback": {
+            "may_have_started_at": "2026-01-01T00:05:00+00:00",
+            "available": True,
+        },
+    }
+
+
+class _DelayedRollbackServer:
+    """A real local HTTP server that delays its rollback response by
+    exactly `delay_seconds` of genuine wall-clock time before returning a
+    valid 202 job body -- modelling the backend's own synchronous,
+    potentially slow, pre-ACK snapshot inspection.
+    """
+
+    def __init__(self, delay_seconds: float, resource_id: str) -> None:
+        self._delay_seconds = delay_seconds
+        self._resource_id = resource_id
+        self.calls = 0
+
+    async def _handle(self, request: web.Request) -> web.Response:
+        self.calls += 1
+        await asyncio.sleep(self._delay_seconds)
+        return web.json_response(
+            _rollback_job_payload(self._resource_id), status=202
+        )
+
+    def app(self) -> web.Application:
+        application = web.Application()
+        application.router.add_post(
+            "/r0/v1/resources/{resource_id}/package-update/rollback",
+            self._handle,
+        )
+        return application
+
+
+@pytest.mark.asyncio
+async def test_rollback_uses_a_longer_timeout_than_ordinary_package_update_requests(
+    hass: HomeAssistant,
+) -> None:
+    """Structural proof: the rollback route is wired to a materially larger
+    bound than every other package-update request, and that bound is
+    pinned against the backend's own named rollback-inspection ceiling.
+    """
+
+    assert (
+        _transport_http_module._ROLLBACK_REQUEST_TIMEOUT.total
+        > _transport_http_module._REQUEST_TIMEOUT.total
+    )
+    # At least the backend's own PACKAGE_UPDATE_ROLLBACK_INSPECTION_TIMEOUT_
+    # SECONDS ceiling (120s, app/inventory_runtime_config.py) -- the
+    # dedicated timeout must never be shorter than the contract it exists
+    # to cover.
+    assert _transport_http_module._ROLLBACK_REQUEST_TIMEOUT.total >= 120
+
+
+@pytest.mark.asyncio
+async def test_ordinary_requests_keep_the_existing_bounded_timeout(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Required test 1: start/fetch/resume are unaffected by this fix and
+    still time out on their existing, short, ordinary bound.
+    """
+
+    monkeypatch.setattr(
+        _transport_http_module, "_REQUEST_TIMEOUT", aiohttp.ClientTimeout(total=0.2)
+    )
+    server = _DelayedRollbackServer(delay_seconds=1.0, resource_id=RESOURCE_CT)
+    application = web.Application()
+    application.router.add_post(
+        "/r0/v1/resources/{resource_id}/package-update", server._handle
+    )
+    test_server = TestServer(application)
+    await test_server.start_server(loop=asyncio.get_running_loop())
+    try:
+        transport = HttpHubinetOpsTransport(
+            hass,
+            base_url=str(test_server.make_url("")).rstrip("/"),
+            api_token=API_TOKEN,
+            verify_tls=False,
+        )
+        with pytest.raises(HubinetOpsCannotConnect):
+            await transport.start_package_update(RESOURCE_CT, "req-1")
+    finally:
+        await test_server.close()
+
+
+@pytest.mark.asyncio
+async def test_rollback_response_beyond_the_ordinary_bound_does_not_report_cannot_connect(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Required test 3, the finding's own core claim: a rollback response
+    that legitimately takes longer than `_REQUEST_TIMEOUT` -- but stays
+    within the rollback-specific budget -- must never surface as
+    `HubinetOpsCannotConnect`. Scaled down: the ordinary bound is
+    monkeypatched to 0.2s, the rollback bound to 2s, and the fake backend
+    delays exactly 1s -- longer than the ordinary bound, comfortably inside
+    the rollback one.
+    """
+
+    monkeypatch.setattr(
+        _transport_http_module, "_REQUEST_TIMEOUT", aiohttp.ClientTimeout(total=0.2)
+    )
+    monkeypatch.setattr(
+        _transport_http_module,
+        "_ROLLBACK_REQUEST_TIMEOUT",
+        aiohttp.ClientTimeout(total=2.0),
+    )
+    server = _DelayedRollbackServer(delay_seconds=1.0, resource_id=RESOURCE_CT)
+    test_server = TestServer(server.app())
+    await test_server.start_server(loop=asyncio.get_running_loop())
+    try:
+        transport = HttpHubinetOpsTransport(
+            hass,
+            base_url=str(test_server.make_url("")).rstrip("/"),
+            api_token=API_TOKEN,
+            verify_tls=False,
+        )
+        result = await transport.rollback_package_update(RESOURCE_CT)
+    finally:
+        await test_server.close()
+
+    assert server.calls == 1
+    assert result.resource_id == RESOURCE_CT
+    assert result.rollback_available is True
+
+
+@pytest.mark.asyncio
+async def test_rollback_beyond_its_own_budget_still_fails_boundedly(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Required test 4: the rollback timeout is longer, not unbounded --
+    a response that outlasts even the (scaled) rollback budget still
+    reports `HubinetOpsCannotConnect`, and does so within a bounded wait.
+    """
+
+    monkeypatch.setattr(
+        _transport_http_module,
+        "_ROLLBACK_REQUEST_TIMEOUT",
+        aiohttp.ClientTimeout(total=0.3),
+    )
+    server = _DelayedRollbackServer(delay_seconds=2.0, resource_id=RESOURCE_CT)
+    test_server = TestServer(server.app())
+    await test_server.start_server(loop=asyncio.get_running_loop())
+    try:
+        transport = HttpHubinetOpsTransport(
+            hass,
+            base_url=str(test_server.make_url("")).rstrip("/"),
+            api_token=API_TOKEN,
+            verify_tls=False,
+        )
+        with pytest.raises(HubinetOpsCannotConnect):
+            await asyncio.wait_for(
+                transport.rollback_package_update(RESOURCE_CT), timeout=5.0
+            )
+    finally:
+        await test_server.close()
+
+
+@pytest.mark.asyncio
+async def test_rollback_request_body_still_carries_no_caller_supplied_target(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Required test 5: the backend contract this fix must not weaken --
+    the request body remains empty (no snapshot/VMID/operation id), so a
+    longer client-side timeout never becomes a wider request surface.
+    """
+
+    captured: dict[str, Any] = {}
+
+    async def _capture(request: web.Request) -> web.Response:
+        captured["body"] = await request.text()
+        return web.json_response(_rollback_job_payload(RESOURCE_CT), status=202)
+
+    application = web.Application()
+    application.router.add_post(
+        "/r0/v1/resources/{resource_id}/package-update/rollback", _capture
+    )
+    test_server = TestServer(application)
+    await test_server.start_server(loop=asyncio.get_running_loop())
+    try:
+        transport = HttpHubinetOpsTransport(
+            hass,
+            base_url=str(test_server.make_url("")).rstrip("/"),
+            api_token=API_TOKEN,
+            verify_tls=False,
+        )
+        await transport.rollback_package_update(RESOURCE_CT)
+    finally:
+        await test_server.close()
+
+    assert captured["body"] in ("{}", "")

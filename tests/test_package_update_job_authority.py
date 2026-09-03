@@ -136,7 +136,12 @@ def test_job_issuance_copies_immutable_authority_and_packages_and_reopens(
     assert job.expected_node_name == "pve-a"
     assert job.status is PackageUpdateJobStatus.ACTIVE
     assert job.checkpoint is PackageUpdateCheckpoint.ISSUED
-    assert store.backend_instance().published_state_revision == published_revision
+    # PR #74 review finding 1: issuance is the first moment this resource's
+    # published `package_update_job` summary exists at all, so it MUST
+    # advance the published revision -- see tests/test_package_update_
+    # publication_revision.py for the dedicated regression covering every
+    # checkpoint transition, not just issuance.
+    assert store.backend_instance().published_state_revision > published_revision
     assert [package.package_name for package in job.packages] == [
         package.package_name for package in scan.packages
     ]
@@ -659,7 +664,10 @@ def test_restart_recovery_is_atomic_idempotent_and_releases_global_slot(
     assert recovered.status is PackageUpdateJobStatus.INTERRUPTED
     assert recovered.terminalized_at is not None
     assert "before package mutation began" in recovered.terminal_reason
-    assert store.backend_instance().published_state_revision == published_revision
+    # PR #74 review finding 1: recovery changes the published `status`/
+    # `terminalized_at`/`terminal_reason` fields of this job's published
+    # summary, so it MUST advance the published revision too.
+    assert store.backend_instance().published_state_revision > published_revision
     assert authority.recover_interrupted_package_update_jobs() == ()
     assert len(store.list_package_update_job_events(job.job_id)) == 2
 

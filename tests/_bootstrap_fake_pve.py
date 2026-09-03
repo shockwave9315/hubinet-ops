@@ -476,6 +476,11 @@ _ROLLBACK_REMOVE_KEYS = {
     "/opt/hubinet-ops/.hubinet-source-commit": "rm_live_marker",
 }
 
+# The exclusive product-update maintenance fence's own fixed CT path (see
+# deploy/lib/update-activate.sh::_update_release_maintenance_fence and
+# tests/test_update_proxmox_0_5_smoke.py::FENCE_CT_PATH).
+_MAINTENANCE_FENCE_CT_PATH = "/var/lib/hubinet-ops/product-update-maintenance.fence"
+
 
 def _matches_run_owned_ct_script(raw_arg, base_name):
     # deploy/lib/update-plan.sh (P2-A/small-cleanup, AGENTS.md) now pushes
@@ -638,6 +643,22 @@ def _exec_inner(vmid, inner, state):
         for raw_target in targets:
             normalized_target = _normalize_ct_arg(raw_target)
             target_path = _ct_path(vmid, normalized_target)
+            if (
+                normalized_target == _MAINTENANCE_FENCE_CT_PATH
+                and _fail("fence_release_rm")
+            ):
+                # A clean, realistic `rm -f` failure (PR #74 review finding
+                # 2's own required test): the command fails and the fence's
+                # existing content is left completely untouched -- unlike
+                # `_ROLLBACK_REMOVE_KEYS`'s `_partial` semantics above, which
+                # deliberately corrupt a file target to model a mid-tree
+                # `rm -rf` interruption. That model is wrong for a single
+                # `rm -f` on one file: this must remain a VALID, re-readable
+                # fence (holder=<run_id>) so a later invocation -- once the
+                # simulated fault is removed -- can retry and actually
+                # succeed, exactly as `_update_release_maintenance_fence`'s
+                # own contract requires.
+                return 1
             remove_key = _ROLLBACK_REMOVE_KEYS.get(normalized_target)
             if remove_key is not None and _fail(f"{remove_key}_partial"):
                 # Realistic mutate-then-fail: remove some content while

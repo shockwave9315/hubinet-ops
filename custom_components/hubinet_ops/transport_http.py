@@ -73,6 +73,40 @@ _LOGGER = logging.getLogger(__name__)
 # posture). Tunable value, not an architecture decision.
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
+# PR #74 review finding 3 -- a dedicated, longer timeout for the explicit
+# rollback request ONLY.
+#
+# The backend's rollback route is synchronous, and durable, before it ever
+# returns 202: it resolves the active job, then performs a FRESH read-only
+# canonical PVE snapshot listing (``inspect_job_snapshot_state``, bounded by
+# the backend's own ``PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS`` = 60s host-
+# control ceiling), and only after that inspection durably arms the same-job
+# rollback and acknowledges. `_REQUEST_TIMEOUT` (15s) is far shorter than
+# that legitimate pre-ACK inspection window, so a rollback request that
+# genuinely takes, say, 20-90 seconds would previously time out on the HA
+# side while the backend legitimately continued toward durably arming
+# rollback -- reporting failure to the operator for a destructive rollback
+# that was, in fact, proceeding. See transport_http.py's own
+# `rollback_package_update`.
+#
+# This value is pinned against `PACKAGE_UPDATE_ROLLBACK_INSPECTION_TIMEOUT_
+# SECONDS` (120s, app/inventory_runtime_config.py) rather than the smaller
+# 60s snapshot ceiling the route currently happens to use: that is the
+# backend's own named ceiling for "a rollback stage's read-only PVE
+# inspection", the more conservative of the two bounds the pre-ACK path
+# could legitimately be governed by, and the one least likely to need
+# updating here if the route's own inspection call ever changes which host
+# control it uses. The +15s margin is the SAME bounded margin
+# `_REQUEST_TIMEOUT` already gives every other request for ordinary
+# HTTP/TLS/network overhead on top of the backend's own processing ceiling --
+# not a second, independent guess at network latency.
+#
+# Deliberately NOT a global increase: every other package-update request
+# (start/fetch/resume) keeps `_REQUEST_TIMEOUT`'s existing 15s bound, and
+# this constant exists to cover exactly one route's documented backend
+# contract, not to widen bounds this PR has no evidence require it.
+_ROLLBACK_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=135)
+
 _BACKEND_ROUTE = "/r0/v1/backend"
 _SNAPSHOT_ROUTE = "/r0/v1/snapshot"
 _PACKAGE_PLAN_APPROVAL_ROUTE = (
@@ -648,13 +682,26 @@ class HttpHubinetOpsTransport:
     # ------------------------------------------------------------------
 
     async def _package_update_request(
-        self, method: str, path: str, **kwargs: Any
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: aiohttp.ClientTimeout | None = None,
+        **kwargs: Any,
     ) -> Any:
+        # Looked up by module global at call time rather than bound as a
+        # default parameter value, deliberately: a default value would be
+        # captured once at function-definition time, which is fine in
+        # production (the module-level constants never change after
+        # import) but makes the ordinary bound un-patchable by a test that
+        # wants to prove the timeout mechanics themselves without waiting
+        # out the real production duration.
+        effective_timeout = timeout if timeout is not None else _REQUEST_TIMEOUT
         url = f"{self._base_url}{path}"
         headers = {"Authorization": f"Bearer {self._api_token}"}
         try:
             async with self._session.request(
-                method, url, headers=headers, timeout=_REQUEST_TIMEOUT, **kwargs
+                method, url, headers=headers, timeout=effective_timeout, **kwargs
             ) as response:
                 return await self._decode_package_update(response)
         except TimeoutError as exc:
@@ -755,11 +802,19 @@ class HttpHubinetOpsTransport:
         The operator selects a RESOURCE. No snapshot name, snapshot id, VMID,
         node, operation id, or rollback target crosses this boundary, and the
         backend resolves the one applicable active job itself.
+
+        Uses `_ROLLBACK_REQUEST_TIMEOUT`, not the ordinary shared
+        `_REQUEST_TIMEOUT`: this request's backend handler performs a fresh,
+        durable, read-only PVE snapshot inspection BEFORE it durably arms
+        rollback and returns 202 (see this module's own `_ROLLBACK_REQUEST_
+        TIMEOUT` docstring), and that legitimate pre-ACK work can outlast the
+        15s bound every other package-update request uses.
         """
 
         payload = await self._package_update_request(
             "POST",
             _PACKAGE_UPDATE_ROLLBACK_ROUTE.format(resource_id=resource_id),
+            timeout=_ROLLBACK_REQUEST_TIMEOUT,
             json={},
         )
         return _package_update_job_view(resource_id, payload)
