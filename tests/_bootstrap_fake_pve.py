@@ -827,16 +827,51 @@ def _exec_inner(vmid, inner, state):
         sys.stdout.write(path.read_text())
         return 0
 
+    if (
+        inner[0] == "sh"
+        and len(inner) >= 5
+        and inner[1] == "-c"
+        and inner[3] == "sh"
+    ):
+        # deploy/lib/update-activate.sh::_update_fence_path_state's own
+        # bounded existence probe (Family 3A micro-correction): a remote
+        # script that always exits 0 once it actually RUNS -- both EXISTS
+        # and ABSENT are legitimate filesystem states -- and encodes the
+        # real answer via an exact stdout token instead of the outer exit
+        # status. That is the whole point of this shape: `pct exec`
+        # itself (ultimately an lxc-attach) can surface an ATTACH failure
+        # as a generic, unremarkable exit status 1 -- indistinguishable,
+        # under the OLD outer-exit-code design, from a legitimate remote
+        # "absent" answer. This fake models both failure shapes
+        # distinctly so the fix's own regression coverage can tell them
+        # apart from a genuine EXISTS/ABSENT answer.
+        probe_path = inner[4]
+        normalized = _normalize_ct_arg(probe_path)
+        if normalized == _MAINTENANCE_FENCE_CT_PATH:
+            if _fail("fence_read_transport"):
+                # UNKNOWN via an ordinary outer transport/attach failure
+                # with a distinctive non-1 code.
+                return 255
+            if _fail("fence_read_attach_exit_1"):
+                # THE regression this micro-correction exists for: an
+                # attach failure that happens to surface as outer exit
+                # status 1 -- exactly the value a legitimate remote
+                # "absent" answer would also produce. Must never be read
+                # as ABSENT.
+                return 1
+            if _fail("fence_read_malformed_token"):
+                # Exit 0 (the remote command DID run), but neither exact
+                # token -- a truncated read, a stray byte, or any other
+                # corruption of the probe's own output. Still UNKNOWN,
+                # never guessed as either EXISTS or ABSENT.
+                sys.stdout.write("nonsense")
+                return 0
+        path = _ct_path(vmid, probe_path)
+        sys.stdout.write("EXISTS" if path.exists() else "ABSENT")
+        return 0
+
     if inner[0] == "test" and inner[1] == "-e":
         normalized = _normalize_ct_arg(inner[2])
-        if normalized == _MAINTENANCE_FENCE_CT_PATH and _fail("fence_read_transport"):
-            # Family 3A regression witness: a simulated `pct exec`/transport
-            # failure while probing the fence -- neither 0 (exists) nor 1
-            # (absent). A real POSIX `test` only ever exits those two values
-            # when it actually runs, so this models `pct exec` itself
-            # failing to run the remote command at all, which
-            # _update_fence_path_state must read as UNKNOWN, never ABSENT.
-            return 255
         path = _ct_path(vmid, inner[2])
         marker = SCENARIO.get("legacy_present", {})
         # Normalize before comparing, not just when resolving the path on

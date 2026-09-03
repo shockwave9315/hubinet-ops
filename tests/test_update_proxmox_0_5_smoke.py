@@ -5368,15 +5368,15 @@ class TestProductUpdateMaintenanceFence:
         """F3-A. A transport failure reading the fence is UNKNOWN, not ABSENT.
 
         Seed a same-run live fence, then inject a failure ONLY into the
-        fence-read probe (`pct exec ... test -e <fence>`), while every
-        other CT operation the terminal path needs still succeeds. The OLD
-        code folded that failed read straight into `raw=""`, indistinguishable
-        from a positively empty read of a genuinely absent fence -- so a
-        following `sync -f` could falsely "prove" release while the fence,
-        for all this run actually knows, still exists. The fix must instead
-        fail closed: no release claim, the fence and the journal both
-        survive, and a later invocation (once the fault clears) still
-        recovers cleanly.
+        fence-read probe (`pct exec ... sh -c '... printf EXISTS/ABSENT
+        ...'`), while every other CT operation the terminal path needs
+        still succeeds. The OLD code folded that failed read straight into
+        `raw=""`, indistinguishable from a positively empty read of a
+        genuinely absent fence -- so a following `sync -f` could falsely
+        "prove" release while the fence, for all this run actually knows,
+        still exists. The fix must instead fail closed: no release claim,
+        the fence and the journal both survive, and a later invocation
+        (once the fault clears) still recovers cleanly.
         """
 
         env = seed_installed_environment(
@@ -5420,6 +5420,117 @@ class TestProductUpdateMaintenanceFence:
 
         # The fault clears; the next invocation reads EXISTS + same holder
         # and completes the release normally.
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovered = _run(env.env, _base_args(target))
+
+        assert recovered.returncode == 0, recovered.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+
+    def test_an_attach_failure_exiting_exactly_one_is_never_read_as_absent(
+        self, tmp_path
+    ):
+        """Family 3A micro-correction: the outer exit status alone can
+        never mean ABSENT, even when it is exactly the value a legitimate
+        remote answer would also produce.
+
+        `pct exec` ultimately attaches to the container (e.g. via
+        lxc-attach), and an ATTACH failure -- the remote probe never
+        running at all -- can itself surface as a generic, unremarkable
+        outer exit status 1. An earlier version of this fix read the
+        fence-probe's OWN exit status directly (0=exists, 1=absent), which
+        could not tell that apart from a genuine "absent" answer. The
+        fix instead never trusts the outer exit status for the answer at
+        all: only exit 0 plus an exact "EXISTS"/"ABSENT" token counts, so
+        any nonzero outer status -- 1 included -- is UNKNOWN and fails
+        closed, exactly like the transport-failure witness above.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
+        assert json.loads(fence.read_text())["holder"] == run_id
+        fence_content_before = fence.read_text(encoding="utf-8")
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_read_attach_exit_1"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        assert "could not be read" in recovery.stderr
+        assert journal.exists()
+        assert fence.exists()
+        assert fence.read_text(encoding="utf-8") == fence_content_before
+
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovered = _run(env.env, _base_args(target))
+
+        assert recovered.returncode == 0, recovered.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+
+    def test_a_malformed_probe_token_is_never_read_as_either_answer(
+        self, tmp_path
+    ):
+        """The remote probe itself ran (outer exit 0) but printed neither
+        exact "EXISTS" nor "ABSENT" token -- a truncated read or any other
+        corruption of its output. Still UNKNOWN, never guessed either way.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+        fence_content_before = fence.read_text(encoding="utf-8")
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_read_malformed_token"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        assert "could not be read" in recovery.stderr
+        assert journal.exists()
+        assert fence.exists()
+        assert fence.read_text(encoding="utf-8") == fence_content_before
+
         scenario["fail"] = []
         env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
         recovered = _run(env.env, _base_args(target))

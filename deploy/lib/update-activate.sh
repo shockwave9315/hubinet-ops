@@ -584,8 +584,8 @@ _update_acquire_pre_activation_fence() {
 # SAME `sync -f /var/lib/hubinet-ops` barrier every other branch already
 # required before it may report success.
 # _update_fence_path_state <path>: three-valued, read-only existence check
-# for the maintenance fence (Family 3A correction pass). Return 0=EXISTS,
-# 1=ABSENT, 2=UNKNOWN.
+# for the maintenance fence (Family 3A correction pass, micro-correction).
+# Return 0=EXISTS, 1=ABSENT, 2=UNKNOWN.
 #
 # This deliberately does NOT reuse _update_ct_path_state's own mechanism
 # (the run-owned authority helper at UPDATE_TOOL_CT_PATH): that helper is
@@ -596,27 +596,38 @@ _update_acquire_pre_activation_fence() {
 # valued answer that depended on a helper not guaranteed present at every
 # call site would itself be a new UNKNOWN-shaped hole.
 #
-# So this reuses the SAME philosophy through the one mechanism guaranteed
-# available everywhere: POSIX `test -e` is a shell builtin that only ever
-# exits 0 (exists) or 1 (does not) when it actually RUNS. Any OTHER exit
-# status therefore means `pct exec` itself failed to run it at all --
-# container unreachable, transport failure, anything else -- and must
-# never be read as a positive answer either way. Bare `cat`'s exit 1 is
-# NOT used for this: real `cat` also returns 1 for "exists but unreadable"
-# and other read errors, which is a different, EXISTS-but-malformed state
-# this function must not collapse into ABSENT.
+# An EARLIER version of this function read the outer `pct exec ... test -e
+# <path>` exit status directly (0=exists, 1=absent, anything else=UNKNOWN),
+# reasoning that a real POSIX `test` only ever exits 0 or 1 when it
+# actually runs. That reasoning has a gap: `pct exec` ultimately attaches
+# to the container (e.g. via lxc-attach), and an ATTACH failure -- the
+# remote `test` never running at all -- can itself surface as a generic,
+# unremarkable exit status 1, indistinguishable at this level from "the
+# remote test ran and correctly reported absent". So exit-1-from-`pct
+# exec` could NOT be trusted as a positive absence proof either.
+#
+# Fixed by never encoding the answer in the outer exit status at all. The
+# remote command below always exits 0 once it actually RUNS -- both
+# EXISTS and ABSENT are legitimate filesystem states, so the wrapping
+# `sh -c` reports success either way -- and instead prints an EXACT,
+# bounded token identifying which. Any OTHER outer exit status therefore
+# means the remote command never ran (attach/transport failure) and must
+# fail closed as UNKNOWN; exit 0 with anything other than the two exact
+# tokens is equally untrustworthy and also UNKNOWN, never a guess. The
+# fence path is this module's own fixed constant, never operator/attacker
+# input, and is still passed as `$1` rather than interpolated into the
+# script text.
 _update_fence_path_state() {
-  local path="$1" status
-  # Under this script's `set -e`, a bare failing command aborts
-  # immediately -- `status=$?` on the NEXT line would never run for the
-  # ordinary ABSENT (1) or UNKNOWN case. `&& status=0 || status=$?` is the
-  # same errexit-safe idiom already used throughout this file (see
-  # _update_acquire_maintenance_fence above) to capture an exit status
-  # without ever leaving this as a bare failing statement.
-  pct exec "${VMID}" -- test -e "${path}" >/dev/null 2>&1 && status=0 || status=$?
-  case "${status}" in
-    0) return 0 ;;
-    1) return 1 ;;
+  local path="$1" output status
+  # Same errexit-safe idiom used throughout this file (see
+  # _update_acquire_maintenance_fence above): capture the exit status
+  # without ever leaving this as a bare failing statement under `set -e`.
+  output="$(pct exec "${VMID}" -- sh -c 'if [ -e "$1" ]; then printf EXISTS; else printf ABSENT; fi' sh "${path}" 2>/dev/null)" \
+    && status=0 || status=$?
+  (( status == 0 )) || return 2
+  case "${output}" in
+    EXISTS) return 0 ;;
+    ABSENT) return 1 ;;
     *) return 2 ;;
   esac
 }
