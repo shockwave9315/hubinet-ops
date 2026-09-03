@@ -4519,9 +4519,47 @@ class TestPreActivationInstallationUpgrade:
         # Nothing else was disturbed: the operator's key, the scan boundary,
         # and the pre-activation configuration are all exactly as they were.
         assert authorized == before_authorized
-        assert env.ct_file_text(
-            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
-        ) == before_inventory
+        restored = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert restored == before_inventory
+        # The property behind that byte comparison, stated directly: a
+        # configuration left activating the lifecycle while naming the five
+        # keys this rollback just deleted would fail the restored service's
+        # own startup closed -- so a failed update would not merely fail, it
+        # would leave the installation unable to come back.
+        assert "package_update:" not in restored
+
+    def test_a_rollback_that_cannot_restore_the_config_hard_stops(self, tmp_path):
+        """The positive control for the rule above.
+
+        If the pre-activation configuration cannot be put back, the updater
+        must NOT go on to delete the key material that configuration still
+        names. It hard stops, preserves every artifact and the active
+        journal, and says so -- manual recovery is strictly safer than an
+        installation whose service can no longer start.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["cp_rollback_config_to_live"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "pre-activation" in result.stderr
+        # It stopped BEFORE deleting the keys the live configuration names.
+        for kind in BOUNDARY_KINDS:
+            assert env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+        # And it preserved the journal for the operator rather than clearing it.
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
 
     def test_a_failed_upgrade_preserves_an_existing_journal_directory(
         self, tmp_path

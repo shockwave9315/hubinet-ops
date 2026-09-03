@@ -398,6 +398,14 @@ _ACTIVATION_MOVE_FAIL_RULES = [
     # "systemd has been told about it", the reachable state in which a
     # replayed rollback must still daemon-reload.
     ("mv", ("prefix", "/etc/systemd/system/hubinet-ops.service.rollback-"), ("exact", "/etc/systemd/system/hubinet-ops.service"), "mv_rollback_unit_to_live"),
+    # The activation config block's own preserve and ROLLBACK-restore seams.
+    # The restore side is the load-bearing one: a rollback that deleted the
+    # five package-update keys while leaving a configuration that still names
+    # them would fail the restored service's own startup closed, so a test
+    # needs to be able to make exactly that restore fail and prove the
+    # updater hard stops instead of proceeding.
+    ("cp", ("exact", "/etc/hubinet-ops/inventory.yaml"), ("prefix", "/etc/hubinet-ops/inventory.yaml.rollback-"), "cp_live_config_to_rollback"),
+    ("cp", ("prefix", "/etc/hubinet-ops/inventory.yaml.rollback-"), ("exact", "/etc/hubinet-ops/inventory.yaml"), "cp_rollback_config_to_live"),
     ("mv", ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.rollback-"), "mv_live_marker_to_rollback"),
     ("mv", ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.staged-"), ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), "mv_staged_marker_to_live"),
 ]

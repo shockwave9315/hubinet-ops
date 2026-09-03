@@ -420,12 +420,31 @@ YAML
 update_boundaries_rollback() {
   local kind live rollback_copy restore_tmp
 
+  # The configuration goes back FIRST, and it is not optional.
+  #
+  # This rollback is about to delete the five private keys this run created.
+  # A configuration left saying `enabled: true` while pointing at keys that no
+  # longer exist would fail the restored service's own startup closed -- the
+  # loader deliberately refuses a missing privileged credential -- so a failed
+  # update would not merely fail, it would leave the installation unable to
+  # come back at all. Every branch here therefore hard stops rather than
+  # skipping: preserving the journal and every artifact for manual recovery is
+  # strictly safer than proceeding to delete keys a live config still names.
   if ledger_has update-boundary-config-activated "${VMID}"; then
     local backup_ct_path="${UPDATE_BOUNDARY_CONFIG_PATH}.rollback-${UPDATE_RUN_ID}"
-    if pct exec "${VMID}" -- test -s "${backup_ct_path}" >/dev/null 2>&1; then
-      pct exec "${VMID}" -- cp "${backup_ct_path}" "${UPDATE_BOUNDARY_CONFIG_PATH}" >/dev/null 2>&1 \
-        || _update_rollback_hard_stop "could not restore the pre-activation ${UPDATE_BOUNDARY_CONFIG_PATH} from ${backup_ct_path} inside container ${VMID}"
-      _update_durability_barrier_ct_or_hard_stop "${UPDATE_BOUNDARY_CONFIG_PATH}" "restoring the pre-activation configuration"
+    pct exec "${VMID}" -- test -e "${backup_ct_path}" >/dev/null 2>&1 \
+      || _update_rollback_hard_stop "the preserved pre-activation ${UPDATE_BOUNDARY_CONFIG_PATH} (${backup_ct_path}) is absent inside container ${VMID}; restore it manually before retrying -- the activated configuration still names key material this rollback is about to remove"
+    pct exec "${VMID}" -- cp "${backup_ct_path}" "${UPDATE_BOUNDARY_CONFIG_PATH}" >/dev/null 2>&1 \
+      || _update_rollback_hard_stop "could not restore the pre-activation ${UPDATE_BOUNDARY_CONFIG_PATH} from ${backup_ct_path} inside container ${VMID}"
+    _update_durability_barrier_ct_or_hard_stop "${UPDATE_BOUNDARY_CONFIG_PATH}" "restoring the pre-activation configuration"
+    # Positively PROVE the restore rather than trusting the copy's exit
+    # status: the property that matters is that the live configuration no
+    # longer activates a lifecycle whose credentials are about to be deleted.
+    local restored
+    restored="$(pct exec "${VMID}" -- cat "${UPDATE_BOUNDARY_CONFIG_PATH}" 2>/dev/null)" \
+      || _update_rollback_hard_stop "could not read back the restored ${UPDATE_BOUNDARY_CONFIG_PATH} inside container ${VMID}"
+    if printf '%s\n' "${restored}" | grep -q '^package_update:'; then
+      _update_rollback_hard_stop "the restored ${UPDATE_BOUNDARY_CONFIG_PATH} still activates the package-update lifecycle; refusing to remove the key material it names -- restore the pre-activation configuration manually before retrying"
     fi
   fi
 
