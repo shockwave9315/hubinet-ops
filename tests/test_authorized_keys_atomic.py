@@ -191,6 +191,176 @@ echo "REMOVE_RC_NONZERO"
         assert authorized.read_text(encoding="utf-8") == original
 
 
+class TestStagingReadWriteFailuresNeverReachRename:
+    """Family 2 correction pass (P1 direct sibling): every byte used to
+    construct the staged replacement must be positively read/written
+    before the atomic rename may ever be attempted. A read/write failure
+    while STAGING (as opposed to the already-covered rename/durability
+    failures above) must discard the temp file and leave the live file
+    byte-identical -- never a corrupted-but-live rename.
+    """
+
+    def _seeded_authorized_keys(self, tmp_path):
+        authorized = tmp_path / "authorized_keys"
+        operator1 = "ssh-ed25519 AAAAoperator1 root@laptop\n"
+        scan_entry = (
+            'command="/usr/local/libexec/hubinet-package-scan-helper-x",'
+            "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty "
+            "ssh-ed25519 AAAAscan hubinet-ops-package-scan-vmid-110-x\n"
+        )
+        operator2 = "ssh-ed25519 AAAAoperator2 root@desktop\n"
+        original = operator1 + scan_entry + operator2
+        authorized.write_text(original, encoding="utf-8")
+        return authorized, original
+
+    def test_a_partial_source_copy_failure_leaves_the_live_file_untouched(
+        self, tmp_path
+    ):
+        """A. A REALISTIC partial write (some bytes land in the temp file,
+        then the copy fails) must still be discarded and reported as
+        failure -- never merely "the temp file happened to stay empty".
+        """
+
+        authorized, original = self._seeded_authorized_keys(tmp_path)
+
+        script = f"""
+AUTHKEYS="{authorized}"
+if _host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "ADD_RC_NONZERO"
+"""
+        result = _run(
+            tmp_path,
+            script,
+            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "copy_partial"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ADD_RC_NONZERO" in result.stdout
+        assert authorized.read_text(encoding="utf-8") == original
+        assert "hubinet-ops-marker-0" not in authorized.read_text(encoding="utf-8")
+        leftovers = list(tmp_path.glob("hubinet-ops-authorized-keys.*"))
+        assert leftovers == []
+
+    def test_b_final_entry_write_failure_leaves_the_live_file_untouched(
+        self, tmp_path
+    ):
+        """B. The source copy succeeds; writing the NEW forced-command
+        entry is what fails.
+        """
+
+        authorized, original = self._seeded_authorized_keys(tmp_path)
+
+        script = f"""
+AUTHKEYS="{authorized}"
+if _host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "ADD_RC_NONZERO"
+"""
+        result = _run(
+            tmp_path,
+            script,
+            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "entry_write"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ADD_RC_NONZERO" in result.stdout
+        assert authorized.read_text(encoding="utf-8") == original
+        leftovers = list(tmp_path.glob("hubinet-ops-authorized-keys.*"))
+        assert leftovers == []
+
+    def test_c_trailing_byte_read_failure_leaves_the_live_file_untouched(
+        self, tmp_path
+    ):
+        """C. The trailing-newline probe itself fails: UNKNOWN, never
+        "already ends in a newline".
+        """
+
+        authorized, original = self._seeded_authorized_keys(tmp_path)
+
+        script = f"""
+AUTHKEYS="{authorized}"
+if _host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "ADD_RC_NONZERO"
+"""
+        result = _run(
+            tmp_path,
+            script,
+            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "trailing_read"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ADD_RC_NONZERO" in result.stdout
+        assert authorized.read_text(encoding="utf-8") == original
+        leftovers = list(tmp_path.glob("hubinet-ops-authorized-keys.*"))
+        assert leftovers == []
+
+    def test_d_add_marker_read_failure_is_unknown_not_absent(self, tmp_path):
+        """D. `grep -cF`'s own read fails while checking whether the
+        marker is already present. Must fail closed -- never silently
+        treated as "zero matches" and proceed to append a duplicate.
+        """
+
+        authorized, original = self._seeded_authorized_keys(tmp_path)
+
+        script = f"""
+AUTHKEYS="{authorized}"
+if _host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "ADD_RC_NONZERO"
+"""
+        result = _run(
+            tmp_path,
+            script,
+            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "grep_read"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ADD_RC_NONZERO" in result.stdout
+        assert authorized.read_text(encoding="utf-8") == original
+        assert "hubinet-ops-marker-0" not in authorized.read_text(encoding="utf-8")
+        leftovers = list(tmp_path.glob("hubinet-ops-authorized-keys.*"))
+        assert leftovers == []
+
+    def test_e_remove_marker_read_failure_is_unknown_not_absent(self, tmp_path):
+        """E. `grep -qF`'s own read fails while checking whether the
+        marker is present to remove. Must fail closed -- never silently
+        treated as "already absent" (which would report false success
+        without ever having proven the entry is gone).
+        """
+
+        authorized = tmp_path / "authorized_keys"
+        unrelated = "ssh-ed25519 AAAAoperator root@laptop\n"
+        original = unrelated + _line(0) + "\n"
+        authorized.write_text(original, encoding="utf-8")
+
+        script = f"""
+AUTHKEYS="{authorized}"
+if _host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "REMOVE_RC_NONZERO"
+"""
+        result = _run(
+            tmp_path,
+            script,
+            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "grep_read_remove"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "REMOVE_RC_NONZERO" in result.stdout
+        # Untouched -- the marker line is still there because removal was
+        # never actually proven, not silently accepted as already absent.
+        assert authorized.read_text(encoding="utf-8") == original
+        leftovers = list(tmp_path.glob("hubinet-ops-authorized-keys.*"))
+        assert leftovers == []
+
+
 class TestDurabilityFailureAfterRenameIsRetrySafe:
     def test_f2d_add_retry_after_barrier_failure_never_duplicates(
         self, tmp_path
