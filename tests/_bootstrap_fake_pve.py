@@ -828,13 +828,22 @@ def _exec_inner(vmid, inner, state):
         return 0
 
     if inner[0] == "test" and inner[1] == "-e":
+        normalized = _normalize_ct_arg(inner[2])
+        if normalized == _MAINTENANCE_FENCE_CT_PATH and _fail("fence_read_transport"):
+            # Family 3A regression witness: a simulated `pct exec`/transport
+            # failure while probing the fence -- neither 0 (exists) nor 1
+            # (absent). A real POSIX `test` only ever exits those two values
+            # when it actually runs, so this models `pct exec` itself
+            # failing to run the remote command at all, which
+            # _update_fence_path_state must read as UNKNOWN, never ABSENT.
+            return 255
         path = _ct_path(vmid, inner[2])
         marker = SCENARIO.get("legacy_present", {})
         # Normalize before comparing, not just when resolving the path on
         # disk (see _normalize_ct_arg) -- an exact-literal comparison
         # against "/var/lib/hubinet-ops/ops.db" would silently never match
         # if this argument happened to arrive MSYS-mangled.
-        if _normalize_ct_arg(inner[2]) == "/var/lib/hubinet-ops/ops.db" and marker.get("ops_db"):
+        if normalized == "/var/lib/hubinet-ops/ops.db" and marker.get("ops_db"):
             return 0
         return 0 if path.exists() else 1
 

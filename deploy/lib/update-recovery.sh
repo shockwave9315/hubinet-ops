@@ -576,6 +576,27 @@ update_journal_resolve() {
   local terminal_state="$1"
   update_journal_checkpoint "${terminal_state}"
   _update_cleanup_recovered_run_artifacts
+  # Family 3B (correction pass): this run may have acquired the exclusive
+  # product-update maintenance fence (_update_acquire_maintenance_fence)
+  # before reaching this terminal, untouched-service recovery point -- see
+  # this function's sole caller, update-proxmox-0.5.sh's own EXIT trap,
+  # for the exact reachable window: a failure or TERM after the fence is
+  # durably held but before the rollback boundary is crossed (before
+  # _update_disable_service_autostart's first mutation). Release must be
+  # positively proven BEFORE the journal carrying this run's recovery
+  # identity is discarded, exactly like every other terminal path in this
+  # file already does (_update_finish_summary, update_rollback_on_failure,
+  # and update_startup_recovery_gate's own two branches below) -- never
+  # the reverse: a crash between "journal cleared" and "fence released"
+  # would leave a durable fence with no journal left to reconnect it to,
+  # permanently refusing every future workload package update. Calling
+  # this unconditionally (regardless of whether THIS run's own
+  # UPDATE_FENCE_HELD ever became "1") is safe and idempotent: release is
+  # keyed off the fence's OWN recorded holder, so a run that never
+  # acquired it simply finds it absent or foreign and no-ops.
+  _update_test_term_checkpoint before_recovery_fence_release
+  _update_release_maintenance_fence
+  _update_test_term_checkpoint after_recovery_fence_release
   _update_journal_clear
 }
 

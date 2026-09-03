@@ -583,11 +583,64 @@ _update_acquire_pre_activation_fence() {
 # left to reconnect it to. The absent branch below therefore performs the
 # SAME `sync -f /var/lib/hubinet-ops` barrier every other branch already
 # required before it may report success.
+# _update_fence_path_state <path>: three-valued, read-only existence check
+# for the maintenance fence (Family 3A correction pass). Return 0=EXISTS,
+# 1=ABSENT, 2=UNKNOWN.
+#
+# This deliberately does NOT reuse _update_ct_path_state's own mechanism
+# (the run-owned authority helper at UPDATE_TOOL_CT_PATH): that helper is
+# only ever pushed/restored on the rollback-armed recovery path (see
+# _update_recovery_restore_authority_tool's own docstring), but fence
+# release is also reached from the "no rollback armed" and "already
+# completed/recovered" recovery branches, which never restore it. A three-
+# valued answer that depended on a helper not guaranteed present at every
+# call site would itself be a new UNKNOWN-shaped hole.
+#
+# So this reuses the SAME philosophy through the one mechanism guaranteed
+# available everywhere: POSIX `test -e` is a shell builtin that only ever
+# exits 0 (exists) or 1 (does not) when it actually RUNS. Any OTHER exit
+# status therefore means `pct exec` itself failed to run it at all --
+# container unreachable, transport failure, anything else -- and must
+# never be read as a positive answer either way. Bare `cat`'s exit 1 is
+# NOT used for this: real `cat` also returns 1 for "exists but unreadable"
+# and other read errors, which is a different, EXISTS-but-malformed state
+# this function must not collapse into ABSENT.
+_update_fence_path_state() {
+  local path="$1" status
+  # Under this script's `set -e`, a bare failing command aborts
+  # immediately -- `status=$?` on the NEXT line would never run for the
+  # ordinary ABSENT (1) or UNKNOWN case. `&& status=0 || status=$?` is the
+  # same errexit-safe idiom already used throughout this file (see
+  # _update_acquire_maintenance_fence above) to capture an exit status
+  # without ever leaving this as a bare failing statement.
+  pct exec "${VMID}" -- test -e "${path}" >/dev/null 2>&1 && status=0 || status=$?
+  case "${status}" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
 _update_release_maintenance_fence() {
   local fence_path="/var/lib/hubinet-ops/product-update-maintenance.fence"
-  local raw holder
-  raw="$(pct exec "${VMID}" -- cat "${fence_path}" 2>/dev/null)" || raw=""
-  if [[ -z "${raw}" ]]; then
+  local raw holder path_state
+
+  # Same errexit-safe idiom as _update_fence_path_state's own internal
+  # call: capturing a nonzero return from a bare function call would
+  # otherwise abort here under `set -e` before `path_state` is ever read.
+  _update_fence_path_state "${fence_path}" && path_state=0 || path_state=$?
+  if (( path_state == 2 )); then
+    # UNKNOWN (correction pass, Family 3A): the OLD code folded a failed
+    # `pct exec ... cat` straight into `raw=""`, indistinguishable from a
+    # positively empty read of a genuinely absent fence -- so a transport
+    # failure here used to let a subsequent `sync -f` "prove" release while
+    # the fence, for all this run actually knows, still exists. UNKNOWN is
+    # never success: fail closed, preserve the journal, and let the next
+    # invocation retry.
+    log_warn "the product-update maintenance fence inside container ${VMID} could not be read (transport failure or unreachable container); leaving it in place. Workload package updates will keep refusing until it is resolved by hand or the next updater invocation retries."
+    return 1
+  fi
+  if (( path_state == 1 )); then
     # Absent is not sufficient by itself (correction pass, the same
     # review finding's durability-retry sibling). A prior invocation's
     # `rm` can have succeeded while ITS OWN following durability barrier
@@ -608,6 +661,10 @@ _update_release_maintenance_fence() {
     UPDATE_FENCE_HELD="0"
     return 0
   fi
+  # EXISTS: positively proven present -- parse it, and never treat an
+  # existing-but-empty/unreadable file as absence just because reading it
+  # produced no bytes (Family 3A: the path is already known to exist).
+  raw="$(pct exec "${VMID}" -- cat "${fence_path}" 2>/dev/null)" || raw=""
   holder="$(_json_field_from_text "${raw}" "holder")" || holder=""
   if [[ -z "${holder}" ]]; then
     log_warn "the product-update maintenance fence inside container ${VMID} is unreadable; leaving it in place. Workload package updates will keep refusing until it is resolved by hand."
@@ -661,6 +718,15 @@ update_activate_and_accept() {
   # proves the CT durability barrier itself is usable before entering the
   # mutation window at all.
   _update_revalidate_before_mutation
+
+  # Test-only (Family 3B correction pass): the exact reachable window this
+  # family closes -- the maintenance fence is now durably held (see
+  # _update_acquire_maintenance_fence above), but no rollback-boundary
+  # mutation has been attempted yet, so _update_rollback_boundary_crossed
+  # is still false and the EXIT trap takes the "existing installation was
+  # never touched" path (update_journal_resolve) rather than
+  # update_rollback_on_failure.
+  _update_test_term_checkpoint after_fence_acquired_before_autostart_disable
 
   # Step 3a -- FIRST mutation of the window: temporarily remove
   # hubinet-ops from boot activation, so no intermediate half-swapped
