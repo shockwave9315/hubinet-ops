@@ -123,7 +123,10 @@ from app.package_update_rollback import PackageUpdateRollbackOrchestrator
 from app.package_update_rollback_host_control import (
     SshPackageUpdateRollbackHostControl,
 )
-from app.package_update_snapshot import PackageUpdateSnapshotOrchestrator
+from app.package_update_snapshot import (
+    PackageUpdateSnapshotHostControl,
+    PackageUpdateSnapshotOrchestrator,
+)
 from app.package_update_snapshot_host_control import (
     SshPackageUpdateSnapshotHostControl,
 )
@@ -386,7 +389,7 @@ class PackageUpdateRuntime:
     """
 
     worker: PackageUpdateWorker
-    snapshot_host_control: SshPackageUpdateSnapshotHostControl
+    snapshot_host_control: PackageUpdateSnapshotHostControl
 
 
 def _build_package_update_runtime(
@@ -477,6 +480,10 @@ def create_read_only_app(
     *,
     start_scheduler: bool = True,
     now: Callable[[], datetime] | None = None,
+    package_update_runtime_factory: Callable[
+        [InventoryAuthority, InventoryAuthorityStore], PackageUpdateRuntime | None
+    ]
+    | None = None,
 ) -> FastAPI:
     """Build the R0 FastAPI application.
 
@@ -490,6 +497,15 @@ def create_read_only_app(
     throughout ``app.inventory``) letting tests deterministically observe
     backend-owned freshness expiry through the HTTP layer; production
     callers should never pass it.
+
+    ``package_update_runtime_factory`` is the same kind of seam for the
+    production update composition. It receives this app's OWN authority and
+    store -- the same two objects :func:`_build_package_update_runtime`
+    receives -- so a hermetic test can drive the REAL routes, the real
+    authority, and the real worker against fake host controls instead of
+    against a Proxmox host. Production callers never pass it, and passing it
+    changes nothing about how the routes behave: only which typed host
+    boundary the existing stages talk to.
     """
 
     if not config.api_bearer_token or not config.api_bearer_token.strip():
@@ -533,7 +549,11 @@ def create_read_only_app(
     # Production update activation. Built only when the operator configured
     # it: with `package_update.enabled` false there is no update host
     # control, no worker, and no thread -- exactly the pre-activation shape.
-    package_update = _build_package_update_runtime(authority, store, config)
+    package_update = (
+        package_update_runtime_factory(authority, store)
+        if package_update_runtime_factory is not None
+        else _build_package_update_runtime(authority, store, config)
+    )
     package_update_worker = None if package_update is None else package_update.worker
     if package_update_worker is not None and start_scheduler:
         # The worker's first cycle is a RECOVERY cycle. `authority.
