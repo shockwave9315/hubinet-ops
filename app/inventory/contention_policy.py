@@ -42,11 +42,10 @@ from __future__ import annotations
 #: bounded SSH round trip that runs a single typed operation
 #: (`ensure_pre_update_snapshot_submitted`, `seal_operation_never_submitted`,
 #: or the read-only `inspect_job_snapshot_state`) against the dark snapshot
-#: helper. Both mutating operations are submission/seal-only and never poll a
-#: PVE task to completion -- see `app/package_update_snapshot.py` and
-#: `deploy/hubinet-package-snapshot-helper.py` -- so the call this bounds is
-#: one `pvesh` trigger plus a durable journal write, not PVE's own
-#: asynchronous snapshot task. The existing canonical timeout used by tests
+#: helper. Snapshot submission journals and starts one detached fixed pvesh
+#: runner; sealing performs no PVE mutation. The call this bounds therefore
+#: never waits for local pvesh CLI's synchronous physical snapshot work.
+#: The existing canonical timeout used by tests
 #: (60s) is ordinary evidence of a healthy round trip, not this ceiling.
 #: 90s gives a real, finite margin above that for a degraded network without
 #: making the derived writer budget below open-ended: unlike the previous
@@ -93,13 +92,12 @@ MAX_PACKAGE_MUTATION_SUBMISSION_TIMEOUT_SECONDS = 90
 #: `SshPackageUpdateRollbackHostControl` -- the wall-clock budget for ONE
 #: bounded SSH round trip running a typed operation that this backend calls
 #: while it still holds the authority writer lock
-#: (`submit_same_job_rollback` or `seal_rollback_never_submitted`). Neither
-#: waits for PVE's own asynchronous `vzrollback` task: the rollback endpoint
-#: returns a UPID immediately, so the submission call journals `submitted`,
-#: invokes `pvesh create` once, journals the returned task identity, and
-#: returns. What this bounds is a live PVE target read, a canonical snapshot
-#: read, two or three fsynced journal writes, and one `pvesh` trigger --
-#: never the rollback's own duration, which includes force-stopping the
+#: (`submit_same_job_rollback` or `seal_rollback_never_submitted`). Submission
+#: journals `submitted` and starts one detached fixed pvesh runner; local
+#: pvesh CLI's synchronous physical rollback work remains outside the writer
+#: transaction. What this bounds is live PVE validation, a canonical snapshot
+#: read, fsynced journal work, and the detach boundary -- never the rollback's
+#: own duration, which includes force-stopping the
 #: container and replacing its volumes and config. The helper's read-only
 #: `inspect_rollback_state` runs strictly OUTSIDE the writer lock and is
 #: deliberately NOT bounded by this value.

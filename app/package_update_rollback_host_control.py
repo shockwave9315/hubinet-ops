@@ -67,8 +67,8 @@ _OPERATIONS = (
 
 #: Outcomes the dark helper may report, mapped onto the orchestrator's typed
 #: vocabulary. ``absent`` maps to UNCERTAIN, never FAILED: a canonical absence
-#: is an observation, not proof that an already-submitted asynchronous PVE
-#: rollback terminated.
+#: is an observation, not proof that an already-submitted PVE rollback
+#: terminated; the detached host runner may still be active.
 _OUTCOMES = {
     "completed": RollbackOperationOutcome.COMPLETED,
     "failed": RollbackOperationOutcome.FAILED,

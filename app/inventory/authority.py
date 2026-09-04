@@ -2522,8 +2522,9 @@ class InventoryAuthority:
         IMMEDIATE below holds this store's one writer lock across it.
 
         ``submit`` MUST be the host's submission-only operation and nothing
-        else: no PVE task polling, no package mutation, no rollback, and no
-        recursive authority mutation. It is invoked at most once, only when
+        else: it durably starts one detached fixed runner, with no PVE task
+        polling, package mutation, rollback, or recursive authority mutation.
+        It is invoked at most once, only when
         current authority still holds, and only while this transaction still
         owns the writer lock. A stale authority context refuses BEFORE
         ``submit`` is ever called, so the host is never asked to submit
@@ -3338,7 +3339,7 @@ class InventoryAuthority:
         across the (potentially multi-minute) host round trip a caller must
         perform first, outside any transaction -- exactly like every other
         snapshot-safety transition holds the writer lock only across a
-        single bounded operation, never across PVE's own asynchronous work.
+        single bounded detached submission, never across physical PVE work.
 
         The job must currently be ACTIVE at exactly ``snapshot_confirmed``:
         this gate exists specifically for the window after the job's own
@@ -5043,9 +5044,9 @@ class InventoryAuthority:
         already-run update must never gate its compensation.
 
         ``submit`` MUST be the host's submission-only rollback operation and
-        nothing else: it journals ``submitted`` durably, invokes `pvesh
-        create` once, journals whatever UPID PVE returns, and returns. It
-        never polls the asynchronous `vzrollback` task to completion. That
+        nothing else: it journals ``submitted`` durably, starts one detached
+        fixed `pvesh create`, and returns. Exact task identity is promoted
+        later from the completed durable capture. That
         bound is machine-enforced by ``app/inventory/contention_policy.py``
         and the rollback transport's own timeout ceiling.
 
@@ -5086,7 +5087,7 @@ class InventoryAuthority:
 
         Pure evidence preservation, and deliberately unconditional on the
         resource/locator context: a task identity is the only thing that lets
-        a restarted backend reattach to an asynchronous `vzrollback` instead
+        a restarted backend reattach to the exact attributed `vzrollback` instead
         of guessing, so a context that moved on must never discard it.
         Write-once at the SQL layer; a conflicting identity raises.
         """

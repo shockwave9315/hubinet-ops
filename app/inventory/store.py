@@ -2090,8 +2090,8 @@ _SCHEMA_STATEMENTS = (
             CHECK(rollback_operation_id IS NULL OR
                   length(rollback_operation_id) = 36),
         rollback_may_have_started_at TEXT,
-        -- Same verified UPID contract as snapshot_task_upid: PVE's rollback
-        -- endpoint is asynchronous and returns a task id immediately.
+        -- Same exact UPID contract as snapshot_task_upid: the detached host
+        -- runner's completed capture must yield one attributable task id.
         rollback_task_upid TEXT CHECK(rollback_task_upid IS NULL OR
             (length(rollback_task_upid) BETWEEN 20 AND 300 AND
              rollback_task_upid GLOB 'UPID:?*:?*:?*:?*:?*:*:?*:')),

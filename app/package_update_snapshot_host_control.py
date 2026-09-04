@@ -52,8 +52,8 @@ _MAX_REQUEST_BYTES = 8192
 #:
 #: ``absent`` is only produced by the read-only ``inspect_job_snapshot_state``
 #: operation, and it maps to UNCERTAIN, never FAILED. A canonical absence is
-#: an *observation*, not proof that an already-submitted asynchronous PVE
-#: snapshot operation terminated: the task may still be queued or running and
+#: an *observation*, not proof that an already-submitted PVE snapshot
+#: operation terminated: the detached host runner may still be running and
 #: about to create the snapshot. Only a terminal failed PVE task (which the
 #: helper reports as ``failed``, with its own canonical evidence attached) may
 #: reach the FAILED branch, and only the explicit durable ``not_submitted``

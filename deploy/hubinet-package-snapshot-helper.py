@@ -19,26 +19,30 @@ Scope is deliberately minimal:
   constants plus validated typed fields.
 - **No snapshot delete operation, and no rollback submission.**
 
-`ensure_pre_update_snapshot_submitted` is submission-only: it never polls a
-PVE task to completion. It journals the submission, invokes `pvesh create`
-at most once, records the task identity the instant PVE returns one, and
-returns immediately. The backend DOES hold a lock of its own across this
+`ensure_pre_update_snapshot_submitted` is submission-only. Local `pvesh` CLI
+waits for the physical snapshot worker and prints its final UPID only after
+that worker exits, so this helper never invokes it synchronously. It journals
+`submitted`, starts exactly one double-forked fixed runner holding the VMID
+lease, and returns while the runner durably captures bounded raw stdout and
+stderr. Later inspect promotes only an exact completed capture to
+`task_known`; incomplete or ambiguous capture stays UNKNOWN. The backend DOES hold a lock of its own across this
 call -- its own authority store's short SQLite writer transaction, so a
 concurrent Hubinet writer cannot invalidate this job's authority in the gap
 between proving it and submitting (see
 `InventoryAuthority.execute_snapshot_submission_if_current` in
 `app/inventory/authority.py`, and the sized wait policy in
 `app/inventory/contention_policy.py`). What the backend must never do is hold
-that lock, or any lock, across PVE's own asynchronous task completion: this
-call itself never blocks for that, and neither does any caller-side
+that lock, or any lock, across PVE's physical snapshot work: this call
+detaches before that work completes, and neither does any caller-side
 transaction wrapping it. `inspect_job_snapshot_state` reads the journaled
 task's status exactly once, synchronously, alongside a fresh canonical
 listing -- fast, bounded, and repeatable from the caller's own bounded retry
 loop -- so completion is observed by the caller polling this cheap read
 operation, never by the mutating one blocking internally.
 
-`inspect_job_snapshot_state` is read-only with respect to PVE and the
-journal -- no write, no `pvesh create` -- but it is serialized against the
+`inspect_job_snapshot_state` is read-only with respect to PVE -- no `pvesh
+create` -- but may promote a completed durable capture in the host journal.
+It is serialized against the
 SAME per-VMID mutation lease (`VmidMutationLock`) the mutating operation
 uses, acquired non-blocking and released before it returns. A backend that
 lost its own lock (crashed, restarted, or is simply a later attempt) cannot
@@ -107,12 +111,12 @@ Mutations are serialized per VMID with a kernel `flock`.
 
 ## Verified PVE semantics this file depends on
 
-- `POST /nodes/{node}/lxc/{vmid}/snapshot` returns a UPID immediately
-  (`fork_worker('vzsnapshot', ...)`); `pvesh create` prints that UPID rather
-  than waiting, so the task identity can be journaled before polling.
-- `pvesh` resolves the endpoint's own `proxyto => node` by running
-  `pvesh --noproxy` on the owning cluster member over PVE's existing root
-  SSH trust, so no per-node Hubinet credential is needed here.
+- The API handler uses `fork_worker('vzsnapshot', ...)`, but local `pvesh` runs
+  in CLI mode with synchronous worker semantics: worker output may precede the
+  final machine-readable UPID and the command waits for physical completion.
+- Current package-update mutation is single-node only. PVE's fixed
+  `/cluster/status` local-node fact must equal `expected_node` before
+  `submitted`, and the destructive argv includes `--noproxy`.
 - `GET /nodes/{node}/tasks/{upid}/status` gives `status` in
   `running`/`stopped` plus an optional `exitstatus`; PVE's own rule treats
   `OK` and `WARNINGS: <n>` as non-errors.
@@ -145,6 +149,7 @@ from typing import Any
 MAX_REQUEST_BYTES = 8192
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 120.0
+MAX_CAPTURE_OUTPUT_BYTES = 512 * 1024
 
 JOURNAL_DIRECTORY = Path("/var/lib/hubinet-ops/snapshot-operations")
 
@@ -540,6 +545,9 @@ class OperationJournal:
         # The id is a validated canonical UUID, so this never escapes.
         return self._directory / f"op-{snapshot_operation_id}.json"
 
+    def _capture_path(self, snapshot_operation_id: str, suffix: str) -> Path:
+        return self._directory / f"op-{snapshot_operation_id}.pvesh-{suffix}"
+
     def ensure_directory(self) -> None:
         self._directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -630,6 +638,111 @@ class OperationJournal:
         finally:
             os.close(directory_descriptor)
 
+    def write_completed_capture(
+        self, snapshot_operation_id: str, result: CommandResult
+    ) -> None:
+        """Durably publish bounded raw pvesh output, completion marker last."""
+
+        self.ensure_directory()
+        streams = {"stdout": result.stdout, "stderr": result.stderr}
+        metadata: dict[str, Any] = {
+            "capture_version": 1,
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "output_exceeded": result.output_exceeded,
+        }
+        for name, payload in streams.items():
+            path = self._capture_path(snapshot_operation_id, name)
+            temporary = path.with_name(path.name + ".tmp")
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            try:
+                offset = 0
+                while offset < len(payload):
+                    offset += os.write(descriptor, payload[offset:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, path)
+            metadata[f"{name}_size"] = len(payload)
+            metadata[f"{name}_sha256"] = hashlib.sha256(payload).hexdigest()
+        marker = self._capture_path(snapshot_operation_id, "complete.json")
+        temporary = marker.with_name(marker.name + ".tmp")
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        try:
+            payload = _canonical_json(metadata).encode("ascii")
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, marker)
+        directory_descriptor = os.open(self._directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+
+    def read_completed_capture(
+        self, snapshot_operation_id: str
+    ) -> CommandResult | None:
+        marker = self._capture_path(snapshot_operation_id, "complete.json")
+        try:
+            metadata = json.loads(marker.read_bytes().decode("ascii"))
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(metadata, dict) or metadata.get("capture_version") != 1:
+            return None
+        streams: dict[str, bytes] = {}
+        for name in ("stdout", "stderr"):
+            size = metadata.get(f"{name}_size")
+            digest = metadata.get(f"{name}_sha256")
+            if type(size) is not int or not 0 <= size <= MAX_CAPTURE_OUTPUT_BYTES + 1:
+                return None
+            if not isinstance(digest, str) or len(digest) != 64:
+                return None
+            try:
+                payload = self._capture_path(snapshot_operation_id, name).read_bytes()
+            except OSError:
+                return None
+            if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+                return None
+            streams[name] = payload
+        returncode = metadata.get("returncode")
+        timed_out = metadata.get("timed_out")
+        output_exceeded = metadata.get("output_exceeded")
+        if (
+            type(returncode) is not int
+            or type(timed_out) is not bool
+            or type(output_exceeded) is not bool
+        ):
+            return None
+        return CommandResult(
+            returncode,
+            streams["stdout"],
+            streams["stderr"],
+            timed_out,
+            output_exceeded,
+        )
+
+    def cleanup_capture(self, snapshot_operation_id: str) -> None:
+        for suffix in ("stdout", "stderr", "complete.json"):
+            try:
+                self._capture_path(snapshot_operation_id, suffix).unlink()
+            except FileNotFoundError:
+                pass
+        directory_descriptor = os.open(self._directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+
 
 class VmidMutationLock:
     """Kernel `flock` serializing snapshot mutation per VMID."""
@@ -659,6 +772,13 @@ class VmidMutationLock:
     def __exit__(self, *_exc: object) -> None:
         if self._descriptor is not None:
             fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    def detach(self) -> None:
+        """Hand the inherited lease to a detached child without unlocking it."""
+
+        if self._descriptor is not None:
             os.close(self._descriptor)
             self._descriptor = None
 
@@ -720,6 +840,33 @@ def revalidate_live_target(runner: Runner, vmid: int, expected_node: str) -> Non
         raise SnapshotError("stale_target", "guest node changed after job issuance")
     if row.get("status") not in ("running", "stopped"):
         raise SnapshotError("guest_unavailable", "guest status is not snapshot-ready")
+
+
+def read_local_node(runner: Runner) -> str:
+    """Return PVE's one typed local-node identity; never guess from hostname."""
+
+    rows = _json_command(
+        runner,
+        ("pvesh", "get", "/cluster/status", "--output-format", "json"),
+        "local PVE node identity",
+        max_output=1024 * 1024,
+    )
+    if not isinstance(rows, list):
+        raise SnapshotError("execution_failed", "local PVE node identity was malformed")
+    local_nodes = [
+        row.get("name")
+        for row in rows
+        if isinstance(row, Mapping)
+        and row.get("type") == "node"
+        and row.get("local") in (1, True)
+    ]
+    if (
+        len(local_nodes) != 1
+        or not isinstance(local_nodes[0], str)
+        or not NODE_RE.fullmatch(local_nodes[0])
+    ):
+        raise SnapshotError("execution_failed", "local PVE node identity was ambiguous")
+    return local_nodes[0]
 
 
 def read_container_lock(
@@ -962,6 +1109,11 @@ def _inspect(
                 submission_state="sealed_not_submitted",
             )
 
+        if record is not None and submission_state == "submitted":
+            recovered_upid = _promote_completed_capture(request, journal, record)
+            if recovered_upid is not None:
+                record = {**record, "phase": "task_known", "task_upid": recovered_upid}
+                submission_state = "task_known"
         task_upid = record.get("task_upid") if record else None
         task = None
         try:
@@ -1130,11 +1282,73 @@ def _finalize(
     )
 
 
+def _run_capture_child(
+    runner: Runner,
+    journal: OperationJournal,
+    operation_id: str,
+    argv: tuple[str, ...],
+) -> None:
+    try:
+        result = runner(argv, COMMAND_TIMEOUT_SECONDS, MAX_CAPTURE_OUTPUT_BYTES)
+        journal.write_completed_capture(operation_id, result)
+    except Exception:
+        # No completion marker means UNKNOWN. The submitted journal is retained.
+        return
+
+
+def _spawn_detached_runner(
+    runner: Runner,
+    journal: OperationJournal,
+    operation_id: str,
+    argv: tuple[str, ...],
+    lease: VmidMutationLock,
+) -> None:
+    """Double-fork one fixed pvesh invocation and hand it the VMID lease."""
+
+    pid = os.fork()
+    if pid > 0:
+        lease.detach()
+        os.waitpid(pid, 0)
+        return
+    try:
+        os.setsid()
+        if os.fork() > 0:
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for descriptor in (0, 1, 2):
+            os.dup2(devnull, descriptor)
+        if devnull > 2:
+            os.close(devnull)
+        _run_capture_child(runner, journal, operation_id, argv)
+    finally:
+        os._exit(0)
+
+
+def _promote_completed_capture(
+    request: Mapping[str, Any], journal: OperationJournal, record: dict[str, Any]
+) -> str | None:
+    """Promote one complete, exact capture to task_known; never infer identity."""
+
+    result = journal.read_completed_capture(request["snapshot_operation_id"])
+    if result is None:
+        return None
+    upid = _extract_upid(result)
+    if upid is None:
+        return None
+    journal.write({**record, "phase": "task_known", "task_upid": upid})
+    journal.cleanup_capture(request["snapshot_operation_id"])
+    return upid
+
+
 def _ensure_submitted(
-    runner: Runner, request: Mapping[str, Any], journal: OperationJournal
+    runner: Runner,
+    request: Mapping[str, Any],
+    journal: OperationJournal,
+    *,
+    detach: bool,
 ) -> dict[str, Any]:
     fingerprint = request_fingerprint(request)
-    with VmidMutationLock(request["vmid"], journal.directory):
+    with VmidMutationLock(request["vmid"], journal.directory) as lease:
         record = journal.read(request["snapshot_operation_id"])
         if record is not None:
             if record["request_fingerprint"] != fingerprint:
@@ -1168,6 +1382,15 @@ def _ensure_submitted(
                 )
             if phase == "submitted":
                 # The genuinely uncertain window. NEVER resubmit here.
+                upid = _promote_completed_capture(request, journal, record)
+                if upid is not None:
+                    return _response(
+                        request,
+                        "uncertain",
+                        task_upid=upid,
+                        submission_state="task_known",
+                        reason="completed pvesh capture yielded the exact task identity",
+                    )
                 return _recover_submitted_without_task(
                     runner, request, journal, record
                 )
@@ -1225,6 +1448,12 @@ def _ensure_submitted(
         try:
             # Live target revalidation immediately before the mutation.
             revalidate_live_target(runner, request["vmid"], request["expected_node"])
+            local_node = read_local_node(runner)
+            if local_node != request["expected_node"]:
+                raise SnapshotError(
+                    "stale_target",
+                    "target guest is not owned by this local PVE node",
+                )
             lock = read_container_lock(
                 runner, request["vmid"], request["expected_node"]
             )
@@ -1286,29 +1515,41 @@ def _ensure_submitted(
                 submission_state="intent",
             )
 
+        # Re-prove the live locator after the canonical reads, still before
+        # the uncertainty boundary and without any proxy routing.
+        revalidate_live_target(runner, request["vmid"], request["expected_node"])
+
         record = {**record, "phase": "submitted"}
         journal.write(record)
 
         description = build_snapshot_description(request["ownership"])
-        result = _command(
-            runner,
-            (
-                "pvesh", "create",
-                f"/nodes/{request['expected_node']}/lxc/{request['vmid']}/snapshot",
-                "--snapname", request["snapshot_name"],
-                "--description", description,
-                "--output-format", "json",
-            ),
-            max_output=256 * 1024,
+        argv = (
+            "pvesh", "create",
+            f"/nodes/{request['expected_node']}/lxc/{request['vmid']}/snapshot",
+            "--snapname", request["snapshot_name"],
+            "--description", description,
+            "--noproxy",
+            "--output-format", "json",
         )
-        upid = _extract_upid(result)
+        if detach:
+            _spawn_detached_runner(
+                runner,
+                journal,
+                request["snapshot_operation_id"],
+                argv,
+                lease,
+            )
+        else:
+            # Explicit injected-runner seam for hermetic tests only.
+            _run_capture_child(runner, journal, request["snapshot_operation_id"], argv)
+        upid = _promote_completed_capture(request, journal, record)
         if upid is None:
             return _response(
                 request,
                 "uncertain",
                 reason=(
-                    "PVE snapshot submission returned no usable task identity; "
-                    "the operation may or may not have started"
+                    "snapshot submitted to detached host runner; exact task "
+                    "identity awaits durable capture recovery"
                 ),
                 submission_state="submitted",
             )
@@ -1329,29 +1570,37 @@ def _ensure_submitted(
 
 
 def _extract_upid(result: CommandResult) -> str | None:
-    if result.returncode != 0:
+    if result.returncode != 0 or result.timed_out or result.output_exceeded:
         return None
     try:
         text = result.stdout.decode("utf-8")
     except UnicodeDecodeError:
         return None
 
-    # ``pvesh``'s machine-readable result is the final complete output line,
-    # but successful create calls can precede it with status/progress lines.
-    # Treat only that final line as the result; never search arbitrary text
-    # for a UPID.  A UPID-looking prefix makes the answer ambiguous and is
-    # refused even when the final line is otherwise valid.
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines or any("UPID:" in line for line in lines[:-1]):
+    stripped = text.strip()
+    if UPID_RE.fullmatch(stripped):
+        return stripped
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[int, str]] = []
+    for start, character in enumerate(text):
+        if character != '"':
+            continue
+        try:
+            decoded, end = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if (
+            isinstance(decoded, str)
+            and UPID_RE.fullmatch(decoded)
+            and not text[end:].strip()
+        ):
+            candidates.append((start, decoded))
+    if len(candidates) != 1:
         return None
-    final_line = lines[-1]
-    try:
-        decoded = json.loads(final_line)
-    except ValueError:
-        decoded = final_line
-    if not isinstance(decoded, str) or not UPID_RE.fullmatch(decoded):
+    start, upid = candidates[0]
+    if "UPID:" in text[:start]:
         return None
-    return decoded
+    return upid
 
 
 def _recover_submitted_without_task(
@@ -1413,17 +1662,21 @@ def _recover_submitted_without_task(
 def handle_request(
     payload: Any,
     *,
-    runner: Runner = _run_bounded,
+    runner: Runner | None = None,
     journal: OperationJournal | None = None,
 ) -> dict[str, Any]:
     request = validate_request(payload)
     operation_journal = journal or OperationJournal()
+    detach = runner is None
+    effective_runner = _run_bounded if runner is None else runner
     try:
         if request["operation"] == "inspect_job_snapshot_state":
-            return _inspect(runner, request, operation_journal)
+            return _inspect(effective_runner, request, operation_journal)
         if request["operation"] == "seal_operation_never_submitted":
             return _seal_never_submitted(request, operation_journal)
-        return _ensure_submitted(runner, request, operation_journal)
+        return _ensure_submitted(
+            effective_runner, request, operation_journal, detach=detach
+        )
     except SnapshotError as exc:
         return {
             "response_version": 1,

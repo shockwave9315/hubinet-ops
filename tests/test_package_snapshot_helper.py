@@ -13,6 +13,7 @@ import json
 import re
 from pathlib import Path
 import sys
+import time
 from types import ModuleType
 import uuid
 
@@ -35,6 +36,17 @@ def _load_helper() -> ModuleType:
 
 
 helper = _load_helper()
+REAL_DETACHED_SPAWN = helper._spawn_detached_runner
+
+
+@pytest.fixture(autouse=True)
+def _synchronous_detached_runner(monkeypatch):
+    """Keep fake-runner state in-process; production spawn is tested separately."""
+
+    def synchronous(runner, journal, operation_id, argv, _lease):
+        helper._run_capture_child(runner, journal, operation_id, argv)
+
+    monkeypatch.setattr(helper, "_spawn_detached_runner", synchronous)
 
 NODE = "pve-a"
 VMID = 112
@@ -101,6 +113,7 @@ class FakePve:
         submit_returncode=0,
         status="running",
         node=NODE,
+        local_node=NODE,
         resource_type="lxc",
         present=True,
         vmid=VMID,
@@ -119,6 +132,7 @@ class FakePve:
         self.submit_returncode = submit_returncode
         self.status = status
         self.node = node
+        self.local_node = local_node
         self.resource_type = resource_type
         self.present = present
         self.argvs: list[tuple[str, ...]] = []
@@ -134,6 +148,10 @@ class FakePve:
         return 0, json.dumps(payload).encode("utf-8"), b""
 
     def _dispatch(self, argv):
+        if argv[:3] == ("pvesh", "get", "/cluster/status"):
+            return self._json(
+                [{"type": "node", "name": self.local_node, "local": 1}]
+            )
         if argv[:3] == ("pvesh", "get", "/cluster/resources"):
             rows = []
             if self.present:
@@ -488,7 +506,7 @@ def test_a_known_task_is_never_polled_or_resubmitted_by_the_submission_operation
 ) -> None:
     """The mutating operation returns the instant a task is journaled.
 
-    It must never poll PVE's own asynchronous task to completion: that is
+    It must never wait for PVE's physical task to completion: that is
     the read-only operation's job, exercised below. Zero PVE calls at all
     proves this returns promptly rather than blocking internally.
     """
@@ -564,7 +582,7 @@ def test_inspecting_a_known_task_reads_it_exactly_once_and_never_submits(
 
 
 def test_a_running_task_is_reported_without_polling(tmp_path: Path) -> None:
-    """The helper never blocks on PVE's own asynchronous task."""
+    """The helper never blocks on PVE's physical task."""
 
     journal = _journal(tmp_path)
     pve = FakePve(task_sequence=[{"upid": UPID, "status": "running"}])
@@ -816,11 +834,30 @@ def test_pvesh_status_prefix_then_exact_json_upid_reaches_task_known(
 @pytest.mark.parametrize(
     "stdout",
     [
+        UPID.encode(),
+        b'"' + UPID.encode() + b'"',
+        b"progress\nwarning\n\"" + UPID.encode() + b"\"\n",
+        b"progress without newline\"" + UPID.encode() + b"\"\n",
+    ],
+)
+def test_upid_extraction_accepts_only_an_exact_terminal_machine_result(
+    stdout: bytes,
+) -> None:
+    result = helper.CommandResult(returncode=0, stdout=stdout, stderr=b"")
+    assert helper._extract_upid(result) == UPID
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
         b"progress only\n",
         b"prefix UPID:not-a-task\n\"" + UPID.encode() + b"\"\n",
         UPID.encode() + b"\n\"" + UPID.encode() + b"\"\n",
         b"prefix " + UPID.encode() + b" suffix\n",
         b'{"upid":"' + UPID.encode() + b'"}\n',
+        b'["' + UPID.encode() + b'"]\n',
+        b'"' + UPID.encode() + b'" garbage',
+        b"\xff\"" + UPID.encode() + b'"',
     ],
 )
 def test_upid_extraction_rejects_unrelated_malformed_or_ambiguous_stdout(
@@ -828,6 +865,96 @@ def test_upid_extraction_rejects_unrelated_malformed_or_ambiguous_stdout(
 ) -> None:
     result = helper.CommandResult(returncode=0, stdout=stdout, stderr=b"")
     assert helper._extract_upid(result) is None
+
+
+def test_remote_owner_refuses_before_submitted_and_create_is_noproxy(
+    tmp_path: Path,
+) -> None:
+    refused_journal = _journal(tmp_path / "remote")
+    refused = _handle(_request(), FakePve(local_node="pve-b"), refused_journal)
+    operation_id, _ = _identity(_ownership())
+    assert refused["ok"] is False
+    assert refused["error"]["submission"] == helper.SUBMISSION_NOT_SUBMITTED
+    assert refused_journal.read(operation_id)["phase"] == "intent"
+
+    local = FakePve()
+    _handle(_request(), local, _journal(tmp_path / "local"))
+    create = next(argv for argv in local.argvs if argv[:2] == ("pvesh", "create"))
+    assert "--noproxy" in create
+
+
+def test_submitted_capture_is_promoted_later_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    pve = FakePve(submit_upid="malformed")
+    operation_id, _ = _identity(_ownership())
+    first = _handle(_request(), pve, journal)
+    assert first["submission_state"] == "submitted"
+    journal.write_completed_capture(
+        operation_id,
+        helper.CommandResult(
+            0, b"progress without newline\"" + UPID.encode() + b'"\n', b"warning"
+        ),
+    )
+
+    recovered = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert recovered["submission_state"] == "task_known"
+    assert recovered["task_upid"] == UPID
+    assert journal.read(operation_id)["phase"] == "task_known"
+    assert pve.submissions == 1
+
+
+def test_incomplete_capture_stays_submitted_and_never_resubmits(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    pve = FakePve(submit_upid="malformed")
+    operation_id, _ = _identity(_ownership())
+    _handle(_request(), pve, journal)
+    journal._capture_path(operation_id, "complete.json").unlink()
+
+    inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert inspected["submission_state"] == "submitted"
+    assert journal.read(operation_id)["phase"] == "submitted"
+    assert pve.submissions == 1
+
+
+def test_real_detached_snapshot_runner_returns_while_physical_task_is_alive(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    operation_id, _ = _identity(_ownership())
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+
+    def slow_runner(argv, timeout, max_output):
+        started.touch()
+        deadline = time.monotonic() + 3
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return helper.CommandResult(0, b'"' + UPID.encode() + b'"', b"")
+
+    began = time.monotonic()
+    with helper.VmidMutationLock(VMID, journal.directory) as lease:
+        REAL_DETACHED_SPAWN(
+            slow_runner,
+            journal,
+            operation_id,
+            ("pvesh", "create", "/fixed", "--noproxy"),
+            lease,
+        )
+    assert time.monotonic() - began < 1
+    deadline = time.monotonic() + 2
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+    with pytest.raises(helper.SnapshotError, match="holds this guest's lease"):
+        with helper.VmidMutationLock(VMID, journal.directory):
+            pass
+    release.touch()
+    deadline = time.monotonic() + 3
+    while journal.read_completed_capture(operation_id) is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert journal.read_completed_capture(operation_id).stdout == b'"' + UPID.encode() + b'"'
 
 
 @pytest.mark.parametrize("exitstatus", ["OK", "WARNINGS: 2"])

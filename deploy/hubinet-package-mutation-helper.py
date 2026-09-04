@@ -151,7 +151,6 @@ import os
 from pathlib import Path
 import re
 import selectors
-import shlex
 import subprocess
 import sys
 import time
@@ -1385,14 +1384,11 @@ def _run_guest_command(
     timeout: float = COMMAND_TIMEOUT_SECONDS,
     stdin: bytes = b"",
 ) -> CommandResult:
-    """Run one fixed ``pct exec`` shape on whichever node currently holds it.
+    """Run one fixed ``pct exec`` shape on the local owning PVE node.
 
-    Identical routing contract to the scan and execution helpers: ``tail`` is
-    always one of this file's own fixed argv shapes, and a non-local guest is
-    routed to its expected cluster member over root's existing passwordless
-    inter-node SSH trust Proxmox itself provisions -- no new Hubinet
-    credential on that node, and no request-provided or arbitrary text ever
-    reaches either command.
+    Package mutation is single-node-only in the current product. The fixed
+    PVE-derived local-node identity must exactly equal the job's expected
+    owning node; remote inter-node SSH is not a supported mutation route.
 
     **This dispatcher owns the live-target invariant.** A VMID is an
     execution locator, not identity: PVE can free one and reuse it for an
@@ -1412,27 +1408,14 @@ def _run_guest_command(
 
     revalidate_live_target(runner, vmid, expected_node)
     inner = ("pct", "exec", str(vmid), "--", *tail)
-    if expected_node == local_node:
-        result = _command(
-            runner, inner, max_output=max_output, timeout=timeout, stdin=stdin
-        )
-    else:
-        argv = (
-            "ssh",
-            "-T",
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=yes",
-            f"root@{expected_node}",
-            shlex.join(inner),
-        )
-        result = _command(
-            runner, argv, max_output=max_output, timeout=timeout, stdin=stdin
-        )
-    if result.returncode == 255:
+    if expected_node != local_node:
         raise MutationError(
-            "execution_failed", "could not execute package command in guest"
+            "stale_target",
+            "target guest is not owned by this local PVE node",
         )
-    return result
+    return _command(
+        runner, inner, max_output=max_output, timeout=timeout, stdin=stdin
+    )
 
 
 def _decode(result: CommandResult) -> tuple[str, str]:

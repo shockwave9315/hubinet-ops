@@ -65,12 +65,13 @@ operation.
 Established from current Proxmox VE sources, not inherited from snapshot
 create and not from Hubinet 0.4:
 
-- `POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback` is
-  `protected => 1`, `proxyto => 'node'`, takes an optional `start` boolean
-  (default 0), and requires `VM.Snapshot` or `VM.Snapshot.Rollback` on
-  `/vms/{vmid}`.
-- It is asynchronous: the worker is `fork_worker('vzrollback', ...)` and the
-  endpoint returns the task id, so a returned POST proves nothing.
+- `POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback` is protected,
+  takes an optional `start` boolean (default 0), and requires `VM.Snapshot` or
+  `VM.Snapshot.Rollback` on `/vms/{vmid}`.
+- The endpoint uses `fork_worker('vzrollback', ...)`, but local `pvesh` CLI
+  runs it synchronously and emits the final task id only after worker output.
+  The host helper detaches that CLI call and recovers the exact UPID from its
+  durable bounded capture, so a returned submission response proves nothing.
 - `snapshot_rollback` refuses, with these exact upstream conditions: a
   template; a snapshot that does not exist; a snapshot still carrying
   `snapstate` ("unable to rollback to incomplete snapshot"); a config already
@@ -170,10 +171,10 @@ class PackageUpdateRollbackHostControl(Protocol):
     ) -> HostRollbackResult:
         """Submit, or reattach to, this exact job's rollback operation.
 
-        Submission-only: it journals `submitted`, invokes `pvesh create`
-        once, journals whatever UPID PVE returns, and returns. It never polls
-        the asynchronous `vzrollback` task to completion, so it is safe to
-        call while the backend holds its authority writer lock across it.
+        Submission-only: it journals `submitted`, starts one detached fixed
+        local `pvesh create`, and returns. Inspect later promotes only an exact
+        completed capture to `task_known`, so it is safe to call while the
+        backend holds its authority writer lock across it.
         """
 
     def inspect_rollback_state(

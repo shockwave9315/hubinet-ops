@@ -48,9 +48,9 @@ Nothing else may write to this authority store while that section runs, so
 nothing can invalidate the job between the final proof and the submission
 request it authorizes. That transaction is kept as short as the submission
 request itself: the host operation it calls
-(`ensure_pre_update_snapshot_submitted`) never polls a PVE task to
-completion, so the writer lock is held only for one bounded round trip, never
-for PVE's own asynchronous task.
+(`ensure_pre_update_snapshot_submitted`) journals and detaches a fixed local
+runner before returning, so the writer lock is held only for one bounded round
+trip, never for the physical snapshot operation.
 
 Recovering evidence about an operation that may already have been submitted
 is a different thing entirely, and never requires current authority: reading
@@ -80,8 +80,10 @@ every failed or unsupported seal stays uncertain and fenced.
 
 Established from current Proxmox VE sources, not from Hubinet 0.4 behaviour:
 
-- `POST /nodes/{node}/lxc/{vmid}/snapshot` is asynchronous. It returns a UPID
-  immediately (`fork_worker('vzsnapshot', ...)`), so a returned POST is never
+- The endpoint uses `fork_worker('vzsnapshot', ...)`, but local `pvesh` CLI
+  runs the worker synchronously and prints the final UPID only after worker
+  output. The host helper therefore detaches it and recovers the exact UPID
+  from a crash-safe bounded capture. A returned submission response is never
   evidence that a snapshot exists.
 - `GET /nodes/{node}/tasks/{upid}/status` reports `status` in
   `running`/`stopped` plus an optional `exitstatus`. `stopped` alone is not
@@ -171,7 +173,7 @@ class SnapshotEvidenceError(PackageUpdateSnapshotError):
 
 @dataclass(frozen=True, slots=True)
 class SnapshotTaskStatus:
-    """One bounded observation of a PVE asynchronous task."""
+    """One bounded observation of the exact PVE task attributed by UPID."""
 
     upid: str
     terminal: bool

@@ -40,10 +40,13 @@ Scope is deliberately minimal:
   change afterwards, and this file runs closest in time to the real `pvesh`
   call.
 
-`submit_same_job_rollback` is submission-only: it never polls the PVE task to
-completion. It journals the submission, invokes `pvesh create` at most once,
-records the task identity the instant PVE returns one, and returns. The
-backend holds its own authority-store writer transaction across this call (see
+`submit_same_job_rollback` is submission-only. Local `pvesh` CLI waits for the
+physical rollback worker and prints its final UPID only after that worker
+exits, so the helper journals `submitted`, starts exactly one double-forked
+fixed runner holding the VMID lease, and returns. The runner durably captures
+bounded raw stdout and stderr; later inspect promotes only one exact completed
+terminal UPID to `task_known`. Incomplete or ambiguous capture stays UNKNOWN.
+The backend holds its own authority-store writer transaction across this call (see
 `InventoryAuthority.execute_rollback_submission_if_current`, and the sized
 wait policy in `app/inventory/contention_policy.py`), so this call must stay
 bounded. `inspect_rollback_state` reads the journaled task's status once,
@@ -51,8 +54,9 @@ synchronously, alongside a fresh canonical listing, so completion is observed
 by the caller polling that cheap read operation, never by the mutating one
 blocking internally.
 
-`inspect_rollback_state` is read-only with respect to PVE and the journal, but
-it is serialized against the SAME per-VMID lease the mutating operations use,
+`inspect_rollback_state` is read-only with respect to PVE, but may promote a
+completed durable capture in the host journal. It is serialized against the
+SAME per-VMID lease the mutating operations use,
 acquired non-blocking and released before it returns. Without joining that
 lease a concurrent inspection could read `intent` while a live submitter was
 about to advance past it and hand the caller stale routing evidence. If the
@@ -110,11 +114,10 @@ product's threat model (see `AGENTS.md`).
 
 ## Verified PVE semantics this file depends on
 
-- `POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback` is
-  `protected => 1`, `proxyto => 'node'`, takes an optional `start` boolean
-  (default 0), and returns the task id; the worker is
-  `fork_worker('vzrollback', ...)`, so `pvesh create` prints a UPID rather
-  than waiting.
+- `POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback` is protected,
+  takes an optional `start` boolean (default 0), and uses
+  `fork_worker('vzrollback', ...)`. Local CLI mode runs that worker
+  synchronously: progress may precede the final UPID and `pvesh` waits.
 - `PVE::AbstractConfig::snapshot_rollback` refuses a template, a missing
   snapshot, a snapshot still carrying `snapstate`, a config under another
   lock, and a container still running after its own forced stop; it holds the
@@ -142,8 +145,9 @@ product's threat model (see `AGENTS.md`).
 - `GET /nodes/{node}/lxc/{vmid}/snapshot` includes PVE's synthetic `current`
   pseudo-entry (carrying `parent`) and carries `snapstate` for unfinished
   snapshots.
-- `pvesh` resolves the endpoint's own `proxyto => node` over PVE's existing
-  root SSH trust, so no per-node Hubinet credential is needed here.
+- Current package-update mutation is single-node only. PVE's fixed
+  `/cluster/status` local-node fact must equal `expected_node` before
+  `submitted`, and the destructive argv includes `--noproxy`.
 """
 
 from __future__ import annotations
@@ -168,6 +172,7 @@ from typing import Any
 MAX_REQUEST_BYTES = 8192
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 120.0
+MAX_CAPTURE_OUTPUT_BYTES = 512 * 1024
 
 JOURNAL_DIRECTORY = Path("/var/lib/hubinet-ops/rollback-operations")
 
@@ -667,6 +672,9 @@ class OperationJournal:
         # The id is a validated canonical UUID, so this never escapes.
         return self._directory / f"op-{rollback_operation_id}.json"
 
+    def _capture_path(self, rollback_operation_id: str, suffix: str) -> Path:
+        return self._directory / f"op-{rollback_operation_id}.pvesh-{suffix}"
+
     def ensure_directory(self) -> None:
         """Create the journal directory durably.
 
@@ -764,6 +772,108 @@ class OperationJournal:
         finally:
             os.close(directory_descriptor)
 
+    def write_completed_capture(
+        self, rollback_operation_id: str, result: CommandResult
+    ) -> None:
+        """Durably publish bounded raw pvesh output, completion marker last."""
+
+        self.ensure_directory()
+        metadata: dict[str, Any] = {
+            "capture_version": 1,
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "output_exceeded": result.output_exceeded,
+        }
+        for name, payload in (("stdout", result.stdout), ("stderr", result.stderr)):
+            path = self._capture_path(rollback_operation_id, name)
+            temporary = path.with_name(path.name + ".tmp")
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            try:
+                _write_all(descriptor, payload)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, path)
+            metadata[f"{name}_size"] = len(payload)
+            metadata[f"{name}_sha256"] = hashlib.sha256(payload).hexdigest()
+        marker = self._capture_path(rollback_operation_id, "complete.json")
+        temporary = marker.with_name(marker.name + ".tmp")
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        try:
+            _write_all(descriptor, _canonical_json(metadata).encode("ascii"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, marker)
+        directory_descriptor = os.open(self._directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+
+    def read_completed_capture(
+        self, rollback_operation_id: str
+    ) -> CommandResult | None:
+        try:
+            metadata = json.loads(
+                self._capture_path(rollback_operation_id, "complete.json")
+                .read_bytes()
+                .decode("ascii")
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(metadata, dict) or metadata.get("capture_version") != 1:
+            return None
+        streams: dict[str, bytes] = {}
+        for name in ("stdout", "stderr"):
+            size = metadata.get(f"{name}_size")
+            digest = metadata.get(f"{name}_sha256")
+            if type(size) is not int or not 0 <= size <= MAX_CAPTURE_OUTPUT_BYTES + 1:
+                return None
+            if not isinstance(digest, str) or len(digest) != 64:
+                return None
+            try:
+                payload = self._capture_path(rollback_operation_id, name).read_bytes()
+            except OSError:
+                return None
+            if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+                return None
+            streams[name] = payload
+        returncode = metadata.get("returncode")
+        timed_out = metadata.get("timed_out")
+        output_exceeded = metadata.get("output_exceeded")
+        if (
+            type(returncode) is not int
+            or type(timed_out) is not bool
+            or type(output_exceeded) is not bool
+        ):
+            return None
+        return CommandResult(
+            returncode,
+            streams["stdout"],
+            streams["stderr"],
+            timed_out,
+            output_exceeded,
+        )
+
+    def cleanup_capture(self, rollback_operation_id: str) -> None:
+        for suffix in ("stdout", "stderr", "complete.json"):
+            try:
+                self._capture_path(rollback_operation_id, suffix).unlink()
+            except FileNotFoundError:
+                pass
+        directory_descriptor = os.open(self._directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+
 
 class VmidRollbackLease:
     """Kernel `flock` serializing rollback operations per VMID.
@@ -810,6 +920,13 @@ class VmidRollbackLease:
     def __exit__(self, *_exc: object) -> None:
         if self._descriptor is not None:
             fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    def detach(self) -> None:
+        """Hand the inherited lease to a detached child without unlocking it."""
+
+        if self._descriptor is not None:
             os.close(self._descriptor)
             self._descriptor = None
 
@@ -887,6 +1004,33 @@ def revalidate_live_target(runner: Runner, vmid: int, expected_node: str) -> Non
         raise RollbackError(
             "stale_target", "current PVE resource is not on the expected node"
         )
+
+
+def read_local_node(runner: Runner) -> str:
+    """Return PVE's one typed local-node identity; never guess from hostname."""
+
+    rows = _json_command(
+        runner,
+        ("pvesh", "get", "/cluster/status", "--output-format", "json"),
+        "local PVE node identity",
+        max_output=1024 * 1024,
+    )
+    if not isinstance(rows, list):
+        raise RollbackError("execution_failed", "local PVE node identity was malformed")
+    local_nodes = [
+        row.get("name")
+        for row in rows
+        if isinstance(row, Mapping)
+        and row.get("type") == "node"
+        and row.get("local") in (1, True)
+    ]
+    if (
+        len(local_nodes) != 1
+        or not isinstance(local_nodes[0], str)
+        or not NODE_RE.fullmatch(local_nodes[0])
+    ):
+        raise RollbackError("execution_failed", "local PVE node identity was ambiguous")
+    return local_nodes[0]
 
 
 def read_config_preflight(
@@ -1174,6 +1318,61 @@ def _phase_response(
     return response
 
 
+def _run_capture_child(
+    runner: Runner,
+    journal: OperationJournal,
+    operation_id: str,
+    argv: tuple[str, ...],
+) -> None:
+    try:
+        result = runner(argv, COMMAND_TIMEOUT_SECONDS, MAX_CAPTURE_OUTPUT_BYTES)
+        journal.write_completed_capture(operation_id, result)
+    except Exception:
+        return
+
+
+def _spawn_detached_runner(
+    runner: Runner,
+    journal: OperationJournal,
+    operation_id: str,
+    argv: tuple[str, ...],
+    lease: VmidRollbackLease,
+) -> None:
+    """Double-fork one fixed pvesh invocation and hand it the VMID lease."""
+
+    pid = os.fork()
+    if pid > 0:
+        lease.detach()
+        os.waitpid(pid, 0)
+        return
+    try:
+        os.setsid()
+        if os.fork() > 0:
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for descriptor in (0, 1, 2):
+            os.dup2(devnull, descriptor)
+        if devnull > 2:
+            os.close(devnull)
+        _run_capture_child(runner, journal, operation_id, argv)
+    finally:
+        os._exit(0)
+
+
+def _promote_completed_capture(
+    request: Mapping[str, Any], journal: OperationJournal, record: Mapping[str, Any]
+) -> str | None:
+    result = journal.read_completed_capture(request["rollback_operation_id"])
+    if result is None or result.returncode != 0 or result.timed_out or result.output_exceeded:
+        return None
+    upid = _extract_upid(result.stdout)
+    if upid is None:
+        return None
+    journal.write(_journal_record(request, "task_known", task_upid=upid))
+    journal.cleanup_capture(request["rollback_operation_id"])
+    return upid
+
+
 def _resolve_post_submission(
     runner: Runner,
     journal: OperationJournal,
@@ -1190,6 +1389,10 @@ def _resolve_post_submission(
 
     phase = record["phase"]
     task_upid = record.get("task_upid")
+    if phase == "submitted" and task_upid is None:
+        task_upid = _promote_completed_capture(request, journal, record)
+        if task_upid is not None:
+            phase = "task_known"
     if task_upid is None:
         return _phase_response(
             request,
@@ -1336,14 +1539,20 @@ def seal_rollback_never_submitted(
 
 
 def submit_same_job_rollback(
-    runner: Runner, journal: OperationJournal, request: Mapping[str, Any]
+    runner: Runner,
+    journal: OperationJournal,
+    request: Mapping[str, Any],
+    *,
+    detach: bool,
 ) -> dict[str, Any]:
     """Submit, or reattach to, this exact job's rollback. At most once.
 
-    Submission-only: it never waits for PVE's asynchronous `vzrollback` task.
+    Submission-only: it detaches before local pvesh's synchronous physical work.
     """
 
-    with VmidRollbackLease(request["vmid"], journal.directory, anchor=journal.anchor):
+    with VmidRollbackLease(
+        request["vmid"], journal.directory, anchor=journal.anchor
+    ) as lease:
         record = journal.read(request["rollback_operation_id"])
         if record is not None:
             _require_same_request(record, request)
@@ -1407,6 +1616,15 @@ def submit_same_job_rollback(
             request["expected_snapshot_ownership"],
         )
 
+        local_node = read_local_node(runner)
+        if local_node != request["expected_node"]:
+            raise RollbackError(
+                "stale_target",
+                "target guest is not owned by this local PVE node",
+                submission="not_submitted",
+            )
+        revalidate_live_target(runner, request["vmid"], request["expected_node"])
+
         if record is None:
             journal.write(_journal_record(request, "intent"))
 
@@ -1415,39 +1633,38 @@ def submit_same_job_rollback(
         # that is never resubmitted from.
         journal.write(_journal_record(request, "submitted"))
 
-        # Fresh revalidation immediately before the one real mutation: the
-        # reads above cost wall-clock time in which PVE could have freed and
-        # reused this VMID.
-        revalidate_live_target(runner, request["vmid"], request["expected_node"])
-        result = _command(
-            runner,
-            (
-                "pvesh",
-                "create",
-                f"/nodes/{request['expected_node']}/lxc/{request['vmid']}"
-                f"/snapshot/{request['snapshot_name']}/rollback",
-                "--start",
-                str(ROLLBACK_START_AFTER),
-                "--output-format",
-                "json",
-            ),
-            max_output=256 * 1024,
+        argv = (
+            "pvesh",
+            "create",
+            f"/nodes/{request['expected_node']}/lxc/{request['vmid']}"
+            f"/snapshot/{request['snapshot_name']}/rollback",
+            "--start",
+            str(ROLLBACK_START_AFTER),
+            "--noproxy",
+            "--output-format",
+            "json",
         )
-        if result.returncode != 0:
-            # PVE refused AFTER the durable `submitted` record exists. That
-            # record stays: this operation is never retried, and the backend
-            # keeps the job fenced. It is deliberately NOT sealed -- the
-            # pre-submission release contract no longer applies.
-            raise RollbackError(
-                "execution_failed", "PVE refused or failed the rollback submission"
+        if detach:
+            _spawn_detached_runner(
+                runner,
+                journal,
+                request["rollback_operation_id"],
+                argv,
+                lease,
             )
-        upid = _extract_upid(result.stdout)
+        else:
+            # Explicit injected-runner seam for hermetic tests only.
+            _run_capture_child(runner, journal, request["rollback_operation_id"], argv)
+        upid = _promote_completed_capture(request, journal, record)
         if upid is None:
             return _phase_response(
                 request,
                 "submitted",
                 outcome="uncertain",
-                reason="PVE accepted the rollback but returned no task identity",
+                reason=(
+                    "rollback submitted to detached host runner; exact task "
+                    "identity awaits durable capture recovery"
+                ),
             )
         journal.write(_journal_record(request, "task_known", task_upid=upid))
         return _phase_response(
@@ -1467,27 +1684,30 @@ def _extract_upid(stdout: bytes) -> str | None:
     except UnicodeDecodeError:
         return None
 
-    # ``pvesh`` may emit complete status/progress lines before the final
-    # machine-readable scalar returned by a successful create call.  The
-    # result is therefore the final non-empty line, not the whole byte
-    # stream.  This deliberately is not a substring search: an earlier
-    # UPID-looking line makes attribution ambiguous and fails closed.
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines or any("UPID:" in line for line in lines[:-1]):
+    stripped = text.strip()
+    if UPID_RE.fullmatch(stripped):
+        return stripped
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[int, str]] = []
+    for start, character in enumerate(text):
+        if character != '"':
+            continue
+        try:
+            decoded, end = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if (
+            isinstance(decoded, str)
+            and UPID_RE.fullmatch(decoded)
+            and not text[end:].strip()
+        ):
+            candidates.append((start, decoded))
+    if len(candidates) != 1:
         return None
-    candidate: Any = None
-    try:
-        parsed = json.loads(lines[-1])
-    except ValueError:
-        candidate = lines[-1]
-    else:
-        candidate = parsed if isinstance(parsed, str) else None
-    if not isinstance(candidate, str):
+    start, upid = candidates[0]
+    if "UPID:" in text[:start]:
         return None
-    candidate = candidate.strip().strip('"')
-    if not UPID_RE.fullmatch(candidate) or len(candidate) > 300:
-        return None
-    return candidate
+    return upid
 
 
 # ---------------------------------------------------------------------------
@@ -1498,19 +1718,25 @@ def _extract_upid(stdout: bytes) -> str | None:
 def handle(
     payload: Any,
     *,
-    runner: Runner = _run_bounded,
+    runner: Runner | None = None,
     journal: OperationJournal | None = None,
 ) -> dict[str, Any]:
     """Dispatch one validated request. The ONLY dispatcher in this file."""
 
     request = parse_request(payload)
     operation_journal = journal if journal is not None else OperationJournal()
+    detach = runner is None
+    effective_runner = _run_bounded if runner is None else runner
     if request["operation"] == "inspect_rollback_state":
-        return inspect_rollback_state(runner, operation_journal, request)
+        return inspect_rollback_state(effective_runner, operation_journal, request)
     if request["operation"] == "seal_rollback_never_submitted":
-        return seal_rollback_never_submitted(runner, operation_journal, request)
+        return seal_rollback_never_submitted(
+            effective_runner, operation_journal, request
+        )
     if request["operation"] == "submit_same_job_rollback":
-        return submit_same_job_rollback(runner, operation_journal, request)
+        return submit_same_job_rollback(
+            effective_runner, operation_journal, request, detach=detach
+        )
     # Unreachable: parse_request already refuses anything else.
     raise RequestError("unsupported operation")
 

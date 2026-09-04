@@ -840,6 +840,35 @@ def test_unfinished_dpkg_state_refuses_before_any_mutation(host, journal) -> Non
     assert host.mutations == 0
 
 
+def test_package_mutation_refuses_a_remote_owning_node_before_submitted(
+    host, journal
+) -> None:
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    digest = prepared["evidence"]["prepared_evidence_digest"]
+    original = host.__call__
+
+    def remote_local_node(argv, timeout, max_output, stdin=b""):
+        if tuple(argv)[2:3] == ("/cluster/status",):
+            return helper.CommandResult(
+                0,
+                json.dumps(
+                    [{"type": "node", "name": "pve-b", "local": 1}]
+                ).encode(),
+                b"",
+            )
+        return original(argv, timeout, max_output, stdin)
+
+    response = helper.handle_request(
+        _request("execute_exact_package_mutation", prepared_evidence_digest=digest),
+        runner=remote_local_node,
+        journal=journal,
+    )
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "stale_target"
+    assert journal.read(OPERATION_ID)["phase"] == "intent"
+    assert host.mutations == 0
+
+
 @pytest.mark.parametrize(
     ("row", "classification"),
     [

@@ -275,6 +275,15 @@ The three destructive boundaries keep root-only (`0700`) durable operation
 journals under `/var/lib/hubinet-ops/` on the PVE host. Those are what make
 them at-most-once across a crash.
 
+**Package-update mutation is single-node only in 0.5.x.** The PVE node reached
+by each privileged mutation connection must currently own the target LXC.
+Snapshot, package mutation, and explicit rollback derive the local node from
+PVE's fixed read-only `/cluster/status` result and refuse a mismatch before
+their durable `submitted` boundary. Snapshot and rollback additionally pass
+`--noproxy` on the destructive `pvesh create`. Remote-node mutation through
+PVE proxying or inter-node SSH is not a supported current path. Package scan,
+execution-time simulation, and health remain distinct read-only boundaries.
+
 **No PVE API privilege was broadened.** Every mutation runs host-local behind
 a root-owned forced command, so the inventory API identity never needs one:
 the provisioned role stays exactly `Sys.Audit,VM.Audit`, and `VM.Snapshot`
@@ -473,8 +482,10 @@ Hubinet-looking snapshot that will not parse is reported as ambiguous rather
 than silently skipped.
 
 **Verified PVE semantics.** Read from current Proxmox VE sources rather than
-inherited from Hubinet 0.4: snapshot create is asynchronous and returns a UPID
-immediately, so a returned POST proves nothing; task status is
+inherited from Hubinet 0.4: the snapshot API handler uses `fork_worker`, but
+local `pvesh` CLI selects synchronous worker semantics, streams worker output,
+waits for physical completion, and prints the final UPID only afterwards. A
+returned helper submission response therefore proves nothing; task status is
 `running`/`stopped` plus an optional `exitstatus`, and PVE's own rule treats
 only `OK` and `WARNINGS: <n>` as non-errors, so `stopped` alone is never
 success; the snapshot listing includes PVE's synthetic `current` pseudo-entry
@@ -498,9 +509,11 @@ helper, which stays scan-only. It exposes three typed operations
 arbitrary shell or argv, and it re-derives
 the snapshot identity from the request's own ownership facts rather than
 trusting the name it was handed. `ensure_pre_update_snapshot_submitted` is
-submission-only: it never polls a PVE task to completion, so it returns the
-instant the operation has crossed (or is already past) its submission
-boundary. Each operation is journaled by operation identity on the PVE host,
+submission-only: after `submitted` is durable it double-forks exactly one
+fixed local `pvesh` runner and returns, so physical snapshot work never
+occupies the backend writer transaction. The runner retains the VMID lease and
+durably captures bounded raw stdout/stderr; later inspect promotes only one
+exact terminal UPID to `task_known`. Each operation is journaled by operation identity on the PVE host,
 with submission and sealing serialized by an `flock` held per VMID. From
 `intent`, either seal wins and writes `sealed_not_submitted`, or submission
 wins and advances through
@@ -531,9 +544,9 @@ a NEW submission runs only inside
 the job's whole current-authority context and calls
 `ensure_pre_update_snapshot_submitted` while it still holds the authority
 store's one writer lock — nothing else may write to that store for the
-whole of it. Because the host call it invokes never polls a PVE task to
-completion, the writer lock is held only for one bounded round trip, never
-for PVE's own asynchronous task. Before attempting any of this, the
+whole of it. Because the host call detaches before physical PVE work
+completes, the writer lock is held only for one bounded round trip. Before
+attempting any of this, the
 orchestrator first reads the host's durable `submission_state` — a pure read
 that never requires current authority, because recovering evidence about an
 operation that may already have been submitted must never be discarded
@@ -565,11 +578,10 @@ of truth for that relationship instead of an unrelated fixed timeout:
 - `MAX_SNAPSHOT_HOST_TIMEOUT_SECONDS = 90` is the deliberate upper bound
   `SshPackageUpdateSnapshotHostControl` accepts for `timeout_seconds`,
   enforced in its constructor before any SSH or subprocess execution. It
-  replaces the historical, unrelated 3600s ceiling: both snapshot mutations
-  are submission/seal-only and never poll a PVE task to completion (see
-  above and `deploy/hubinet-package-snapshot-helper.py`), so this bounds one
-  `pvesh` trigger plus a durable journal write, not PVE's own asynchronous
-  task. The canonical 60s test timeout is ordinary evidence of a healthy
+  replaces the historical, unrelated 3600s ceiling: snapshot submission
+  durably detaches one fixed runner and sealing performs no PVE mutation, so
+  this bounds validation, journal writes, and detach rather than synchronous
+  physical snapshot work. The canonical 60s test timeout is ordinary evidence of a healthy
   round trip, not this ceiling.
 - `BOUNDED_PROCESS_CLEANUP_SECONDS = 5` is the bounded process runner's own
   `Popen.wait` reap allowance after it kills a timed-out subprocess
@@ -1925,10 +1937,12 @@ restart.
 
 **Verified PVE rollback semantics.** Read from current Proxmox VE sources, not
 inherited from snapshot create:
-`POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback` is `protected`,
-`proxyto => 'node'`, takes an optional `start` boolean (default 0), and returns
-a task id from `fork_worker('vzrollback', ...)` — so a returned POST proves
-nothing. `PVE::AbstractConfig::snapshot_rollback` refuses a template, a
+`POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback` is protected,
+takes an optional `start` boolean (default 0), and uses
+`fork_worker('vzrollback', ...)`. Local `pvesh` CLI runs that worker
+synchronously, streams progress, and prints the final task id only after
+physical completion, so a returned helper submission response proves nothing.
+`PVE::AbstractConfig::snapshot_rollback` refuses a template, a
 missing snapshot, a snapshot still carrying `snapstate`, a config under
 another lock, and a container still running after its own forced stop. It
 holds the config lock as `rollback`, replaces the current config from the
@@ -1966,8 +1980,8 @@ the same helper `select_package_update_rollback_target` uses. Only after that
 boundary is durable may a rollback be submitted, and only from inside
 `execute_rollback_submission_if_current`, which re-proves the rollback
 predicate while holding the authority store's one writer lock across a single
-bounded submission-only host round trip. The instant that call (or a
-reattaching read) returns a known PVE task identity, the orchestrator records
+bounded detached-submission host round trip. The instant that call (or a
+reattaching read) returns a recovered PVE task identity, the orchestrator records
 it durably — in its own short transaction, which ends immediately — BEFORE
 any polling begins. So a failed poll, a lost SSH session, a timeout, or a
 backend crash during that bounded, read-only wait can never cost authority a
@@ -1995,7 +2009,7 @@ under a non-blocking per-VMID `flock`
 same crash-durable directory primitive the mutation helper uses (every caller
 proves its own parent-fsync barrier, because "already exists" is not "already
 durable"), and complete-write journal semantics. `submitted` is fsynced before
-`pvesh create` runs and is never resubmitted from; `sealed_not_submitted` is
+a double-forked fixed `pvesh create` runner starts and is never resubmitted from; `sealed_not_submitted` is
 the only durable release proof; `absent`/`intent` are transient routing
 evidence that report `uncertain`, never `not_submitted`. Every pre-flight
 refusal — a wrong live target, **any** config lock, a missing, incomplete, or
@@ -2028,8 +2042,11 @@ each would be wrong:
   metadata, on a second entry claiming this job under another name, and on any
   mismatch.
 
-**`submitted` without a UPID never recovers into success**, which is a
-deliberate difference from the snapshot helper. A snapshot's existence with
+**`submitted` without a completed attributable capture never recovers into
+success**, which is a deliberate difference from the snapshot helper. Inspect
+may promote a crash-safe completed capture containing exactly one terminal
+UPID to `task_known`; missing, incomplete, truncated, malformed, or ambiguous
+capture stays UNKNOWN forever and is never resubmitted. A snapshot's existence with
 this job's exact ownership metadata is unique canonical proof that *that*
 operation completed. Rollback has no such witness: the source snapshot
 survives either way, and `parent == snapname` is equally true after any

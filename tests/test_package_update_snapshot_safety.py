@@ -2899,7 +2899,7 @@ def test_post_submission_transitions_do_not_require_current_authority(
 # An inspected canonical absence is an observation, not a failure
 #
 # `inspect_job_snapshot_state` is read-only. Absence does not prove that an
-# already-submitted asynchronous PVE snapshot operation terminated: its task
+# already-submitted PVE snapshot operation terminated: its exact task
 # may still be queued or running and about to create the snapshot. So it must
 # never reach the FAILED branch, which is what terminalizes a job.
 # ===========================================================================

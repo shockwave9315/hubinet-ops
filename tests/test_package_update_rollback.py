@@ -30,6 +30,7 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+import time
 from types import ModuleType
 import uuid
 
@@ -89,6 +90,17 @@ def _load_helper() -> ModuleType:
 
 
 helper = _load_helper()
+REAL_DETACHED_SPAWN = helper._spawn_detached_runner
+
+
+@pytest.fixture(autouse=True)
+def _synchronous_detached_runner(monkeypatch):
+    """Keep fake-runner state in-process; production spawn is tested separately."""
+
+    def synchronous(runner, journal, operation_id, argv, _lease):
+        helper._run_capture_child(runner, journal, operation_id, argv)
+
+    monkeypatch.setattr(helper, "_spawn_detached_runner", synchronous)
 
 
 # ===========================================================================
@@ -108,6 +120,7 @@ class FakePve:
     def __init__(self, *, vmid: int, snapshot_name: str, ownership) -> None:
         self.vmid = vmid
         self.node = NODE
+        self.local_node = NODE
         self.snapshot_name = snapshot_name
         self.ownership = ownership
         self.present = True
@@ -134,6 +147,7 @@ class FakePve:
         self.snapshot_description: str | None = None
         #: Extra listing rows, for ambiguity cases.
         self.extra_rows: list[dict] = []
+        self.argvs: list[tuple[str, ...]] = []
 
     # -- rendering -----------------------------------------------------
 
@@ -169,6 +183,7 @@ class FakePve:
 
     def runner(self, argv, timeout, max_output):
         argv = tuple(argv)
+        self.argvs.append(argv)
         result = self._dispatch(argv)
         if result is None:
             raise AssertionError(f"fake PVE received an unexpected command: {argv}")
@@ -193,6 +208,10 @@ class FakePve:
         )
 
     def _dispatch(self, argv):
+        if argv[:3] == ("pvesh", "get", "/cluster/status"):
+            return self._ok(
+                [{"type": "node", "name": self.local_node, "local": 1}]
+            )
         if argv[:3] == ("pvesh", "get", "/cluster/resources"):
             if "resources" in self.fail_reads:
                 return self._fail()
@@ -1010,17 +1029,149 @@ def test_real_pvesh_framing_captures_rollback_task_and_completes_once(
 @pytest.mark.parametrize(
     "stdout",
     [
+        UPID.encode(),
+        b'"' + UPID.encode() + b'"',
+        b"progress\nwarning\n\"" + UPID.encode() + b"\"\n",
+        b"progress without newline\"" + UPID.encode() + b"\"\n",
+    ],
+)
+def test_rollback_upid_accepts_only_an_exact_terminal_machine_result(
+    stdout: bytes,
+) -> None:
+    assert helper._extract_upid(stdout) == UPID
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
         b"progress only\n",
         b"prefix UPID:not-a-task\n\"" + UPID.encode() + b"\"\n",
         UPID.encode() + b"\n\"" + UPID.encode() + b"\"\n",
         b"prefix " + UPID.encode() + b" suffix\n",
         b'{"upid":"' + UPID.encode() + b'"}\n',
+        b'["' + UPID.encode() + b'"]\n',
+        b'"' + UPID.encode() + b'" garbage',
+        b"\xff\"" + UPID.encode() + b'"',
     ],
 )
 def test_rollback_upid_extraction_rejects_malformed_or_ambiguous_stdout(
     stdout: bytes,
 ) -> None:
     assert helper._extract_upid(stdout) is None
+
+
+def test_remote_owner_refuses_before_submitted_and_rollback_is_noproxy(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.local_node = "pve-b"
+    refused = host.submit_same_job_rollback(request)
+    assert refused.outcome is RollbackOperationOutcome.NOT_SUBMITTED
+    assert pve.rollbacks == []
+    assert host.journal.read(request.rollback_operation_id) is None
+
+    pve.local_node = NODE
+    host.submit_same_job_rollback(request)
+    create = next(argv for argv in pve.argvs if argv[:2] == ("pvesh", "create"))
+    assert "--noproxy" in create
+
+
+def test_rollback_submitted_capture_promotes_later_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.returned_upid = None
+    host.submit_same_job_rollback(request)
+    host.journal.write_completed_capture(
+        request.rollback_operation_id,
+        helper.CommandResult(
+            0,
+            b"progress without newline\"" + UPID.encode() + b'"\n',
+            b"warning",
+            False,
+            False,
+        ),
+    )
+
+    recovered = host.inspect_rollback_state(request)
+    assert recovered.rollback_state is HostRollbackState.TASK_KNOWN
+    assert recovered.task_upid == UPID
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "task_known"
+    assert len(pve.rollbacks) == 1
+
+
+def test_rollback_incomplete_capture_stays_submitted_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.returned_upid = None
+    host.submit_same_job_rollback(request)
+    host.journal._capture_path(
+        request.rollback_operation_id, "complete.json"
+    ).unlink()
+
+    inspected = host.inspect_rollback_state(request)
+    assert inspected.rollback_state is HostRollbackState.SUBMITTED
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"
+    assert len(pve.rollbacks) == 1
+
+
+def test_real_detached_rollback_runner_returns_while_physical_task_is_alive(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "rollback-operations"
+    journal = helper.OperationJournal(directory, anchor=tmp_path)
+    operation_id = "11111111-1111-4111-8111-111111111111"
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+
+    def slow_runner(argv, timeout, max_output):
+        started.touch()
+        deadline = time.monotonic() + 3
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return helper.CommandResult(0, b'"' + UPID.encode() + b'"', b"", False, False)
+
+    began = time.monotonic()
+    with helper.VmidRollbackLease(110, directory, anchor=tmp_path) as lease:
+        REAL_DETACHED_SPAWN(
+            slow_runner,
+            journal,
+            operation_id,
+            ("pvesh", "create", "/fixed", "--noproxy"),
+            lease,
+        )
+    assert time.monotonic() - began < 1
+    deadline = time.monotonic() + 2
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+    with pytest.raises(helper.RollbackError, match="holds this guest's lease"):
+        with helper.VmidRollbackLease(110, directory, anchor=tmp_path):
+            pass
+    release.touch()
+    deadline = time.monotonic() + 3
+    while journal.read_completed_capture(operation_id) is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert journal.read_completed_capture(operation_id).stdout == b'"' + UPID.encode() + b'"'
 
 
 def test_a_sealed_operation_can_never_be_submitted(tmp_path: Path) -> None:
