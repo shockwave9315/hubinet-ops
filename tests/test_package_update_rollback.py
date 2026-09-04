@@ -967,6 +967,62 @@ def test_a_submitted_operation_is_never_resubmitted(tmp_path: Path) -> None:
     assert len(pve.rollbacks) == 1
 
 
+def test_real_pvesh_framing_captures_rollback_task_and_completes_once(
+    tmp_path: Path,
+) -> None:
+    """A status line before pvesh's final JSON UPID must not lose identity."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, orchestrator = (
+        _mutating_job(tmp_path)
+    )
+    observed = _canonical_before_rollback(ownership, identity)
+    original = pve.runner
+
+    def prefixed(argv, timeout, max_output):
+        result = original(argv, timeout, max_output)
+        if tuple(argv)[:2] == ("pvesh", "create") and result.returncode == 0:
+            return helper.CommandResult(
+                returncode=0,
+                stdout=b"200 OK\n" + result.stdout + b"\n",
+                stderr=b"",
+                timed_out=False,
+                output_exceeded=False,
+            )
+        return result
+
+    pve.runner = prefixed
+    first = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    request = authority.package_update_rollback_request(job.job_id)
+    record = host.journal.read(request.rollback_operation_id)
+    assert first.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert first.job.rollback_task_upid == UPID
+    assert record["phase"] == "task_known"
+    assert record["task_upid"] == UPID
+
+    _complete_rollback(pve)
+    completed = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+    assert completed.outcome is RollbackOperationOutcome.COMPLETED
+    assert completed.job.status is PackageUpdateJobStatus.ROLLED_BACK
+    assert len(pve.rollbacks) == 1
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"progress only\n",
+        b"prefix UPID:not-a-task\n\"" + UPID.encode() + b"\"\n",
+        UPID.encode() + b"\n\"" + UPID.encode() + b"\"\n",
+        b"prefix " + UPID.encode() + b" suffix\n",
+        b'{"upid":"' + UPID.encode() + b'"}\n',
+    ],
+)
+def test_rollback_upid_extraction_rejects_malformed_or_ambiguous_stdout(
+    stdout: bytes,
+) -> None:
+    assert helper._extract_upid(stdout) is None
+
+
 def test_a_sealed_operation_can_never_be_submitted(tmp_path: Path) -> None:
     _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
         tmp_path

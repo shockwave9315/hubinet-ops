@@ -1442,7 +1442,7 @@ def test_a_fresh_database_initializes_at_the_current_schema_version(
 ) -> None:
     from app.inventory.store import AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION
 
-    assert AUTHORITY_SCHEMA_VERSION == 17
+    assert AUTHORITY_SCHEMA_VERSION == 18
     store = InventoryAuthorityStore(tmp_path / "authority.db")
     with sqlite3.connect(tmp_path / "authority.db") as connection:
         marker, version = connection.execute(
@@ -1621,8 +1621,20 @@ def test_the_whole_dark_chain_creates_and_confirms_exactly_one_snapshot(
             "snaptime": 1_700_000_000,
         }
     )
+    original = pve.__call__
+
+    def real_pve_framing(argv, timeout, max_output):
+        result = original(argv, timeout, max_output)
+        if tuple(argv)[:2] == ("pvesh", "create") and result.returncode == 0:
+            return snapshot_helper.CommandResult(
+                returncode=0,
+                stdout=b"200 OK\n" + result.stdout + b"\n",
+                stderr=b"",
+            )
+        return result
+
     orchestrator = PackageUpdateSnapshotOrchestrator(
-        authority, _dark_channel(pve, journal)
+        authority, _dark_channel(real_pve_framing, journal)
     )
 
     first = orchestrator.ensure_job_owned_snapshot(job.job_id)
@@ -1631,6 +1643,7 @@ def test_the_whole_dark_chain_creates_and_confirms_exactly_one_snapshot(
     assert first.job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
     assert first.job.snapshot_name == identity.snapshot_name
     assert first.job.snapshot_task_upid == upid
+    assert journal.read(identity.snapshot_operation_id)["phase"] == "task_known"
     assert pve.submissions == 1
 
     # Re-running the whole stage submits nothing further and stays confirmed.

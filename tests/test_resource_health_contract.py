@@ -181,7 +181,7 @@ def test_fresh_database_is_schema_v15_with_the_health_contract_tables(
 ) -> None:
     from app.inventory.store import AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION
 
-    assert AUTHORITY_SCHEMA_VERSION == 17
+    assert AUTHORITY_SCHEMA_VERSION == 18
     InventoryAuthorityStore(tmp_path / "authority.db")
     with sqlite3.connect(tmp_path / "authority.db") as connection:
         marker, version = connection.execute(

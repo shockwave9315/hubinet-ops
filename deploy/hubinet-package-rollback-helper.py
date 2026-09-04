@@ -1466,11 +1466,20 @@ def _extract_upid(stdout: bytes) -> str | None:
         text = stdout.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+    # ``pvesh`` may emit complete status/progress lines before the final
+    # machine-readable scalar returned by a successful create call.  The
+    # result is therefore the final non-empty line, not the whole byte
+    # stream.  This deliberately is not a substring search: an earlier
+    # UPID-looking line makes attribution ambiguous and fails closed.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or any("UPID:" in line for line in lines[:-1]):
+        return None
     candidate: Any = None
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(lines[-1])
     except ValueError:
-        candidate = text.strip()
+        candidate = lines[-1]
     else:
         candidate = parsed if isinstance(parsed, str) else None
     if not isinstance(candidate, str):

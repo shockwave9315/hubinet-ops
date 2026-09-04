@@ -579,6 +579,10 @@ def create_read_only_app(
         else _build_package_update_runtime(authority, store, config)
     )
     package_update_worker = None if package_update is None else package_update.worker
+    if package_update_worker is not None:
+        package_update_worker.configure_post_update_scan_wake(
+            package_scan_scheduler.wake_for_post_update_scan
+        )
     if package_update_worker is not None and start_scheduler:
         # The worker's first cycle is a RECOVERY cycle. `authority.
         # recover_interrupted_package_update_jobs()` above has already

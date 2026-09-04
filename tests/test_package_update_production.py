@@ -47,14 +47,18 @@ from app.inventory import (
     HealthProbeOutcome,
     InventoryAuthority,
     InventoryAuthorityStore,
+    InventoryPublication,
     HostSubmissionState,
     ObservedSnapshot,
+    PackageScanFailure,
     PackageUpdateCheckpoint,
     PackageUpdateIssuanceRefused,
     PackageUpdateJobStatus,
     ProductUpdateFenceError,
     product_update_fence_path,
 )
+from app.package_scan import HostScanFailure, HostScanResult, expected_host_context
+from app.package_scan_scheduler import PackageScanScheduler
 from app.inventory_runtime import PackageUpdateRuntime, create_read_only_app
 from app.inventory_runtime_config import parse_r0_runtime_config
 from app.package_update_health import (
@@ -463,6 +467,178 @@ def test_explicit_start_drives_the_whole_lifecycle_to_succeeded(
     assert "submit_same_job_rollback" not in system.rollback_host.calls
 
 
+class _PostUpdateScanHost:
+    def __init__(self, *, packages=(), failure: PackageScanFailure | None = None):
+        self.packages = tuple(packages)
+        self.failure = failure
+        self.calls = 0
+
+    def scan_packages(self, run):
+        self.calls += 1
+        if self.failure is not None:
+            raise HostScanFailure(self.failure, "fresh post-update scan failed")
+        return HostScanResult(
+            context=expected_host_context(run),
+            os_release='ID=debian\nVERSION_ID="12"\n',
+            native_architecture="amd64\n",
+            installed_inventory=_inventory_for(self.packages),
+            simulation_stdout=_simulation_for(self.packages),
+            reboot_required=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status", "expected_pending"),
+    [
+        ("zero", "success", 0),
+        ("nonzero", "success", 2),
+        ("unknown", "failed", None),
+    ],
+)
+def test_success_requests_one_real_scan_and_publishes_its_actual_result(
+    tmp_path: Path,
+    mode: str,
+    expected_status: str,
+    expected_pending: int | None,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    wakes: list[str] = []
+    system.worker.configure_post_update_scan_wake(lambda: wakes.append("wake"))
+
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    assert wakes == ["wake"]
+    assert system.authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+    assert "post_update_scan_requested" in system.events(job.job_id)
+
+    packages = system.scan.packages[:2] if mode == "nonzero" else ()
+    host = _PostUpdateScanHost(
+        packages=packages,
+        failure=(
+            PackageScanFailure.METADATA_REFRESH_FAILED
+            if mode == "unknown"
+            else None
+        ),
+    )
+    scheduler = PackageScanScheduler(
+        system.authority,
+        system.store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+
+    outcomes = scheduler.run_post_update_once()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].resource_id == job.resource_id
+    assert host.calls == 1
+    assert system.authority.pending_post_update_package_scans() == ()
+    latest = system.store.list_package_scan_runs(job.resource_id)[-1]
+    assert latest.outcome is not None and latest.outcome.value == expected_status
+    assert latest.pending_count == expected_pending
+    published = next(
+        resource
+        for resource in InventoryPublication(
+            system.store, system.authority
+        ).read().resources
+        if resource["resource_id"] == job.resource_id
+    )["package_scan"]
+    assert published["status"] == expected_status
+    assert published["pending_count"] == expected_pending
+    assert (
+        system.authority.package_update_job(job.job_id).status
+        is PackageUpdateJobStatus.SUCCEEDED
+    )
+
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.IDLE
+    InventoryPublication(system.store, system.authority).read()
+    assert scheduler.run_post_update_once() == ()
+    assert system.authority.pending_post_update_package_scans() == ()
+    assert wakes == ["wake"]
+    assert host.calls == 1
+
+
+def test_restart_before_post_update_scan_claim_preserves_one_request(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    path = system.store.path
+    system.store.close()
+    store = InventoryAuthorityStore(path, now=system.clock)
+    authority = InventoryAuthority(store, now=system.clock)
+    assert authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    outcomes = scheduler.run_post_update_once()
+    assert len(outcomes) == 1
+    assert host.calls == 1
+    assert authority.pending_post_update_package_scans() == ()
+    assert scheduler.run_post_update_once() == ()
+    store.close()
+
+
+def test_restart_after_post_update_scan_claim_resumes_same_run_once(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    claimed = system.authority.issue_post_update_package_scan(job.job_id)
+    assert claimed.lifecycle.value == "running"
+
+    path = system.store.path
+    system.store.close()
+    store = InventoryAuthorityStore(path, now=system.clock)
+    authority = InventoryAuthority(store, now=system.clock)
+    assert authority.recover_interrupted_package_scans() == ()
+    assert authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    outcomes = scheduler.run_post_update_once()
+    assert len(outcomes) == 1
+    assert outcomes[0].scan_run_id == claimed.scan_run_id
+    assert authority.pending_post_update_package_scans() == ()
+    assert scheduler.run_post_update_once() == ()
+    assert host.calls == 1
+    latest = store.list_package_scan_runs(job.resource_id)[-1]
+    assert latest.scan_run_id == claimed.scan_run_id
+    assert latest.outcome is not None and latest.outcome.value == "success"
+    assert latest.pending_count == 0
+    published = next(
+        resource
+        for resource in InventoryPublication(store, authority).read().resources
+        if resource["resource_id"] == job.resource_id
+    )["package_scan"]
+    assert published["status"] == "success"
+    assert published["pending_count"] == 0
+    store.close()
+
+
 def test_the_execution_gate_runs_before_the_mutation_stage(tmp_path: Path) -> None:
     """The gate is not skipped because mutation re-proves material itself.
 
@@ -658,12 +834,14 @@ def test_a_failed_health_verdict_leaves_the_job_rollback_capable_and_idle(
     assert final.rollback_may_have_started_at is None
     assert final.rollback_operation_id is None
     assert system.rollback_host.calls == []
+    assert system.authority.pending_post_update_package_scans() == ()
 
     # And a further wake changes nothing: it is not a retry loop.
     again = system.worker.run_once()
     assert again.stop_reason == "health_failed"
     assert system.health_host.calls == 1
     assert system.rollback_host.calls == []
+    assert system.authority.pending_post_update_package_scans() == ()
 
 
 def test_an_unknown_health_verdict_writes_no_verdict_and_never_retries(
@@ -690,6 +868,7 @@ def test_an_unknown_health_verdict_writes_no_verdict_and_never_retries(
     assert final.health_probe_results == ()
     assert system.health_host.calls == 1
     assert system.rollback_host.calls == []
+    assert system.authority.pending_post_update_package_scans() == ()
 
 
 def test_an_explicit_resume_re_evaluates_read_only_health_and_can_succeed(
@@ -1278,6 +1457,9 @@ class _DeferredWorker:
 
     def wake(self) -> None:
         self.wakes += 1
+
+    def configure_post_update_scan_wake(self, wake) -> None:
+        self.post_update_scan_wake = wake
 
     def start(self) -> None:  # pragma: no cover - the app may start it
         pass

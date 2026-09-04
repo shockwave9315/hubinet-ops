@@ -23,7 +23,7 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v17). Schema v10 added
+database (marker `hubinet_ops_0_5_authority`, schema v18). Schema v10 added
 the job-owned snapshot operation identity, its write-ahead uncertainty
 checkpoint, the observed PVE task identity, and SQL-level state-machine
 invariants over all of them. Schema v11 added the explicit, material
@@ -50,7 +50,10 @@ at issuance and never consumed a second time by a retried idempotent
 `request_id`; latest-job readback and publication order by
 `issuance_sequence` rather than wall-clock `issued_at`, so an ordinary host
 clock correction between two issuances can never outrank a genuinely later
-job. There is no migration from v9 through v16; pre-release installs use the
+job. Schema v18 adds one durable, job-keyed post-update package-scan request,
+created atomically with a successful terminal health verdict and linked once
+to an ordinary package-scan run by the independent scan scheduler. There is no
+migration from v9 through v17; pre-release installs use the
 product updater's explicit backed-up authority reset and require Home
 Assistant re-enrollment.
 
@@ -92,7 +95,11 @@ describes how to reach a Proxmox **source**. It never enumerates workloads.
 `app/package_scan_scheduler.py` is an independent single-worker scheduler. It
 reads the validated runtime interval (default six hours), issues durable
 per-resource scan ownership through `InventoryAuthority`, and scans only
-current LXC resources. `app/package_scan_host_control.py` sends one bounded JSON
+current LXC resources. A successful update also commits one durable scan
+request for that resource; the update worker only wakes this scheduler, which
+claims the request into the same real metadata-refresh/simulation path. The
+request-to-run link is write-once, so restart and repeated publication cannot
+create a scan storm. `app/package_scan_host_control.py` sends one bounded JSON
 request over a dedicated pinned-key SSH connection to the bootstrap PVE node.
 The PVE forced helper accepts only `scan_packages`, rechecks live type/node/
 status before each fixed operation, and uses fixed `pct exec` shapes for OS
@@ -2338,6 +2345,13 @@ package command exit code, no proven mutation, no reachable guest, and no
 absence of observed failures can independently produce `SUCCEEDED`, and a
 passing verdict and a succeeded job are one indivisible durable event written
 by one statement.
+
+That same transaction inserts one job-keyed post-update package-scan request.
+It does not run a scan and does not synthesize zero updates. The independent
+scan scheduler claims the request exactly once into a normal
+`package_scan_runs` attempt, whose real result becomes the next published
+0/N/UNKNOWN package state. A failed or interrupted scan changes no update-job
+history; the already-proven successful update remains successful.
 
 `package_update_job_health_probe_results` holds that evidence: one row per
 frozen probe, bound by foreign key to the exact `(job_id, probe_index)` it

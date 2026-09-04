@@ -27,7 +27,7 @@ def test_fresh_authority_database_initializes_one_persistent_backend(
 ) -> None:
     path = tmp_path / "authority.db"
     store = InventoryAuthorityStore(path, now=fixed_now)
-    assert AUTHORITY_SCHEMA_VERSION == 17
+    assert AUTHORITY_SCHEMA_VERSION == 18
 
     backend = store.backend_instance()
     parsed = uuid.UUID(backend.backend_instance_id)

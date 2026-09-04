@@ -1332,15 +1332,23 @@ def _extract_upid(result: CommandResult) -> str | None:
     if result.returncode != 0:
         return None
     try:
-        text = result.stdout.decode("utf-8").strip()
+        text = result.stdout.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    if not text:
+
+    # ``pvesh``'s machine-readable result is the final complete output line,
+    # but successful create calls can precede it with status/progress lines.
+    # Treat only that final line as the result; never search arbitrary text
+    # for a UPID.  A UPID-looking prefix makes the answer ambiguous and is
+    # refused even when the final line is otherwise valid.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or any("UPID:" in line for line in lines[:-1]):
         return None
+    final_line = lines[-1]
     try:
-        decoded = json.loads(text)
+        decoded = json.loads(final_line)
     except ValueError:
-        decoded = text
+        decoded = final_line
     if not isinstance(decoded, str) or not UPID_RE.fullmatch(decoded):
         return None
     return decoded

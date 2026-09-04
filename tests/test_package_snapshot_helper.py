@@ -775,6 +775,61 @@ def test_a_submission_that_returns_no_usable_task_identity_is_uncertain(
         assert response["submission_state"] == "submitted"
 
 
+def test_pvesh_status_prefix_then_exact_json_upid_reaches_task_known(
+    tmp_path: Path,
+) -> None:
+    """Real pvesh create framing may precede its final JSON scalar."""
+
+    ownership = _ownership()
+    operation_id, snapshot_name = _identity(ownership)
+    journal = _journal(tmp_path)
+    pve = FakePve()
+    pve.on_submit = lambda current: current.snapshots.append(
+        _completed_snapshot(ownership, snapshot_name)
+    )
+    original = pve.__call__
+
+    def prefixed(argv, timeout, max_output):
+        result = original(argv, timeout, max_output)
+        if tuple(argv)[:2] == ("pvesh", "create") and result.returncode == 0:
+            return helper.CommandResult(
+                returncode=0,
+                stdout=b"200 OK\n" + result.stdout + b"\n",
+                stderr=b"",
+            )
+        return result
+
+    submitted = helper.handle_request(_request(), runner=prefixed, journal=journal)
+
+    assert submitted["submission_state"] == "task_known"
+    assert submitted["task_upid"] == UPID
+    assert journal.read(operation_id)["phase"] == "task_known"
+    assert journal.read(operation_id)["task_upid"] == UPID
+
+    inspected = helper.handle_request(
+        _request("inspect_job_snapshot_state"), runner=prefixed, journal=journal
+    )
+    assert inspected["outcome"] == "completed"
+    assert pve.submissions == 1
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"progress only\n",
+        b"prefix UPID:not-a-task\n\"" + UPID.encode() + b"\"\n",
+        UPID.encode() + b"\n\"" + UPID.encode() + b"\"\n",
+        b"prefix " + UPID.encode() + b" suffix\n",
+        b'{"upid":"' + UPID.encode() + b'"}\n',
+    ],
+)
+def test_upid_extraction_rejects_unrelated_malformed_or_ambiguous_stdout(
+    stdout: bytes,
+) -> None:
+    result = helper.CommandResult(returncode=0, stdout=stdout, stderr=b"")
+    assert helper._extract_upid(result) is None
+
+
 @pytest.mark.parametrize("exitstatus", ["OK", "WARNINGS: 2"])
 def test_pve_non_error_exit_statuses_are_accepted(
     tmp_path: Path, exitstatus: str

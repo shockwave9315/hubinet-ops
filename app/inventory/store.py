@@ -60,7 +60,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 17
+AUTHORITY_SCHEMA_VERSION = 18
 
 #: Every authority connection's writer wait policy -- both `PRAGMA
 #: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
@@ -92,6 +92,7 @@ _REQUIRED_TABLES = frozenset(
         "package_update_job_events",
         "package_update_job_health_probes",
         "package_update_job_health_probe_results",
+        "package_update_post_scan_requests",
         "resource_health_contracts",
         "resource_health_contract_probes",
         "resource_health_contract_revision_state",
@@ -131,6 +132,10 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "package_update_job_package_delete_immutable",
         "package_update_job_event_update_immutable",
         "package_update_job_event_delete_immutable",
+        "package_update_post_scan_request_identity_immutable",
+        "package_update_post_scan_request_link_once",
+        "package_update_post_scan_request_no_delete",
+        "package_update_post_scan_request_requires_success",
         "package_update_job_snapshot_identity_immutable",
         "package_update_job_snapshot_task_immutable",
         "package_update_job_snapshot_confirmation_immutable",
@@ -2413,6 +2418,22 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    -- One durable request for the real package scan that follows a successful
+    -- update job. The request is created in the SAME transaction as the
+    -- passing health verdict and SUCCEEDED terminal state. scan_run_id is
+    -- linked exactly once when the independent scan scheduler claims it;
+    -- the normal package_scan_runs row then owns 0/N/UNKNOWN publication.
+    CREATE TABLE package_update_post_scan_requests (
+        job_id TEXT PRIMARY KEY,
+        resource_id TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        scan_run_id TEXT UNIQUE,
+        FOREIGN KEY(job_id) REFERENCES package_update_jobs(job_id),
+        FOREIGN KEY(resource_id) REFERENCES resource_incarnations(resource_id),
+        FOREIGN KEY(scan_run_id) REFERENCES package_scan_runs(scan_run_id)
+    )
+    """,
+    """
     CREATE TRIGGER backend_instance_identity_immutable
     BEFORE UPDATE OF backend_instance_id, created_at ON backend_instance
     BEGIN SELECT RAISE(ABORT, 'backend instance identity is immutable'); END
@@ -2606,6 +2627,36 @@ _SCHEMA_STATEMENTS = (
     CREATE TRIGGER package_update_job_event_delete_immutable
     BEFORE DELETE ON package_update_job_events
     BEGIN SELECT RAISE(ABORT, 'package update job events are append-only'); END
+    """,
+    """
+    CREATE TRIGGER package_update_post_scan_request_identity_immutable
+    BEFORE UPDATE OF job_id, resource_id, requested_at
+    ON package_update_post_scan_requests
+    BEGIN SELECT RAISE(ABORT, 'post-update scan request identity is immutable'); END
+    """,
+    """
+    CREATE TRIGGER package_update_post_scan_request_link_once
+    BEFORE UPDATE OF scan_run_id ON package_update_post_scan_requests
+    WHEN OLD.scan_run_id IS NOT NULL OR NEW.scan_run_id IS NULL OR
+         (SELECT resource_id FROM package_scan_runs
+          WHERE scan_run_id=NEW.scan_run_id) IS NOT NEW.resource_id
+    BEGIN SELECT RAISE(ABORT, 'post-update scan request link is invalid'); END
+    """,
+    """
+    CREATE TRIGGER package_update_post_scan_request_no_delete
+    BEFORE DELETE ON package_update_post_scan_requests
+    BEGIN SELECT RAISE(ABORT, 'post-update scan requests cannot be deleted'); END
+    """,
+    """
+    CREATE TRIGGER package_update_post_scan_request_requires_success
+    BEFORE INSERT ON package_update_post_scan_requests
+    WHEN NOT EXISTS (
+        SELECT 1 FROM package_update_jobs job
+        WHERE job.job_id=NEW.job_id AND job.resource_id=NEW.resource_id
+          AND job.status='succeeded' AND job.checkpoint='health_completed'
+          AND job.health_outcome='passed'
+    )
+    BEGIN SELECT RAISE(ABORT, 'post-update scan requires a succeeded update job'); END
     """,
     """
     CREATE TRIGGER package_update_job_snapshot_identity_immutable

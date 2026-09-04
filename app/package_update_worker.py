@@ -63,6 +63,7 @@ holds no lock across host I/O.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 import logging
@@ -221,6 +222,7 @@ class PackageUpdateWorker:
         mutation: PackageUpdateMutationOrchestrator,
         rollback: PackageUpdateRollbackOrchestrator,
         health: PackageUpdateHealthOrchestrator,
+        post_update_scan_wake: Callable[[], None] | None = None,
     ) -> None:
         self._authority = authority
         self._store = store
@@ -229,6 +231,7 @@ class PackageUpdateWorker:
         self._mutation = mutation
         self._rollback = rollback
         self._health = health
+        self._post_update_scan_wake = post_update_scan_wake
         self._cycle_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -272,6 +275,13 @@ class PackageUpdateWorker:
         """
 
         self._wake_event.set()
+
+    def configure_post_update_scan_wake(self, wake: Callable[[], None]) -> None:
+        """Connect the independent scan scheduler before this worker starts."""
+
+        if self.is_running:
+            raise RuntimeError("post-update scan wake must be configured before start")
+        self._post_update_scan_wake = wake
 
     def stop(self, *, grace_seconds: float = 30.0) -> None:
         """Stop scheduling NEW work and wait, bounded, for the current cycle.
@@ -578,8 +588,22 @@ class PackageUpdateWorker:
         except AuthorityNotFound:  # pragma: no cover - defensive
             return job
 
-    @staticmethod
-    def _terminal(job: PackageUpdateJob) -> PackageUpdateWorkerCycle:
+    def _terminal(self, job: PackageUpdateJob) -> PackageUpdateWorkerCycle:
+        if (
+            job.status is PackageUpdateJobStatus.SUCCEEDED
+            and self._post_update_scan_wake is not None
+        ):
+            # The durable request already exists in the same transaction that
+            # made the job SUCCEEDED.  This call carries no authority and is
+            # only a latency hint; failure cannot rewrite successful history.
+            try:
+                self._post_update_scan_wake()
+            except Exception as exc:  # noqa: BLE001 - durable request survives
+                _LOGGER.error(
+                    "post-update package scan wake failed for job %s: %s",
+                    job.job_id,
+                    type(exc).__name__,
+                )
         return PackageUpdateWorkerCycle(
             status=PackageUpdateWorkerCycleStatus.TERMINAL,
             job_id=job.job_id,

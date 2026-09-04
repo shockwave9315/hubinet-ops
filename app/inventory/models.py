@@ -235,6 +235,7 @@ class PackageUpdateEventType(StrEnum):
     MUTATION_BLOCKED_BEFORE_SUBMISSION = "mutation_blocked_before_submission"
     HEALTH_STARTED = "health_started"
     HEALTH_PASSED = "health_passed"
+    POST_UPDATE_SCAN_REQUESTED = "post_update_scan_requested"
     HEALTH_FAILED = "health_failed"
     HEALTH_OUTCOME_UNKNOWN = "health_outcome_unknown"
     ROLLBACK_MAY_HAVE_STARTED = "rollback_may_have_started"
