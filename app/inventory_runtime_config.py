@@ -546,6 +546,23 @@ def parse_r0_runtime_config(
     package_update = _parse_package_update_config(
         raw.get("package_update") or {}, default_host=default_host
     )
+    if package_update.enabled and package_update.host_control is not None:
+        # The package-scan boundary is a SIXTH, separate forced-command
+        # credential (see PACKAGE_UPDATE_KEY_FIELDS's own docstring) -- the
+        # five-way distinctness check inside _parse_package_update_config
+        # only proves the five update keys differ from EACH OTHER, not that
+        # none of them was configured to literally reuse the scan key. A
+        # reused key would let the scan boundary's connection also run
+        # whichever update forced command that key was meant to gate,
+        # silently merging two independent privilege boundaries into one.
+        if host_control.private_key_path in package_update.host_control.private_key_paths():
+            raise R0ConfigError(
+                "package_scan.host_control.private_key_path must be distinct "
+                "from every package_update.host_control forced-command key "
+                "(snapshot/execution/mutation/rollback/health) -- the "
+                "package-scan SSH key must never be reused by a "
+                "package-update boundary"
+            )
 
     pve_api_token = _require_env_secret(env, pve_token_env, purpose="PVE API token")
     api_bearer_token = _require_env_secret(env, api_token_env, purpose="R0 API bearer token")

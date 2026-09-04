@@ -95,6 +95,122 @@ def test_package_scan_interval_is_a_validated_runtime_setting() -> None:
             parse_r0_runtime_config(raw, env=VALID_ENV)
 
 
+# ---------------------------------------------------------------------------
+# package_update host-control key distinctness -- six forced-command
+# boundaries (one scan, five update), each requiring its OWN dedicated key.
+# ---------------------------------------------------------------------------
+
+_PACKAGE_UPDATE_KEY_FIELD_NAMES = (
+    "snapshot_private_key_path",
+    "execution_private_key_path",
+    "mutation_private_key_path",
+    "rollback_private_key_path",
+    "health_private_key_path",
+)
+
+
+def _write_fake_key(tmp_path: Path, name: str) -> str:
+    path = tmp_path / name
+    path.write_text("fake key material\n", encoding="utf-8")
+    return str(path)
+
+
+def _raw_with_activated_package_update(tmp_path: Path) -> dict:
+    """A valid config with package_update activated: five distinct, readable
+    dedicated update keys, plus a package-scan key that is ALSO distinct from
+    every one of them -- the six-way baseline every test below starts from
+    and then deliberately breaks."""
+
+    known_hosts = _write_fake_key(tmp_path, "known_hosts")
+    update_keys = {
+        name: _write_fake_key(tmp_path, name) for name in _PACKAGE_UPDATE_KEY_FIELD_NAMES
+    }
+    scan_key = _write_fake_key(tmp_path, "id_ed25519_scan")
+
+    raw = _raw()
+    raw["package_scan"] = {
+        "host_control": {
+            "host": "pve.example.internal",
+            "private_key_path": scan_key,
+            "known_hosts_path": known_hosts,
+        }
+    }
+    raw["package_update"] = {
+        "enabled": True,
+        "host_control": {
+            "host": "pve.example.internal",
+            "known_hosts_path": known_hosts,
+            **update_keys,
+        },
+    }
+    return raw
+
+
+def test_six_distinct_forced_command_keys_parse_successfully(tmp_path: Path) -> None:
+    """Positive control: one scan key plus five update keys, all distinct,
+    parses cleanly -- proving the new cross-boundary check does not reject a
+    correctly configured installation."""
+
+    config = parse_r0_runtime_config(_raw_with_activated_package_update(tmp_path), env=VALID_ENV)
+    assert config.package_update.enabled is True
+    assert config.package_scan.host_control.private_key_path not in (
+        config.package_update.host_control.private_key_paths()
+    )
+
+
+@pytest.mark.parametrize("field", _PACKAGE_UPDATE_KEY_FIELD_NAMES)
+def test_reusing_the_scan_key_for_any_update_boundary_fails_closed(
+    tmp_path: Path, field: str
+) -> None:
+    """The package-scan SSH key must never be reused by a package-update
+    forced-command boundary -- doing so would silently let the scan
+    connection also run that boundary's privileged command, merging two
+    independent privilege boundaries into one."""
+
+    raw = _raw_with_activated_package_update(tmp_path)
+    raw["package_update"]["host_control"][field] = raw["package_scan"]["host_control"][
+        "private_key_path"
+    ]
+    with pytest.raises(R0ConfigError, match="package_scan.host_control.private_key_path"):
+        parse_r0_runtime_config(raw, env=VALID_ENV)
+
+
+def test_package_update_disabled_never_checks_the_scan_key_for_collisions(
+    tmp_path: Path,
+) -> None:
+    """`enabled: false` means package_update.host_control is never even
+    parsed -- there is nothing to collide with, and the cross-boundary check
+    must not be reached (let alone reject a perfectly valid, unactivated
+    installation whose package_scan key happens to match unrelated leftover
+    package_update config)."""
+
+    raw = _raw_with_activated_package_update(tmp_path)
+    raw["package_update"]["enabled"] = False
+    raw["package_update"]["host_control"]["snapshot_private_key_path"] = raw["package_scan"][
+        "host_control"
+    ]["private_key_path"]
+
+    config = parse_r0_runtime_config(raw, env=VALID_ENV)
+    assert config.package_update.enabled is False
+    assert config.package_update.host_control is None
+
+
+def test_two_update_keys_colliding_with_each_other_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """The pre-existing five-way distinctness check (update keys among
+    themselves) is untouched by the new scan-vs-update check above."""
+
+    raw = _raw_with_activated_package_update(tmp_path)
+    raw["package_update"]["host_control"]["mutation_private_key_path"] = raw["package_update"][
+        "host_control"
+    ]["snapshot_private_key_path"]
+    with pytest.raises(
+        R0ConfigError, match="each package-update host-control boundary requires its own"
+    ):
+        parse_r0_runtime_config(raw, env=VALID_ENV)
+
+
 def test_config_repr_never_leaks_secrets() -> None:
     config = parse_r0_runtime_config(_raw(), env=VALID_ENV)
     rendered = repr(config)
