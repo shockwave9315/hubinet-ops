@@ -315,31 +315,28 @@ _update_boundary_authorize() {
     || die "failed to durably add the ${kind} forced-command authorization to ${HOST_CONTROL_AUTHORIZED_KEYS}"
 }
 
-# Read one scalar out of the installation's OWN existing
-# `package_scan.host_control` block.
+# Read one scalar out of the installation's OWN existing configuration at an
+# arbitrary bounded key path (e.g. `source pve_endpoint`, or `package_scan
+# host_control host`). Prints the scalar (quotes stripped) and exits 0 if the
+# exact key path is present; prints nothing if it is not -- callers decide
+# what an absent key means (an error, or a runtime default), this only
+# reports what is literally written in the file.
 #
-# The update boundaries reach the SAME PVE SSH endpoint the scan boundary
-# already reaches -- it is the one configured source -- so the endpoint facts
-# are taken from the running installation rather than re-derived from a flag
-# this updater does not have. That also means an operator who moved their
-# endpoint has moved it for every boundary at once, instead of leaving the new
-# ones pointed somewhere the old one is not.
-_update_boundary_scan_host_control_field() {
-  local field="$1" config_file="$2" value
-  # Standard library only. PyYAML is not guaranteed present on a Proxmox
-  # host, and every other static read this updater performs is likewise a
-  # bounded scan rather than an import -- see _update_target_authority_schema.
-  # This walks indentation to find exactly `package_scan:` ->
-  # `host_control:` -> `<field>:`, so a same-named key under any other
-  # section can never be mistaken for it.
-  value="$(python3 -c '
+# Standard library only. PyYAML is not guaranteed present on a Proxmox host,
+# and every other static read this updater performs is likewise a bounded
+# scan rather than an import -- see _update_target_authority_schema. This
+# walks indentation to find the exact nested key path, so a same-named key
+# under any other section can never be mistaken for it.
+_update_boundary_config_scalar() {
+  local config_file="$1"
+  shift
+  python3 -c '
 import re
 import sys
 
-field = sys.argv[1]
-wanted = ("package_scan", "host_control", field)
+wanted = tuple(sys.argv[1:-1])
 depth = 0
-with open(sys.argv[2], encoding="utf-8") as handle:
+with open(sys.argv[-1], encoding="utf-8") as handle:
     for raw in handle:
         line = raw.rstrip("\n")
         if not line.strip() or line.lstrip().startswith("#"):
@@ -354,15 +351,71 @@ with open(sys.argv[2], encoding="utf-8") as handle:
             if indent > depth * 2:
                 continue
             depth = indent // 2
-        if key != wanted[depth]:
+        if depth >= len(wanted) or key != wanted[depth]:
             continue
         if depth == len(wanted) - 1:
             print(inline.strip().strip("\"" + chr(39)))
             break
         depth += 1
-' "${field}" "${config_file}" 2>/dev/null)"
-  [[ -n "${value}" ]] \
-    || die "cannot activate the package-update lifecycle: ${UPDATE_BOUNDARY_CONFIG_PATH} has no package_scan.host_control.${field} to reuse for the update boundaries"
+' "$@" "${config_file}" 2>/dev/null
+}
+
+# _update_boundary_effective_host_control_field <field> <config_file>: the
+# SAME effective value app/inventory_runtime_config.py's parse_r0_runtime_
+# config would compute for package_scan.host_control.<field> on this
+# installation's OWN existing configuration -- an explicit scalar when
+# present, or the identical runtime default when the field is omitted.
+#
+# The update boundaries reach the SAME PVE SSH endpoint the scan boundary
+# already reaches -- it is the one configured source -- so the endpoint facts
+# are taken from the running installation rather than re-derived from a flag
+# this updater does not have. That also means an operator who moved their
+# endpoint has moved it for every boundary at once, instead of leaving the new
+# ones pointed somewhere the old one is not.
+#
+# The activation path only ever needs these four fields (host, port, user,
+# known_hosts_path -- see update_boundaries_activate's own module header).
+# An EARLIER version of this reader (_update_boundary_scan_host_control_field)
+# demanded every one of the four be LITERALLY present in the YAML, which
+# disagreed with parse_r0_runtime_config: a perfectly valid, already-running
+# installation that omits port/user/known_hosts_path (or derives host from
+# source.pve_endpoint, exactly as the runtime already does) failed
+# activation and rolled back a config change that was never actually
+# invalid. Fixed by reproducing the SAME four runtime defaults here -- never
+# inventing a new one, and never applying this fallback to any other
+# package_scan.host_control field.
+_update_boundary_effective_host_control_field() {
+  local field="$1" config_file="$2" value default_pve_endpoint
+
+  value="$(_update_boundary_config_scalar "${config_file}" package_scan host_control "${field}")"
+  if [[ -n "${value}" ]]; then
+    printf '%s' "${value}"
+    return 0
+  fi
+
+  case "${field}" in
+    host)
+      # Same fallback as parse_r0_runtime_config's own `default_host =
+      # urlsplit(transport_locator).hostname`.
+      default_pve_endpoint="$(_update_boundary_config_scalar "${config_file}" source pve_endpoint)"
+      [[ -n "${default_pve_endpoint}" ]] \
+        || die "cannot activate the package-update lifecycle: ${UPDATE_BOUNDARY_CONFIG_PATH} has no package_scan.host_control.host and no source.pve_endpoint to derive it from"
+      value="$(python3 -c '
+import sys
+from urllib.parse import urlsplit
+
+hostname = urlsplit(sys.argv[1]).hostname
+if hostname:
+    print(hostname)
+' "${default_pve_endpoint}" 2>/dev/null)"
+      [[ -n "${value}" ]] \
+        || die "cannot activate the package-update lifecycle: source.pve_endpoint (${default_pve_endpoint}) in ${UPDATE_BOUNDARY_CONFIG_PATH} has no host-control hostname"
+      ;;
+    port) value="22" ;;
+    user) value="root" ;;
+    known_hosts_path) value="/etc/hubinet-ops/host-control/known_hosts" ;;
+    *) die "internal error: no runtime default is defined for package_scan.host_control.${field}" ;;
+  esac
   printf '%s' "${value}"
 }
 
@@ -381,10 +434,10 @@ _update_boundary_activate_config() {
   # Resolved BEFORE anything is preserved or written: a configuration this
   # updater cannot read the endpoint out of must fail before it has changed
   # a byte, not halfway through appending a block.
-  endpoint_host="$(_update_boundary_scan_host_control_field host "${current_tmp}")"
-  endpoint_port="$(_update_boundary_scan_host_control_field port "${current_tmp}")"
-  endpoint_user="$(_update_boundary_scan_host_control_field user "${current_tmp}")"
-  endpoint_known_hosts="$(_update_boundary_scan_host_control_field known_hosts_path "${current_tmp}")"
+  endpoint_host="$(_update_boundary_effective_host_control_field host "${current_tmp}")"
+  endpoint_port="$(_update_boundary_effective_host_control_field port "${current_tmp}")"
+  endpoint_user="$(_update_boundary_effective_host_control_field user "${current_tmp}")"
+  endpoint_known_hosts="$(_update_boundary_effective_host_control_field known_hosts_path "${current_tmp}")"
 
   run_logged pct exec "${VMID}" -- cp "${UPDATE_BOUNDARY_CONFIG_PATH}" "${backup_ct_path}" \
     || die "failed to preserve ${UPDATE_BOUNDARY_CONFIG_PATH} before activating the update lifecycle"

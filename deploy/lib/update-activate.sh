@@ -606,23 +606,77 @@ _update_acquire_pre_activation_fence() {
 # remote test ran and correctly reported absent". So exit-1-from-`pct
 # exec` could NOT be trusted as a positive absence proof either.
 #
-# Fixed by never encoding the answer in the outer exit status at all. The
-# remote command below always exits 0 once it actually RUNS -- both
-# EXISTS and ABSENT are legitimate filesystem states, so the wrapping
-# `sh -c` reports success either way -- and instead prints an EXACT,
-# bounded token identifying which. Any OTHER outer exit status therefore
-# means the remote command never ran (attach/transport failure) and must
-# fail closed as UNKNOWN; exit 0 with anything other than the two exact
-# tokens is equally untrustworthy and also UNKNOWN, never a guess. The
-# fence path is this module's own fixed constant, never operator/attacker
-# input, and is still passed as `$1` rather than interpolated into the
-# script text.
+# Fixed (first pass) by never encoding the answer in the outer exit
+# status at all: a remote `sh -c 'if [ -e "$1" ]; ...'` that always exits
+# 0 once it actually RUNS, printing an exact bounded EXISTS/ABSENT token
+# instead. Any OTHER outer exit status means the remote command never ran
+# (attach/transport failure) and must fail closed as UNKNOWN; exit 0 with
+# anything other than the two exact tokens is equally untrustworthy and
+# also UNKNOWN, never a guess. That outer protocol is still exactly right
+# and is unchanged below.
+#
+# A SECOND gap remained in the in-container classifier itself (P1
+# correction pass): `[ -e "$1" ]` is a boolean test, and it evaluates to
+# the SAME false result whether the path is positively absent (ENOENT) or
+# the underlying inspection failed for any OTHER reason (EACCES, EIO, a
+# symlink loop, ...) -- POSIX `test` cannot tell the two apart. A real
+# metadata/stat failure on a fence that still EXISTS could therefore still
+# be classified ABSENT: _update_release_maintenance_fence would run its
+# ABSENT-branch durability barrier, report the fence released, and let the
+# caller clear the recovery journal, while the fence itself never actually
+# went away -- permanently blocking workload updates with no journal left
+# to reconnect the stale fence to.
+#
+# Fixed the same way the authorized_keys path classifier in
+# bootstrap-host-control.sh (_host_control_authorized_keys_path_state) was
+# fixed: delegate the in-container classification to a tiny, bounded
+# python3 script. python3's os.lstat raises FileNotFoundError SPECIFICALLY
+# for ENOENT and any other OSError subclass for every other failure --
+# exactly the distinction `[ -e ]` cannot make. This is not a new
+# dependency: _update_acquire_maintenance_fence and
+# _update_acquire_pre_activation_fence above already run a python3 script
+# unconditionally inside this SAME container to take the fence in the
+# first place, so CT-side python3 is already load-bearing for this module
+# before this classifier is ever reached, and deploy/update-proxmox-0.5.sh
+# also hard-requires python3 on the PVE host driving `pct exec`.
+#
+# Deliberately an INLINE `python3 -c` script, not a call through the
+# run-owned UPDATE_TOOL_CT_PATH authority helper (which already has its
+# own path-state subcommand): that helper is only ever pushed/restored on
+# the rollback-armed recovery path (see
+# _update_recovery_restore_authority_tool's own docstring), but fence
+# release is also reached from the "no rollback armed" and "already
+# completed/recovered" recovery branches, which never restore it. A
+# three-valued answer that depended on a helper not guaranteed present at
+# every call site would itself be a new UNKNOWN-shaped hole -- exactly the
+# reasoning this function's docstring already gave for not reusing that
+# mechanism, still true with python3 in the mix.
+#
+# The script below always exits 0 once it actually runs (an lstat failure
+# is caught and reported as a token, never left to raise/crash the
+# process) and prints exactly one of EXISTS/ABSENT/UNKNOWN; the outer
+# protocol above still fails closed as UNKNOWN on any other outer exit
+# status or any other stdout content. The fence path is this module's own
+# fixed constant, never operator/attacker input, and is still passed as
+# argv rather than interpolated into the script text.
 _update_fence_path_state() {
   local path="$1" output status
   # Same errexit-safe idiom used throughout this file (see
   # _update_acquire_maintenance_fence above): capture the exit status
   # without ever leaving this as a bare failing statement under `set -e`.
-  output="$(pct exec "${VMID}" -- sh -c 'if [ -e "$1" ]; then printf EXISTS; else printf ABSENT; fi' sh "${path}" 2>/dev/null)" \
+  output="$(pct exec "${VMID}" -- python3 -c '
+import os
+import sys
+
+try:
+    os.lstat(sys.argv[1])
+except FileNotFoundError:
+    print("ABSENT")
+except OSError:
+    print("UNKNOWN")
+else:
+    print("EXISTS")
+' "${path}" 2>/dev/null)" \
     && status=0 || status=$?
   (( status == 0 )) || return 2
   case "${output}" in

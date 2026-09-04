@@ -827,25 +827,22 @@ def _exec_inner(vmid, inner, state):
         sys.stdout.write(path.read_text())
         return 0
 
-    if (
-        inner[0] == "sh"
-        and len(inner) >= 5
-        and inner[1] == "-c"
-        and inner[3] == "sh"
-    ):
+    if inner[0] == "python3" and inner[1] == "-c" and len(inner) >= 4:
         # deploy/lib/update-activate.sh::_update_fence_path_state's own
-        # bounded existence probe (Family 3A micro-correction): a remote
-        # script that always exits 0 once it actually RUNS -- both EXISTS
-        # and ABSENT are legitimate filesystem states -- and encodes the
-        # real answer via an exact stdout token instead of the outer exit
-        # status. That is the whole point of this shape: `pct exec`
-        # itself (ultimately an lxc-attach) can surface an ATTACH failure
-        # as a generic, unremarkable exit status 1 -- indistinguishable,
-        # under the OLD outer-exit-code design, from a legitimate remote
-        # "absent" answer. This fake models both failure shapes
-        # distinctly so the fix's own regression coverage can tell them
-        # apart from a genuine EXISTS/ABSENT answer.
-        probe_path = inner[4]
+        # bounded existence probe (P1 correction pass: ENOENT-vs-stat-
+        # failure). An inline python3 script that always exits 0 once it
+        # actually RUNS -- EXISTS, ABSENT, and UNKNOWN are all legitimate
+        # answers the script itself can print (os.lstat's
+        # FileNotFoundError vs. any other OSError) -- and encodes the real
+        # answer via an exact stdout token instead of the outer exit
+        # status. `pct exec` itself (ultimately an lxc-attach) can ALSO
+        # surface an ATTACH failure as a generic, unremarkable exit status
+        # 1 -- indistinguishable at the outer-status level from a
+        # legitimate remote "absent" answer -- so this fake models both
+        # the outer transport taxonomy and the in-container stat-failure
+        # taxonomy distinctly, so the fix's own regression coverage can
+        # tell all of them apart from a genuine EXISTS/ABSENT answer.
+        probe_path = inner[3]
         normalized = _normalize_ct_arg(probe_path)
         if normalized == _MAINTENANCE_FENCE_CT_PATH:
             if _fail("fence_read_transport"):
@@ -853,8 +850,7 @@ def _exec_inner(vmid, inner, state):
                 # with a distinctive non-1 code.
                 return 255
             if _fail("fence_read_attach_exit_1"):
-                # THE regression this micro-correction exists for: an
-                # attach failure that happens to surface as outer exit
+                # An attach failure that happens to surface as outer exit
                 # status 1 -- exactly the value a legitimate remote
                 # "absent" answer would also produce. Must never be read
                 # as ABSENT.
@@ -865,6 +861,16 @@ def _exec_inner(vmid, inner, state):
                 # corruption of the probe's own output. Still UNKNOWN,
                 # never guessed as either EXISTS or ABSENT.
                 sys.stdout.write("nonsense")
+                return 0
+            if _fail("fence_read_stat_failure"):
+                # THE P1 regression this classifier now closes: the fence
+                # positively EXISTS on disk, but the in-container
+                # os.lstat call itself fails for a reason OTHER than
+                # ENOENT (EACCES, EIO, ...). Models python3's own
+                # `except OSError: print("UNKNOWN")` branch -- distinct
+                # from the outer transport/exit-status failures above,
+                # and must never collapse to ABSENT.
+                sys.stdout.write("UNKNOWN")
                 return 0
         path = _ct_path(vmid, probe_path)
         sys.stdout.write("EXISTS" if path.exists() else "ABSENT")

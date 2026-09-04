@@ -4483,6 +4483,105 @@ class TestPreActivationInstallationUpgrade:
         for journal in UPDATE_BOUNDARY_JOURNAL_DIRS:
             assert (_host_root(env) / journal.lstrip("/")).is_dir(), journal
 
+    def test_omitted_host_control_fields_get_the_same_runtime_defaults(
+        self, tmp_path
+    ):
+        """P2: activation must derive the SAME effective values
+        app/inventory_runtime_config.py's parse_r0_runtime_config already
+        applies for an omitted package_scan.host_control.<field> --
+        port=22, user=root, known_hosts_path=/etc/hubinet-ops/host-control/
+        known_hosts -- not demand every field be literally present.
+
+        Also doubles as the positive control for `host`: an explicit host
+        must be preserved exactly even when a DIFFERENT source.pve_endpoint
+        is also present in the same file (proving explicit always wins over
+        derivation, not merely that derivation happens to agree).
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        inventory_path = env.ct_file(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        inventory_path.write_text(
+            'source:\n'
+            '  display_name: "Home Proxmox"\n'
+            '  provider_kind: proxmox_ve\n'
+            '  pve_endpoint: "https://pve-other.example.internal:8006"\n'
+            "\npackage_scan:\n"
+            "  interval_seconds: 21600\n"
+            "  initial_delay_seconds: 30\n"
+            "  host_control:\n"
+            '    host: "pve.example.internal"\n'
+            '    private_key_path: "/etc/hubinet-ops/host-control/id_ed25519"\n'
+            "    timeout_seconds: 900\n"
+            "    max_result_bytes: 8388608\n",
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        inventory = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert "package_update:" in inventory
+        activation = inventory.split("package_update:", 1)[1]
+        # Explicit host wins over the (deliberately different) derivable
+        # source.pve_endpoint hostname.
+        assert 'host: "pve.example.internal"' in activation
+        # Every field this run never wrote reproduces the exact runtime
+        # default parse_r0_runtime_config would have applied.
+        assert "port: 22" in activation
+        assert 'user: "root"' in activation
+        assert 'known_hosts_path: "/etc/hubinet-ops/host-control/known_hosts"' in activation
+
+    def test_omitted_host_falls_back_to_the_source_pve_endpoint_hostname(
+        self, tmp_path
+    ):
+        """P2 host fallback: package_scan.host_control.host omitted ->
+        effective host is the hostname of source.pve_endpoint, exactly as
+        parse_r0_runtime_config's own `default_host = urlsplit(
+        transport_locator).hostname` computes it.
+
+        Also the positive control for port/user/known_hosts_path: all three
+        are given NON-default explicit values here and must be preserved
+        exactly, proving an explicit operator value always wins over the
+        runtime default rather than the default silently overwriting it.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        inventory_path = env.ct_file(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        inventory_path.write_text(
+            'source:\n'
+            '  display_name: "Home Proxmox"\n'
+            '  provider_kind: proxmox_ve\n'
+            '  pve_endpoint: "https://pve.example.internal:8006"\n'
+            "\npackage_scan:\n"
+            "  interval_seconds: 21600\n"
+            "  initial_delay_seconds: 30\n"
+            "  host_control:\n"
+            "    port: 2222\n"
+            '    user: "svc-deploy"\n'
+            '    private_key_path: "/etc/hubinet-ops/host-control/id_ed25519"\n'
+            '    known_hosts_path: "/custom/known_hosts"\n'
+            "    timeout_seconds: 900\n"
+            "    max_result_bytes: 8388608\n",
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        inventory = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert "package_update:" in inventory
+        activation = inventory.split("package_update:", 1)[1]
+        assert 'host: "pve.example.internal"' in activation
+        assert "port: 2222" in activation
+        assert 'user: "svc-deploy"' in activation
+        assert 'known_hosts_path: "/custom/known_hosts"' in activation
+
     def test_a_failed_upgrade_leaves_no_new_privileged_access_path(self, tmp_path):
         """The rule this whole module exists for.
 
@@ -5531,6 +5630,81 @@ class TestProductUpdateMaintenanceFence:
         assert fence.exists()
         assert fence.read_text(encoding="utf-8") == fence_content_before
 
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovered = _run(env.env, _base_args(target))
+
+        assert recovered.returncode == 0, recovered.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+
+    def test_a_genuine_non_enoent_stat_failure_is_unknown_not_absent(
+        self, tmp_path
+    ):
+        """P1 correction pass: a fence that genuinely EXISTS, but whose
+        in-container metadata inspection fails for a reason OTHER than
+        ENOENT (EACCES, EIO, ...), must classify UNKNOWN -- never ABSENT.
+
+        `[ -e "$1" ]` could not tell "positively absent" apart from "could
+        not be inspected"; both evaluated to the same false result. The
+        fix delegates the in-container classification to python3's
+        os.lstat, which raises FileNotFoundError SPECIFICALLY for ENOENT
+        and any other OSError for every other failure. This exercises
+        that real ENOENT-vs-other-OSError distinction (not merely
+        injecting a final UNKNOWN state variable): the fence file is
+        still genuinely present on the fake CT filesystem throughout, and
+        only the stat-classification step itself is faulted.
+
+        Required outcome: the classifier reports UNKNOWN, release is
+        refused, the journal is preserved, and UPDATE_FENCE_HELD is never
+        cleared as a success -- exactly the same fail-closed shape as the
+        sibling outer-transport/attach/malformed-token witnesses above.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
+        assert json.loads(fence.read_text())["holder"] == run_id
+        fence_content_before = fence.read_text(encoding="utf-8")
+
+        # The fence file is genuinely still present on disk the whole
+        # time -- only the in-container stat/lstat classification of it
+        # is faulted, modelling a real EACCES/EIO rather than the file
+        # having been removed.
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_read_stat_failure"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        assert "could not be read" in recovery.stderr
+        # Journal preserved, fence untouched -- UPDATE_FENCE_HELD is never
+        # cleared as though release had succeeded.
+        assert journal.exists()
+        assert fence.exists()
+        assert fence.read_text(encoding="utf-8") == fence_content_before
+        assert json.loads(fence.read_text())["holder"] == run_id
+
+        # The fault clears; a later invocation reads the still-genuine
+        # EXISTS answer and completes the release normally.
         scenario["fail"] = []
         env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
         recovered = _run(env.env, _base_args(target))
