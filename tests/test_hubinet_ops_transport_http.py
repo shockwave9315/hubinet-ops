@@ -864,19 +864,39 @@ async def test_rollback_uses_a_longer_timeout_than_ordinary_package_update_reque
     hass: HomeAssistant,
 ) -> None:
     """Structural proof: the rollback route is wired to a materially larger
-    bound than every other package-update request, and that bound is
-    pinned against the backend's own named rollback-inspection ceiling.
+    bound than every other package-update request, and that bound covers
+    the full SEQUENTIAL pre-ACK budget -- the backend's own real snapshot-
+    inspection ceiling, PLUS the full authority writer-wait budget
+    `arm_package_update_rollback` can separately wait on afterwards -- not
+    merely one of the two (required test 1).
     """
 
     assert (
         _transport_http_module._ROLLBACK_REQUEST_TIMEOUT.total
         > _transport_http_module._REQUEST_TIMEOUT.total
     )
-    # At least the backend's own PACKAGE_UPDATE_ROLLBACK_INSPECTION_TIMEOUT_
-    # SECONDS ceiling (120s, app/inventory_runtime_config.py) -- the
-    # dedicated timeout must never be shorter than the contract it exists
-    # to cover.
-    assert _transport_http_module._ROLLBACK_REQUEST_TIMEOUT.total >= 120
+
+    from app.inventory_runtime_config import PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS
+
+    backend_policy = _load_backend_contention_policy()
+    assert (
+        _transport_http_module._PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS_MIRROR
+        == PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS
+    ), (
+        "the HA-side mirror of the backend's snapshot-inspection ceiling "
+        "has drifted from the real backend constant -- update "
+        "_PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS_MIRROR in "
+        "transport_http.py to match "
+        "app.inventory_runtime_config.PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS"
+    )
+    # The dedicated timeout must never be shorter than the SUM of the two
+    # legitimate sequential pre-ACK waits -- covering it exactly, with no
+    # margin, would still let a legitimate worst case race the deadline.
+    assert (
+        _transport_http_module._ROLLBACK_REQUEST_TIMEOUT.total
+        > PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS
+        + backend_policy.AUTHORITY_WRITER_WAIT_BUDGET_SECONDS
+    )
 
 
 @pytest.mark.asyncio
@@ -913,6 +933,55 @@ async def test_ordinary_requests_keep_the_existing_bounded_timeout(
             await transport.resume_package_update(RESOURCE_CT)
     finally:
         await test_server.close()
+
+
+@pytest.mark.asyncio
+async def test_rollback_survives_the_snapshot_plus_writer_wait_sequential_delay(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Required test 2: a rollback response delayed beyond what the OLD,
+    inspection-only-derived 135s bound would have covered, but within the
+    NEW budget that also covers `arm_package_update_rollback`'s own
+    SEQUENTIAL authority writer wait, must not report
+    `HubinetOpsCannotConnect`.
+
+    Scaled by a flat 0.01 from the real formulas (old 135s = 120s
+    inspection-pin + 15s margin; new 185s = 60s real inspection ceiling +
+    105s writer-wait budget + 5s route margin + 15s network margin):
+    delay 1.6s -- past where the old 1.35s-scaled bound would have given
+    up, comfortably inside the new 1.85s-scaled one. This is the exact P1
+    witness: snapshot inspection (~60s real) followed by a separate,
+    legitimate writer-lock wait while arming rollback (~80s real) totals
+    past the old bound while the backend is still legitimately working
+    toward a durable commit.
+    """
+
+    monkeypatch.setattr(
+        _transport_http_module,
+        "_ROLLBACK_REQUEST_TIMEOUT",
+        aiohttp.ClientTimeout(total=1.85),
+    )
+    server = _DelayedRollbackServer(delay_seconds=1.6, resource_id=RESOURCE_CT)
+    test_server = TestServer(server.app())
+    await test_server.start_server(loop=asyncio.get_running_loop())
+    try:
+        transport = HttpHubinetOpsTransport(
+            hass,
+            base_url=str(test_server.make_url("")).rstrip("/"),
+            api_token=API_TOKEN,
+            verify_tls=False,
+        )
+        result = await transport.rollback_package_update(RESOURCE_CT)
+    finally:
+        await test_server.close()
+
+    assert server.calls == 1
+    assert result.resource_id == RESOURCE_CT
+    assert result.rollback_available is True
+    # The delay genuinely exceeds where the OLD, inspection-only bound
+    # would have given up -- proof this pass's widening, not merely the
+    # pre-existing dedicated-rollback-timeout mechanism, is what covers it.
+    assert 1.6 > 1.35
 
 
 @pytest.mark.asyncio

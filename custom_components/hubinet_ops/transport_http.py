@@ -73,57 +73,14 @@ _LOGGER = logging.getLogger(__name__)
 # posture). Tunable value, not an architecture decision.
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
-# PR #74 review finding 3 -- a dedicated, longer timeout for the explicit
-# rollback request ONLY.
-#
-# The backend's rollback route is synchronous, and durable, before it ever
-# returns 202: it resolves the active job, then performs a FRESH read-only
-# canonical PVE snapshot listing (``inspect_job_snapshot_state``, bounded by
-# the backend's own ``PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS`` = 60s host-
-# control ceiling), and only after that inspection durably arms the same-job
-# rollback and acknowledges. `_REQUEST_TIMEOUT` (15s) is far shorter than
-# that legitimate pre-ACK inspection window, so a rollback request that
-# genuinely takes, say, 20-90 seconds would previously time out on the HA
-# side while the backend legitimately continued toward durably arming
-# rollback -- reporting failure to the operator for a destructive rollback
-# that was, in fact, proceeding. See transport_http.py's own
-# `rollback_package_update`.
-#
-# This value is pinned against `PACKAGE_UPDATE_ROLLBACK_INSPECTION_TIMEOUT_
-# SECONDS` (120s, app/inventory_runtime_config.py) rather than the smaller
-# 60s snapshot ceiling the route currently happens to use: that is the
-# backend's own named ceiling for "a rollback stage's read-only PVE
-# inspection", the more conservative of the two bounds the pre-ACK path
-# could legitimately be governed by, and the one least likely to need
-# updating here if the route's own inspection call ever changes which host
-# control it uses. The +15s margin is the SAME bounded margin
-# `_REQUEST_TIMEOUT` already gives every other request for ordinary
-# HTTP/TLS/network overhead on top of the backend's own processing ceiling --
-# not a second, independent guess at network latency.
-#
-# Deliberately NOT a global increase: every other ordinary package-update
-# request (fetch/resume) keeps `_REQUEST_TIMEOUT`'s existing 15s bound, and
-# this constant exists to cover exactly one route's documented backend
-# contract, not to widen bounds this PR has no evidence require it. START
-# has its own dedicated, separately derived timeout below for the same
-# reason -- see `_START_REQUEST_TIMEOUT`.
-_ROLLBACK_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=135)
-
-# Pre-ACK side-effect timeout contract -- the START request's own dedicated
-# timeout.
-#
-# `start_package_update`'s POST is synchronous and durable before it ever
-# returns 202: the backend's route calls `issue_package_update_job`, which
-# can, before it answers, wait to become the authority store's one SQLite
-# writer -- the same `BEGIN IMMEDIATE` lock a Hubinet product update's
-# maintenance-fence acquisition takes -- because that shared lock is the
-# whole mechanism that makes a product update and a workload update mutually
-# exclusive (see `app/inventory/product_update_fence.py`). A workload
-# host-control critical section (or another package-update job's own
-# submission step) legitimately holding that lock is not a bug; a client
-# deadline too short to outlast it is: the operator would be told START
-# failed while the backend, moments later, durably issues the job anyway and
-# wakes the worker regardless.
+# Pre-ACK side-effect timeout contract -- the authority writer-wait budget
+# shared by every route below that can, before its own ACK, wait to become
+# the authority store's one SQLite writer (`BEGIN IMMEDIATE`). One product
+# update's maintenance-fence acquisition, a workload package-update job's
+# own issuance, and arming a same-job rollback all take that SAME lock --
+# see `app/inventory/product_update_fence.py` -- so a client deadline too
+# short to outlast a legitimate holder is not a per-route coincidence, it
+# is one contract every one of these routes shares.
 #
 # `_AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR` mirrors the backend's own
 # `AUTHORITY_WRITER_WAIT_BUDGET_SECONDS` (see `app/inventory/contention_
@@ -135,18 +92,76 @@ _ROLLBACK_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=135)
 # may hold the writer lock (95s), and the scheduling margin on top of it
 # (10s). A regression test (tests/test_hubinet_ops_transport_http.py)
 # asserts this mirror still equals the real backend constant, so drift
-# fails a test instead of silently reopening the P1 this timeout closes.
-# `_START_ROUTE_PROCESSING_MARGIN_SECONDS` covers the route's own small
-# bounded pre-ACK DB work (a `request_id` lookup, a fence-file read, a
-# handful of `SELECT`s and one `INSERT`, never a host round trip), and the
-# final `+15s` is the SAME ordinary HTTP/TLS/loopback margin
-# `_ROLLBACK_REQUEST_TIMEOUT` already applies on top of its own backend
-# processing ceiling.
+# fails a test instead of silently reopening the P1s this closes.
 _MAX_HOST_CRITICAL_SECTION_SECONDS_MIRROR = 95
 _WRITER_SCHEDULING_MARGIN_SECONDS_MIRROR = 10
 _AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR = (
     _MAX_HOST_CRITICAL_SECTION_SECONDS_MIRROR + _WRITER_SCHEDULING_MARGIN_SECONDS_MIRROR
 )
+
+# PR #74 review finding 3, corrected -- a dedicated, longer timeout for the
+# explicit rollback request ONLY.
+#
+# The backend's rollback route is synchronous, and durable, before it ever
+# returns 202, in exactly this order: it resolves the active job, then
+# performs a FRESH read-only canonical PVE snapshot listing
+# (`inspect_job_snapshot_state`, bounded by the backend's own
+# `PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS` = 60s host-control ceiling --
+# `_PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS_MIRROR` below), and only THEN
+# calls `arm_package_update_rollback`, which is an ordinary authority
+# writer transaction and can itself legitimately wait the FULL
+# `_AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR` for the writer lock before
+# it durably commits `rollback_may_have_started` and the route acknowledges.
+# Those two waits are sequential, not alternatives, so the route's real
+# worst-case pre-ACK budget is their SUM: a client timeout that only covers
+# one of them (the previous `135s`, pinned against the inspection ceiling
+# alone) can still time out while the backend is legitimately still waiting
+# to arm the rollback -- reporting failure to the operator for a
+# destructive rollback that durably proceeds anyway once the backend
+# obtains the lock. See transport_http.py's own `rollback_package_update`.
+#
+# The `+15s` margin is the SAME bounded margin `_REQUEST_TIMEOUT` already
+# gives every other request for ordinary HTTP/TLS/network overhead on top
+# of the backend's own processing ceiling -- not a second, independent
+# guess at network latency. `_ROLLBACK_ROUTE_PROCESSING_MARGIN_SECONDS`
+# covers the route's own small bounded pre-ACK DB work outside the two
+# waits above (the job/identity/ownership lookups, never a host round
+# trip).
+#
+# Deliberately NOT a global increase: every other ordinary package-update
+# request (fetch/resume) keeps `_REQUEST_TIMEOUT`'s existing 15s bound, and
+# this constant exists to cover exactly this route's documented backend
+# contract. START has its own dedicated, separately derived timeout below
+# for the same underlying writer-wait reason -- see `_START_REQUEST_
+# TIMEOUT` -- but does not share the additional snapshot-inspection wait
+# rollback has, so the two constants are deliberately not equal.
+_PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS_MIRROR = 60
+_ROLLBACK_ROUTE_PROCESSING_MARGIN_SECONDS = 5
+_ROLLBACK_REQUEST_TIMEOUT = aiohttp.ClientTimeout(
+    total=_PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS_MIRROR
+    + _AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR
+    + _ROLLBACK_ROUTE_PROCESSING_MARGIN_SECONDS
+    + 15
+)
+
+# Pre-ACK side-effect timeout contract -- the START request's own dedicated
+# timeout.
+#
+# `start_package_update`'s POST is synchronous and durable before it ever
+# returns 202: the backend's route calls `issue_package_update_job`, which
+# can, before it answers, wait for the SAME shared authority writer lock
+# described above. A workload host-control critical section (or another
+# package-update job's own submission step) legitimately holding that lock
+# is not a bug; a client deadline too short to outlast it is: the operator
+# would be told START failed while the backend, moments later, durably
+# issues the job anyway and wakes the worker regardless. Unlike rollback,
+# START has no separate read-only inspection before it, so its budget is
+# the writer-wait budget alone plus its own small bounded margin.
+#
+# `_START_ROUTE_PROCESSING_MARGIN_SECONDS` covers the route's own small
+# bounded pre-ACK DB work (a `request_id` lookup, a fence-file read, a
+# handful of `SELECT`s and one `INSERT`, never a host round trip), and the
+# final `+15s` is the same ordinary HTTP/TLS/loopback margin used above.
 _START_ROUTE_PROCESSING_MARGIN_SECONDS = 5
 _START_REQUEST_TIMEOUT = aiohttp.ClientTimeout(
     total=_AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR
