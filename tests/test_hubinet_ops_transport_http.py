@@ -17,6 +17,8 @@ fixture.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -881,8 +883,13 @@ async def test_rollback_uses_a_longer_timeout_than_ordinary_package_update_reque
 async def test_ordinary_requests_keep_the_existing_bounded_timeout(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Required test 1: start/fetch/resume are unaffected by this fix and
-    still time out on their existing, short, ordinary bound.
+    """Required test 1: fetch/resume are unaffected by this fix and still
+    time out on their existing, short, ordinary bound.
+
+    START is deliberately NOT exercised here any more: it now has its own
+    dedicated `_START_REQUEST_TIMEOUT` for exactly the same pre-ACK
+    writer-wait reason rollback does -- see the `TestStartRequestTimeout`
+    class below.
     """
 
     monkeypatch.setattr(
@@ -891,7 +898,7 @@ async def test_ordinary_requests_keep_the_existing_bounded_timeout(
     server = _DelayedRollbackServer(delay_seconds=1.0, resource_id=RESOURCE_CT)
     application = web.Application()
     application.router.add_post(
-        "/r0/v1/resources/{resource_id}/package-update", server._handle
+        "/r0/v1/resources/{resource_id}/package-update/resume", server._handle
     )
     test_server = TestServer(application)
     await test_server.start_server(loop=asyncio.get_running_loop())
@@ -903,7 +910,7 @@ async def test_ordinary_requests_keep_the_existing_bounded_timeout(
             verify_tls=False,
         )
         with pytest.raises(HubinetOpsCannotConnect):
-            await transport.start_package_update(RESOURCE_CT, "req-1")
+            await transport.resume_package_update(RESOURCE_CT)
     finally:
         await test_server.close()
 
@@ -1013,3 +1020,214 @@ async def test_rollback_request_body_still_carries_no_caller_supplied_target(
         await test_server.close()
 
     assert captured["body"] in ("{}", "")
+
+
+# ---------------------------------------------------------------------------
+# Family C -- pre-ACK side-effect timeout contract, START's own dedicated
+# timeout. Same shape and same reason as the rollback suite above:
+# `start_package_update`'s backend route durably issues the job inside the
+# authority store's writer transaction BEFORE it acknowledges, and that
+# legitimate pre-ACK wait can outlast the ordinary 15s bound.
+# ---------------------------------------------------------------------------
+
+_CONTENTION_POLICY_PATH = (
+    Path(__file__).resolve().parents[1] / "app" / "inventory" / "contention_policy.py"
+)
+
+
+def _load_backend_contention_policy():
+    """Load the backend's writer-wait policy module directly by path.
+
+    Deliberately not ``import app.inventory.contention_policy``: that would
+    execute ``app/inventory/__init__.py``, which pulls in the rest of the
+    authority package. Loading the one pure-constants module by file path
+    keeps this cross-check dependency-free under the pinned HA environment,
+    matching how this file's own module-under-test and every other
+    ``test_hubinet_ops_*.py``/``test_update_*`` helper loads standalone
+    scripts in this repository.
+    """
+
+    spec = importlib.util.spec_from_file_location(
+        "hubinet_ops_contention_policy_backend_mirror_check",
+        _CONTENTION_POLICY_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _start_job_payload(resource_id: str) -> dict[str, Any]:
+    """The minimum complete, contract-valid START response body."""
+
+    body = _rollback_job_payload(resource_id)
+    body["checkpoint"] = "issued"
+    body["rollback"] = {"may_have_started_at": None, "available": False}
+    return body
+
+
+class _DelayedStartServer:
+    """A real local HTTP server that delays its START response by exactly
+    ``delay_seconds`` of genuine wall-clock time before returning a valid
+    202 job body -- modelling the backend's own synchronous, potentially
+    slow, pre-ACK authority-writer-lock wait.
+    """
+
+    def __init__(self, delay_seconds: float, resource_id: str) -> None:
+        self._delay_seconds = delay_seconds
+        self._resource_id = resource_id
+        self.calls = 0
+
+    async def _handle(self, request: web.Request) -> web.Response:
+        self.calls += 1
+        await asyncio.sleep(self._delay_seconds)
+        return web.json_response(_start_job_payload(self._resource_id), status=202)
+
+    def app(self) -> web.Application:
+        application = web.Application()
+        application.router.add_post(
+            "/r0/v1/resources/{resource_id}/package-update", self._handle
+        )
+        return application
+
+
+class TestStartRequestTimeout:
+    def test_start_uses_a_longer_timeout_than_ordinary_package_update_requests(
+        self,
+    ) -> None:
+        """Structural proof: START is wired to a materially larger bound
+        than every other ordinary package-update request, and that bound is
+        pinned against the backend's own real writer-wait budget -- not an
+        unexplained, independently drifting magic number.
+        """
+
+        assert (
+            _transport_http_module._START_REQUEST_TIMEOUT.total
+            > _transport_http_module._REQUEST_TIMEOUT.total
+        )
+
+        backend_policy = _load_backend_contention_policy()
+        assert (
+            _transport_http_module._AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR
+            == backend_policy.AUTHORITY_WRITER_WAIT_BUDGET_SECONDS
+        ), (
+            "the HA-side mirror of the backend's authority writer wait "
+            "budget has drifted from the real backend constant -- update "
+            "_AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR in "
+            "transport_http.py to match "
+            "app.inventory.contention_policy.AUTHORITY_WRITER_WAIT_BUDGET_"
+            "SECONDS"
+        )
+        # The client timeout must exceed the backend's own real writer-wait
+        # budget -- covering it exactly, with no margin at all, would still
+        # let a legitimate worst-case wait race the client's own deadline.
+        assert (
+            _transport_http_module._START_REQUEST_TIMEOUT.total
+            > backend_policy.AUTHORITY_WRITER_WAIT_BUDGET_SECONDS
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_response_beyond_the_ordinary_bound_does_not_report_cannot_connect(
+        self, hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Required test 1 (HA START): a start response delayed beyond the
+        old ordinary bound, but within the supported writer-wait budget,
+        must never surface as `HubinetOpsCannotConnect` -- HA must not
+        report timeout while the backend can still legitimately issue the
+        job. Scaled down: the ordinary bound is monkeypatched to 0.2s, the
+        START bound to 2s, and the fake backend delays exactly 1s.
+        """
+
+        monkeypatch.setattr(
+            _transport_http_module, "_REQUEST_TIMEOUT", aiohttp.ClientTimeout(total=0.2)
+        )
+        monkeypatch.setattr(
+            _transport_http_module,
+            "_START_REQUEST_TIMEOUT",
+            aiohttp.ClientTimeout(total=2.0),
+        )
+        server = _DelayedStartServer(delay_seconds=1.0, resource_id=RESOURCE_CT)
+        test_server = TestServer(server.app())
+        await test_server.start_server(loop=asyncio.get_running_loop())
+        try:
+            transport = HttpHubinetOpsTransport(
+                hass,
+                base_url=str(test_server.make_url("")).rstrip("/"),
+                api_token=API_TOKEN,
+                verify_tls=False,
+            )
+            result = await transport.start_package_update(RESOURCE_CT, "req-1")
+        finally:
+            await test_server.close()
+
+        assert server.calls == 1
+        assert result.resource_id == RESOURCE_CT
+
+    @pytest.mark.asyncio
+    async def test_start_beyond_its_own_budget_still_fails_boundedly(
+        self, hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Required test: the START timeout is longer, not unbounded -- a
+        response that outlasts even the (scaled) START budget still reports
+        `HubinetOpsCannotConnect`, and does so within a bounded wait. Because
+        the real (unscaled) budget is proven above to exceed the backend's
+        own real writer-wait ceiling, a genuine timeout under the real
+        contract is proof the backend's own legitimate pre-ACK window was
+        already exceeded too -- not a race the backend could still win.
+        """
+
+        monkeypatch.setattr(
+            _transport_http_module,
+            "_START_REQUEST_TIMEOUT",
+            aiohttp.ClientTimeout(total=0.3),
+        )
+        server = _DelayedStartServer(delay_seconds=2.0, resource_id=RESOURCE_CT)
+        test_server = TestServer(server.app())
+        await test_server.start_server(loop=asyncio.get_running_loop())
+        try:
+            transport = HttpHubinetOpsTransport(
+                hass,
+                base_url=str(test_server.make_url("")).rstrip("/"),
+                api_token=API_TOKEN,
+                verify_tls=False,
+            )
+            with pytest.raises(HubinetOpsCannotConnect):
+                await asyncio.wait_for(
+                    transport.start_package_update(RESOURCE_CT, "req-1"), timeout=5.0
+                )
+        finally:
+            await test_server.close()
+
+    @pytest.mark.asyncio
+    async def test_start_request_id_still_the_only_thing_sent(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Required test (HA START): idempotent `request_id` behavior is
+        unchanged by the dedicated timeout -- the request body still carries
+        exactly one field, and no VMID/plan/target crosses this boundary.
+        """
+
+        captured: dict[str, Any] = {}
+
+        async def _capture(request: web.Request) -> web.Response:
+            captured["body"] = await request.json()
+            return web.json_response(_start_job_payload(RESOURCE_CT), status=202)
+
+        application = web.Application()
+        application.router.add_post(
+            "/r0/v1/resources/{resource_id}/package-update", _capture
+        )
+        test_server = TestServer(application)
+        await test_server.start_server(loop=asyncio.get_running_loop())
+        try:
+            transport = HttpHubinetOpsTransport(
+                hass,
+                base_url=str(test_server.make_url("")).rstrip("/"),
+                api_token=API_TOKEN,
+                verify_tls=False,
+            )
+            await transport.start_package_update(RESOURCE_CT, "req-42")
+        finally:
+            await test_server.close()
+
+        assert captured["body"] == {"request_id": "req-42"}

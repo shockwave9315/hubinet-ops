@@ -101,11 +101,58 @@ _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 # HTTP/TLS/network overhead on top of the backend's own processing ceiling --
 # not a second, independent guess at network latency.
 #
-# Deliberately NOT a global increase: every other package-update request
-# (start/fetch/resume) keeps `_REQUEST_TIMEOUT`'s existing 15s bound, and
+# Deliberately NOT a global increase: every other ordinary package-update
+# request (fetch/resume) keeps `_REQUEST_TIMEOUT`'s existing 15s bound, and
 # this constant exists to cover exactly one route's documented backend
-# contract, not to widen bounds this PR has no evidence require it.
+# contract, not to widen bounds this PR has no evidence require it. START
+# has its own dedicated, separately derived timeout below for the same
+# reason -- see `_START_REQUEST_TIMEOUT`.
 _ROLLBACK_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=135)
+
+# Pre-ACK side-effect timeout contract -- the START request's own dedicated
+# timeout.
+#
+# `start_package_update`'s POST is synchronous and durable before it ever
+# returns 202: the backend's route calls `issue_package_update_job`, which
+# can, before it answers, wait to become the authority store's one SQLite
+# writer -- the same `BEGIN IMMEDIATE` lock a Hubinet product update's
+# maintenance-fence acquisition takes -- because that shared lock is the
+# whole mechanism that makes a product update and a workload update mutually
+# exclusive (see `app/inventory/product_update_fence.py`). A workload
+# host-control critical section (or another package-update job's own
+# submission step) legitimately holding that lock is not a bug; a client
+# deadline too short to outlast it is: the operator would be told START
+# failed while the backend, moments later, durably issues the job anyway and
+# wakes the worker regardless.
+#
+# `_AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR` mirrors the backend's own
+# `AUTHORITY_WRITER_WAIT_BUDGET_SECONDS` (see `app/inventory/contention_
+# policy.py`) rather than importing it -- this integration ships and runs
+# independently of the backend package. Built from two named
+# sub-components, mirroring the backend's own `MAX_HOST_CRITICAL_SECTION_
+# SECONDS`/`WRITER_SCHEDULING_MARGIN_SECONDS` individually rather than one
+# opaque summed literal: the worst-case bounded host critical section that
+# may hold the writer lock (95s), and the scheduling margin on top of it
+# (10s). A regression test (tests/test_hubinet_ops_transport_http.py)
+# asserts this mirror still equals the real backend constant, so drift
+# fails a test instead of silently reopening the P1 this timeout closes.
+# `_START_ROUTE_PROCESSING_MARGIN_SECONDS` covers the route's own small
+# bounded pre-ACK DB work (a `request_id` lookup, a fence-file read, a
+# handful of `SELECT`s and one `INSERT`, never a host round trip), and the
+# final `+15s` is the SAME ordinary HTTP/TLS/loopback margin
+# `_ROLLBACK_REQUEST_TIMEOUT` already applies on top of its own backend
+# processing ceiling.
+_MAX_HOST_CRITICAL_SECTION_SECONDS_MIRROR = 95
+_WRITER_SCHEDULING_MARGIN_SECONDS_MIRROR = 10
+_AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR = (
+    _MAX_HOST_CRITICAL_SECTION_SECONDS_MIRROR + _WRITER_SCHEDULING_MARGIN_SECONDS_MIRROR
+)
+_START_ROUTE_PROCESSING_MARGIN_SECONDS = 5
+_START_REQUEST_TIMEOUT = aiohttp.ClientTimeout(
+    total=_AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR
+    + _START_ROUTE_PROCESSING_MARGIN_SECONDS
+    + 15
+)
 
 _BACKEND_ROUTE = "/r0/v1/backend"
 _SNAPSHOT_ROUTE = "/r0/v1/snapshot"
@@ -761,11 +808,19 @@ class HttpHubinetOpsTransport:
         parameter here for a VMID, a package, a version, a snapshot, a probe,
         or a command, and adding one would be adding a way for Home Assistant
         to decide something the backend authority owns.
+
+        Uses `_START_REQUEST_TIMEOUT`, not the ordinary shared
+        `_REQUEST_TIMEOUT`: this request's backend handler durably issues the
+        job inside the authority store's writer transaction BEFORE it
+        acknowledges (see this module's own `_START_REQUEST_TIMEOUT`
+        docstring), and that legitimate pre-ACK wait can outlast the 15s
+        bound every other ordinary package-update request uses.
         """
 
         payload = await self._package_update_request(
             "POST",
             _PACKAGE_UPDATE_ROUTE.format(resource_id=resource_id),
+            timeout=_START_REQUEST_TIMEOUT,
             json={"request_id": request_id},
         )
         return _package_update_job_view(resource_id, payload)

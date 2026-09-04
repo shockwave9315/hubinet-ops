@@ -83,6 +83,7 @@ import shutil
 import sys
 import tarfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 FAKE_STORAGE = "local-lxc"
 FAKE_TEMPLATE_STORAGE = "local"
@@ -1005,6 +1006,15 @@ def _exec_inner(vmid, inner, state):
             return _missing_python_script(inner[1])
         return _exec_venv_stage(vmid, inner[2:])
 
+    if inner[0].replace("\\", "/").endswith(
+        "/opt/hubinet-ops/.venv/bin/python3"
+    ) and len(inner) >= 2 and _matches_run_owned_ct_script(
+        inner[1], "hubinet-ops-update-host-control-fields"
+    ):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
+        return _exec_host_control_fields(vmid, inner[2:], state)
+
     _log("pct", "exec", "UNHANDLED", *inner)
     return 2
 
@@ -1180,6 +1190,123 @@ def _exec_venv_stage(vmid, args):
         os.kill(os.getppid(), signal.SIGKILL)
     if _fail("pip_install"):
         return 1
+    return 0
+
+
+def _fake_parse_simple_yaml(text):
+    """Minimal, deliberately NON-semantic YAML-shaped reader for the fake
+    CT's own seeded configuration text.
+
+    NOT a stand-in for real YAML, and never meant to be: the hardened
+    update-smoke Docker sandbox installs only pytest (see
+    tests/test_update_boundary_yaml_scalar.py's own module docstring), so
+    `_exec_host_control_fields` below cannot `import yaml` the way the
+    REAL deploy/lib/hubinet-ops-update-host-control-fields.py does. This
+    only has to decode the scalar shapes the update-smoke scenarios
+    actually seed -- a double-quoted JSON-safe string, or a plain
+    (unquoted) scalar kept byte-for-byte -- nested by the same fixed
+    two-space indentation bootstrap/activation always generates. The
+    REAL script's full semantic decoding (inline comments, single-quoted
+    `#`, YAML escape sequences, non-ASCII) is proven separately, with
+    real PyYAML, by tests/test_update_boundary_yaml_scalar.py and
+    tests/test_update_authority_helpers.py on the ordinary
+    (non-sandboxed) pytest host -- never by this fake.
+    """
+    root = {}
+    stack = [(0, root)]
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        stripped = raw_line.strip()
+        if ":" not in stripped:
+            continue
+        key, _sep, inline = stripped.partition(":")
+        key = key.strip()
+        inline = inline.strip()
+        while len(stack) > 1 and indent < stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if inline == "":
+            child = {}
+            parent[key] = child
+            stack.append((indent + 2, child))
+            continue
+        if inline.startswith('"') and inline.endswith('"') and len(inline) >= 2:
+            try:
+                value = json.loads(inline)
+            except ValueError:
+                value = inline.strip('"')
+        elif inline.startswith("'") and inline.endswith("'") and len(inline) >= 2:
+            value = inline[1:-1].replace("''", "'")
+        else:
+            value = inline
+        parent[key] = value
+    return root
+
+
+def _exec_host_control_fields(vmid, args, state=None):
+    """Simulates deploy/lib/hubinet-ops-update-host-control-fields.py's
+    JSON contract, reading the fake CT's own filesystem via
+    `_fake_parse_simple_yaml` above instead of real PyYAML. `args` is
+    `[mode, config_ct_path]`, matching the real script's own argv shape.
+    """
+
+    del state
+    if len(args) != 2:
+        return 2
+    mode, config_ct_path = args
+    if not _pushed_ct_script_exists(vmid, config_ct_path):
+        return _missing_python_script(config_ct_path)
+
+    text = _ct_path(vmid, config_ct_path).read_text(encoding="utf-8")
+    root = _fake_parse_simple_yaml(text)
+
+    if mode == "package_update":
+        host_control = (root.get("package_update") or {}).get("host_control") or {}
+        print(json.dumps({
+            "ok": True,
+            "host": host_control.get("host"),
+            "port": host_control.get("port"),
+            "user": host_control.get("user"),
+            "known_hosts_path": host_control.get("known_hosts_path"),
+        }))
+        return 0
+
+    # package_scan mode -- the SAME default rules
+    # app/inventory_runtime_config.py's parse_r0_runtime_config applies.
+    host_control = (root.get("package_scan") or {}).get("host_control") or {}
+    host = host_control.get("host")
+    if host is None:
+        pve_endpoint = (root.get("source") or {}).get("pve_endpoint")
+        if not pve_endpoint:
+            print(json.dumps({"ok": False, "reason": "no_host_control_host", "detail": ""}))
+            return 0
+        hostname = urlsplit(pve_endpoint).hostname
+        if not hostname:
+            print(json.dumps({
+                "ok": False,
+                "reason": "pve_endpoint_no_hostname",
+                "detail": pve_endpoint,
+            }))
+            return 0
+        host = hostname
+    port = host_control.get("port")
+    if port is None:
+        port = 22
+    user = host_control.get("user")
+    if user is None:
+        user = "root"
+    known_hosts_path = host_control.get("known_hosts_path")
+    if known_hosts_path is None:
+        known_hosts_path = "/etc/hubinet-ops/host-control/known_hosts"
+    print(json.dumps({
+        "ok": True,
+        "host": host,
+        "port": port,
+        "user": user,
+        "known_hosts_path": known_hosts_path,
+    }))
     return 0
 
 

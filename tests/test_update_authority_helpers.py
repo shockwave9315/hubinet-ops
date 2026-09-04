@@ -13,6 +13,7 @@ HTTP, never touching a real PVE/network endpoint.
 from __future__ import annotations
 
 import errno
+import http.server
 import importlib.util
 import json
 import os
@@ -20,17 +21,28 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+import time as _time
 import urllib.error
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+import yaml
+
+from app.inventory_runtime_config import parse_r0_runtime_config
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTHORITY_TOOL_PATH = ROOT / "deploy" / "lib" / "hubinet-ops-authority-tool.py"
 UPDATE_PROBE_PATH = ROOT / "deploy" / "lib" / "hubinet-ops-update-probe.py"
+UPDATE_FENCE_PATH = ROOT / "deploy" / "lib" / "hubinet-ops-update-fence.py"
 ACCEPT_SCRIPT_PATH = ROOT / "deploy" / "lib" / "hubinet-ops-bootstrap-accept.py"
 VENV_BUILD_PATH = ROOT / "deploy" / "lib" / "hubinet-ops-update-venv-stage.py"
+CONTENTION_POLICY_PATH = ROOT / "app" / "inventory" / "contention_policy.py"
+HOST_CONTROL_FIELDS_PATH = (
+    ROOT / "deploy" / "lib" / "hubinet-ops-update-host-control-fields.py"
+)
 
 MARKER = "hubinet_ops_0_5_authority"
 BACKEND_ID = "11111111-1111-4111-8111-111111111111"
@@ -47,7 +59,18 @@ def _load(path: Path, name: str) -> ModuleType:
 
 authority_tool = _load(AUTHORITY_TOOL_PATH, "hubinet_ops_authority_tool")
 update_probe = _load(UPDATE_PROBE_PATH, "hubinet_ops_update_probe")
+update_fence = _load(UPDATE_FENCE_PATH, "hubinet_ops_update_fence")
 accept_script = _load(ACCEPT_SCRIPT_PATH, "hubinet_ops_bootstrap_accept")
+# The backend's pure-constants writer-wait policy, loaded directly by path
+# rather than `import app.inventory.contention_policy`: that would execute
+# `app/inventory/__init__.py`, pulling in the rest of the authority package
+# for what is otherwise a dependency-free cross-check.
+contention_policy = _load(
+    CONTENTION_POLICY_PATH, "hubinet_ops_contention_policy_fence_mirror_check"
+)
+host_control_fields = _load(
+    HOST_CONTROL_FIELDS_PATH, "hubinet_ops_update_host_control_fields"
+)
 
 
 def _make_authority_db(path: Path, *, marker: str = MARKER, version: int = 8, backend_id: str = BACKEND_ID) -> None:
@@ -578,6 +601,398 @@ class TestUpdateProbe:
         payload = json.loads(capsys.readouterr().out)
         assert payload["ok"] is False
         assert payload["reason"] == "package_update_active_malformed"
+
+
+# ---------------------------------------------------------------------------
+# Family C -- pre-ACK side-effect timeout contract, the maintenance-fence
+# client. `acquire()`'s POST can legitimately still be waiting on the
+# backend's `acquire_product_update_maintenance_fence` when that route is
+# itself waiting to become the authority store's one SQLite writer -- the
+# real P1 this pass closes. These tests use a REAL local loopback HTTP
+# server (never a private-network endpoint) and small, test-scaled
+# durations -- never the real 105s/125s production budget -- to prove the
+# actual `urllib` timeout mechanics `acquire()` relies on, the same
+# methodology `tests/test_hubinet_ops_transport_http.py` already uses for
+# the rollback/START HA timeouts.
+# ---------------------------------------------------------------------------
+
+
+class _DelayedFenceHandler(http.server.BaseHTTPRequestHandler):
+    """Answers exactly one fence POST after a fixed, genuine delay."""
+
+    delay_seconds: float = 0.0
+    holder: str = "run-a"
+    calls: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler method name
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        _time.sleep(self.delay_seconds)
+        type(self).calls.append(self.path)
+        body = json.dumps(
+            {"holder": self.holder, "acquired_at": "2026-01-01T00:00:05+00:00"}
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        pass  # keep test output quiet; failures still raise/assert normally
+
+
+@contextmanager
+def _run_delayed_fence_server(*, delay_seconds: float, holder: str):
+    """Run `_DelayedFenceHandler` on a real loopback socket for one test."""
+
+    handler_cls = type(
+        "_ScopedDelayedFenceHandler",
+        (_DelayedFenceHandler,),
+        {"delay_seconds": delay_seconds, "holder": holder, "calls": []},
+    )
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/r0/v1", handler_cls
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+class TestUpdateFenceTimeout:
+    def test_timeout_budget_matches_backend_writer_wait_policy(self) -> None:
+        """Structural proof: the mirrored writer-wait constant has not
+        drifted from the real backend policy, and the derived client
+        timeout exceeds it -- never merely approximates it. If either
+        assertion fails, the P1 this pass closes is silently reopened.
+        """
+
+        assert (
+            update_fence.AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR
+            == contention_policy.AUTHORITY_WRITER_WAIT_BUDGET_SECONDS
+        ), (
+            "deploy/lib/hubinet-ops-update-fence.py's mirrored writer-wait "
+            "budget has drifted from the real backend constant -- update "
+            "AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR to match "
+            "app.inventory.contention_policy.AUTHORITY_WRITER_WAIT_BUDGET_"
+            "SECONDS"
+        )
+        assert (
+            update_fence.TIMEOUT_SECONDS
+            > contention_policy.AUTHORITY_WRITER_WAIT_BUDGET_SECONDS
+        )
+        # The old 15s-style deadline must be gone, not merely nudged.
+        assert update_fence.TIMEOUT_SECONDS > 15
+
+    def test_delayed_but_legitimate_fence_acquisition_is_not_abandoned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Required test 1/2: a fence response delayed beyond the old
+        15s-style deadline, but within the supported authority writer
+        budget, must be received -- the client must not abandon a request
+        that may still legitimately acquire the fence -- and the returned
+        holder/acquired_at are exactly the (delayed) durable answer, never
+        a value invented before the fence actually existed.
+        """
+
+        monkeypatch.setattr(update_fence, "TIMEOUT_SECONDS", 2.0)
+        with _run_delayed_fence_server(
+            delay_seconds=1.0, holder="run-a"
+        ) as (base_url, handler_cls):
+            monkeypatch.setattr(update_fence, "BASE_URL", base_url)
+            result = update_fence.acquire("run-a", "token")
+
+        assert result == {
+            "ok": True,
+            "holder": "run-a",
+            "acquired_at": "2026-01-01T00:00:05+00:00",
+        }
+        assert handler_cls.calls == ["/r0/v1/package-update/maintenance-fence"]
+
+    def test_response_beyond_the_scaled_budget_still_fails_boundedly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Required test: the fence timeout is longer, not unbounded -- a
+        response that outlasts even the (scaled) budget still reports a
+        bounded failure rather than hanging. Because the REAL (unscaled)
+        budget is proven above to exceed the backend's own real writer-wait
+        ceiling, a genuine production timeout under the real contract is
+        proof the backend's own legitimate pre-ACK window was already
+        exceeded too -- never a race the backend could still legitimately
+        win. That is required test 4: there is no path where the client
+        reports failure while the backend can still durably create the
+        fence afterwards for this same request.
+        """
+
+        monkeypatch.setattr(update_fence, "TIMEOUT_SECONDS", 0.3)
+        with _run_delayed_fence_server(
+            delay_seconds=2.0, holder="run-a"
+        ) as (base_url, _handler_cls):
+            monkeypatch.setattr(update_fence, "BASE_URL", base_url)
+            start = _time.monotonic()
+            result = update_fence.acquire("run-a", "token")
+            elapsed = _time.monotonic() - start
+
+        assert result["ok"] is False
+        assert result["reason"] == "fence_endpoint_unreachable"
+        assert elapsed < 5.0
+
+
+# ---------------------------------------------------------------------------
+# Family D -- semantic YAML inheritance/round-trip. The confirmed Codex P2:
+# `_update_boundary_config_scalar` used to scan the installation's own YAML
+# configuration as SOURCE TEXT with a line-oriented regex, not parse it, so
+# an inline comment, a quoted `#`, or a YAML escape sequence inside a
+# double-quoted scalar was returned lexically instead of decoded. These
+# tests exercise the real `deploy/lib/hubinet-ops-update-host-control-
+# fields.py` (real PyYAML, on the ordinary non-sandboxed pytest host --
+# never the hardened update-smoke Docker sandbox, which has no PyYAML
+# installed; see tests/test_update_boundary_yaml_scalar.py's own module
+# docstring) and prove the semantic INPUT decode against the SAME real
+# runtime parser (`app.inventory_runtime_config.parse_r0_runtime_config`),
+# not merely against a hand-written expectation.
+# ---------------------------------------------------------------------------
+
+VALID_RUNTIME_ENV = {
+    "HUBINET_OPS_R0_PVE_TOKEN": "root@pam!hubinet-ops=00000000-0000-0000-0000-000000000000",
+    "HUBINET_OPS_R0_API_TOKEN": "a" * 32,
+}
+
+
+def _full_raw_config(pve_endpoint="https://pve.example.internal:8006", host_control=None):
+    """The minimum complete `parse_r0_runtime_config`-valid mapping, with a
+    caller-controlled `package_scan.host_control` mapping -- mirrors
+    tests/test_inventory_runtime_config.py's own `_raw()` builder, kept
+    local rather than imported so this file's dependency-free-by-default
+    load list (see its own module docstring) is not disturbed.
+    """
+
+    return {
+        "source": {
+            "display_name": "Home Proxmox",
+            "provider_kind": "proxmox_ve",
+            "pve_endpoint": pve_endpoint,
+            "freshness_duration_seconds": 300,
+            "credential_reference": "secret://pve-token-v1",
+            "pve_token_env": "HUBINET_OPS_R0_PVE_TOKEN",
+            "tls": {"verify": True},
+        },
+        "runtime": {
+            "authority_db_path": "/var/lib/hubinet-ops/authority.db",
+            "api_token_env": "HUBINET_OPS_R0_API_TOKEN",
+        },
+        "package_scan": {
+            "host_control": {
+                "private_key_path": "/etc/hubinet-ops/host-control/id_ed25519",
+                **(host_control or {}),
+            },
+        },
+    }
+
+
+def _write_yaml(tmp_path, raw) -> str:
+    path = tmp_path / "inventory.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    return str(path)
+
+
+def _write_text(tmp_path, text: str) -> str:
+    path = tmp_path / "inventory.yaml"
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+class TestUpdateHostControlFieldsSemanticDecode:
+    """Isolated scalar-shape edge cases (required tests 1-7): the decoded
+    value must be the SEMANTIC one, never the lexical source text."""
+
+    def test_plain_scalar(self, tmp_path) -> None:
+        path = _write_text(
+            tmp_path,
+            "source:\n  pve_endpoint: https://pve.example.internal:8006\n"
+            "package_scan:\n  host_control:\n    host: pve.example.internal\n",
+        )
+        fields = host_control_fields.read_host_control_fields("package_scan", path)
+        assert fields["host"] == "pve.example.internal"
+
+    def test_inline_comment_is_not_part_of_the_value(self, tmp_path) -> None:
+        """The exact Codex P2 witness: `host: pve.example # primary
+        endpoint` must decode to `pve.example`, never the comment text
+        too."""
+
+        path = _write_text(
+            tmp_path,
+            "source:\n  pve_endpoint: https://pve.example.internal:8006\n"
+            "package_scan:\n  host_control:\n"
+            "    host: pve.example # primary endpoint\n",
+        )
+        fields = host_control_fields.read_host_control_fields("package_scan", path)
+        assert fields["host"] == "pve.example"
+
+    def test_single_quoted_scalar_containing_hash(self, tmp_path) -> None:
+        path = _write_text(
+            tmp_path,
+            "source:\n  pve_endpoint: https://pve.example.internal:8006\n"
+            "package_scan:\n  host_control:\n"
+            "    user: 'svc#deploy'\n"
+            "    private_key_path: /etc/hubinet-ops/host-control/id_ed25519\n"
+            "    host: pve.example.internal\n",
+        )
+        fields = host_control_fields.read_host_control_fields("package_scan", path)
+        assert fields["user"] == "svc#deploy"
+
+    def test_double_quoted_escape_sequence(self, tmp_path) -> None:
+        path = _write_text(
+            tmp_path,
+            "source:\n  pve_endpoint: https://pve.example.internal:8006\n"
+            "package_scan:\n  host_control:\n"
+            '    known_hosts_path: "/etc/hubinet-ops/host-control/known\\thosts"\n'
+            "    host: pve.example.internal\n",
+        )
+        fields = host_control_fields.read_host_control_fields("package_scan", path)
+        assert fields["known_hosts_path"] == "/etc/hubinet-ops/host-control/known\thosts"
+
+    def test_literal_backslash(self, tmp_path) -> None:
+        path = _write_text(
+            tmp_path,
+            "source:\n  pve_endpoint: https://pve.example.internal:8006\n"
+            "package_scan:\n  host_control:\n"
+            "    user: svc\\deploy\n"
+            "    host: pve.example.internal\n",
+        )
+        fields = host_control_fields.read_host_control_fields("package_scan", path)
+        assert fields["user"] == "svc\\deploy"
+
+    def test_embedded_double_quote(self, tmp_path) -> None:
+        path = _write_text(
+            tmp_path,
+            "source:\n  pve_endpoint: https://pve.example.internal:8006\n"
+            "package_scan:\n  host_control:\n"
+            '    user: svc"deploy\n'
+            "    host: pve.example.internal\n",
+        )
+        fields = host_control_fields.read_host_control_fields("package_scan", path)
+        assert fields["user"] == 'svc"deploy'
+
+    def test_non_ascii(self, tmp_path) -> None:
+        path = _write_text(
+            tmp_path,
+            "source:\n  pve_endpoint: https://pve.example.internal:8006\n"
+            "package_scan:\n  host_control:\n"
+            '    user: "opérateur"\n'
+            "    host: pve.example.internal\n",
+        )
+        fields = host_control_fields.read_host_control_fields("package_scan", path)
+        assert fields["user"] == "opérateur"
+
+
+class TestUpdateHostControlFieldsDefaultsMatchRuntime:
+    """Required tests 8-9: an omitted field's effective value must be the
+    EXACT value the real `parse_r0_runtime_config` computes for the same
+    file -- proven against the real runtime parser, not a hand-copied
+    expectation that could drift from it unnoticed."""
+
+    def test_omitted_fields_get_exact_runtime_defaults(self, tmp_path) -> None:
+        raw = _full_raw_config(host_control={"host": "pve.example.internal"})
+        path = _write_yaml(tmp_path, raw)
+
+        fields = host_control_fields.read_host_control_fields("package_scan", path)
+        runtime_config = parse_r0_runtime_config(raw, env=VALID_RUNTIME_ENV)
+        runtime_host_control = runtime_config.package_scan.host_control
+
+        assert fields["port"] == runtime_host_control.port == 22
+        assert fields["user"] == runtime_host_control.user == "root"
+        assert (
+            fields["known_hosts_path"]
+            == str(runtime_host_control.known_hosts_path)
+            == "/etc/hubinet-ops/host-control/known_hosts"
+        )
+
+    def test_omitted_host_derives_the_exact_runtime_hostname(self, tmp_path) -> None:
+        raw = _full_raw_config(
+            pve_endpoint="https://pve-other.example.internal:8006",
+            host_control={
+                "port": 2222,
+                "user": "svc-deploy",
+                "known_hosts_path": "/custom/known_hosts",
+            },
+        )
+        path = _write_yaml(tmp_path, raw)
+
+        fields = host_control_fields.read_host_control_fields("package_scan", path)
+        runtime_config = parse_r0_runtime_config(raw, env=VALID_RUNTIME_ENV)
+        runtime_host_control = runtime_config.package_scan.host_control
+
+        assert fields["host"] == runtime_host_control.host == "pve-other.example.internal"
+        # Positive control: explicit values in the same file are preserved,
+        # not overwritten by defaults meant only for the omitted host.
+        assert fields["port"] == runtime_host_control.port == 2222
+        assert fields["user"] == runtime_host_control.user == "svc-deploy"
+        assert fields["known_hosts_path"] == str(runtime_host_control.known_hosts_path) == "/custom/known_hosts"
+
+
+class TestUpdateHostControlFieldsRoundTrip:
+    def test_activated_package_update_config_parses_to_the_current_runtime_values(
+        self, tmp_path
+    ) -> None:
+        """Required test 10: the INPUT semantic decode and OUTPUT semantic
+        re-encode together. Reads the CURRENT runtime's effective
+        `package_scan.host_control` values (cross-checked against the real
+        `parse_r0_runtime_config`, exactly like the two tests above), emits
+        them into an activated `package_update.host_control` block using
+        the SAME JSON-safe double-quoted scalar shape
+        `_update_boundary_yaml_dq_scalar` produces in the real bash
+        updater, and proves reading that activated block back
+        (`package_update` mode -- no defaulting, exact values) parses to
+        values EXACTLY equal to what the current runtime computed --
+        including the escape/quote-bearing scalars the old lexical scanner
+        could not have round-tripped.
+        """
+
+        host_value = 'pve\\example.internal'
+        user_value = 'svc"deploy # not a comment'
+        known_hosts_value = "/etc/hubinet-ops/host-control/kn\town_hosts"
+
+        raw = _full_raw_config(
+            host_control={"host": host_value, "user": user_value, "known_hosts_path": known_hosts_value}
+        )
+        current_path = _write_yaml(tmp_path, raw)
+
+        runtime_config = parse_r0_runtime_config(raw, env=VALID_RUNTIME_ENV)
+        runtime_host_control = runtime_config.package_scan.host_control
+
+        inherited = host_control_fields.read_host_control_fields(
+            "package_scan", current_path
+        )
+        assert inherited["host"] == runtime_host_control.host == host_value
+        assert inherited["user"] == runtime_host_control.user == user_value
+        assert (
+            inherited["known_hosts_path"]
+            == str(runtime_host_control.known_hosts_path)
+            == known_hosts_value
+        )
+
+        # The exact serialization _update_boundary_yaml_dq_scalar uses in
+        # production: JSON's string syntax is a legal YAML double-quoted
+        # flow scalar (YAML 1.2 is a strict superset of JSON).
+        activated_path = tmp_path / "activated.yaml"
+        activated_path.write_text(
+            "package_update:\n"
+            "  enabled: true\n"
+            "  host_control:\n"
+            f"    host: {json.dumps(inherited['host'])}\n"
+            f"    port: {inherited['port']}\n"
+            f"    user: {json.dumps(inherited['user'])}\n"
+            f"    known_hosts_path: {json.dumps(inherited['known_hosts_path'])}\n",
+            encoding="utf-8",
+        )
+        activated = host_control_fields.read_host_control_fields(
+            "package_update", str(activated_path)
+        )
+        assert activated == inherited
 
 
 class _FakeAcceptClock:

@@ -77,7 +77,55 @@ FENCE_FILE = "/var/lib/hubinet-ops/product-update-maintenance.fence"
 BASE_URL = "http://127.0.0.1:8787/r0/v1"
 FENCE_PATH = "/package-update/maintenance-fence"
 TOKEN_ENV_KEY = "HUBINET_OPS_R0_API_TOKEN"
-TIMEOUT_SECONDS = 15
+
+# --- Pre-ACK timeout contract -----------------------------------------
+#
+# `acquire()`'s POST is synchronous, and the backend route it calls
+# (`acquire_product_update_maintenance_fence`) can, before it ever answers,
+# wait to become the authority store's one SQLite writer -- the same
+# `BEGIN IMMEDIATE` lock `issue_package_update_job` takes -- because that is
+# the whole synchronization the fence relies on (see
+# `app/inventory/product_update_fence.py`). A workload host-control critical
+# section already legitimately holding that lock is not a bug; refusing to
+# wait for it is. A client deadline shorter than the backend's own
+# legitimate pre-ACK budget does not fail safe here -- it fails INTO the P1
+# this timeout exists to close: the client abandons, this run's recovery
+# journal is resolved/cleared on the belief the fence was never acquired,
+# and the backend later durably creates the fence anyway, for a run that no
+# longer exists to release it. See this module's own docstring.
+#
+# `AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR` is that budget, mirrored
+# from `app.inventory.contention_policy.AUTHORITY_WRITER_WAIT_BUDGET_SECONDS`
+# rather than imported: this script runs standalone inside the CT via
+# `pct exec`, with no application import path (see the module docstring's
+# "Pre-activation installations" section -- it must keep working against a
+# backend that may not even be the one that shipped it). A regression test
+# (tests/test_update_authority_helpers.py) asserts this mirror still equals
+# the real backend constant, so drift fails a test instead of silently
+# reintroducing the P1.
+AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR = 105
+
+#: Bounded margin for the route's own pre-ACK work once it actually holds
+#: the writer lock: one `SELECT` against `package_update_jobs`, one small
+#: fence-file read, and one fsynced fence-file write -- never another host
+#: round trip and never the writer wait itself.
+FENCE_ROUTE_PROCESSING_MARGIN_SECONDS = 5
+
+#: Same bounded allowance every synchronous request in this control surface
+#: gives on top of the backend's own processing ceiling for ordinary
+#: HTTP/TLS/loopback overhead (matches
+#: `custom_components/hubinet_ops/transport_http.py`'s
+#: `_ROLLBACK_REQUEST_TIMEOUT` derivation).
+NETWORK_MARGIN_SECONDS = 15
+
+#: The client timeout itself. Must exceed the backend's maximum legitimate
+#: pre-ACK budget (writer wait + its own bounded processing), never merely
+#: approximate it -- see the contract note above.
+TIMEOUT_SECONDS = (
+    AUTHORITY_WRITER_WAIT_BUDGET_SECONDS_MIRROR
+    + FENCE_ROUTE_PROCESSING_MARGIN_SECONDS
+    + NETWORK_MARGIN_SECONDS
+)
 
 _HOLDER_RE = re.compile(r"^[0-9A-Za-z-]{1,64}$")
 
