@@ -3839,7 +3839,9 @@ class TestCompletedCleanupStrictBeforeJournalClear:
         assert "ROLLBACK COULD NOT BE COMPLETED" in first.stderr
         journal = _update_state_path(env, FAKE_VMID, "journal")
         assert journal.exists()
-        assert "state=completed" in journal.read_text(encoding="utf-8")
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "state=completed" in journal_text
+        run_id = _journal_run_id(journal_text)
         # The target is fully accepted and live, and the leftover rollback
         # artifact this run's cleanup could not remove is still there,
         # proving cleanup really failed rather than being skipped.
@@ -3851,6 +3853,17 @@ class TestCompletedCleanupStrictBeforeJournalClear:
         post = env.state()["vmids"][FAKE_VMID]
         assert post["service"] == "active"
         assert post["service_enabled"] is True
+        # This fault hard-stops at the FIRST rm block (staged/rollback
+        # artifacts), before cleanup ever reaches the SECOND rm block that
+        # removes the run-owned planning/staging tools (authority tool,
+        # update probe, and the maintenance-fence helper) -- so all three
+        # are still present after this first, failed invocation.
+        tool_ct_path = env.ct_file(FAKE_VMID, f"/tmp/hubinet-ops-authority-tool-{run_id}.py")
+        probe_ct_path = env.ct_file(FAKE_VMID, f"/tmp/hubinet-ops-update-probe-{run_id}.py")
+        fence_ct_path = env.ct_file(FAKE_VMID, f"/tmp/hubinet-ops-update-fence-{run_id}.py")
+        assert tool_ct_path.exists()
+        assert probe_ct_path.exists()
+        assert fence_ct_path.exists()
 
         # A later invocation (fault cleared) resolves the surviving
         # `completed` journal through the existing startup-recovery path:
@@ -3861,6 +3874,13 @@ class TestCompletedCleanupStrictBeforeJournalClear:
         assert "was already" in second.stderr
         assert not journal.exists()
         assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert not tool_ct_path.exists()
+        assert not probe_ct_path.exists()
+        # P3 correction pass: the fence helper used to be left behind here
+        # (only the tool and probe paths were removed by
+        # _update_cleanup_recovered_run_artifacts) even on this otherwise
+        # fully successful cleanup replay.
+        assert not fence_ct_path.exists()
 
     def test_host_helper_cleanup_failure_retains_journal_and_replay_finishes_it(self, tmp_path):
         env = seed_installed_environment(
@@ -4581,6 +4601,87 @@ class TestPreActivationInstallationUpgrade:
         assert "port: 2222" in activation
         assert 'user: "svc-deploy"' in activation
         assert 'known_hosts_path: "/custom/known_hosts"' in activation
+
+    def test_inherited_scalars_containing_quotes_or_backslashes_round_trip(
+        self, tmp_path
+    ):
+        """P2: host/user/known_hosts_path are inherited, already-decoded
+        strings this updater does not choose the shape of --
+        parse_r0_runtime_config's own `_require_text` accepts any non-empty
+        string, including one containing a literal '"' or '\\'. Activation
+        used to interpolate that string directly inside a YAML
+        double-quoted scalar (`"${value}"`), which a literal '"' breaks
+        (malformed YAML) and a literal '\\' silently reinterprets (YAML
+        double-quoted scalars process backslash escapes).
+
+        The inherited values below are written as PLAIN (unquoted) YAML
+        scalars in the pre-activation package_scan.host_control block --
+        the shape that lets the updater's own bounded scanner decode them
+        exactly as written, isolating the WRITE-side (serialization) bug
+        this test exists for from the scanner's own separate, unrelated
+        read-side behavior.
+
+        This file runs inside the hardened update-smoke Docker sandbox,
+        which has no PyYAML installed (only pytest), so this proves the
+        activation's own emitted bytes are correct using only the stdlib
+        `json` module -- the real production `yaml.safe_load` round-trip
+        proof for the exact same serializer
+        (_update_boundary_yaml_dq_scalar) lives in
+        tests/test_update_boundary_yaml_scalar.py, which runs on the
+        ordinary (non-sandboxed) pytest host where PyYAML is available.
+        """
+
+        known_hosts_value = '/etc/hubinet-ops/host-control/kn"own_hosts'
+        host_value = 'pve\\example.internal'
+        user_value = 'svc"deploy\\user'
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        inventory_path = env.ct_file(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        inventory_path.write_text(
+            'source:\n'
+            '  display_name: "Home Proxmox"\n'
+            '  provider_kind: proxmox_ve\n'
+            "\npackage_scan:\n"
+            "  interval_seconds: 21600\n"
+            "  initial_delay_seconds: 30\n"
+            "  host_control:\n"
+            f"    host: {host_value}\n"
+            f"    user: {user_value}\n"
+            '    private_key_path: "/etc/hubinet-ops/host-control/id_ed25519"\n'
+            f"    known_hosts_path: {known_hosts_value}\n"
+            "    timeout_seconds: 900\n"
+            "    max_result_bytes: 8388608\n",
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        inventory = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert "package_update:" in inventory
+        activation = inventory.split("package_update:", 1)[1]
+        # Every inherited scalar must be emitted as the EXACT JSON-quoted
+        # form json.dumps would produce for it -- the same mechanism
+        # _update_boundary_yaml_dq_scalar itself uses -- not merely
+        # "something quote-shaped".
+        assert f"host: {json.dumps(host_value)}" in activation
+        assert f"user: {json.dumps(user_value)}" in activation
+        assert f"known_hosts_path: {json.dumps(known_hosts_value)}" in activation
+        # And decoding each emitted scalar back (stdlib `json.loads` -- a
+        # JSON string literal decodes identically whether read by `json`
+        # or by a YAML 1.2 double-quoted-scalar reader) reproduces the
+        # EXACT original decoded string, byte-for-byte.
+        for key, original in (
+            ("host", host_value),
+            ("user", user_value),
+            ("known_hosts_path", known_hosts_value),
+        ):
+            match = re.search(rf'^\s*{key}: (".*")\s*$', activation, re.MULTILINE)
+            assert match, f"{key} not found as a double-quoted scalar in:\n{activation}"
+            assert json.loads(match.group(1)) == original
 
     def test_a_failed_upgrade_leaves_no_new_privileged_access_path(self, tmp_path):
         """The rule this whole module exists for.

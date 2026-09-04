@@ -419,6 +419,38 @@ if hostname:
   printf '%s' "${value}"
 }
 
+# _update_boundary_yaml_dq_scalar <value>: print <value> as a YAML
+# double-quoted scalar that round-trips to the EXACT original string (P2
+# correction pass).
+#
+# host/user/known_hosts_path from _update_boundary_effective_host_control_
+# field above are inherited from the installation's OWN existing
+# package_scan.host_control configuration (or reproduce its documented
+# defaults) -- an already-decoded string this updater does not choose the
+# shape of. The runtime config parser (app/inventory_runtime_config.py)
+# accepts any non-empty string, including one containing a literal '"' or
+# a literal '\'. _update_boundary_activate_config used to interpolate that
+# string directly inside a YAML double-quoted scalar (`"${value}"`): a
+# literal '"' breaks the quoting (malformed YAML), and a literal '\' is
+# processed as a YAML escape inside a double-quoted scalar, silently
+# reinterpreting the decoded value into something other than what was
+# configured.
+#
+# JSON's string syntax is a legal YAML double-quoted flow scalar (YAML 1.2
+# is a strict superset of JSON), so `json.dumps` of the exact input string
+# is sufficient -- no partial hand-rolled escaping, no restriction on
+# otherwise-valid existing values, and no path canonicalization. Standard
+# library only: no new dependency, and python3 is already unconditionally
+# required by this module.
+_update_boundary_yaml_dq_scalar() {
+  python3 -c '
+import json
+import sys
+
+print(json.dumps(sys.argv[1]))
+' "$1"
+}
+
 # The activation block is APPENDED, never merged: it is one self-contained
 # top-level YAML key, and appending it leaves every other line of the
 # operator's configuration byte-for-byte as it was. The updater still never
@@ -427,6 +459,7 @@ _update_boundary_activate_config() {
   local backup_ct_path="${UPDATE_BOUNDARY_CONFIG_PATH}.rollback-${UPDATE_RUN_ID}"
   local block_tmp merged_tmp current_tmp
   local endpoint_host endpoint_port endpoint_user endpoint_known_hosts
+  local endpoint_host_yaml endpoint_user_yaml endpoint_known_hosts_yaml
 
   current_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-config-read.XXXXXX")"
   pct exec "${VMID}" -- cat "${UPDATE_BOUNDARY_CONFIG_PATH}" >"${current_tmp}" \
@@ -438,6 +471,13 @@ _update_boundary_activate_config() {
   endpoint_port="$(_update_boundary_effective_host_control_field port "${current_tmp}")"
   endpoint_user="$(_update_boundary_effective_host_control_field user "${current_tmp}")"
   endpoint_known_hosts="$(_update_boundary_effective_host_control_field known_hosts_path "${current_tmp}")"
+  # host/user/known_hosts_path are inherited strings, not this updater's own
+  # literal -- see _update_boundary_yaml_dq_scalar's own docstring for why
+  # they cannot simply be interpolated inside "${...}" below. port is
+  # already the validated integer produced above and needs no quoting.
+  endpoint_host_yaml="$(_update_boundary_yaml_dq_scalar "${endpoint_host}")"
+  endpoint_user_yaml="$(_update_boundary_yaml_dq_scalar "${endpoint_user}")"
+  endpoint_known_hosts_yaml="$(_update_boundary_yaml_dq_scalar "${endpoint_known_hosts}")"
 
   run_logged pct exec "${VMID}" -- cp "${UPDATE_BOUNDARY_CONFIG_PATH}" "${backup_ct_path}" \
     || die "failed to preserve ${UPDATE_BOUNDARY_CONFIG_PATH} before activating the update lifecycle"
@@ -468,10 +508,10 @@ _update_boundary_activate_config() {
 package_update:
   enabled: true
   host_control:
-    host: "${endpoint_host}"
+    host: ${endpoint_host_yaml}
     port: ${endpoint_port}
-    user: "${endpoint_user}"
-    known_hosts_path: "${endpoint_known_hosts}"
+    user: ${endpoint_user_yaml}
+    known_hosts_path: ${endpoint_known_hosts_yaml}
     snapshot_private_key_path: "$(_update_boundary_key_path snapshot)"
     execution_private_key_path: "$(_update_boundary_key_path execution)"
     mutation_private_key_path: "$(_update_boundary_key_path mutation)"

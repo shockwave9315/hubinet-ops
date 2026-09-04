@@ -479,7 +479,7 @@ _update_cleanup_recovered_run_artifacts() {
   if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" && "${HUBINET_OPS_TEST_FAIL_CT_PLAN_TOOL_CLEANUP:-0}" == "1" ]]; then
     _update_rollback_hard_stop "could not remove run-owned planning/staging tools for interrupted run ${UPDATE_RUN_ID} (simulated test failure)"
   fi
-  pct exec "${VMID}" -- rm -f "${UPDATE_TOOL_CT_PATH}" "${UPDATE_PROBE_CT_PATH}" >/dev/null 2>&1 \
+  pct exec "${VMID}" -- rm -f "${UPDATE_TOOL_CT_PATH}" "${UPDATE_PROBE_CT_PATH}" "${UPDATE_FENCE_CT_PATH}" >/dev/null 2>&1 \
     || _update_rollback_hard_stop "could not remove run-owned planning/staging tools for interrupted run ${UPDATE_RUN_ID}"
   # The virtualenv build helper is only ever pushed when requirements
   # actually changed (_update_stage_venv_builder) -- a code-only update
