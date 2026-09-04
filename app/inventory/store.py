@@ -60,7 +60,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 16
+AUTHORITY_SCHEMA_VERSION = 17
 
 #: Every authority connection's writer wait policy -- both `PRAGMA
 #: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
@@ -427,6 +427,52 @@ class InventoryAuthorityStore:
             if row is None:
                 raise AuthorityNotFound("package update job does not exist")
             return _package_update_job(connection, row)
+
+    def active_package_update_job(self) -> PackageUpdateJob | None:
+        """Return the ONE globally active package-update job, or ``None``.
+
+        The ``one_active_package_update_job_globally`` unique index makes at
+        most one such row possible, so this is a total read of the durable
+        single-flight slot rather than a "pick the newest" heuristic. The
+        production worker re-reads it before every action: in-memory belief
+        about what is running is never permission to act.
+        """
+
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM package_update_jobs WHERE status='active'"
+            ).fetchall()
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise AuthorityInvariantError(
+                    "more than one active package update job exists"
+                )
+            return _package_update_job(connection, rows[0])
+
+    def latest_package_update_job_for_resource(
+        self, resource_id: str
+    ) -> PackageUpdateJob | None:
+        """Return one resource's most recently issued job, or ``None``.
+
+        Bounded to exactly one row: this is the operator readback's "what is
+        this resource's update doing", not a job history feed. Ordering is by
+        ``issuance_sequence`` descending -- the durable per-resource issuance
+        order allocated atomically at issuance (schema v17) -- NOT
+        ``issued_at``: an ordinary host clock step backward between two
+        issuances can give a genuinely later job an earlier ``issued_at``,
+        and this read must still return the job that was actually issued
+        most recently. ``issuance_sequence`` is unique per resource by
+        construction, so no tiebreak is needed.
+        """
+
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM package_update_jobs WHERE resource_id=? "
+                "ORDER BY issuance_sequence DESC LIMIT 1",
+                (resource_id,),
+            ).fetchone()
+            return None if row is None else _package_update_job(connection, row)
 
     def list_package_update_jobs(self) -> tuple[PackageUpdateJob, ...]:
         with self._read_transaction() as connection:
@@ -1097,6 +1143,7 @@ def _package_update_job(
         job_id=str(row["job_id"]),
         request_id=str(row["request_id"]),
         issued_at=str(row["issued_at"]),
+        issuance_sequence=int(row["issuance_sequence"]),
         resource_id=str(row["resource_id"]),
         approval_id=str(row["approval_id"]),
         approval_reviewed_scan_run_id=str(row["approval_reviewed_scan_run_id"]),
@@ -1894,6 +1941,23 @@ _SCHEMA_STATEMENTS = (
         job_id TEXT PRIMARY KEY,
         request_id TEXT NOT NULL UNIQUE,
         issued_at TEXT NOT NULL,
+        -- The durable per-resource issuance order (schema v17), allocated
+        -- atomically in the SAME transaction as this row's insert -- one
+        -- more than the previous MAX(issuance_sequence) for this
+        -- resource_id, exactly the package_scan_runs.attempt_sequence
+        -- pattern. `issued_at` is wall-clock text and is never sufficient
+        -- to order "which job is most recently issued": a host clock that
+        -- steps backward (an ordinary NTP correction, not hostile
+        -- tampering) between two issuances can make a genuinely LATER job
+        -- carry an EARLIER issued_at, and every "latest job for this
+        -- resource" production read (the operator/HA readback and the
+        -- published per-resource job header) would then permanently keep
+        -- surfacing the older job instead. issuance_sequence has no such
+        -- dependency on the clock: it is written once, never reused, and
+        -- strictly increasing in real issuance order regardless of what
+        -- issued_at says.
+        issuance_sequence INTEGER NOT NULL
+            CHECK(typeof(issuance_sequence) = 'integer' AND issuance_sequence > 0),
         resource_id TEXT NOT NULL,
         approval_id TEXT NOT NULL,
         approval_reviewed_scan_run_id TEXT NOT NULL,
@@ -2037,6 +2101,7 @@ _SCHEMA_STATEMENTS = (
         FOREIGN KEY(expected_binding_id) REFERENCES resource_locator_bindings(binding_id),
         FOREIGN KEY(inventory_source_id, expected_node_id)
             REFERENCES inventory_nodes(inventory_source_id, node_id),
+        UNIQUE(resource_id, issuance_sequence),
         CHECK((status = 'active' AND terminalized_at IS NULL AND terminal_reason IS NULL) OR
               (status != 'active' AND terminalized_at IS NOT NULL AND
                terminal_reason IS NOT NULL)),
@@ -2486,7 +2551,8 @@ _SCHEMA_STATEMENTS = (
     """,
     """
     CREATE TRIGGER package_update_job_issuance_immutable
-    BEFORE UPDATE OF job_id, request_id, issued_at, resource_id, approval_id,
+    BEFORE UPDATE OF job_id, request_id, issued_at, issuance_sequence,
+                     resource_id, approval_id,
                      approval_reviewed_scan_run_id, approved_plan_fingerprint,
                      approval_approved_at, current_plan_scan_run_id,
                      inventory_source_id, committed_source_config_revision,

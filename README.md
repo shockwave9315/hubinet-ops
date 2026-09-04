@@ -19,12 +19,16 @@ a guest in Proxmox never requires touching this repository or its config.
 - PVE autodiscovery of every node, LXC, and QEMU guest.
 - A durable SQLite inventory owned by the backend.
 - An HTTP API with read-only inventory routes (`GET /r0/v1/health`, `/backend`,
-  `/snapshot`), one authority-only exact-plan approval route, and the
+  `/snapshot`), one authority-only exact-plan approval route, the
   authority-only per-resource health-contract routes
-  (`GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`). Bearer
-  authentication is required on every endpoint except the deliberately
-  unauthenticated minimal `/r0/v1/health` liveness probe, which exposes no
-  inventory or credential data.
+  (`GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`), and
+  the explicit operator update controls
+  (`POST`/`GET /r0/v1/resources/{resource_id}/package-update`,
+  `POST .../package-update/resume`, `POST .../package-update/rollback`,
+  `GET /r0/v1/package-update/active`). Bearer authentication is required on
+  every endpoint except the deliberately unauthenticated minimal
+  `/r0/v1/health` liveness probe, which exposes no inventory or credential
+  data.
 - A native Home Assistant integration with dynamic devices and entities.
 - Automatic Debian/Ubuntu LXC package scanning with exact durable plans and
   Home Assistant summary entities.
@@ -41,36 +45,46 @@ a guest in Proxmox never requires touching this repository or its config.
   *unconfigured*, which is never "healthy" — and it can no longer be given an
   update job at all, because a job whose success criterion does not exist
   could never truthfully be called successful.
-- Internal durable package-update job authority that freezes one current,
-  non-empty approved exact plan with immutable approval/source/resource
-  provenance, copied package rows, request-id idempotency, global single-flight,
-  and pre-mutation restart interruption. Job issuance is not exposed through
-  HTTP or Home Assistant and does not execute workload changes.
+- **Operator-triggered package updates.** One explicit action starts the
+  currently approved update for one resource; the backend takes a fresh
+  job-owned snapshot, re-proves the exact plan, performs one bounded package
+  operation, and health-checks the guest against the contract the job froze at
+  issuance. Managed through the `start_update` / `view_update_job` /
+  `resume_update` / `rollback_update` Home Assistant actions and the routes
+  above, with a concise per-resource job status sensor.
 - An automated Proxmox bootstrap that provisions the whole backend.
 - An in-place updater for an existing installation: install once, update
   many times, preserving identity/config/credentials.
 
 Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never
-installs packages. Internal durable package-update job authority, job-owned
-snapshot safety, the execution-time plan equality gate, crash-safe workload
-package mutation, same-job rollback execution, and job-bound healthcheck
-execution are built, but none of them is production-reachable: no HTTP, Home
-Assistant, scheduler, bootstrap, or updater path can create a PVE snapshot,
-change a workload package, roll a guest back, or probe a workload, and no
-snapshot, execution, mutation, rollback, or health helper, key, or PVE
-mutation privilege is deployed. A job now freezes the exact health contract
-generation it must satisfy when it is issued, and may only be called
-successful when every one of those probes was positively proven — see
-`PRODUCT.md` and `STATUS.md`.
+installs packages.
+
+**Nothing updates itself.** An update begins only because an authenticated
+operator asked for it — not on a timer, not from a scan, not from an approval,
+and not from a Home Assistant poll. Approving a plan records what you
+reviewed; a separate explicit action installs it. Nothing rolls back on its
+own either: a failed package operation, an unproven one, a failed healthcheck,
+and an unknown one each leave the job owning its snapshot and waiting to be
+asked. Snapshots a job created are kept — there is no automatic deletion or
+retention policy yet. See `PRODUCT.md` and `STATUS.md`.
+
+**The update lifecycle has not yet been validated against a real workload.**
+Its automated coverage is complete, but no real package has been changed and
+no real snapshot rolled back by Hubinet Ops. The runbook for that first
+operator validation is below.
 
 Pre-release authority schema versions are not migrated in place: the current
-schema is v16 and has no migration from v15 or earlier. An existing
-pre-release deployment uses
-`deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
-authority schema, backs it up, and resets only the authority database (with
-explicit operator authorization) while preserving the LXC, its VMID/network,
-PVE identity/token, and every other credential/config file. Home Assistant
-re-enrollment is required only after that explicit reset.
+schema is v17. Schema v17 adds a per-resource durable `issuance_sequence` to
+package-update jobs, so "latest job" readback is ordered by issuance rather
+than wall-clock `issued_at`. An existing schema-v16 pre-release deployment is
+therefore incompatible in place. `deploy/update-proxmox-0.5.sh` reports
+`reset_required`, makes and validates a coherent authority backup, and resets
+only the authority database after explicit operator authorization. The LXC,
+its VMID/network, PVE identity/token, HA bearer, config, TLS material and
+host-control credentials are preserved; authority identities/history,
+package-scan/job history and exact-plan approvals are recreated with the fresh
+database. Home Assistant re-enrollment is required after that reset because
+`backend_instance_id` and resource identities are regenerated.
 
 ## Installation
 
@@ -79,18 +93,26 @@ The two halves deploy independently.
 **Backend (on the Proxmox host).** `deploy/bootstrap-proxmox-0.5.sh` creates a
 fresh unprivileged Debian LXC at the next free VMID, provisions a
 least-privilege PVE token, sets up TLS trust, installs the service, provisions
-a dedicated pinned-key/forced-command package-scan boundary, writes the config,
-and applies an nftables boundary — after one upfront confirmation of the full
-plan. This is the first-install / disaster-recovery / deliberate-rebuild path
-only. See [`deploy/README-bootstrap-proxmox-0.5.md`](deploy/README-bootstrap-proxmox-0.5.md)
+a dedicated pinned-key/forced-command package-scan boundary plus five further
+dedicated boundaries for the update lifecycle (snapshot, plan simulation,
+mutation, rollback, health), writes the config, and applies an nftables
+boundary — after one upfront confirmation of the full plan. Each boundary gets
+its own private key, because the key is what selects which forced command a
+connection may run. The PVE API token stays exactly `Sys.Audit,VM.Audit`:
+every workload mutation runs host-local behind a root-owned forced command.
+This is the first-install / disaster-recovery / deliberate-rebuild path only. See [`deploy/README-bootstrap-proxmox-0.5.md`](deploy/README-bootstrap-proxmox-0.5.md)
 and [`deploy/README-0.5-firewall.md`](deploy/README-0.5-firewall.md).
 
 **Updating an existing backend.** `deploy/update-proxmox-0.5.sh --vmid <N>`
 updates an already-bootstrapped installation in place — it verifies
 ownership, prints an exact plan, and preserves identity/config/credentials
 (and the authority database, unless an incompatible pre-release schema
-requires an explicit, backed-up reset). It never re-runs the fresh
-installer. See [`deploy/README-update-proxmox-0.5.md`](deploy/README-update-proxmox-0.5.md).
+requires an explicit, backed-up reset). It never re-runs the fresh installer.
+It also upgrades a pre-activation installation into the update lifecycle,
+creating the five boundaries and their keys. **It refuses outright, before
+touching any file, while a package-update job is active** — let the update
+finish, or resolve it with `resume_update` or `rollback_update`, then run the
+updater again. See [`deploy/README-update-proxmox-0.5.md`](deploy/README-update-proxmox-0.5.md).
 
 **Home Assistant integration (via HACS).**
 
@@ -110,6 +132,81 @@ PVE-facing code path at all, and HACS distributes code only.
 For integration development you may symlink `custom_components/hubinet_ops/`
 into a Home Assistant `config/custom_components/` directory instead. That is a
 development fallback, not a supported installation method.
+
+## Running your first real update
+
+The update lifecycle is production reachable but has never touched a real
+workload. This is the operator procedure for that first validation. Use a
+disposable Debian LXC you are willing to roll back — not a guest you care
+about.
+
+Everything below is done from Home Assistant (**Developer tools → Actions**)
+except step 1.
+
+1. **Update the backend to an activation build.** On the Proxmox host, run
+   `deploy/update-proxmox-0.5.sh --vmid <N>`. Confirm the plan; it will report
+   the five package-update boundaries it creates or leaves alone. Afterwards
+   check the service is enabled, active, and healthy, and that Home Assistant
+   still shows the backend's resources.
+
+2. **Pick a disposable Debian/Ubuntu LXC** that is running and appears in Home
+   Assistant with a successful package scan.
+
+3. **Declare its health contract.** `hubinet_ops.set_health_contract`, naming
+   the resource device and one or more probes that are genuinely true right
+   now, for example `{"kind": "systemd_unit_active", "target": "ssh.service"}`.
+   Read it back with `view_health_contract`. Without a contract the guest
+   cannot be given an update job at all.
+
+4. **Get a real, small plan.** Wait for (or wait out) an automatic scan so the
+   guest has pending updates. A handful of packages is ideal.
+
+5. **View the plan.** `hubinet_ops.view_update_plan`. Read the exact package
+   rows: name, architecture, installed version, candidate version.
+
+6. **Approve exactly that plan.** `hubinet_ops.approve_update_plan`, using the
+   `approval_reference` the previous step returned. This still installs
+   nothing.
+
+7. **Start the update.** `hubinet_ops.start_update`, naming the resource
+   device. This is the first action in the product's history that can change a
+   real workload package. It returns the job it created.
+
+8. **Watch it.** `hubinet_ops.view_update_job` (or the resource's *Package
+   update job* sensor). Expect `snapshot_confirmed` → `mutation_completed` →
+   `health_completed` with `health_outcome: passed`, and a final status of
+   `succeeded`.
+
+9. **Verify on the Proxmox host, independently of Hubinet:**
+   - `pct listsnapshot <vmid>` shows exactly one new Hubinet-owned snapshot,
+     created before the update, and every snapshot you took by hand is
+     untouched;
+   - `pct exec <vmid> -- apt list --upgradable` no longer lists the packages
+     from step 5;
+   - your health probe's subject really is up.
+
+10. **Then test a failure, deliberately.** Repeat steps 4-7 on the same
+    disposable guest, but first set the health contract to something that will
+    NOT hold after the update — for example a systemd unit you stop by hand
+    while the update runs. Expect the job to end ACTIVE at `health_completed`
+    with `health_outcome: failed`, `rollback_available: true`, and **no
+    rollback attempted**. Confirm nothing rolled back on its own.
+
+11. **Roll it back explicitly.** `hubinet_ops.rollback_update`, naming the
+    resource device. Expect the job to reach `rolled_back`.
+
+12. **Verify the rollback:** the guest is **stopped** — that is the documented
+    final state, because Proxmox force-stops a container to roll it back and
+    Hubinet deliberately does not restart it; the packages are back at their
+    pre-update versions; the job's own snapshot is still present; and no
+    unrelated or manual snapshot was touched.
+
+13. **Start the guest again** yourself (`pct start <vmid>`) when you are done.
+
+If anything is uncertain rather than wrong — an unknown health verdict, an
+unproven package operation — the job stays ACTIVE and owned and the backend
+waits. `hubinet_ops.resume_update` asks it to look again; it never re-runs a
+destructive step.
 
 ## Development
 
@@ -163,9 +260,13 @@ Run the backend locally with:
 from the environment variables that config references, currently
 `HUBINET_OPS_R0_PVE_TOKEN` and `HUBINET_OPS_R0_API_TOKEN`. The validated
 `package_scan.interval_seconds` runtime setting defaults to 21,600 seconds;
-the scheduler supports controlled interval replacement. The only Home
-Assistant write is exact-plan approval authority; it cannot execute package or
-workload mutations. See
+the scheduler supports controlled interval replacement. Home Assistant writes
+exact-plan approval authority, health-contract configuration, and the
+explicit operator update controls (start/resume/roll back one resource's
+update) — none of them executes a package or workload mutation directly:
+each durably records an authority fact or an explicit request, and only the
+backend's own worker, through its forced-command helpers, ever runs a real
+command against a guest. See
 [`config/inventory.example.yaml`](config/inventory.example.yaml) and
 [`.env.r0.example`](.env.r0.example) for the config shape and required
 variables. Never run a deployment script against a real host from a

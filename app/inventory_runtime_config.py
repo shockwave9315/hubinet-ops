@@ -112,6 +112,101 @@ class R0PackageScanConfig:
     host_control: R0HostControlConfig
 
 
+# ---------------------------------------------------------------------------
+# Package-update production execution boundaries.
+#
+# Source-level execution-boundary information ONLY. There is no VMID, no
+# resource id, no per-guest setting, and no managed-resource list here, for
+# exactly the reason there is none in the source section above: adding or
+# removing a PVE guest must never require a config change.
+#
+# There are also deliberately no timeout knobs. Each stage already owns its
+# bound -- three of them are load-bearing ceilings derived in
+# `app.inventory.contention_policy` from how long a bounded host round trip
+# may hold the authority store's writer lock -- and a per-installation
+# override would let an operator quietly widen a safety bound. The constants
+# below are those exact existing bounds, named once.
+# ---------------------------------------------------------------------------
+
+#: Snapshot submission/seal/inspection. Bounded by the writer-lock ceiling.
+PACKAGE_UPDATE_SNAPSHOT_TIMEOUT_SECONDS = 60
+#: The execution-time equality gate: an APT metadata refresh plus a full
+#: `-s upgrade` simulation, entirely outside every writer transaction. Same
+#: budget the package scanner already uses for the same two operations.
+PACKAGE_UPDATE_EXECUTION_TIMEOUT_SECONDS = 900
+#: The mutation stage's read-only PREPARE/inspect round trips -- metadata
+#: refresh, simulation, and two dpkg identity reads -- outside the lock.
+PACKAGE_UPDATE_MUTATION_TIMEOUT_SECONDS = 600
+#: The mutation stage's submit/seal round trips, which run while the backend
+#: holds the authority writer lock. Never waits for `apt-get` itself.
+PACKAGE_UPDATE_MUTATION_SUBMISSION_TIMEOUT_SECONDS = 60
+#: The rollback stage's submit/seal round trips, under the writer lock.
+PACKAGE_UPDATE_ROLLBACK_SUBMISSION_TIMEOUT_SECONDS = 60
+#: The rollback stage's read-only inspection, outside the lock.
+PACKAGE_UPDATE_ROLLBACK_INSPECTION_TIMEOUT_SECONDS = 120
+#: One read-only health evaluation of a complete frozen probe set.
+PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS = 300
+#: Shared bounded response ceiling for every production update host control.
+PACKAGE_UPDATE_MAX_RESULT_BYTES = 8 * 1024 * 1024
+
+#: One dedicated private key per privileged forced-command boundary. The
+#: five host-side helpers are five different privilege boundaries -- create a
+#: snapshot, simulate a plan, mutate packages, roll a guest back, read health
+#: -- so one key must never be able to reach two of them. The package-scan
+#: key is a sixth, separate, unchanged boundary and is never reused here.
+PACKAGE_UPDATE_KEY_FIELDS: tuple[tuple[str, str], ...] = (
+    ("snapshot_private_key_path", "id_ed25519_snapshot"),
+    ("execution_private_key_path", "id_ed25519_execution"),
+    ("mutation_private_key_path", "id_ed25519_mutation"),
+    ("rollback_private_key_path", "id_ed25519_rollback"),
+    ("health_private_key_path", "id_ed25519_health"),
+)
+
+_HOST_CONTROL_DIR = "/etc/hubinet-ops/host-control"
+
+
+@dataclass(frozen=True, slots=True)
+class R0PackageUpdateHostControlConfig:
+    """How to reach each privileged forced-command boundary on the source.
+
+    Host, port, user, and pinned `known_hosts` are legitimately shared: they
+    describe the one configured PVE source's SSH endpoint, which is the same
+    endpoint for every boundary. The PRIVATE KEYS are not shared, because the
+    key is what selects which forced command the connection may run.
+    """
+
+    host: str
+    port: int
+    user: str
+    known_hosts_path: Path
+    snapshot_private_key_path: Path
+    execution_private_key_path: Path
+    mutation_private_key_path: Path
+    rollback_private_key_path: Path
+    health_private_key_path: Path
+
+    def private_key_paths(self) -> tuple[Path, ...]:
+        return tuple(
+            getattr(self, name) for name, _default in PACKAGE_UPDATE_KEY_FIELDS
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class R0PackageUpdateConfig:
+    """Production activation of the operator-triggered update lifecycle.
+
+    ``enabled`` is the whole activation switch. When it is false the backend
+    builds no update host control, starts no update worker, and serves no
+    update route -- the lifecycle stays exactly as unreachable as it was
+    before this release. When it is true, a missing or unreadable required
+    helper credential fails startup closed rather than deferring the failure
+    to the first real operator request.
+    """
+
+    enabled: bool
+    host_control: R0PackageUpdateHostControlConfig | None
+
+
 @dataclass(frozen=True, slots=True)
 class R0RuntimeConfig:
     """Fully loaded R0 runtime configuration, secrets included in memory only.
@@ -124,6 +219,7 @@ class R0RuntimeConfig:
     source: R0SourceConfig
     authority_db_path: Path
     package_scan: R0PackageScanConfig
+    package_update: R0PackageUpdateConfig
     pve_api_token: str = field(repr=False)
     api_bearer_token: str = field(repr=False)
 
@@ -132,6 +228,7 @@ class R0RuntimeConfig:
             "R0RuntimeConfig(source="
             f"{self.source!r}, authority_db_path={self.authority_db_path!r}, "
             f"package_scan={self.package_scan!r}, "
+            f"package_update={self.package_update!r}, "
             "pve_api_token=<redacted>, api_bearer_token=<redacted>)"
         )
 
@@ -197,6 +294,91 @@ def _require_env_secret(env: Mapping[str, str], var_name: str, *, purpose: str) 
             "is missing or empty"
         )
     return value
+
+
+def _parse_package_update_config(
+    value: Any, *, default_host: str
+) -> R0PackageUpdateConfig:
+    """Parse the production update-execution boundary section.
+
+    Absent or ``enabled: false`` means the lifecycle is not activated on this
+    installation and NOTHING is constructed for it. ``enabled: true`` requires
+    every one of the five dedicated helper credentials to be present, absolute,
+    and readable *now*, at startup: discovering a missing privileged credential
+    at the moment an operator asks for a real package mutation would be
+    discovering it far too late.
+    """
+
+    raw = _require_mapping(value, "package_update")
+    enabled = _require_bool(raw.get("enabled"), "package_update.enabled", default=False)
+    host_control_value = raw.get("host_control") or {}
+    host_control_raw = _require_mapping(host_control_value, "package_update.host_control")
+    if not enabled:
+        # Deliberately not parsed further. An installation that has not
+        # activated the lifecycle must not fail startup over the shape of a
+        # section nothing will read.
+        return R0PackageUpdateConfig(enabled=False, host_control=None)
+
+    key_paths: dict[str, Path] = {}
+    for name, default_basename in PACKAGE_UPDATE_KEY_FIELDS:
+        key_paths[name] = Path(
+            _require_text(
+                host_control_raw.get(name, f"{_HOST_CONTROL_DIR}/{default_basename}"),
+                f"package_update.host_control.{name}",
+            )
+        )
+    known_hosts_path = Path(
+        _require_text(
+            host_control_raw.get("known_hosts_path", f"{_HOST_CONTROL_DIR}/known_hosts"),
+            "package_update.host_control.known_hosts_path",
+        )
+    )
+    host_control = R0PackageUpdateHostControlConfig(
+        host=_require_text(
+            host_control_raw.get("host", default_host),
+            "package_update.host_control.host",
+        ),
+        port=_require_bounded_int(
+            host_control_raw.get("port", 22),
+            "package_update.host_control.port",
+            minimum=1,
+            maximum=65535,
+        ),
+        user=_require_text(
+            host_control_raw.get("user", "root"),
+            "package_update.host_control.user",
+        ),
+        known_hosts_path=known_hosts_path,
+        **key_paths,
+    )
+
+    required = (known_hosts_path, *host_control.private_key_paths())
+    for path in required:
+        if not path.is_absolute():
+            raise R0ConfigError(
+                "package-update host-control credential paths must be absolute"
+            )
+    distinct = set(host_control.private_key_paths())
+    if len(distinct) != len(PACKAGE_UPDATE_KEY_FIELDS):
+        # One key reaching two forced commands would silently merge two
+        # different privilege boundaries -- the exact thing separate helpers
+        # exist to prevent.
+        raise R0ConfigError(
+            "each package-update host-control boundary requires its own "
+            "dedicated private key"
+        )
+    for path in required:
+        # Fail startup CLOSED on a missing or unreadable required production
+        # helper credential, once activation is enabled.
+        try:
+            with path.open("rb") as handle:
+                handle.read(1)
+        except OSError as exc:
+            raise R0ConfigError(
+                f"package-update host-control credential {str(path)!r} is "
+                f"missing or not readable: {exc}"
+            ) from exc
+    return R0PackageUpdateConfig(enabled=True, host_control=host_control)
 
 
 def parse_r0_runtime_config(
@@ -361,6 +543,27 @@ def parse_r0_runtime_config(
     if not host_control.private_key_path.is_absolute() or not host_control.known_hosts_path.is_absolute():
         raise R0ConfigError("package-scan host-control paths must be absolute")
 
+    package_update = _parse_package_update_config(
+        raw.get("package_update") or {}, default_host=default_host
+    )
+    if package_update.enabled and package_update.host_control is not None:
+        # The package-scan boundary is a SIXTH, separate forced-command
+        # credential (see PACKAGE_UPDATE_KEY_FIELDS's own docstring) -- the
+        # five-way distinctness check inside _parse_package_update_config
+        # only proves the five update keys differ from EACH OTHER, not that
+        # none of them was configured to literally reuse the scan key. A
+        # reused key would let the scan boundary's connection also run
+        # whichever update forced command that key was meant to gate,
+        # silently merging two independent privilege boundaries into one.
+        if host_control.private_key_path in package_update.host_control.private_key_paths():
+            raise R0ConfigError(
+                "package_scan.host_control.private_key_path must be distinct "
+                "from every package_update.host_control forced-command key "
+                "(snapshot/execution/mutation/rollback/health) -- the "
+                "package-scan SSH key must never be reused by a "
+                "package-update boundary"
+            )
+
     pve_api_token = _require_env_secret(env, pve_token_env, purpose="PVE API token")
     api_bearer_token = _require_env_secret(env, api_token_env, purpose="R0 API bearer token")
     if len(api_bearer_token) < _MIN_API_TOKEN_LENGTH:
@@ -383,6 +586,7 @@ def parse_r0_runtime_config(
             initial_delay_seconds=initial_delay_seconds,
             host_control=host_control,
         ),
+        package_update=package_update,
         pve_api_token=pve_api_token,
         api_bearer_token=api_bearer_token,
     )

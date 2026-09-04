@@ -269,6 +269,8 @@ source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-identity.sh"
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-deploy.sh"
 # shellcheck source=lib/bootstrap-host-control.sh
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-host-control.sh"
+# shellcheck source=lib/bootstrap-update-boundaries.sh
+source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-update-boundaries.sh"
 # shellcheck source=lib/bootstrap-firewall.sh
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-firewall.sh"
 # shellcheck source=lib/bootstrap-finish.sh
@@ -290,6 +292,7 @@ rollback_on_failure() {
   # Exact Hubinet-owned helper/key/authorization artifacts only. The
   # cleanup function filters by this run's unique marker and never
   # replaces or removes unrelated operator authorized_keys entries.
+  rollback_update_boundaries
   rollback_host_control
 
   if ledger_has ct "${VMID}"; then
@@ -537,9 +540,10 @@ trap 'exit 143' TERM
 phase1_preflight
 phase2_plan_template
 phase2c_plan_host_control
+phase2d_plan_update_boundaries
 _plan_source_commit
 
-log_info "Plan: create VMID ${VMID}$( [[ "${VMID_EXPLICIT}" == "0" ]] && printf ' (auto-detected next-free)' ) (${HOSTNAME_}) from template [${TEMPLATE_PLAN_NOTE}] on storage ${STORAGE}, bridge ${BRIDGE}, network ${NETWORK_MODE}; PVE endpoint ${PVE_ENDPOINT}; source commit ${SOURCE_HEAD_SHA}; HA source ${HA_SOURCE_CIDR} -> TCP 8787 only; package scans every ${PACKAGE_SCAN_INTERVAL_SECONDS}s through one pinned-key, forced-command SSH boundary."
+log_info "Plan: create VMID ${VMID}$( [[ "${VMID_EXPLICIT}" == "0" ]] && printf ' (auto-detected next-free)' ) (${HOSTNAME_}) from template [${TEMPLATE_PLAN_NOTE}] on storage ${STORAGE}, bridge ${BRIDGE}, network ${NETWORK_MODE}; PVE endpoint ${PVE_ENDPOINT}; source commit ${SOURCE_HEAD_SHA}; HA source ${HA_SOURCE_CIDR} -> TCP 8787 only; package scans every ${PACKAGE_SCAN_INTERVAL_SECONDS}s through one pinned-key, forced-command SSH boundary; operator-triggered package updates through five further dedicated-key forced-command boundaries (snapshot, plan simulation, mutation, rollback, health) -- no update ever starts without an explicit operator action."
 confirm_or_abort "Proceed with this plan?"
 
 phase2b_provision_template
@@ -551,6 +555,7 @@ phase7_tls_trust
 phase8_deploy_source
 phase8b_provision_tooling
 phase8c_provision_host_control
+phase8d_provision_update_boundaries
 phase9_generate_config
 phase10_firewall
 phase11_start_service

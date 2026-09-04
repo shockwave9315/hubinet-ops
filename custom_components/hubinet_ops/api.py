@@ -24,6 +24,11 @@ from .contract import (
     PackageScanStatus,
     PackagePlanApprovalSnapshot,
     PackagePlanApprovalStatus,
+    PackageUpdateHealthOutcome,
+    PackageUpdateJobEvent,
+    PackageUpdateJobState,
+    PackageUpdateJobSummary,
+    PackageUpdateJobView,
     PresenceState,
     ResourceHealthContract,
     ResourceSnapshot,
@@ -35,6 +40,12 @@ from .contract import (
     SourceHealth,
     SourceHealthOrigin,
 )
+
+
+#: How many trailing job events an explicit readback asks for by default.
+#: Bounded on both sides: the backend caps what it will return, and this is
+#: what Home Assistant asks for when nobody says otherwise.
+DEFAULT_PACKAGE_UPDATE_EVENTS = 20
 
 
 class HubinetOpsApiError(RuntimeError):
@@ -99,6 +110,22 @@ class HubinetOpsTransport(Protocol):
         self, resource_id: str, expected_revision: int | None
     ) -> None:
         """Clear one exact resource's health contract."""
+
+    async def start_package_update(
+        self, resource_id: str, request_id: str
+    ) -> PackageUpdateJobView:
+        """Explicitly start the currently approved update for one resource."""
+
+    async def fetch_package_update(
+        self, resource_id: str, events: int
+    ) -> PackageUpdateJobView:
+        """Read one resource's current/latest job and bounded event tail."""
+
+    async def resume_package_update(self, resource_id: str) -> PackageUpdateJobView:
+        """Ask the backend worker to re-enter an existing recoverable job."""
+
+    async def rollback_package_update(self, resource_id: str) -> PackageUpdateJobView:
+        """Explicitly roll one resource back to its own job's snapshot."""
 
 
 class HubinetOpsApi:
@@ -167,6 +194,34 @@ class HubinetOpsApi:
 
         await self._transport.clear_health_contract(resource_id, expected_revision)
 
+    async def async_start_package_update(
+        self, resource_id: str, request_id: str
+    ) -> PackageUpdateJobView:
+        """Forward one explicit operator start request unchanged."""
+
+        return await self._transport.start_package_update(resource_id, request_id)
+
+    async def async_fetch_package_update(
+        self, resource_id: str, events: int = DEFAULT_PACKAGE_UPDATE_EVENTS
+    ) -> PackageUpdateJobView:
+        """Read one resource's package-update job."""
+
+        return await self._transport.fetch_package_update(resource_id, events)
+
+    async def async_resume_package_update(
+        self, resource_id: str
+    ) -> PackageUpdateJobView:
+        """Forward one explicit operator resume request unchanged."""
+
+        return await self._transport.resume_package_update(resource_id)
+
+    async def async_rollback_package_update(
+        self, resource_id: str
+    ) -> PackageUpdateJobView:
+        """Forward one explicit operator same-job rollback request unchanged."""
+
+        return await self._transport.rollback_package_update(resource_id)
+
 
 class HubinetOpsApiFactory(Protocol):
     """Factory boundary used by config flow, setup and fake transports."""
@@ -214,6 +269,22 @@ class _UnconfiguredPhaseZeroTransport:
     async def clear_health_contract(
         self, resource_id: str, expected_revision: int | None
     ) -> None:
+        raise self._error()
+
+    async def start_package_update(
+        self, resource_id: str, request_id: str
+    ) -> PackageUpdateJobView:
+        raise self._error()
+
+    async def fetch_package_update(
+        self, resource_id: str, events: int
+    ) -> PackageUpdateJobView:
+        raise self._error()
+
+    async def resume_package_update(self, resource_id: str) -> PackageUpdateJobView:
+        raise self._error()
+
+    async def rollback_package_update(self, resource_id: str) -> PackageUpdateJobView:
         raise self._error()
 
 

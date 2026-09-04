@@ -134,6 +134,7 @@ _update_set_run_paths() {
   [[ -n "${UPDATE_RUN_ID}" ]] || die "internal error: cannot derive updater paths without UPDATE_RUN_ID"
   UPDATE_TOOL_CT_PATH="/tmp/hubinet-ops-authority-tool-${UPDATE_RUN_ID}.py"
   UPDATE_PROBE_CT_PATH="/tmp/hubinet-ops-update-probe-${UPDATE_RUN_ID}.py"
+  UPDATE_FENCE_CT_PATH="/tmp/hubinet-ops-update-fence-${UPDATE_RUN_ID}.py"
   UPDATE_CT_SOURCE_TARBALL="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}.tar.gz"
   UPDATE_CT_SOURCE_DIR="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}"
   UPDATE_APP_STAGED_PATH="/opt/hubinet-ops/app.staged-${UPDATE_RUN_ID}"
@@ -192,7 +193,71 @@ _update_journal_marker_is_recovery_relevant() {
     update-authority-restored|\
     update-marker-activation-attempted|\
     update-marker-precondition-exists|\
-    update-marker-precondition-absent) return 0 ;;
+    update-marker-precondition-absent|\
+    update-maintenance-fence-held) return 0 ;;
+    # Family 1 correction pass: the four package-update boundary markers,
+    # kept as their own arm (rather than chained onto the legacy list
+    # above) so each existing marker's own line is untouched.
+    update-boundary-created|\
+    update-boundary-activated|\
+    update-boundary-config-activated|\
+    update-boundary-journal-created) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _update_journal_marker_id_is_valid <kind> <id>: typed per-kind id
+# validation for every durable journal ledger marker, shared identically by
+# update_journal_checkpoint (write) and _update_journal_load (read) so the
+# two can never drift (Family 1 correction pass, P1).
+#
+# The legacy VMID-scoped markers keep requiring id == VMID exactly as
+# before -- that is unchanged and never weakened. The package-update
+# boundary markers instead validate against the fixed, closed set of ids
+# update-boundaries.sh can ever actually record for that SPECIFIC marker
+# kind: a bare "id == VMID" would have silently accepted only the
+# config-activation marker (whose id genuinely is the VMID) while dropping
+# "update-boundary-created snapshot", "update-boundary-activated
+# execution", and "update-boundary-journal-created <path>" -- exactly the
+# confirmed P1 (a durable-looking update_journal_record call whose marker
+# never actually survives to the on-disk journal, so a restart cannot
+# reconstruct which boundary artifacts the interrupted run owns).
+#
+# "update-boundary-staged" is deliberately NOT here and never durable --
+# see update-boundaries.sh's own module header for why: its cleanup is
+# deterministic from the live path plus the loaded UPDATE_RUN_ID alone, so
+# giving it durable journal identity would only grow the journal format
+# for no rollback-correctness benefit.
+_update_journal_marker_id_is_valid() {
+  local kind="$1" id="$2" candidate
+  case "${kind}" in
+    update-service-autostart-disable-attempted|\
+    update-service-stop-attempted|\
+    update-app-activation-attempted|\
+    update-venv-activation-attempted|\
+    update-unit-activation-attempted|\
+    update-helper-activated|\
+    update-authority-reset-attempted|\
+    update-authority-restored|\
+    update-marker-activation-attempted|\
+    update-marker-precondition-exists|\
+    update-marker-precondition-absent|\
+    update-maintenance-fence-held|\
+    update-boundary-config-activated)
+      [[ "${id}" == "${VMID}" ]]
+      ;;
+    update-boundary-created|update-boundary-activated)
+      case "${id}" in
+        snapshot|execution|mutation|rollback|health) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    update-boundary-journal-created)
+      for candidate in ${UPDATE_BOUNDARY_JOURNAL_DIRS}; do
+        [[ "${id}" == "$(_host_control_host_path "${candidate}")" ]] && return 0
+      done
+      return 1
+      ;;
     *) return 1 ;;
   esac
 }
@@ -222,7 +287,8 @@ update_journal_checkpoint() {
     printf 'db_backup_path=%s\n' "${UPDATE_DB_BACKUP_PATH:-}"
     if [[ -f "${BOOTSTRAP_LEDGER}" ]]; then
       while read -r kind id; do
-        if _update_journal_marker_is_recovery_relevant "${kind}" && [[ "${id}" == "${VMID}" ]]; then
+        if _update_journal_marker_is_recovery_relevant "${kind}" \
+          && _update_journal_marker_id_is_valid "${kind}" "${id}"; then
           printf 'ledger=%s %s\n' "${kind}" "${id}"
         fi
       done <"${BOOTSTRAP_LEDGER}"
@@ -290,7 +356,8 @@ _update_journal_load() {
       ledger)
         kind="${value%% *}"
         id="${value#* }"
-        if ! _update_journal_marker_is_recovery_relevant "${kind}" || [[ "${id}" != "${VMID}" ]]; then
+        if ! _update_journal_marker_is_recovery_relevant "${kind}" \
+          || ! _update_journal_marker_id_is_valid "${kind}" "${id}"; then
           die "interrupted-update journal ${UPDATE_JOURNAL_PATH} has an invalid rollback marker; preserve it and recover manually"
         fi
         ledger_record "${kind}" "${id}"
@@ -412,7 +479,7 @@ _update_cleanup_recovered_run_artifacts() {
   if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" && "${HUBINET_OPS_TEST_FAIL_CT_PLAN_TOOL_CLEANUP:-0}" == "1" ]]; then
     _update_rollback_hard_stop "could not remove run-owned planning/staging tools for interrupted run ${UPDATE_RUN_ID} (simulated test failure)"
   fi
-  pct exec "${VMID}" -- rm -f "${UPDATE_TOOL_CT_PATH}" "${UPDATE_PROBE_CT_PATH}" >/dev/null 2>&1 \
+  pct exec "${VMID}" -- rm -f "${UPDATE_TOOL_CT_PATH}" "${UPDATE_PROBE_CT_PATH}" "${UPDATE_FENCE_CT_PATH}" >/dev/null 2>&1 \
     || _update_rollback_hard_stop "could not remove run-owned planning/staging tools for interrupted run ${UPDATE_RUN_ID}"
   # The virtualenv build helper is only ever pushed when requirements
   # actually changed (_update_stage_venv_builder) -- a code-only update
@@ -426,9 +493,36 @@ _update_cleanup_recovered_run_artifacts() {
   if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" && "${HUBINET_OPS_TEST_FAIL_HOST_CLEANUP:-0}" == "1" ]]; then
     _update_rollback_hard_stop "could not remove host-side run-owned helper artifacts for interrupted run ${UPDATE_RUN_ID} (simulated test failure)"
   fi
+  # Family 1 correction pass, required cleanup sibling: the five package-
+  # update forced-command boundary helpers (deploy/lib/update-boundaries.sh)
+  # stage and roll back through the exact same run-owned
+  # <live>.staged-${UPDATE_RUN_ID} / <live>.rollback-${UPDATE_RUN_ID} /
+  # <live>.restore-tmp-${UPDATE_RUN_ID} host-side naming convention as the
+  # package-scan helper immediately below, on the SAME PVE host
+  # filesystem. The staged filename is deterministically derived from
+  # each boundary's own live path plus this run's own loaded
+  # UPDATE_RUN_ID, so this cleanup needs no additional durable journal
+  # identity for "staged" itself (see update-boundaries.sh's own module
+  # header for why "update-boundary-staged" stays out of the durable
+  # journal). Reached from every terminal path that calls this function --
+  # forward success (_update_finish_summary), in-process rollback
+  # (update_rollback_on_failure), and restart recovery
+  # (update_startup_recovery_gate) alike -- so a leftover boundary staging/
+  # rollback artifact cannot survive any of the three.
+  local _cleanup_boundary_kind _cleanup_boundary_live
+  local -a _cleanup_boundary_paths=()
+  for _cleanup_boundary_kind in $(_update_boundary_kinds); do
+    _cleanup_boundary_live="$(_update_boundary_host_path "${_cleanup_boundary_kind}")"
+    _cleanup_boundary_paths+=(
+      "${_cleanup_boundary_live}.staged-${UPDATE_RUN_ID}"
+      "${_cleanup_boundary_live}.rollback-${UPDATE_RUN_ID}"
+      "${_cleanup_boundary_live}.restore-tmp-${UPDATE_RUN_ID}"
+    )
+  done
   rm -f -- "${UPDATE_HELPER_STAGED_HOST_PATH}" \
     "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" \
     "${UPDATE_HELPER_HOST_PATH}.restore-tmp-${UPDATE_RUN_ID}" \
+    "${_cleanup_boundary_paths[@]}" \
     || _update_rollback_hard_stop "could not remove host-side run-owned helper artifacts for interrupted run ${UPDATE_RUN_ID}"
 }
 
@@ -482,6 +576,27 @@ update_journal_resolve() {
   local terminal_state="$1"
   update_journal_checkpoint "${terminal_state}"
   _update_cleanup_recovered_run_artifacts
+  # Family 3B (correction pass): this run may have acquired the exclusive
+  # product-update maintenance fence (_update_acquire_maintenance_fence)
+  # before reaching this terminal, untouched-service recovery point -- see
+  # this function's sole caller, update-proxmox-0.5.sh's own EXIT trap,
+  # for the exact reachable window: a failure or TERM after the fence is
+  # durably held but before the rollback boundary is crossed (before
+  # _update_disable_service_autostart's first mutation). Release must be
+  # positively proven BEFORE the journal carrying this run's recovery
+  # identity is discarded, exactly like every other terminal path in this
+  # file already does (_update_finish_summary, update_rollback_on_failure,
+  # and update_startup_recovery_gate's own two branches below) -- never
+  # the reverse: a crash between "journal cleared" and "fence released"
+  # would leave a durable fence with no journal left to reconnect it to,
+  # permanently refusing every future workload package update. Calling
+  # this unconditionally (regardless of whether THIS run's own
+  # UPDATE_FENCE_HELD ever became "1") is safe and idempotent: release is
+  # keyed off the fence's OWN recorded holder, so a run that never
+  # acquired it simply finds it absent or foreign and no-ops.
+  _update_test_term_checkpoint before_recovery_fence_release
+  _update_release_maintenance_fence
+  _update_test_term_checkpoint after_recovery_fence_release
   _update_journal_clear
 }
 
@@ -503,7 +618,36 @@ update_startup_recovery_gate() {
   if [[ "${UPDATE_JOURNAL_STATE}" == "completed" || "${UPDATE_JOURNAL_STATE}" == "recovered" ]]; then
     _update_prove_service_enabled_active_and_healthy \
       || _update_rollback_hard_stop "run ${UPDATE_RUN_ID} was durably marked ${UPDATE_JOURNAL_STATE}, but VMID ${VMID} does not now prove enabled + active + healthy within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (enabled: ${_UPDATE_SERVICE_ENABLED_DETAIL}; readiness: ${_UPDATE_SERVICE_READINESS_DETAIL})"
-    update_journal_resolve "${UPDATE_JOURNAL_STATE}"
+    # Terminal product state is already durable (this journal's own
+    # recorded state), so run-owned cleanup may proceed. Deliberately NOT
+    # `update_journal_resolve` here (correction pass, review finding on PR
+    # #74): that helper clears the journal itself, and this run's journal
+    # is the ONLY durable record carrying its recovery identity
+    # (UPDATE_RUN_ID) that a later invocation could match the maintenance
+    # fence's own recorded holder against. Releasing the fence THIS run may
+    # still hold and clearing that journal must therefore happen in this
+    # exact order -- release proven first, journal discarded only after --
+    # never the reverse: a crash between "journal cleared" and "fence
+    # released" would otherwise leave a durable fence with no journal left
+    # to reconnect it to, permanently refusing every future workload update.
+    _update_cleanup_recovered_run_artifacts
+    # Test-only (PR #74 review finding 2): exercise a real TERM here, after
+    # cleanup but before the fence release this journal still owes.
+    _update_test_term_checkpoint before_recovery_fence_release
+    # The interrupted run was already terminal and the installation now
+    # proves enabled + active + healthy, so nothing can still replace
+    # backend or helper material on its behalf. Release the fence it may
+    # have been holding when it was interrupted -- a release failure
+    # propagates (`set -e`, `_UPDATE_STARTUP_RECOVERY_IN_PROGRESS` is still
+    # "1" here) straight to the EXIT trap's preserve-and-report path,
+    # leaving this journal exactly as it was for the next invocation to
+    # retry, rather than falsely reporting cleanup complete.
+    _update_release_maintenance_fence
+    # Test-only: exercise a real TERM here, after the fence release this
+    # journal owed is durably proven but before the journal carrying that
+    # proof is discarded -- the exact edge this correction pass closes.
+    _update_test_term_checkpoint after_recovery_fence_release
+    _update_journal_clear
     _UPDATE_STARTUP_RECOVERY_IN_PROGRESS="0"
     log_warn "previous updater run ${UPDATE_RUN_ID} was already ${detected_state}; final cleanup is complete. Rerun the requested update."
     exit 0
@@ -522,6 +666,14 @@ update_startup_recovery_gate() {
     _update_prove_service_enabled_active_and_healthy \
       || _update_rollback_hard_stop "interrupted run ${UPDATE_RUN_ID} had not armed rollback, but the existing service does not prove enabled + active + healthy"
     update_journal_checkpoint recovered
+    _update_test_term_checkpoint before_recovery_fence_release
+    # Released only AFTER the untouched installation has been positively
+    # proven, not merely because this branch never armed rollback: an
+    # unproven service is not a released fence. And -- same ordering as
+    # the completed/recovered branch above -- released BEFORE the journal
+    # carrying this run's recovery identity is cleared, never after.
+    _update_release_maintenance_fence
+    _update_test_term_checkpoint after_recovery_fence_release
     _update_journal_clear
   fi
 

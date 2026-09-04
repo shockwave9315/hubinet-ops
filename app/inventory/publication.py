@@ -127,6 +127,30 @@ class InventoryPublication:
             health_contract_by_resource = {
                 str(row["resource_id"]): row for row in health_contract_rows
             }
+            # One bounded header row per resource: the resource's most
+            # recently issued job. Not the event log, not the frozen package
+            # rows, and not the per-probe health results -- those are exact
+            # material an operator reads through the explicit action that
+            # exists for them, never something every Home Assistant poll
+            # carries into entity state.
+            job_rows = connection.execute(
+                "SELECT j.job_id, j.resource_id, j.status, j.checkpoint, "
+                "j.issued_at, j.health_outcome, j.snapshot_confirmed_at, "
+                "j.mutation_completed_at, j.rollback_completed_at, "
+                "j.terminalized_at, j.terminal_reason FROM package_update_jobs j "
+                "WHERE j.issuance_sequence=("
+                "SELECT MAX(latest.issuance_sequence) FROM package_update_jobs latest "
+                "WHERE latest.resource_id=j.resource_id) "
+                "ORDER BY j.resource_id, j.job_id"
+            ).fetchall()
+            job_by_resource: dict[str, Any] = {}
+            for row in job_rows:
+                # `issuance_sequence` is the durable per-resource issuance
+                # order (schema v17), unique per resource by construction --
+                # not `issued_at`, which is wall-clock text and can tie or
+                # even regress across an ordinary clock correction. See
+                # PackageUpdateJob.issuance_sequence's own docstring.
+                job_by_resource[str(row["resource_id"])] = row
             package_rows = connection.execute(
                 "SELECT package.* FROM package_scan_packages package "
                 "JOIN package_scan_runs run USING(scan_run_id) "
@@ -151,6 +175,7 @@ class InventoryPublication:
                     approval_by_resource.get(str(row["resource_id"])),
                     packages_by_run,
                     health_contract_by_resource.get(str(row["resource_id"])),
+                    job_by_resource.get(str(row["resource_id"])),
                 )
                 for row in resource_rows
             )
@@ -227,6 +252,7 @@ class InventoryPublication:
         approval,
         packages_by_run: Mapping[str, list[Any]],
         health_contract,
+        package_update_job,
     ) -> dict[str, Any]:
         return {
             "resource_id": str(row["resource_id"]),
@@ -261,6 +287,9 @@ class InventoryPublication:
             ),
             "health_contract": InventoryPublication._health_contract(
                 row, health_contract
+            ),
+            "package_update_job": InventoryPublication._package_update_job(
+                row, package_update_job
             ),
             "termination_reason": row["termination_reason"],
             "successor_resource_id": row["successor_resource_id"],
@@ -384,6 +413,62 @@ class InventoryPublication:
                 "fingerprint": str(contract["fingerprint"]),
                 "probe_count": int(contract["probe_count"]),
                 "updated_at": str(contract["updated_at"]),
+            }
+        )
+        return base
+
+    @staticmethod
+    def _package_update_job(resource, job) -> dict[str, Any]:
+        """Publish one concise per-resource update-job state.
+
+        A summary of what the durable job IS, derived from its own status and
+        checkpoint. It is never a second state machine: every field here is
+        read straight off the job row, and nothing about it decides, permits,
+        or advances anything.
+
+        `state` collapses the durable pair into the small vocabulary an
+        operator reads at a glance:
+
+        - `not_started` -- no job has ever been issued for this resource;
+        - `active` -- a job owns the global destructive slot right now;
+        - `blocked` -- a job stopped before mutating, plan or authority drift;
+        - `interrupted` -- a restart terminalized a still-pre-mutation job;
+        - `succeeded` / `rolled_back` / `failed` / `manual_intervention` --
+          the durable terminal statuses, unchanged.
+
+        `active` deliberately does not distinguish "waiting for the worker"
+        from "the worker is inside a host operation": in-memory worker state
+        is not authority and must never be published as though it were.
+        """
+
+        base = {
+            "state": (
+                "unsupported" if resource["resource_type"] != "lxc" else "not_started"
+            ),
+            "job_id": None,
+            "checkpoint": None,
+            "issued_at": None,
+            "health_outcome": None,
+            "snapshot_confirmed_at": None,
+            "mutation_completed_at": None,
+            "rollback_completed_at": None,
+            "terminalized_at": None,
+            "terminal_reason": None,
+        }
+        if job is None or resource["resource_type"] != "lxc":
+            return base
+        base.update(
+            {
+                "state": str(job["status"]),
+                "job_id": str(job["job_id"]),
+                "checkpoint": str(job["checkpoint"]),
+                "issued_at": str(job["issued_at"]),
+                "health_outcome": job["health_outcome"],
+                "snapshot_confirmed_at": job["snapshot_confirmed_at"],
+                "mutation_completed_at": job["mutation_completed_at"],
+                "rollback_completed_at": job["rollback_completed_at"],
+                "terminalized_at": job["terminalized_at"],
+                "terminal_reason": job["terminal_reason"],
             }
         )
         return base

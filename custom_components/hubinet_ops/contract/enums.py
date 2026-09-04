@@ -114,6 +114,46 @@ class PackagePlanApprovalStatus(StrEnum):
     STALE = "stale"
 
 
+class PackageUpdateJobState(StrEnum):
+    """The concise per-resource package-update job state in the snapshot.
+
+    Derived by the backend from one durable job's ``status``, and nothing
+    else. Home Assistant never infers it, never combines two polls to reach
+    it, and never treats an absent job as a successful one.
+    """
+
+    #: The resource type has no package-update lifecycle at all.
+    UNSUPPORTED = "unsupported"
+    #: No update job has ever been issued for this resource.
+    NOT_STARTED = "not_started"
+    #: A job owns the one global destructive slot right now.
+    ACTIVE = "active"
+    #: Every declared probe of the job's frozen contract was proven.
+    SUCCEEDED = "succeeded"
+    #: The job stopped before mutating: plan drift, or stale authority.
+    BLOCKED = "blocked"
+    #: The job reached a terminal failure.
+    FAILED = "failed"
+    #: An operator's same-job rollback completed. Never "succeeded".
+    ROLLED_BACK = "rolled_back"
+    #: A restart terminalized a still-pre-mutation job.
+    INTERRUPTED = "interrupted"
+    #: The job needs an operator, and no automatic step remains.
+    MANUAL_INTERVENTION = "manual_intervention"
+
+
+class PackageUpdateHealthOutcome(StrEnum):
+    """The definitive verdict a job recorded, when it recorded one.
+
+    There is deliberately no ``unknown`` member: an evaluation that could not
+    reach a verdict writes nothing durable, so ``None`` -- no verdict yet --
+    is the only representation of it, and it is never a pass.
+    """
+
+    PASSED = "passed"
+    FAILED = "failed"
+
+
 class HealthProbeKind(StrEnum):
     """The exact typed probes an operator may declare in a health contract."""
 

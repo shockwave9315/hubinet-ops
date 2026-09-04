@@ -34,6 +34,7 @@ update_stage_all() {
   if [[ "${UPDATE_HELPER_CHANGED}" == "1" ]]; then
     _update_stage_helper
   fi
+  update_boundaries_stage
 
   log_pass "staging complete"
 }
@@ -143,6 +144,7 @@ _update_stage_helper() {
 # are cleaned up separately, only after acceptance succeeds).
 update_stage_cleanup() {
   _update_cleanup_plan_tools
+  update_boundaries_stage_cleanup
   if ledger_has update-staged-helper "${UPDATE_HELPER_STAGED_HOST_PATH}" \
     && ! ledger_has update-helper-activated "${VMID}"; then
     rm -f "${UPDATE_HELPER_STAGED_HOST_PATH}" 2>/dev/null || true

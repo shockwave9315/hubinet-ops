@@ -72,6 +72,13 @@ from .health_execution import (
     HealthContractExecutionError,
     require_health_contract_execution_eligible,
 )
+from .package_update_issuance import PackageUpdateIssuanceRefused
+from .product_update_fence import (
+    ProductUpdateMaintenanceFence,
+    read_product_update_fence,
+    require_fence_holder,
+    write_product_update_fence,
+)
 from .health_observation import (
     HEALTH_PROBE_REASONS,
     require_health_probe_semantics,
@@ -1504,17 +1511,48 @@ class InventoryAuthority:
                     str(existing["resource_id"]) != canonical_resource_id
                     or str(existing["approval_id"]) != canonical_approval_id
                 ):
-                    raise AuthorityConflict(
-                        "request_id was already used for another package update request"
+                    raise PackageUpdateIssuanceRefused(
+                        "request_id_conflict",
+                        "request_id was already used for another package update request",
                     )
                 result_job_id = str(existing["job_id"])
             else:
-                resource = self._require_package_scan_target(
-                    connection, canonical_resource_id
-                )
+                # The exclusive product-update maintenance fence, read INSIDE
+                # this transaction. A Hubinet product update that holds it is
+                # about to replace this backend and its privileged helpers,
+                # and a workload job issued now could be mid-snapshot or
+                # mid-mutation when that happens.
+                #
+                # This read is not the synchronization -- the store's single
+                # `BEGIN IMMEDIATE` writer lock is. Fence acquisition takes
+                # that same lock and makes the fence durable before it
+                # commits, so there is no interleaving in which acquisition
+                # and issuance both succeed. See
+                # `app/inventory/product_update_fence.py`.
+                fence = read_product_update_fence(self._store.path)
+                if fence is not None:
+                    raise PackageUpdateIssuanceRefused(
+                        "product_update_in_progress",
+                        "a Hubinet product update holds the exclusive "
+                        f"maintenance fence (holder {fence.holder}, acquired "
+                        f"{fence.acquired_at}); no workload update may start "
+                        "until it completes or is rolled back",
+                    )
+                try:
+                    resource = self._require_package_scan_target(
+                        connection, canonical_resource_id
+                    )
+                except AuthorityConflict as exc:
+                    # `_require_package_scan_target` is shared with package
+                    # scanning and keeps its own message; only the name this
+                    # operator-facing path reports is added here.
+                    raise PackageUpdateIssuanceRefused(
+                        "resource_not_current", str(exc)
+                    ) from exc
                 if str(resource["resource_type"]) != "lxc":
-                    raise AuthorityConflict(
-                        "package update jobs support LXC resources only"
+                    raise PackageUpdateIssuanceRefused(
+                        "resource_unsupported",
+                        "package update jobs support LXC resources only",
                     )
 
                 approval = connection.execute(
@@ -1522,12 +1560,14 @@ class InventoryAuthority:
                     (canonical_resource_id,),
                 ).fetchone()
                 if approval is None:
-                    raise AuthorityConflict(
-                        "package update job requires a current package plan approval"
+                    raise PackageUpdateIssuanceRefused(
+                        "no_current_approval",
+                        "package update job requires a current package plan approval",
                     )
                 if str(approval["approval_id"]) != canonical_approval_id:
-                    raise AuthorityConflict(
-                        "approval_id does not identify the current package plan approval"
+                    raise PackageUpdateIssuanceRefused(
+                        "approval_not_current",
+                        "approval_id does not identify the current package plan approval",
                     )
 
                 reviewed = self._require_package_scan_run_row(
@@ -1566,15 +1606,29 @@ class InventoryAuthority:
                     or str(current["outcome"])
                     != PackageScanOutcome.SUCCESS.value
                 ):
-                    raise AuthorityConflict(
-                        "latest package scan attempt is not a successful exact plan"
+                    # The decision is unchanged -- issuance still refuses.
+                    # A scan that is still RUNNING is the one case where
+                    # current plan authority is undecidable rather than
+                    # proven wrong, exactly as the execution gate already
+                    # distinguishes it, so the operator is told to ask again
+                    # instead of being told their plan drifted.
+                    raise PackageUpdateIssuanceRefused(
+                        (
+                            "source_authority_unavailable"
+                            if current is not None
+                            and str(current["lifecycle"])
+                            == PackageScanLifecycle.RUNNING.value
+                            else "plan_not_approved"
+                        ),
+                        "latest package scan attempt is not a successful exact plan",
                     )
                 current_fingerprint = self._successful_package_scan_fingerprint(
                     connection, current
                 )
                 if current_fingerprint != approved_fingerprint:
-                    raise AuthorityConflict(
-                        "current package plan does not match the approved plan"
+                    raise PackageUpdateIssuanceRefused(
+                        "plan_not_approved",
+                        "current package plan does not match the approved plan",
                     )
 
                 decision_time = self._authority_decision_time()
@@ -1601,8 +1655,9 @@ class InventoryAuthority:
                         (str(current["scan_run_id"]),),
                     ).fetchall()
                     if not packages:
-                        raise AuthorityConflict(
-                            "package update job requires a non-empty exact plan"
+                        raise PackageUpdateIssuanceRefused(
+                            "plan_empty",
+                            "package update job requires a non-empty exact plan",
                         )
                     # The success criterion, frozen in the SAME transaction
                     # as the plan and read through the same fail-closed
@@ -1613,9 +1668,10 @@ class InventoryAuthority:
                         connection, canonical_resource_id
                     )
                     if contract is None:
-                        raise AuthorityConflict(
+                        raise PackageUpdateIssuanceRefused(
+                            "health_contract_unconfigured",
                             "package update job requires a declared resource "
-                            "health contract"
+                            "health contract",
                         )
                     # Configuration deliberately stores bounded opaque
                     # targets.  A package-update job is narrower: every
@@ -1626,12 +1682,28 @@ class InventoryAuthority:
                     try:
                         require_health_contract_execution_eligible(contract.probes)
                     except HealthContractExecutionError as exc:
-                        raise AuthorityConflict(
+                        raise PackageUpdateIssuanceRefused(
+                            "health_contract_not_executable",
                             "resource health contract is not executable for a "
-                            "package update job"
+                            "package update job",
                         ) from exc
                     job_id = _new_uuid()
                     issued_at = _timestamp(decision_time)
+                    # Durable per-resource issuance order (schema v17),
+                    # allocated atomically in this SAME transaction -- the
+                    # package_scan_runs.attempt_sequence pattern above,
+                    # applied here so "latest job for this resource" reads
+                    # never have to trust wall-clock issued_at ordering
+                    # (see PackageUpdateJob.issuance_sequence's own
+                    # docstring).
+                    previous_sequence = connection.execute(
+                        "SELECT MAX(issuance_sequence) FROM package_update_jobs "
+                        "WHERE resource_id=?",
+                        (canonical_resource_id,),
+                    ).fetchone()[0]
+                    issuance_sequence = (
+                        int(previous_sequence) if previous_sequence is not None else 0
+                    ) + 1
 
                     # The child FK is deferred specifically so immutable job
                     # package rows can be inserted before their parent. The
@@ -1672,7 +1744,8 @@ class InventoryAuthority:
                     try:
                         connection.execute(
                             "INSERT INTO package_update_jobs("
-                            "job_id, request_id, issued_at, resource_id, approval_id, "
+                            "job_id, request_id, issued_at, issuance_sequence, "
+                            "resource_id, approval_id, "
                             "approval_reviewed_scan_run_id, approved_plan_fingerprint, "
                             "approval_approved_at, current_plan_scan_run_id, "
                             "inventory_source_id, committed_source_config_revision, "
@@ -1688,11 +1761,12 @@ class InventoryAuthority:
                             "health_contract_probe_count, "
                             "status, checkpoint) "
                             "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'issued')",
+                            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'issued')",
                             (
                                 job_id,
                                 canonical_request_id,
                                 issued_at,
+                                issuance_sequence,
                                 canonical_resource_id,
                                 canonical_approval_id,
                                 str(approval["reviewed_scan_run_id"]),
@@ -1724,8 +1798,9 @@ class InventoryAuthority:
                             ),
                         )
                     except sqlite3.IntegrityError as exc:
-                        raise AuthorityConflict(
-                            "another active package update job owns the global slot"
+                        raise PackageUpdateIssuanceRefused(
+                            "another_job_active",
+                            "another active package update job owns the global slot",
                         ) from exc
                     self._append_package_update_job_event(
                         connection,
@@ -1752,15 +1827,98 @@ class InventoryAuthority:
                     self._after_package_update_job_issuance(
                         connection, job_id=job_id
                     )
+                    # Issuance is the first moment a resource's published
+                    # `package_update_job` summary exists at all -- from
+                    # `not_started` to the job's own issued state. Every
+                    # later transition that changes that same summary bumps
+                    # this the same way; see the sibling calls throughout
+                    # this stage.
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
                     result_job_id = job_id
 
         if rejected_current_authority:
-            raise AuthorityConflict(
-                "approved package plan or its current authority context is stale"
+            raise PackageUpdateIssuanceRefused(
+                "plan_not_approved",
+                "approved package plan or its current authority context is stale",
             )
         if result_job_id is None:
             raise AuthorityInvariantError("package update job issuance was not captured")
         return self._store.package_update_job(result_job_id)
+
+    def acquire_product_update_maintenance_fence(
+        self, holder: str
+    ) -> ProductUpdateMaintenanceFence:
+        """Take the exclusive product-update maintenance fence, or refuse.
+
+        The one operation that makes a Hubinet PRODUCT update and a WORKLOAD
+        package-update job mutually exclusive. It runs inside the authority
+        store's single ``BEGIN IMMEDIATE`` writer lock -- the same lock
+        :meth:`issue_package_update_job` takes -- and makes the fence durable
+        BEFORE that transaction commits. Those two facts together are the
+        whole invariant:
+
+        - an ACTIVE job proved here means the product update is refused, and
+          it is refused before the updater has mutated anything;
+        - a fence made durable here is visible to every issuing transaction
+          that could possibly start afterwards, because none of them can
+          enter its critical section until this one commits.
+
+        There is deliberately no check-then-act gap and no bypass. Releasing
+        is a separate, deliberately un-synchronized filesystem operation the
+        product updater performs at a terminal point; see
+        `app/inventory/product_update_fence.py` for why the asymmetry is
+        correct.
+
+        Idempotent for the SAME holder, so a product-update run that retries
+        or re-enters through its own recovery does not deadlock itself. A
+        DIFFERENT holder is refused rather than allowed to steal the fence:
+        one product update at a time, and a fence left by a crashed run is
+        released by that run's own recovery, never silently taken over.
+        """
+
+        canonical_holder = require_fence_holder(holder)
+        with self._store._transaction() as connection:
+            existing = read_product_update_fence(self._store.path)
+            if existing is not None:
+                if existing.holder != canonical_holder:
+                    raise AuthorityConflict(
+                        "another Hubinet product update already holds the "
+                        f"maintenance fence (holder {existing.holder}, "
+                        f"acquired {existing.acquired_at})"
+                    )
+                return existing
+            active = connection.execute(
+                "SELECT job_id, checkpoint FROM package_update_jobs "
+                "WHERE status='active'"
+            ).fetchall()
+            if active:
+                row = active[0]
+                raise AuthorityConflict(
+                    "a workload package update job is ACTIVE "
+                    f"({row['job_id']} at checkpoint {row['checkpoint']}); "
+                    "a Hubinet product update may not begin until it "
+                    "completes or is rolled back"
+                )
+            fence = ProductUpdateMaintenanceFence(
+                holder=canonical_holder,
+                acquired_at=_timestamp(self._now()),
+            )
+            # Durable BEFORE the commit that releases the writer lock. A
+            # crash between these two lines leaves the fence present with no
+            # committed claim, which is the safe direction: workload starts
+            # refuse and the product updater never entered its mutation
+            # window, because this call did not return.
+            write_product_update_fence(self._store.path, fence)
+            return fence
+
+    def product_update_maintenance_fence(
+        self,
+    ) -> ProductUpdateMaintenanceFence | None:
+        """Report the currently held fence, if any. Pure read."""
+
+        return read_product_update_fence(self._store.path)
 
     def revalidate_package_update_job(self, job_id: str) -> PackageUpdateJob:
         """Revalidate the current authority half of future mutation safety.
@@ -2099,6 +2257,9 @@ class InventoryAuthority:
                         message="package update job preflight authority revalidated",
                         details={},
                     )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
                 elif checkpoint is not PackageUpdateCheckpoint.PREFLIGHT_PASSED:
                     raise AuthorityConflict(
                         "package update job has already advanced past preflight"
@@ -2117,19 +2278,32 @@ class InventoryAuthority:
 
         Pure and restart-stable: it reads only immutable job facts plus this
         backend instance's identity, so the same job always derives the same
-        snapshot name and operation id.
+        snapshot name and operation id. A pure read over immutable facts
+        authorizes no mutation and has nothing to serialize against another
+        writer for, so this deliberately uses the store's plain
+        `_read_transaction` (`BEGIN`), never `_transaction` (`BEGIN
+        IMMEDIATE`) -- the latter would needlessly make this call wait for
+        the authority writer lock before it could even start, which the
+        rollback route's own pre-ACK budget does not, and must not, account
+        for. See `_read_transaction`/`_transaction` in
+        `app/inventory/store.py`.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        with self._store._transaction() as connection:
+        with self._store._read_transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             return self._snapshot_identity_in_transaction(connection, job)
 
     def package_update_snapshot_ownership(self, job_id: str) -> SnapshotOwnership:
-        """Build the strict ownership metadata one job's snapshot must carry."""
+        """Build the strict ownership metadata one job's snapshot must carry.
+
+        Same reasoning as `package_update_snapshot_identity` immediately
+        above: a pure read over immutable job facts, so it uses
+        `_read_transaction`, never the writer-serializing `_transaction`.
+        """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        with self._store._transaction() as connection:
+        with self._store._read_transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             return self._snapshot_ownership_in_transaction(connection, job)
 
@@ -2227,6 +2401,9 @@ class InventoryAuthority:
                 "snapshot_operation_id": identity.snapshot_operation_id,
                 "snapshot_name": identity.snapshot_name,
             },
+        )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
         )
 
     def execute_snapshot_submission_if_current(
@@ -2431,6 +2608,9 @@ class InventoryAuthority:
                         message="job-owned pre-update snapshot confirmed canonically",
                         details={"snapshot_name": snapshot_name},
                     )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
                 elif checkpoint is not PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED:
                     raise AuthorityConflict(
                         "package update job is not inside a snapshot operation"
@@ -2522,6 +2702,9 @@ class InventoryAuthority:
                     ),
                     message=reason,
                     details={"snapshot_name": str(job["snapshot_name"])},
+                )
+                self._bump_global_revisions(
+                    connection, inventory_changed=False, published_changed=True
                 )
                 blocked = True
         return blocked, self._store.package_update_job(canonical_job_id)
@@ -2625,6 +2808,9 @@ class InventoryAuthority:
                 event_type=PackageUpdateEventType.SNAPSHOT_FAILED,
                 message=canonical_reason,
                 details={},
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -2750,6 +2936,9 @@ class InventoryAuthority:
             ),
             message=reason,
             details={},
+        )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
         )
 
     def select_package_update_rollback_target(
@@ -2992,6 +3181,9 @@ class InventoryAuthority:
             message=reason,
             details={},
         )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
+        )
         return True
 
     def revalidate_or_release_stale_package_update_execution(
@@ -3169,6 +3361,9 @@ class InventoryAuthority:
                             "job_package_count": len(job_material),
                             "fresh_package_count": len(fresh_material),
                         },
+                    )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
                     )
 
         if outcome is None:
@@ -3438,6 +3633,9 @@ class InventoryAuthority:
                             "fresh_package_count": len(fresh_material),
                         },
                     )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
 
         if outcome is None:
             raise AuthorityInvariantError(
@@ -3497,6 +3695,9 @@ class InventoryAuthority:
                 "package_count": package_count,
                 "accepted_prepared_evidence_digest": accepted_evidence_digest,
             },
+        )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
         )
 
     def execute_package_mutation_submission_if_current(
@@ -3800,6 +4001,9 @@ class InventoryAuthority:
             message=reason,
             details={},
         )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
+        )
 
     def complete_package_update_mutation(
         self, job_id: str, post_state: PackageMutationPostState
@@ -3887,6 +4091,9 @@ class InventoryAuthority:
                     "package mutation is complete"
                 ),
                 details={"package_count": len(job_material)},
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -4061,6 +4268,9 @@ class InventoryAuthority:
                     ),
                     "probe_count": len(probes),
                 },
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -4241,6 +4451,9 @@ class InventoryAuthority:
                     "failed_probe_indexes": failed_indexes,
                     "unknown_probe_indexes": unknown_indexes,
                 },
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -4664,6 +4877,9 @@ class InventoryAuthority:
                 "health_outcome": health_outcome,
             },
         )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
+        )
 
     @staticmethod
     def _require_armed_rollback_job(job: sqlite3.Row) -> None:
@@ -4981,6 +5197,9 @@ class InventoryAuthority:
             message=reason,
             details={},
         )
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
+        )
 
     def complete_package_update_rollback(
         self,
@@ -5104,6 +5323,9 @@ class InventoryAuthority:
                     "guest_left_stopped": True,
                 },
             )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
         return self._store.package_update_job(canonical_job_id)
 
     @staticmethod
@@ -5210,6 +5432,14 @@ class InventoryAuthority:
                     event_type=PackageUpdateEventType.RESTART_INTERRUPTED,
                     message=reason,
                     details={},
+                )
+            if recovered:
+                # One bump for the whole pass, not one per job: every
+                # recovered job's published summary changed, but the
+                # published revision is a single global counter, not a
+                # per-resource one.
+                self._bump_global_revisions(
+                    connection, inventory_changed=False, published_changed=True
                 )
         return recovered
 

@@ -78,7 +78,21 @@
       },
       "resource_pending_updates": {"name": "Oczekujące aktualizacje"},
       "resource_last_package_scan": {"name": "Ostatnie skanowanie pakietów"},
-      "resource_reboot_required": {"name": "Wymagany restart"}
+      "resource_reboot_required": {"name": "Wymagany restart"},
+      "resource_package_update_job": {
+        "name": "Zadanie aktualizacji pakietów",
+        "state": {
+          "unsupported": "Nieobsługiwane",
+          "not_started": "Nierozpoczęte",
+          "active": "Aktywne",
+          "succeeded": "Zakończone powodzeniem",
+          "blocked": "Zablokowane",
+          "failed": "Nieudane",
+          "rolled_back": "Wycofane",
+          "interrupted": "Przerwane",
+          "manual_intervention": "Wymaga interwencji"
+        }
+      }
     }
   },
   "services": {
@@ -149,6 +163,50 @@
         "expected_revision": {
           "name": "Oczekiwana rewizja",
           "description": "Opcjonalne. Odrzuca zmianę, jeśli zapisany kontrakt nie jest już w tej rewizji."
+        }
+      }
+    },
+    "start_update": {
+      "name": "Rozpocznij aktualizację",
+      "description": "Jawnie rozpoczyna zatwierdzoną aktualizację pakietów dla wybranego zasobu Hubinet Ops. To jedyny sposób, w jaki rozpoczyna się realna zmiana pakietów; Hubinet Ops nigdy nie rozpoczyna jej samodzielnie.",
+      "fields": {
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz zasób roboczy zarządzany przez Hubinet Ops."
+        }
+      }
+    },
+    "view_update_job": {
+      "name": "Wyświetl zadanie aktualizacji",
+      "description": "Odczytuje bieżące lub ostatnie zadanie aktualizacji pakietów dla wybranego zasobu Hubinet Ops wraz z ograniczoną listą zdarzeń.",
+      "fields": {
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz zasób roboczy zarządzany przez Hubinet Ops."
+        },
+        "events": {
+          "name": "Zdarzenia",
+          "description": "Ile ostatnich zdarzeń zadania zwrócić (0-200)."
+        }
+      }
+    },
+    "resume_update": {
+      "name": "Wznów aktualizację",
+      "description": "Prosi Hubinet Ops o ponowne wejście w istniejące, możliwe do odzyskania zadanie aktualizacji po przejściowej niepewności. Nigdy nie wysyła ponownie zmiany pakietów; odczytuje trwały punkt kontrolny i kontynuuje tylko tam, gdzie jest to bezpieczne.",
+      "fields": {
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz zasób roboczy zarządzany przez Hubinet Ops."
+        }
+      }
+    },
+    "rollback_update": {
+      "name": "Wycofaj aktualizację",
+      "description": "Jawnie wycofuje zasób do migawki utworzonej przez jego własne zadanie aktualizacji. Hubinet Ops nigdy nie wycofuje samodzielnie ani do żadnej innej migawki. Udane wycofanie pozostawia gościa zatrzymanego.",
+      "fields": {
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz zasób roboczy zarządzany przez Hubinet Ops."
         }
       }
     }

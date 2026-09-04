@@ -40,6 +40,49 @@ _host_control_install_file() {
   fi
 }
 
+# _host_control_dir_state <path>: three-valued, read-only classification
+# of a directory path on the PVE HOST filesystem (Family A correction
+# pass). Prints exactly one of ABSENT / DIRECTORY / UNKNOWN.
+#
+# Shared by fresh bootstrap and the in-place updater's own journal-
+# directory creation gates (bootstrap-update-boundaries.sh's
+# phase8d_provision_update_boundaries, and update-boundaries.sh's
+# update_boundaries_activate): both used a bare `[[ ! -d "${path}" ]]` to
+# decide whether THIS run is creating a NEW root-only operation journal
+# (and therefore owns removing it on rollback) or reusing one that already
+# existed. `[[ ! -d ]]` cannot distinguish genuine ENOENT from any other
+# stat failure -- a transient one on an EXISTING journal directory would
+# make this run wrongly believe (and durably record) that it created a
+# directory it does not own, so a later rollback could `rmdir` another
+# operation's still-durable at-most-once evidence.
+_host_control_dir_state() {
+  local path="$1" output status
+  output="$(python3 -c '
+import os
+import stat
+import sys
+
+try:
+    st = os.lstat(sys.argv[1])
+except FileNotFoundError:
+    print("ABSENT")
+    sys.exit(0)
+except OSError:
+    print("UNKNOWN")
+    sys.exit(0)
+
+print("DIRECTORY" if stat.S_ISDIR(st.st_mode) else "UNKNOWN")
+' "${path}" 2>/dev/null)" && status=0 || status=$?
+  if (( status != 0 )); then
+    printf 'UNKNOWN'
+    return 0
+  fi
+  case "${output}" in
+    ABSENT|DIRECTORY) printf '%s' "${output}" ;;
+    *) printf 'UNKNOWN' ;;
+  esac
+}
+
 _host_control_validate_authorized_keys() {
   local path="$1"
   if [[ -L "${path}" && ! -e "${path}" ]]; then
@@ -48,6 +91,541 @@ _host_control_validate_authorized_keys() {
   if [[ -e "${path}" && ! -f "${path}" ]]; then
     die "${HOST_CONTROL_AUTHORIZED_KEYS} exists but is not a usable regular file; refusing to modify it"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Family 2 (correction pass) -- ONE atomic, durable, idempotent
+# authorized_keys mutation contract, shared by every production path that
+# adds or removes a Hubinet-owned forced-command entry:
+#
+#   - the package-update boundaries' own runtime authorize/deauthorize
+#     (deploy/lib/update-boundaries.sh);
+#   - bootstrap's package-update boundary provisioning/rollback
+#     (deploy/lib/bootstrap-update-boundaries.sh);
+#   - bootstrap's package-scan boundary provisioning/rollback (this file).
+#
+# The bug this replaces: `awk ... >"${filtered}"; cat "${filtered}" >
+# "${authorized_keys_path}"` TRUNCATES the live file before the filtered
+# replacement is fully written back -- a crash mid-truncate can leave
+# authorized_keys empty or half-rewritten -- and `printf ... >>"${
+# authorized_keys_path}"` silently assumes the existing last line already
+# ends in a newline. A hand-managed operator key with no final newline,
+# followed by an appended Hubinet entry, concatenates the two into one
+# invalid line; a later marker-based removal can then delete that whole
+# concatenated line, destroying the unrelated operator key.
+#
+# Both functions below therefore only ever construct a COMPLETE
+# replacement in a temp file in the SAME directory as the live file, fsync
+# it, atomically rename it onto the live path, and fsync the containing
+# directory -- exactly the write/fsync/rename/dir-fsync discipline already
+# used for the maintenance fence and every other rollback-critical
+# artifact in this codebase. A crash before the rename leaves the OLD file
+# completely untouched; a crash after leaves the COMPLETE new file. Never
+# an intermediate.
+#
+# Retry safety mirrors the exact fix already applied to the maintenance
+# fence: a rename that already succeeded, with only ITS OWN following
+# durability barrier having failed, must be re-proven on the next call
+# rather than silently reported "nothing to do" from content alone -- see
+# _host_control_authorized_keys_barrier's callers below.
+#
+# HUBINET_OPS_TEST_FAIL_HOST_SYNC (consulted only when HUBINET_OPS_TEST_
+# MODE=1) is the same narrow substring fault-injection seam already used
+# by deploy/lib/update-recovery.sh's own host-side durability barriers,
+# reused here unmodified so one test suite covers both.
+# HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_RENAME (same substring-match
+# convention) is this module's own seam for the write/rename half: no fake
+# command layer intercepts these direct filesystem calls the way `pct
+# exec` mutations are intercepted, so a dedicated seam is needed to model
+# a realistic ENOSPC/EIO-style failure before the atomic rename commits.
+_host_control_authorized_keys_barrier() {
+  local path="$1" dir needle
+  dir="$(dirname -- "${path}")"
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]]; then
+    for needle in ${HUBINET_OPS_TEST_FAIL_HOST_SYNC:-}; do
+      [[ -n "${needle}" && "${path}" == *"${needle}"* ]] && return 1
+    done
+  fi
+  sync -f "${dir}"
+}
+
+_host_control_authorized_keys_rename_should_fail() {
+  local path="$1" needle
+  [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]] || return 1
+  for needle in ${HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_RENAME:-}; do
+    [[ -n "${needle}" && "${path}" == *"${needle}"* ]] && return 0
+  done
+  return 1
+}
+
+# _host_control_authorized_keys_test_fail_stage <point>: narrow test-only
+# fault-injection seam (Family 2 correction pass, P1 micro-correction)
+# for the fallible reads/writes that CONSTRUCT the staged replacement,
+# distinct from HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_RENAME above (which
+# models the atomic-replace half). <point> is one of: grep_read,
+# grep_read_remove, copy_partial, trailing_read, entry_write -- see each
+# call site. (Path-state UNKNOWN/ABSENT classification is exercised
+# through REAL filesystem errors instead -- ENOENT and genuine permission
+# failures -- rather than a synthetic seam here; see
+# _host_control_authorized_keys_path_state's own docstring.) Inert
+# whenever HUBINET_OPS_TEST_MODE is not "1".
+_host_control_authorized_keys_test_fail_stage() {
+  local point="$1" needle
+  [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]] || return 1
+  for needle in ${HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE:-}; do
+    [[ "${needle}" == "${point}" ]] && return 0
+  done
+  return 1
+}
+
+# _host_control_authorized_keys_marker_count <path> <marker>: wraps
+# `grep -cF` so a real read failure (permission, I/O error) can be
+# distinguished from a legitimate zero-match answer -- see ADD's own
+# caller below for why collapsing them was the confirmed P1 sibling.
+_host_control_authorized_keys_marker_count() {
+  local path="$1" marker="$2"
+  if _host_control_authorized_keys_test_fail_stage "grep_read"; then
+    return 2
+  fi
+  grep -cF " ${marker}" "${path}" 2>/dev/null
+}
+
+# _host_control_authorized_keys_marker_present <path> <marker>: the same
+# wrapper for REMOVE's presence probe (`grep -qF`), whose exit contract
+# ADD's own wrapper above deliberately mirrors: 0=present, 1=positively
+# absent, anything else=read failure.
+_host_control_authorized_keys_marker_present() {
+  local path="$1" marker="$2"
+  if _host_control_authorized_keys_test_fail_stage "grep_read_remove"; then
+    return 2
+  fi
+  grep -qF " ${marker}" "${path}" 2>/dev/null
+}
+
+# _host_control_authorized_keys_copy_into_stage <src> <dst>: copies the
+# existing live content into the staged replacement. In production this
+# is exactly `cat "$src" >"$dst"`; its exit status is what the caller
+# checks. The test-only fault path below models a REALISTIC partial
+# read/write failure (EIO/ENOSPC partway through a real `cat`) -- some
+# bytes land in <dst>, then the copy fails -- rather than a clean failure
+# before anything is written, so a fix that only checked "did <dst> stay
+# empty" would still be caught out by it.
+_host_control_authorized_keys_copy_into_stage() {
+  local src="$1" dst="$2" content
+  if _host_control_authorized_keys_test_fail_stage "copy_partial"; then
+    content="$(cat "${src}" 2>/dev/null)"
+    printf '%s' "${content:0:$(( (${#content} + 1) / 2 ))}" >"${dst}" 2>/dev/null || true
+    return 1
+  fi
+  cat "${src}" >"${dst}"
+}
+
+# _host_control_authorized_keys_trailing_byte <path>: wraps `tail -c1` so
+# a read failure is distinguishable from "the file ends in a newline"
+# (both would otherwise produce empty output).
+_host_control_authorized_keys_trailing_byte() {
+  local path="$1"
+  if _host_control_authorized_keys_test_fail_stage "trailing_read"; then
+    return 2
+  fi
+  tail -c1 "${path}"
+}
+
+# _host_control_authorized_keys_write_entry <dst> <text>: appends the new
+# forced-command line onto the staged replacement, checked like every
+# other fallible write that constructs it.
+_host_control_authorized_keys_write_entry() {
+  local dst="$1" text="$2"
+  if _host_control_authorized_keys_test_fail_stage "entry_write"; then
+    return 1
+  fi
+  printf '%s\n' "${text}" >>"${dst}"
+}
+
+# _host_control_authorized_keys_path_state <path>: closed, positively-
+# proven classification of the live authorized_keys path (Family 2
+# correction pass, ENOENT-vs-error micro-correction). Replaces an EARLIER
+# version built on bash `[[ -L ]]`/`[[ -e ]]`/`[[ -f ]]` predicates, which
+# had the exact same structural bug the two before it did: those
+# predicates evaluate to the SAME false result whether the path is
+# positively absent (ENOENT) or the underlying inspection failed for any
+# OTHER reason (EACCES, EIO, a symlink loop, ...) -- bash itself cannot
+# tell the two apart, so a real metadata/stat failure could still be
+# reported as ABSENT and let ADD silently start from an empty file,
+# discarding an operator key or the package-scan authorization that this
+# run genuinely could not read, or let REMOVE report a false idempotent
+# "already gone".
+#
+# The classification is now delegated to a tiny, bounded python3 helper.
+# python3 is ALREADY a hard preflight requirement for both entrypoints
+# that source this module -- deploy/bootstrap-proxmox-0.5.sh
+# (phase1_preflight; see bootstrap-common.sh's own JSON-helper header:
+# "`python3` is a hard preflight requirement... so this repository never
+# has to fall back to a lexical regex parser") and deploy/update-
+# proxmox-0.5.sh (its own `require_command python3`) -- so this adds no
+# new dependency. The reason for reaching for it here specifically:
+# Python's os.lstat/os.stat raise FileNotFoundError SPECIFICALLY for
+# ENOENT and any other OSError subclass for everything else, which is
+# exactly the one distinction bash's boolean tests cannot make. Nothing
+# else about this primitive changes: no TOCTOU protection between this
+# classification and the later stage/rename, no generation numbers, no
+# fd-based rename, no lock -- the contract stays "classify the state at
+# THIS point truthfully, and fail closed when it cannot be classified".
+#
+# A live authorized_keys is commonly a symlink (PVE's own /root/.ssh/
+# authorized_keys is conventionally -> /etc/pve/priv/authorized_keys),
+# and `mv`/`rename()` replaces whatever is named at its DESTINATION
+# argument's own directory entry -- renaming a staged file directly onto
+# the symlink path itself would delete the symlink and put a plain
+# regular file in its place, breaking whatever the symlink was for. So an
+# unresolved symlink (or a resolution/target-stat failure, INCLUDING a
+# dangling symlink -- a target-side ENOENT, never conflated with <path>
+# itself being absent) is never silently treated as its own target.
+#
+# Prints exactly one line on stdout:
+#   ABSENT                    -- lstat(<path>) positively raised ENOENT.
+#                                 No other lstat failure is ever reported
+#                                 this way.
+#   REGULAR                   -- lstat(<path>) succeeded and <path> is
+#                                 itself a usable regular file.
+#   SYMLINK_TO_REGULAR <real> -- lstat(<path>) succeeded and shows a
+#                                 symlink; its target <real> was
+#                                 positively resolved AND stat'd as a
+#                                 usable regular file.
+#   UNKNOWN                   -- lstat(<path>) failed for any reason
+#                                 OTHER than ENOENT; or <path> is a
+#                                 symlink whose target could not be
+#                                 positively resolved/stat'd; or the
+#                                 (resolved) path exists but is neither
+#                                 absent nor a regular file (a directory,
+#                                 a device, ...); or the helper itself
+#                                 could not be run or produced anything
+#                                 other than one of the three answers
+#                                 above. Never guessed as ABSENT or
+#                                 REGULAR.
+#
+# _host_control_validate_authorized_keys has already hard-stopped on a
+# dangling symlink or an existing-but-not-regular <path> itself, so those
+# two shapes never reach here as call sites always run it first; this
+# only has to keep ABSENT/REGULAR/SYMLINK_TO_REGULAR from ever being
+# reported for a state this function could not actually prove.
+_host_control_authorized_keys_path_state() {
+  local path="$1" output status
+  output="$(python3 -c '
+import os
+import stat
+import sys
+
+target = sys.argv[1]
+try:
+    st = os.lstat(target)
+except FileNotFoundError:
+    print("ABSENT")
+    sys.exit(0)
+except OSError:
+    print("UNKNOWN")
+    sys.exit(0)
+
+if stat.S_ISLNK(st.st_mode):
+    try:
+        real = os.path.realpath(target)
+        real_st = os.stat(real)
+    except OSError:
+        print("UNKNOWN")
+        sys.exit(0)
+    if stat.S_ISREG(real_st.st_mode):
+        print("SYMLINK_TO_REGULAR " + real)
+    else:
+        print("UNKNOWN")
+    sys.exit(0)
+
+if stat.S_ISREG(st.st_mode):
+    print("REGULAR")
+else:
+    print("UNKNOWN")
+' "${path}" 2>/dev/null)" && status=0 || status=$?
+  if (( status != 0 )); then
+    printf 'UNKNOWN'
+    return 0
+  fi
+  case "${output}" in
+    ABSENT|REGULAR) printf '%s' "${output}" ;;
+    'SYMLINK_TO_REGULAR '*) printf '%s' "${output}" ;;
+    *)
+      # Includes bare "UNKNOWN" and any malformed/unexpected output --
+      # never guessed as one of the three positive answers.
+      printf 'UNKNOWN'
+      ;;
+  esac
+}
+
+# _host_control_authorized_keys_add <path> <marker> <line>: idempotently
+# and atomically ensure exactly one forced-command entry -- <line>,
+# identified by the space-delimited <marker> comment field it ends with --
+# exists in the authorized_keys file at <path>. Never truncates the live
+# file; never assumes it ends in a newline.
+#
+# Returns 0 once the marker is present AND its presence has been durably
+# proven, whether THIS call just added it or an earlier, interrupted call
+# already did.
+_host_control_authorized_keys_add() {
+  local path="$1" marker="$2" line="$3"
+  local state kind real_path dir tmp count
+  local grep_output grep_status trailing_byte trailing_status
+
+  _host_control_validate_authorized_keys "${path}"
+  # Family 2 correction pass (path-state micro-correction): a positively
+  # closed classification, never a bare `[[ -f ]]` that cannot itself
+  # distinguish "proven absent" from "could not be proven either way" --
+  # see _host_control_authorized_keys_path_state's own docstring.
+  state="$(_host_control_authorized_keys_path_state "${path}")"
+  kind="${state%% *}"
+  case "${kind}" in
+    ABSENT) real_path="${path}" ;;
+    REGULAR) real_path="${path}" ;;
+    SYMLINK_TO_REGULAR) real_path="${state#* }" ;;
+    *)
+      log_warn "could not positively classify ${path} (metadata/stat failure or unresolved symlink); refusing to add the '${marker}' entry"
+      return 1
+      ;;
+  esac
+  dir="$(dirname -- "${real_path}")"
+
+  count=0
+  if [[ "${kind}" != "ABSENT" ]]; then
+    # Family 2 correction pass (P1 sibling): a read failure here must
+    # never be folded into "zero matches" -- see this module's header.
+    # 0 = matched (the printed count is trustworthy), 1 = grep's own
+    # positive "no match" answer, anything else = the read itself
+    # failed and must fail closed rather than being treated as absent.
+    grep_output="$(_host_control_authorized_keys_marker_count "${real_path}" "${marker}")" \
+      && grep_status=0 || grep_status=$?
+    case "${grep_status}" in
+      0) count="${grep_output}" ;;
+      1) count=0 ;;
+      *)
+        log_warn "could not read ${path} to check for an existing '${marker}' entry"
+        return 1
+        ;;
+    esac
+  fi
+  case "${count}" in
+    0) : ;;
+    1)
+      # Idempotent replay: the entry is already there. Re-prove durability
+      # rather than trusting that an earlier attempt's own barrier
+      # succeeded -- see this module's header. `if` (not a bare statement
+      # followed by `return $?`) so this is correct under `set -e`
+      # regardless of how the caller wraps this function.
+      if _host_control_authorized_keys_barrier "${real_path}"; then
+        return 0
+      else
+        return 1
+      fi
+      ;;
+    *)
+      log_warn "authorized_keys at ${path} already has ${count} entries for marker '${marker}'; refusing to add another"
+      return 1
+      ;;
+  esac
+
+  tmp="$(mktemp "${dir}/hubinet-ops-authorized-keys.XXXXXX")" || return 1
+  if [[ "${kind}" != "ABSENT" ]]; then
+    # Family 2 correction pass (P1): mode setup must not silently
+    # continue if BOTH the reference chmod and the safe fallback fail --
+    # a staged file left at the wrong mode could still be renamed live.
+    if ! chmod --reference="${real_path}" "${tmp}" 2>/dev/null && ! chmod 0600 "${tmp}"; then
+      rm -f -- "${tmp}"
+      log_warn "could not set the staged authorized_keys replacement mode for ${path}"
+      return 1
+    fi
+    if [[ -s "${real_path}" ]]; then
+      # Family 2 correction pass (P1): the confirmed witness. Every byte
+      # used to construct the staged replacement must be positively read/
+      # written -- an interrupted/partial copy (EIO/ENOSPC) must discard
+      # the staged file and fail here, never proceed to append onto,
+      # fsync, and atomically rename a TRUNCATED copy of the live file
+      # over it.
+      if ! _host_control_authorized_keys_copy_into_stage "${real_path}" "${tmp}"; then
+        rm -f -- "${tmp}"
+        log_warn "could not copy the existing authorized_keys content at ${path} into the staged replacement"
+        return 1
+      fi
+      # Preserve every existing byte, but never let this run's own
+      # appended entry land on the same physical line as a hand-managed
+      # key that does not itself end in a newline. A failed read here is
+      # UNKNOWN, never "already ends in a newline".
+      trailing_byte="$(_host_control_authorized_keys_trailing_byte "${real_path}")" \
+        && trailing_status=0 || trailing_status=$?
+      if (( trailing_status != 0 )); then
+        rm -f -- "${tmp}"
+        log_warn "could not determine whether ${path} ends in a newline"
+        return 1
+      fi
+      if [[ -n "${trailing_byte}" ]]; then
+        if ! printf '\n' >>"${tmp}"; then
+          rm -f -- "${tmp}"
+          log_warn "could not write the separator newline for the staged authorized_keys replacement for ${path}"
+          return 1
+        fi
+      fi
+    fi
+  else
+    if ! chmod 0600 "${tmp}"; then
+      rm -f -- "${tmp}"
+      log_warn "could not set the staged authorized_keys replacement mode for ${path}"
+      return 1
+    fi
+  fi
+  if ! _host_control_authorized_keys_write_entry "${tmp}" "${line}"; then
+    rm -f -- "${tmp}"
+    log_warn "could not write the new forced-command entry into the staged authorized_keys replacement for ${path}"
+    return 1
+  fi
+  sync -f "${tmp}" \
+    || { rm -f -- "${tmp}"; log_warn "could not flush the staged authorized_keys replacement for ${path}"; return 1; }
+  if _host_control_authorized_keys_rename_should_fail "${real_path}"; then
+    rm -f -- "${tmp}"
+    log_warn "could not atomically replace ${path} (simulated test failure)"
+    return 1
+  fi
+  mv -f -- "${tmp}" "${real_path}" \
+    || { rm -f -- "${tmp}" 2>/dev/null || true; log_warn "could not atomically replace ${path}"; return 1; }
+  if _host_control_authorized_keys_barrier "${real_path}"; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# _host_control_authorized_keys_remove <path> <marker>: idempotently and
+# atomically remove every line containing " <marker>" from the
+# authorized_keys file at <path>. Every other line -- an unrelated
+# operator key, or a Hubinet entry a DIFFERENT run/marker owns -- is
+# copied through byte-for-byte. A live path that does not exist, or that
+# already has no such line, is a true no-op EXCEPT for re-proving the
+# durability barrier (see this module's header: an earlier attempt's
+# rename may already have removed it while its own following barrier
+# failed).
+_host_control_authorized_keys_remove() {
+  local path="$1" marker="$2" state kind real_path dir tmp present_status
+
+  _host_control_validate_authorized_keys "${path}"
+  # Family 2 correction pass (path-state micro-correction): "could not be
+  # proven to exist" is not the same as "positively proven absent" -- see
+  # _host_control_authorized_keys_path_state's own docstring. Only a
+  # genuine ABSENT answer is a no-op; anything unresolved fails closed
+  # rather than reporting removal complete.
+  state="$(_host_control_authorized_keys_path_state "${path}")"
+  kind="${state%% *}"
+  case "${kind}" in
+    ABSENT) return 0 ;;
+    REGULAR) real_path="${path}" ;;
+    SYMLINK_TO_REGULAR) real_path="${state#* }" ;;
+    *)
+      log_warn "could not positively classify ${path} (metadata/stat failure or unresolved symlink); refusing to remove the '${marker}' entry"
+      return 1
+      ;;
+  esac
+  dir="$(dirname -- "${real_path}")"
+
+  # Family 2 correction pass (P1 direct sibling): the same fail-closed
+  # classification as ADD's own marker check above. 0 = positively
+  # PRESENT (build the removal stage below), 1 = positively ABSENT (an
+  # idempotent replay -- re-prove durability, never claim removal from a
+  # read this run never actually performed), anything else = the read
+  # itself failed and must never be folded into "already absent".
+  _host_control_authorized_keys_marker_present "${real_path}" "${marker}" \
+    && present_status=0 || present_status=$?
+  case "${present_status}" in
+    0) : ;;
+    1)
+      if _host_control_authorized_keys_barrier "${real_path}"; then
+        return 0
+      else
+        return 1
+      fi
+      ;;
+    *)
+      log_warn "could not read ${path} to check for the '${marker}' entry to remove"
+      return 1
+      ;;
+  esac
+
+  tmp="$(mktemp "${dir}/hubinet-ops-authorized-keys.XXXXXX")" || return 1
+  # Family 2 correction pass (P1): mode setup must not silently continue
+  # if BOTH the reference chmod and the safe fallback fail -- the same
+  # unchecked-write family as ADD's own mode setup above.
+  if ! chmod --reference="${real_path}" "${tmp}" 2>/dev/null && ! chmod 0600 "${tmp}"; then
+    rm -f -- "${tmp}"
+    log_warn "could not set the staged authorized_keys replacement mode for ${path}"
+    return 1
+  fi
+  if ! awk -v marker=" ${marker}" 'index($0, marker) == 0 { print }' "${real_path}" >"${tmp}"; then
+    rm -f -- "${tmp}" 2>/dev/null || true
+    log_warn "could not filter the Hubinet-owned entry for marker '${marker}' out of ${path}"
+    return 1
+  fi
+  sync -f "${tmp}" \
+    || { rm -f -- "${tmp}"; log_warn "could not flush the staged authorized_keys replacement for ${path}"; return 1; }
+  if _host_control_authorized_keys_rename_should_fail "${real_path}"; then
+    rm -f -- "${tmp}"
+    log_warn "could not atomically replace ${path} (simulated test failure)"
+    return 1
+  fi
+  mv -f -- "${tmp}" "${real_path}" \
+    || { rm -f -- "${tmp}" 2>/dev/null || true; log_warn "could not atomically replace ${path}"; return 1; }
+  if _host_control_authorized_keys_barrier "${real_path}"; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# _host_control_probe_forced_command_boundary <key_path> <host> <port>
+# <user> <known_hosts_path> <expected_refusal_substring>: the non-mutating
+# acceptance primitive for one host-control forced-command boundary (P1
+# correction pass, Family B).
+#
+# Shared by fresh bootstrap (bootstrap-update-boundaries.sh's own
+# _accept_update_boundaries, and this module's own package-scan boundary
+# probe above) and the in-place updater (update-boundaries.sh) so both
+# entrypoints prove the SAME end-to-end property through ONE mechanism
+# rather than two copies that could quietly drift apart: sends exactly one
+# deliberately malformed typed request over SSH using the boundary's OWN
+# dedicated key, which the forced command on the PVE host side refuses
+# structurally before doing anything else. This proves key validity, host-
+# key pinning, sshd forced-command policy, and that the intended helper
+# actually executes and can load its runtime -- all without creating a
+# snapshot, mutating a package, submitting a rollback, or evaluating health
+# against any real workload. There is no generic "ping" operation: this
+# existing structural refusal already proves the key reached exactly this
+# forced command.
+#
+# host/port/user/known_hosts_path are always taken from the CALLER, never
+# assumed to be bootstrap's own defaults: an already-running installation
+# being updated may have an explicit, non-default configured endpoint, and
+# the acceptance probe must prove THAT exact configuration is usable, not
+# merely that bootstrap's defaults would have been.
+#
+# Returns 0 when the expected structured-refusal substring is found in the
+# response; non-zero otherwise (prints nothing -- callers supply their own
+# diagnostic, since bootstrap's and the updater's failure messages differ).
+_host_control_probe_forced_command_boundary() {
+  local key_path="$1" host="$2" port="$3" user="$4" known_hosts_path="$5" expected_marker="$6"
+  local probe_output probe_status
+  local probe_request='{"request_version":1,"operation":"probe","target":{},"context":{}}'
+  probe_output="$(printf '%s' "${probe_request}" | pct exec "${VMID}" -- runuser -u hubinetops -- \
+    ssh -T -p "${port}" -i "${key_path}" \
+    -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+    -o "UserKnownHostsFile=${known_hosts_path}" \
+    -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+    -o ForwardAgent=no -o ClearAllForwardings=yes \
+    "${user}@${host}" 2>/dev/null)" && probe_status=0 || probe_status=$?
+  # A structured refusal proves the forced command ran. Exit 255 or an
+  # empty body would instead mean SSH/key/host-key policy is unusable.
+  (( probe_status != 0 && probe_status != 255 )) \
+    && printf '%s' "${probe_output}" | grep -qF "${expected_marker}"
 }
 
 phase2c_plan_host_control() {
@@ -124,14 +702,14 @@ phase8c_provision_host_control() {
       || die "failed to create ${HOST_CONTROL_AUTHORIZED_KEYS}"
     ledger_record host-control-authorized-keys-file "${authorized_keys_path}"
   fi
-  _host_control_validate_authorized_keys "${authorized_keys_path}"
-  if grep -qF " ${HOST_CONTROL_AUTH_MARKER}" "${authorized_keys_path}"; then
-    die "forced-command authorization marker already exists unexpectedly"
-  fi
-  printf 'command="%s",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty %s %s %s\n' \
-    "${HOST_CONTROL_HELPER_PATH}" "${key_type}" "${key_data}" "${HOST_CONTROL_AUTH_MARKER}" \
-    >>"${authorized_keys_path}" \
-    || die "failed to append the Hubinet-owned forced-command authorization"
+  # Family 2 correction pass: one shared atomic/durable/idempotent
+  # add-or-reprove-durable primitive -- see this module's own header above
+  # for the full contract this replaces.
+  local line
+  line="$(printf 'command="%s",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty %s %s %s' \
+    "${HOST_CONTROL_HELPER_PATH}" "${key_type}" "${key_data}" "${HOST_CONTROL_AUTH_MARKER}")"
+  _host_control_authorized_keys_add "${authorized_keys_path}" "${HOST_CONTROL_AUTH_MARKER}" "${line}" \
+    || die "failed to durably add the Hubinet-owned forced-command authorization to ${HOST_CONTROL_AUTHORIZED_KEYS}"
   ledger_record host-control-authorization "${HOST_CONTROL_AUTH_MARKER}"
 
   local host_key_tmp known_hosts_tmp host_key_type host_key_data host_key_comment
@@ -179,23 +757,13 @@ rollback_host_control() {
   helper_path="$(_host_control_host_path "${HOST_CONTROL_HELPER_PATH}")"
   helper_dir_path="$(_host_control_host_path /usr/local/libexec)"
   root_ssh_dir_path="$(_host_control_host_path /root/.ssh)"
-  if [[ -n "${HOST_CONTROL_AUTH_MARKER:-}" && -f "${authorized_keys_path}" ]]; then
-    local filtered
-    filtered="$(mktemp "${root_ssh_dir_path}/hubinet-ops-authorized-keys.XXXXXX")" || {
-      log_warn "could not allocate a temporary authorized_keys cleanup file"
-      filtered=""
-    }
-    if [[ -n "${filtered}" ]]; then
-      if awk -v marker=" ${HOST_CONTROL_AUTH_MARKER}" 'index($0, marker) == 0 { print }' \
-        "${authorized_keys_path}" >"${filtered}" \
-        && cat "${filtered}" >"${authorized_keys_path}"; then
-        rm -f "${filtered}" \
-          || log_warn "could not remove the temporary authorized_keys cleanup file"
-      else
-        log_warn "could not remove the Hubinet-owned forced-command authorization"
-        rm -f "${filtered}" >/dev/null 2>&1 || true
-      fi
-    fi
+  if [[ -n "${HOST_CONTROL_AUTH_MARKER:-}" ]]; then
+    # Family 2 correction pass: one shared atomic/durable/idempotent
+    # remove-or-reprove-durable primitive -- see this module's own header
+    # above. Filtered by the exact marker only: an unrelated operator
+    # authorized_keys line is never rewritten or removed.
+    _host_control_authorized_keys_remove "${authorized_keys_path}" "${HOST_CONTROL_AUTH_MARKER}" \
+      || log_warn "could not remove the Hubinet-owned forced-command authorization"
   fi
   if ledger_has host-control-authorized-keys-file "${authorized_keys_path}" \
     && [[ -f "${authorized_keys_path}" && ! -s "${authorized_keys_path}" ]]; then

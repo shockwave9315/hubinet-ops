@@ -17,6 +17,8 @@ from .enums import (
     ObservationalContinuity,
     PackageScanStatus,
     PackagePlanApprovalStatus,
+    PackageUpdateHealthOutcome,
+    PackageUpdateJobState,
     PresenceState,
     ResourceStateLevel,
     ResourceType,
@@ -33,6 +35,10 @@ from .health_contract_validation import (
 from .primitives import _immutable_mapping, _require_uuid_identity
 from .package_scan_validation import validate_package_scan_snapshot
 from .approval_validation import validate_package_plan_approval_snapshot
+from .package_update_validation import (
+    validate_package_update_job_summary,
+    validate_package_update_job_view,
+)
 from .projections import (
     inventory_projection as _inventory_projection,
     source_reconciliation_projection as _source_reconciliation_projection,
@@ -293,6 +299,100 @@ class ResourceHealthContract:
 
 
 @dataclass(frozen=True, slots=True)
+class PackageUpdateJobSummary:
+    """The per-resource package-update job fact carried in the snapshot.
+
+    A concise state, not a replica of the event log. Everything detailed --
+    the frozen package rows, the per-probe results, the append-only events --
+    is response data from an explicitly invoked action.
+    """
+
+    state: PackageUpdateJobState = PackageUpdateJobState.NOT_STARTED
+    job_id: str | None = None
+    checkpoint: str | None = None
+    issued_at: str | None = None
+    health_outcome: PackageUpdateHealthOutcome | None = None
+    snapshot_confirmed_at: str | None = None
+    mutation_completed_at: str | None = None
+    rollback_completed_at: str | None = None
+    terminalized_at: str | None = None
+    terminal_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_package_update_job_summary(self)
+
+    @property
+    def in_progress(self) -> bool:
+        """Whether a job owns the global destructive slot right now."""
+
+        return self.state is PackageUpdateJobState.ACTIVE
+
+    @property
+    def rollback_completed(self) -> bool:
+        return self.state is PackageUpdateJobState.ROLLED_BACK
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateJobEvent:
+    """One bounded append-only job event, as an operator reads it.
+
+    ``details`` is deliberately not carried across this boundary. The backend
+    authors it as bounded typed data for direct API consumers, but a mapping
+    of arbitrary shape rendered into a Home Assistant action response is
+    exactly the kind of unbounded detail this integration keeps out. What an
+    operator needs here is the classification and the sentence.
+    """
+
+    sequence: int
+    created_at: str
+    level: str
+    stage: str
+    event_type: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateJobView:
+    """One complete package-update job, as an explicit action returns it.
+
+    Response data from an action an operator invoked, never entity state.
+    Flat by design: Home Assistant renders these as a response mapping, and a
+    nested shape would only invite a template to reach into it. Everything
+    here is a durable authority fact -- no helper output, no PVE task log, no
+    command text, no package rows, and no per-probe results.
+    """
+
+    job_id: str
+    request_id: str
+    resource_id: str
+    status: PackageUpdateJobState
+    checkpoint: str
+    issued_at: str
+    approved_plan_fingerprint: str
+    package_count: int
+    snapshot_name: str | None = None
+    snapshot_confirmed_at: str | None = None
+    mutation_may_have_started_at: str | None = None
+    mutation_completed_at: str | None = None
+    health_contract_revision: int | None = None
+    health_started_at: str | None = None
+    health_completed_at: str | None = None
+    health_outcome: PackageUpdateHealthOutcome | None = None
+    rollback_may_have_started_at: str | None = None
+    rollback_completed_at: str | None = None
+    rollback_available: bool = False
+    terminalized_at: str | None = None
+    terminal_reason: str | None = None
+    events: tuple[PackageUpdateJobEvent, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_uuid_identity(self.job_id, "job_id")
+        _require_uuid_identity(self.request_id, "request_id")
+        _require_uuid_identity(self.resource_id, "resource_id")
+        validate_package_update_job_view(self)
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceSnapshot:
     """One backend-owned resource incarnation and effective presentation view."""
 
@@ -330,6 +430,9 @@ class ResourceSnapshot:
     )
     health_contract: HealthContractSummary = field(
         default_factory=HealthContractSummary
+    )
+    package_update_job: PackageUpdateJobSummary = field(
+        default_factory=PackageUpdateJobSummary
     )
     termination_reason: str | None = None
     successor_resource_id: str | None = None

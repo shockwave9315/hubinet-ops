@@ -1962,7 +1962,7 @@ def test_sql_forbids_inserting_a_job_row_that_already_claims_a_verdict(
     _, store, authority, resource, _, approval = _approved_system(tmp_path)
     template = _issue(authority, resource, approval)
     columns = (
-        "job_id, request_id, issued_at, resource_id, approval_id, "
+        "job_id, request_id, issued_at, issuance_sequence, resource_id, approval_id, "
         "approval_reviewed_scan_run_id, approved_plan_fingerprint, "
         "approval_approved_at, current_plan_scan_run_id, inventory_source_id, "
         "committed_source_config_revision, committed_endpoint_id, "
@@ -1982,6 +1982,7 @@ def test_sql_forbids_inserting_a_job_row_that_already_claims_a_verdict(
         str(uuid.uuid4()),
         str(uuid.uuid4()),
         template.issued_at,
+        template.issuance_sequence,
         template.resource_id,
         template.approval_id,
         template.approval_reviewed_scan_run_id,

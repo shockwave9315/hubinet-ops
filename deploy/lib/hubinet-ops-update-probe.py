@@ -29,8 +29,31 @@ a nonzero exit here) unless argv itself is unusable:
 
   {"ok": true, "backend_instance_id": "...", "service_active": true,
    "last_committed_run_sequence": <int|null>, "health": "...",
-   "freshness": "..."}
+   "freshness": "...", "package_update_active": <true|false|null>,
+   "package_update_job_id": "<uuid|null>",
+   "package_update_checkpoint": "<checkpoint|null>"}
   {"ok": false, "reason": "<short-code>"}
+
+`package_update_active` is the updater's ACTIVE-WORKLOAD-JOB WITNESS, and it
+is the reason this probe reads a third endpoint. Replacing the backend or any
+of its privileged helpers while a package-update job owns a snapshot,
+mutation, or rollback journal can leave a new backend talking to a
+half-replaced set of helpers about an operation that is already in flight, so
+the updater must refuse before it touches a single file.
+
+Three values, and the distinction matters:
+
+- `true`  -- a job owns the one global destructive slot right now. The caller
+             MUST refuse.
+- `false` -- no job owns it. Ordinary product update may proceed.
+- `null`  -- the endpoint does not exist, which means this installation
+             predates production update activation. Such a backend has no
+             worker, no update route, and no way to have started a workload
+             job at all, so there is nothing to fence. That is read from the
+             endpoint's ABSENCE (HTTP 404), never from a transport failure:
+             an unreachable or erroring backend is reported as `ok: false`
+             and the caller refuses, because "we could not ask" must never
+             be treated as "the answer was no".
 """
 from __future__ import annotations
 
@@ -58,6 +81,44 @@ def get_json(path: str, token: str) -> dict:
     req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:  # noqa: S310
         return json.loads(resp.read().decode("utf-8"))
+
+
+class ProbeUnavailable(RuntimeError):
+    """The question could not be asked. Never the same as answering "no"."""
+
+
+def read_active_package_update(token: str) -> dict:
+    """Ask whether any package-update job owns the global slot.
+
+    A 404 is a real, meaningful answer here and only here: the route is
+    absent, so this backend predates production update activation and cannot
+    have an active workload job. Every other failure is unavailability.
+    """
+
+    try:
+        payload = get_json("/package-update/active", token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return {
+                "package_update_active": None,
+                "package_update_job_id": None,
+                "package_update_checkpoint": None,
+            }
+        raise ProbeUnavailable(f"package_update_endpoint_http_{exc.code}") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise ProbeUnavailable(f"package_update_endpoint_unreachable: {exc}") from exc
+
+    active = payload.get("active")
+    if not isinstance(active, bool):
+        raise ProbeUnavailable("package_update_active_malformed")
+    job = payload.get("job")
+    if active and not isinstance(job, dict):
+        raise ProbeUnavailable("package_update_active_job_malformed")
+    return {
+        "package_update_active": active,
+        "package_update_job_id": (job or {}).get("job_id") if active else None,
+        "package_update_checkpoint": (job or {}).get("checkpoint") if active else None,
+    }
 
 
 def main() -> int:
@@ -94,6 +155,12 @@ def main() -> int:
         print(json.dumps({"ok": False, "reason": "last_committed_run_sequence_malformed"}))
         return 0
 
+    try:
+        package_update = read_active_package_update(token)
+    except ProbeUnavailable as exc:
+        print(json.dumps({"ok": False, "reason": str(exc)}))
+        return 0
+
     print(json.dumps({
         "ok": True,
         "backend_instance_id": backend_instance_id,
@@ -101,6 +168,7 @@ def main() -> int:
         "last_committed_run_sequence": sequence,
         "health": source.get("health"),
         "freshness": source.get("freshness"),
+        **package_update,
     }, separators=(",", ":")))
     return 0
 

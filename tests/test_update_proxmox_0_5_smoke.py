@@ -29,6 +29,10 @@ from _update_fake_pve import (  # noqa: E402
     FAKE_BACKEND_INSTANCE_ID,
     FAKE_RUN_ID,
     FAKE_VMID,
+    UPDATE_BOUNDARY_HELPERS,
+    UPDATE_BOUNDARY_JOURNAL_DIRS,
+    boundary_helper_host_path,
+    boundary_key_ct_path,
     build_update_target_checkout,
     seed_installed_environment,
 )
@@ -3835,7 +3839,9 @@ class TestCompletedCleanupStrictBeforeJournalClear:
         assert "ROLLBACK COULD NOT BE COMPLETED" in first.stderr
         journal = _update_state_path(env, FAKE_VMID, "journal")
         assert journal.exists()
-        assert "state=completed" in journal.read_text(encoding="utf-8")
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "state=completed" in journal_text
+        run_id = _journal_run_id(journal_text)
         # The target is fully accepted and live, and the leftover rollback
         # artifact this run's cleanup could not remove is still there,
         # proving cleanup really failed rather than being skipped.
@@ -3847,6 +3853,17 @@ class TestCompletedCleanupStrictBeforeJournalClear:
         post = env.state()["vmids"][FAKE_VMID]
         assert post["service"] == "active"
         assert post["service_enabled"] is True
+        # This fault hard-stops at the FIRST rm block (staged/rollback
+        # artifacts), before cleanup ever reaches the SECOND rm block that
+        # removes the run-owned planning/staging tools (authority tool,
+        # update probe, and the maintenance-fence helper) -- so all three
+        # are still present after this first, failed invocation.
+        tool_ct_path = env.ct_file(FAKE_VMID, f"/tmp/hubinet-ops-authority-tool-{run_id}.py")
+        probe_ct_path = env.ct_file(FAKE_VMID, f"/tmp/hubinet-ops-update-probe-{run_id}.py")
+        fence_ct_path = env.ct_file(FAKE_VMID, f"/tmp/hubinet-ops-update-fence-{run_id}.py")
+        assert tool_ct_path.exists()
+        assert probe_ct_path.exists()
+        assert fence_ct_path.exists()
 
         # A later invocation (fault cleared) resolves the surviving
         # `completed` journal through the existing startup-recovery path:
@@ -3857,6 +3874,13 @@ class TestCompletedCleanupStrictBeforeJournalClear:
         assert "was already" in second.stderr
         assert not journal.exists()
         assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert not tool_ct_path.exists()
+        assert not probe_ct_path.exists()
+        # P3 correction pass: the fence helper used to be left behind here
+        # (only the tool and probe paths were removed by
+        # _update_cleanup_recovered_run_artifacts) even on this otherwise
+        # fully successful cleanup replay.
+        assert not fence_ct_path.exists()
 
     def test_host_helper_cleanup_failure_retains_journal_and_replay_finishes_it(self, tmp_path):
         env = seed_installed_environment(
@@ -4338,3 +4362,2300 @@ class TestRollbackResetsStaleEnablementLinks:
         assert "rollback complete" in result.stderr
         assert "systemctl reenable" not in result.stderr
         assert env.state()["vmids"][FAKE_VMID].get("service_autostart_reenable_calls", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# The five package-update forced-command boundaries.
+#
+# Two paths matter here and are genuinely different. Updating an ALREADY
+# activated installation replaces helper content in place; upgrading a
+# PRE-ACTIVATION one CREATES new privileged access paths, and is therefore
+# the one whose rollback has to remove a key, an authorized_keys entry, and
+# a root-owned mutation helper rather than merely restore a file.
+# ---------------------------------------------------------------------------
+
+
+BOUNDARY_KINDS = tuple(kind for kind, _name in UPDATE_BOUNDARY_HELPERS)
+
+
+def _host_root(env):
+    return Path(env.env["HUBINET_OPS_TEST_HOST_ROOT"])
+
+
+def _authorized_keys_text(env):
+    path = _host_root(env) / "root" / ".ssh" / "authorized_keys"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def _boundary_helper(env, kind, run_id=FAKE_RUN_ID):
+    return _host_root(env) / boundary_helper_host_path(kind, run_id).lstrip("/")
+
+
+class TestActivatedInstallationBoundaries:
+    def test_an_ordinary_update_leaves_every_boundary_untouched(self, tmp_path):
+        """Nothing to do is nothing done: no key rotation, no re-authorization."""
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        before = _authorized_keys_text(env)
+        before_helpers = {
+            kind: _boundary_helper(env, kind).read_text(encoding="utf-8")
+            for kind in BOUNDARY_KINDS
+        }
+        before_keys = {
+            kind: env.ct_file_text(FAKE_VMID, boundary_key_ct_path(kind))
+            for kind in BOUNDARY_KINDS
+        }
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert _authorized_keys_text(env) == before
+        for kind in BOUNDARY_KINDS:
+            assert _boundary_helper(env, kind).read_text(encoding="utf-8") == (
+                before_helpers[kind]
+            ), kind
+            assert env.ct_file_text(FAKE_VMID, boundary_key_ct_path(kind)) == (
+                before_keys[kind]
+            ), kind
+        assert "unchanged -- all five forced-command boundaries" in result.stdout
+
+    def test_a_changed_boundary_helper_is_replaced_at_the_same_path(self, tmp_path):
+        """Content changes; the path, the key, and the authorization do not."""
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            boundary_helper_text={"mutation": "#!/usr/bin/env python3\n# stale\n"},
+        )
+        before_authorized = _authorized_keys_text(env)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        installed = _boundary_helper(env, "mutation").read_text(encoding="utf-8")
+        expected = (
+            REPO_ROOT / "deploy" / "hubinet-package-mutation-helper.py"
+        ).read_text(encoding="utf-8")
+        assert installed == expected
+        assert _authorized_keys_text(env) == before_authorized
+        assert "1 replaced in place" in result.stdout
+
+    def test_a_repeated_update_is_idempotent(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        first = _run(env.env, _base_args(target))
+        assert first.returncode == 0, first.stderr
+        after_first = _authorized_keys_text(env)
+        second = _run(env.env, _base_args(target))
+
+        assert second.returncode == 0, second.stderr
+        assert _authorized_keys_text(env) == after_first
+        helper_dir = _host_root(env) / "usr" / "local" / "libexec"
+        for kind in BOUNDARY_KINDS:
+            assert len(list(helper_dir.glob(f"hubinet-package-{kind}-boundary-*"))) == 1
+
+
+class TestPreActivationInstallationUpgrade:
+    """A pre-activation installation upgraded into the activated lifecycle."""
+
+    def test_the_upgrade_creates_every_boundary_and_activates_the_config(
+        self, tmp_path
+    ):
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        unrelated = "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFB pve-operator\n"
+        authorized_path = _host_root(env) / "root" / ".ssh" / "authorized_keys"
+        authorized_path.write_text(
+            authorized_path.read_text(encoding="utf-8") + unrelated, encoding="utf-8"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        authorized = _authorized_keys_text(env)
+        for kind in BOUNDARY_KINDS:
+            assert _boundary_helper(env, kind).exists(), kind
+            assert env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+            assert f"hubinet-ops-package-{kind}-vmid-{FAKE_VMID}-" in authorized, kind
+        # The scan boundary and the operator's own key both survive intact.
+        assert unrelated in authorized
+        assert f"hubinet-ops-package-scan-vmid-{FAKE_VMID}-{FAKE_RUN_ID}" in authorized
+        inventory = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert "package_update:" in inventory
+        assert "enabled: true" in inventory
+        # And the pre-existing configuration is preserved byte-for-byte above
+        # the appended block.
+        assert inventory.startswith('source:\n  display_name: "Home Proxmox"')
+        assert "package_scan:" in inventory.split("package_update:", 1)[0]
+        # The five boundaries reach the SAME endpoint the scan boundary
+        # already reaches -- one configured source, one SSH endpoint. Only
+        # the private keys differ.
+        activation = inventory.split("package_update:", 1)[1]
+        assert 'host: "192.0.2.10"' in activation
+        assert 'known_hosts_path: "/etc/hubinet-ops/host-control/known_hosts"' in activation
+        for kind in BOUNDARY_KINDS:
+            assert f'{kind}_private_key_path: "{boundary_key_ct_path(kind)}"' in activation
+        for journal in UPDATE_BOUNDARY_JOURNAL_DIRS:
+            assert (_host_root(env) / journal.lstrip("/")).is_dir(), journal
+
+    def test_omitted_host_control_fields_get_the_same_runtime_defaults(
+        self, tmp_path
+    ):
+        """P2: activation must derive the SAME effective values
+        app/inventory_runtime_config.py's parse_r0_runtime_config already
+        applies for an omitted package_scan.host_control.<field> --
+        port=22, user=root, known_hosts_path=/etc/hubinet-ops/host-control/
+        known_hosts -- not demand every field be literally present.
+
+        Also doubles as the positive control for `host`: an explicit host
+        must be preserved exactly even when a DIFFERENT source.pve_endpoint
+        is also present in the same file (proving explicit always wins over
+        derivation, not merely that derivation happens to agree).
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        inventory_path = env.ct_file(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        inventory_path.write_text(
+            'source:\n'
+            '  display_name: "Home Proxmox"\n'
+            '  provider_kind: proxmox_ve\n'
+            '  pve_endpoint: "https://pve-other.example.internal:8006"\n'
+            "\npackage_scan:\n"
+            "  interval_seconds: 21600\n"
+            "  initial_delay_seconds: 30\n"
+            "  host_control:\n"
+            '    host: "pve.example.internal"\n'
+            '    private_key_path: "/etc/hubinet-ops/host-control/id_ed25519"\n'
+            "    timeout_seconds: 900\n"
+            "    max_result_bytes: 8388608\n",
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        inventory = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert "package_update:" in inventory
+        activation = inventory.split("package_update:", 1)[1]
+        # Explicit host wins over the (deliberately different) derivable
+        # source.pve_endpoint hostname.
+        assert 'host: "pve.example.internal"' in activation
+        # Every field this run never wrote reproduces the exact runtime
+        # default parse_r0_runtime_config would have applied.
+        assert "port: 22" in activation
+        assert 'user: "root"' in activation
+        assert 'known_hosts_path: "/etc/hubinet-ops/host-control/known_hosts"' in activation
+
+    def test_omitted_host_falls_back_to_the_source_pve_endpoint_hostname(
+        self, tmp_path
+    ):
+        """P2 host fallback: package_scan.host_control.host omitted ->
+        effective host is the hostname of source.pve_endpoint, exactly as
+        parse_r0_runtime_config's own `default_host = urlsplit(
+        transport_locator).hostname` computes it.
+
+        Also the positive control for port/user/known_hosts_path: all three
+        are given NON-default explicit values here and must be preserved
+        exactly, proving an explicit operator value always wins over the
+        runtime default rather than the default silently overwriting it.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        inventory_path = env.ct_file(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        inventory_path.write_text(
+            'source:\n'
+            '  display_name: "Home Proxmox"\n'
+            '  provider_kind: proxmox_ve\n'
+            '  pve_endpoint: "https://pve.example.internal:8006"\n'
+            "\npackage_scan:\n"
+            "  interval_seconds: 21600\n"
+            "  initial_delay_seconds: 30\n"
+            "  host_control:\n"
+            "    port: 2222\n"
+            '    user: "svc-deploy"\n'
+            '    private_key_path: "/etc/hubinet-ops/host-control/id_ed25519"\n'
+            '    known_hosts_path: "/custom/known_hosts"\n'
+            "    timeout_seconds: 900\n"
+            "    max_result_bytes: 8388608\n",
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        inventory = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert "package_update:" in inventory
+        activation = inventory.split("package_update:", 1)[1]
+        assert 'host: "pve.example.internal"' in activation
+        assert "port: 2222" in activation
+        assert 'user: "svc-deploy"' in activation
+        assert 'known_hosts_path: "/custom/known_hosts"' in activation
+
+    def test_inherited_scalars_containing_quotes_or_backslashes_round_trip(
+        self, tmp_path
+    ):
+        """P2: host/user/known_hosts_path are inherited, already-decoded
+        strings this updater does not choose the shape of --
+        parse_r0_runtime_config's own `_require_text` accepts any non-empty
+        string, including one containing a literal '"' or '\\'. Activation
+        used to interpolate that string directly inside a YAML
+        double-quoted scalar (`"${value}"`), which a literal '"' breaks
+        (malformed YAML) and a literal '\\' silently reinterprets (YAML
+        double-quoted scalars process backslash escapes).
+
+        The inherited values below are written as PLAIN (unquoted) YAML
+        scalars in the pre-activation package_scan.host_control block --
+        the shape that lets the updater's own bounded scanner decode them
+        exactly as written, isolating the WRITE-side (serialization) bug
+        this test exists for from the scanner's own separate, unrelated
+        read-side behavior.
+
+        This file runs inside the hardened update-smoke Docker sandbox,
+        which has no PyYAML installed (only pytest), so this proves the
+        activation's own emitted bytes are correct using only the stdlib
+        `json` module -- the real production `yaml.safe_load` round-trip
+        proof for the exact same serializer
+        (_update_boundary_yaml_dq_scalar) lives in
+        tests/test_update_boundary_yaml_scalar.py, which runs on the
+        ordinary (non-sandboxed) pytest host where PyYAML is available.
+        """
+
+        known_hosts_value = '/etc/hubinet-ops/host-control/kn"own_hosts'
+        host_value = 'pve\\example.internal'
+        user_value = 'svc"deploy\\user'
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        inventory_path = env.ct_file(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        inventory_path.write_text(
+            'source:\n'
+            '  display_name: "Home Proxmox"\n'
+            '  provider_kind: proxmox_ve\n'
+            "\npackage_scan:\n"
+            "  interval_seconds: 21600\n"
+            "  initial_delay_seconds: 30\n"
+            "  host_control:\n"
+            f"    host: {host_value}\n"
+            f"    user: {user_value}\n"
+            '    private_key_path: "/etc/hubinet-ops/host-control/id_ed25519"\n'
+            f"    known_hosts_path: {known_hosts_value}\n"
+            "    timeout_seconds: 900\n"
+            "    max_result_bytes: 8388608\n",
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        inventory = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert "package_update:" in inventory
+        activation = inventory.split("package_update:", 1)[1]
+        # Every inherited scalar must be emitted as the EXACT JSON-quoted
+        # form json.dumps would produce for it -- the same mechanism
+        # _update_boundary_yaml_dq_scalar itself uses -- not merely
+        # "something quote-shaped".
+        assert f"host: {json.dumps(host_value)}" in activation
+        assert f"user: {json.dumps(user_value)}" in activation
+        assert f"known_hosts_path: {json.dumps(known_hosts_value)}" in activation
+        # And decoding each emitted scalar back (stdlib `json.loads` -- a
+        # JSON string literal decodes identically whether read by `json`
+        # or by a YAML 1.2 double-quoted-scalar reader) reproduces the
+        # EXACT original decoded string, byte-for-byte.
+        for key, original in (
+            ("host", host_value),
+            ("user", user_value),
+            ("known_hosts_path", known_hosts_value),
+        ):
+            match = re.search(rf'^\s*{key}: (".*")\s*$', activation, re.MULTILINE)
+            assert match, f"{key} not found as a double-quoted scalar in:\n{activation}"
+            assert json.loads(match.group(1)) == original
+
+    def test_a_failed_upgrade_leaves_no_new_privileged_access_path(self, tmp_path):
+        """The rule this whole module exists for.
+
+        A product update that created a key, an `authorized_keys` entry, and
+        a root-owned mutation helper and then failed must remove all three --
+        and only those three.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        unrelated = "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFB pve-operator\n"
+        authorized_path = _host_root(env) / "root" / ".ssh" / "authorized_keys"
+        before_authorized = authorized_path.read_text(encoding="utf-8") + unrelated
+        authorized_path.write_text(before_authorized, encoding="utf-8")
+        before_inventory = env.ct_file_text(
+            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        authorized = _authorized_keys_text(env)
+        for kind in BOUNDARY_KINDS:
+            assert not _boundary_helper(env, kind).exists(), kind
+            assert not env.ct_file(
+                FAKE_VMID, boundary_key_ct_path(kind)
+            ).exists(), kind
+            assert f"hubinet-ops-package-{kind}-vmid-{FAKE_VMID}-" not in authorized
+        # Nothing else was disturbed: the operator's key, the scan boundary,
+        # and the pre-activation configuration are all exactly as they were.
+        assert authorized == before_authorized
+        restored = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert restored == before_inventory
+        # The property behind that byte comparison, stated directly: a
+        # configuration left activating the lifecycle while naming the five
+        # keys this rollback just deleted would fail the restored service's
+        # own startup closed -- so a failed update would not merely fail, it
+        # would leave the installation unable to come back.
+        assert "package_update:" not in restored
+
+    def test_a_rollback_that_cannot_restore_the_config_hard_stops(self, tmp_path):
+        """The positive control for the rule above.
+
+        If the pre-activation configuration cannot be put back, the updater
+        must NOT go on to delete the key material that configuration still
+        names. It hard stops, preserves every artifact and the active
+        journal, and says so -- manual recovery is strictly safer than an
+        installation whose service can no longer start.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["cp_rollback_config_to_live"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "pre-activation" in result.stderr
+        # It stopped BEFORE deleting the keys the live configuration names.
+        for kind in BOUNDARY_KINDS:
+            assert env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+        # And it preserved the journal for the operator rather than clearing it.
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+
+    def test_a_failed_upgrade_preserves_an_existing_journal_directory(
+        self, tmp_path
+    ):
+        """A journal this run did not create is never removed to tidy up.
+
+        It may hold another operation's durable at-most-once evidence, and
+        destroying that would be strictly worse than leaving a directory.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        journal = _host_root(env) / "var/lib/hubinet-ops/rollback-operations"
+        journal.mkdir(parents=True, exist_ok=True)
+        (journal / "evidence.json").write_text("{}", encoding="utf-8")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert (journal / "evidence.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Family A (correction pass) -- an UNKNOWN metadata/stat classification of a
+# boundary path must never be silently read as a definite answer, at any of
+# the three points update-boundaries.sh classifies one: the installed
+# helper (update_boundaries_classify), the boundary private key inside the
+# container (_update_boundary_create_key), and the preserved rollback
+# copy/backup on either side (update_boundaries_rollback). Only positively
+# proven ENOENT may mean ABSENT; anything else fails closed before
+# mutation.
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryClassificationFailsClosed:
+    def test_a_stat_failure_classifying_an_installed_helper_fails_closed_before_mutation(
+        self, tmp_path
+    ):
+        """The exact Codex witness: a genuinely present, unusable-to-
+        inspect helper must never be planned as "absent" -- that would
+        stage a fresh provision over it and let rollback later remove it
+        as though this run had created it. Real EACCES/stat-failure
+        coverage for this classifier in isolation lives in
+        tests/test_update_boundary_path_classification.py; a genuine
+        directory-permission denial cannot be used HERE (see
+        HUBINET_OPS_TEST_FAIL_BOUNDARY_ROLLBACK_COPY_STATE's own docstring
+        in _update_boundary_helper_path_state for why: every boundary
+        helper lives in the SAME shared /usr/local/libexec directory as
+        the package-scan helper update-ownership.sh's own unrelated,
+        always-checked Phase U1 verification depends on). This must fail
+        with no journal ever created and nothing mutated at all --
+        classification happens during PLANNING, well before the
+        maintenance window opens.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        before_authorized = _authorized_keys_text(env)
+        before_helpers = {
+            kind: _boundary_helper(env, kind).read_text(encoding="utf-8")
+            for kind in BOUNDARY_KINDS
+        }
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(
+            dict(env.env, HUBINET_OPS_TEST_FAIL_BOUNDARY_INSTALLED_HELPER_STATE="1"),
+            _base_args(target),
+        )
+
+        assert result.returncode != 0
+        assert "could not positively classify" in result.stderr
+        assert _authorized_keys_text(env) == before_authorized
+        for kind in BOUNDARY_KINDS:
+            assert _boundary_helper(env, kind).read_text(encoding="utf-8") == (
+                before_helpers[kind]
+            ), kind
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert not journal.exists()
+
+    def test_a_non_regular_installed_helper_fails_closed_not_absent(self, tmp_path):
+        """A directory sitting where a helper file should be is UNKNOWN,
+        never ABSENT -- classifying it "absent" would stage a fresh
+        provision on top of whatever that directory actually is."""
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        helper = _boundary_helper(env, "health")
+        before_authorized = _authorized_keys_text(env)
+        helper.unlink()
+        helper.mkdir()
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not positively classify" in result.stderr
+        assert _authorized_keys_text(env) == before_authorized
+        assert helper.is_dir()
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert not journal.exists()
+
+    def test_a_stat_failure_on_the_boundary_key_refuses_to_generate_a_new_one(
+        self, tmp_path
+    ):
+        """_update_boundary_create_key must never generate a new key while
+        it cannot positively prove none already exists at that path --
+        doing so on a false ABSENT could silently overwrite key material
+        an existing authorization trusts. Pre-activation, so this is also
+        the "no new privileged access path" witness: the failed run must
+        leave nothing behind for ANY of the five boundaries.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        before_authorized = _authorized_keys_text(env)
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["boundary_key_stat_failure"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "refusing to generate a new key while its state is unproven" in (
+            result.stderr
+        )
+        assert _authorized_keys_text(env) == before_authorized
+        for kind in BOUNDARY_KINDS:
+            assert not _boundary_helper(env, kind).exists(), kind
+            assert not env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+
+    def test_a_stat_failure_on_the_rollback_copy_hard_stops_instead_of_guessing(
+        self, tmp_path
+    ):
+        """The confirmed P1 sibling: the OLD `[[ -e "${rollback_copy}" ]]`
+        branch selector could not distinguish "genuinely absent" from
+        "could not be inspected". A false negative there fell through to
+        the "already restored" replay branch, which only checks whether
+        the LIVE path is SOME executable regular file -- and on a genuine
+        first rollback attempt, the live path still holds the NEW
+        (post-activation) helper at that point, which passes that check
+        too. Rollback would then silently believe this boundary was fully
+        undone while the target helper stayed live.
+
+        Reached via a real two-invocation restart (HUBINET_OPS_TEST_KILL_AT)
+        rather than the in-process EXIT trap, so the rollback_copy this
+        run created is genuinely durable on disk before the second
+        invocation's classification of it is faulted.
+
+        The fault itself (HUBINET_OPS_TEST_FAIL_BOUNDARY_ROLLBACK_COPY_
+        STATE, consulted only under HUBINET_OPS_TEST_MODE=1) is a real
+        EACCES/stat-failure witness for `_update_boundary_helper_path_
+        state` in isolation -- see
+        tests/test_update_boundary_path_classification.py -- but genuine
+        directory-permission denial cannot be used HERE: rollback_copy
+        lives in the SAME shared /usr/local/libexec directory as the
+        package-scan helper update-ownership.sh's own (unrelated, always-
+        checked) re-verification depends on, so blocking that directory
+        would trip ownership re-verification before recovery ever reaches
+        this classifier at all.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            boundary_helper_text={"mutation": "#!/usr/bin/env python3\n# stale\n"},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(
+            dict(env.env, HUBINET_OPS_TEST_KILL_AT="boundary-replaced-mutation"),
+            _base_args(target),
+        )
+        assert crashed.returncode < 0, crashed.stderr  # killed by a real signal
+
+        live = _boundary_helper(env, "mutation")
+        libexec = live.parent
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        journal_text = journal.read_text(encoding="utf-8")
+        run_id = _journal_run_id(journal_text)
+        rollback_copy = libexec / f"{live.name}.rollback-{run_id}"
+        assert rollback_copy.is_file(), "the fixture: preserved before the kill"
+        target_content = live.read_text(encoding="utf-8")
+        assert target_content != rollback_copy.read_text(encoding="utf-8")
+
+        recovery = _run(
+            dict(env.env, HUBINET_OPS_TEST_FAIL_BOUNDARY_ROLLBACK_COPY_STATE="1"),
+            _base_args(target),
+        )
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in recovery.stderr
+        assert "could not be positively classified" in recovery.stderr
+        # Never silently accepted as "already restored": the target
+        # content is still live, and the journal survives for a real retry.
+        assert live.read_text(encoding="utf-8") == target_content
+        assert journal.exists()
+
+        # The fault clears; a later invocation genuinely restores the
+        # preserved pre-update content.
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert not journal.exists()
+        assert live.read_text(encoding="utf-8") == "#!/usr/bin/env python3\n# stale\n"
+
+    def test_a_stat_failure_on_the_config_backup_hard_stops_the_rollback(
+        self, tmp_path
+    ):
+        """update_boundaries_rollback's config-restore step must never
+        proceed past a preserved-backup existence check it cannot
+        positively answer -- a false ABSENT there already hard-stops (the
+        message just used to claim "absent" even when it was really
+        unproven); this proves the UNKNOWN path is genuinely reached and
+        still hard-stops, never silently treated as EXISTS either.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["boundary_config_backup_stat_failure"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "could not be positively classified" in result.stderr
+        # The hard stop happens BEFORE the restore is even attempted: the
+        # live configuration still activates the lifecycle, exactly as
+        # activation itself left it -- never silently treated as restored.
+        assert "package_update:" in env.ct_file_text(
+            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Family 1 (correction pass) -- durable run ownership for package-update
+# boundary artifacts. update_journal_checkpoint used to persist a ledger
+# marker only when its id matched VMID exactly, silently dropping every
+# "update-boundary-created <kind>", "update-boundary-activated <kind>", and
+# "update-boundary-journal-created <path>" marker from the ON-DISK journal
+# even though update_journal_record was called for each -- so a real
+# process/PVE restart mid-activation could not reconstruct which boundary
+# artifacts the interrupted run owned. HUBINET_OPS_TEST_KILL_AT delivers a
+# genuine, untrappable SIGKILL (see _update_test_kill_checkpoint's own
+# docstring) so these tests exercise a REAL restart -- a fresh second
+# invocation reloading the journal from disk -- rather than the EXIT trap's
+# own in-process rollback (which already had the ephemeral ledger intact
+# and would mask this bug).
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Family B (correction pass) -- the in-place updater must prove the same
+# end-to-end usability of all five package-update forced-command boundaries
+# that fresh bootstrap already proves (bootstrap-update-boundaries.sh's own
+# _accept_update_boundaries) before it may declare the target accepted.
+# update_boundaries_accept_all uses the SAME non-mutating structured-
+# refusal probe (bootstrap-host-control.sh's shared
+# _host_control_probe_forced_command_boundary), against THIS installation's
+# own active endpoint values rather than bootstrap's defaults.
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryAcceptanceParity:
+    @pytest.mark.parametrize("kind", BOUNDARY_KINDS)
+    def test_each_boundary_failing_acceptance_fails_the_update(self, tmp_path, kind):
+        """Every one of the five boundaries is independently load-bearing:
+        a helper/key/authorization that exists but does not actually work
+        end to end must still fail the update, before the source marker
+        and before final acceptance, and roll back to the prior supported
+        installation -- exactly as though the boundary had never been
+        provisioned. Boundaries themselves are UNCHANGED here (an ordinary
+        code-only update): only the new acceptance probe touches them.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        before_marker = env.ct_file_text(
+            FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit"
+        ).strip()
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = [f"boundary_probe_{kind}"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert (
+            f"the {kind} forced-command SSH boundary did not reject the "
+            "typed acceptance probe as expected"
+        ) in result.stderr
+        assert "rollback complete" in result.stderr
+        # Before source marker / final acceptance: the pre-update marker
+        # survives untouched.
+        assert env.ct_file_text(
+            FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit"
+        ).strip() == before_marker
+        # The probe triggers no real destructive operation of any kind.
+        for journal_dir in UPDATE_BOUNDARY_JOURNAL_DIRS:
+            assert list(env.ct_file(FAKE_VMID, journal_dir).glob("*")) == []
+
+    def test_non_default_endpoint_is_used_for_the_acceptance_probe(self, tmp_path):
+        """host/port/user/known_hosts_path come from THIS installation's
+        own now-active package_update.host_control, never bootstrap's
+        root@22 defaults -- an already-running installation may have an
+        explicit, non-default configured endpoint."""
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        inventory_path = env.ct_file(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        inventory_path.write_text(
+            'source:\n'
+            '  display_name: "Home Proxmox"\n'
+            '  provider_kind: proxmox_ve\n'
+            "\npackage_scan:\n"
+            "  interval_seconds: 21600\n"
+            "  initial_delay_seconds: 30\n"
+            "  host_control:\n"
+            '    host: "pve.example.internal"\n'
+            "    port: 2222\n"
+            '    user: "svc-deploy"\n'
+            '    private_key_path: "/etc/hubinet-ops/host-control/id_ed25519"\n'
+            '    known_hosts_path: "/custom/known_hosts"\n'
+            "    timeout_seconds: 900\n"
+            "    max_result_bytes: 8388608\n",
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+        before_lines = len(env.log_lines())
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        probe_lines = [
+            line
+            for line in env.log_lines()[before_lines:]
+            if "runuser" in line and "ssh" in line and "id_ed25519_" in line
+        ]
+        assert len(probe_lines) == len(BOUNDARY_KINDS)
+        for line in probe_lines:
+            assert "svc-deploy@pve.example.internal" in line, line
+            assert " -p 2222 " in line, line
+            assert "UserKnownHostsFile=/custom/known_hosts" in line, line
+
+    def test_package_scan_boundary_acceptance_is_unaffected(self, tmp_path):
+        """The pre-existing, separate package-scan acceptance
+        (_update_accept_host_control) is untouched by this correction
+        pass: it still succeeds and still runs, independent of the five
+        package-update boundaries' own new acceptance."""
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert any(
+            "runuser" in line and "ssh" in line and "id_ed25519_" not in line
+            for line in env.log_lines()
+        )
+
+
+class TestBoundaryRecoveryOwnershipAcrossRestart:
+    def test_a_restart_after_helper_install_still_removes_the_orphaned_helper(
+        self, tmp_path
+    ):
+        """F1-A/F1-B. Helper installed, no key or authorization yet, then a
+        genuine crash and restart. The durable "update-boundary-created"
+        marker must survive to let recovery know this helper belongs to the
+        interrupted run -- and remove it -- rather than leaving a root-owned
+        helper with no key/authorization behind forever, or (worse) later
+        being misread as an already-healthy, unchanged boundary.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        env_with_kill = dict(
+            env.env, HUBINET_OPS_TEST_KILL_AT="boundary-helper-installed-snapshot"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(env_with_kill, _base_args(target))
+        assert crashed.returncode < 0, crashed.stderr  # killed by a real signal
+
+        helper = _boundary_helper(env, "snapshot")
+        assert helper.exists(), "the fixture: helper installed before the kill"
+        assert not env.ct_file(FAKE_VMID, boundary_key_ct_path("snapshot")).exists()
+
+        recovery = _run(env.env, _base_args(target))
+
+        # A genuine restart's own recovery invocation exits 0 once the
+        # PREVIOUS run's rollback is proven complete -- it is this new
+        # invocation that succeeds at recovering, not a failing update.
+        assert recovery.returncode == 0, recovery.stderr
+        assert "rollback complete" in recovery.stderr
+        # The orphaned helper -- installed by the interrupted run, with no
+        # key or authorization -- is gone.
+        assert not helper.exists()
+        for kind in BOUNDARY_KINDS:
+            assert not env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+        assert f"hubinet-ops-package-snapshot-vmid-{FAKE_VMID}-" not in (
+            _authorized_keys_text(env)
+        )
+        # And nothing this run never touched (kinds after "snapshot" in
+        # iteration order were never even attempted) was disturbed either.
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert not journal.exists()
+
+    def test_a_restart_after_replacement_restores_the_exact_old_helper(
+        self, tmp_path
+    ):
+        """F1-D. Old helper preserved, staged target moved live, then a
+        genuine crash and restart. The durable "update-boundary-activated"
+        marker for a REPLACED (not newly created) boundary must survive so
+        recovery restores the exact preserved pre-update content rather than
+        leaving the NEW target content live with no rollback ever having run
+        against it.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            boundary_helper_text={"mutation": "#!/usr/bin/env python3\n# stale\n"},
+        )
+        env_with_kill = dict(
+            env.env, HUBINET_OPS_TEST_KILL_AT="boundary-replaced-mutation"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(env_with_kill, _base_args(target))
+        assert crashed.returncode < 0, crashed.stderr
+
+        helper = _boundary_helper(env, "mutation")
+        target_content = (
+            REPO_ROOT / "deploy" / "hubinet-package-mutation-helper.py"
+        ).read_text(encoding="utf-8")
+        assert helper.read_text(encoding="utf-8") == target_content, (
+            "the fixture: the new content is already live before the kill"
+        )
+
+        recovery = _run(env.env, _base_args(target))
+
+        # A genuine restart's own recovery invocation exits 0 once the
+        # PREVIOUS run's rollback is proven complete -- it is this new
+        # invocation that succeeds at recovering, not a failing update.
+        assert recovery.returncode == 0, recovery.stderr
+        assert "rollback complete" in recovery.stderr
+        assert helper.read_text(encoding="utf-8") == "#!/usr/bin/env python3\n# stale\n"
+        for kind, source_name in UPDATE_BOUNDARY_HELPERS:
+            if kind == "mutation":
+                continue
+            assert _boundary_helper(env, kind).read_text(encoding="utf-8") == (
+                REPO_ROOT / "deploy" / source_name
+            ).read_text(encoding="utf-8"), kind
+
+    def test_a_restart_after_config_write_restores_it_before_deleting_keys(
+        self, tmp_path
+    ):
+        """F1-C. Every boundary fully created (helper + key + authorization),
+        the pre-activation config preserved and durable, and the NEW
+        activated config already live -- then a genuine crash and restart.
+        Recovery must restore the pre-activation configuration AND remove
+        every created boundary's helper, key, and authorization: the
+        "update-boundary-created"/"update-boundary-activated" markers for
+        all five kinds, and the "update-boundary-config-activated" marker,
+        must all have survived the restart for this to be possible at all.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        before_inventory = env.ct_file_text(
+            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
+        )
+        env_with_kill = dict(
+            env.env, HUBINET_OPS_TEST_KILL_AT="boundary-config-written"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(env_with_kill, _base_args(target))
+        assert crashed.returncode < 0, crashed.stderr
+
+        inventory_after_crash = env.ct_file_text(
+            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
+        )
+        assert "package_update:" in inventory_after_crash, (
+            "the fixture: the new config is already live before the kill"
+        )
+        for kind in BOUNDARY_KINDS:
+            assert _boundary_helper(env, kind).exists(), kind
+            assert env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+
+        recovery = _run(env.env, _base_args(target))
+
+        # A genuine restart's own recovery invocation exits 0 once the
+        # PREVIOUS run's rollback is proven complete -- it is this new
+        # invocation that succeeds at recovering, not a failing update.
+        assert recovery.returncode == 0, recovery.stderr
+        assert "rollback complete" in recovery.stderr
+        restored = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        assert restored == before_inventory
+        assert "package_update:" not in restored
+        authorized = _authorized_keys_text(env)
+        for kind in BOUNDARY_KINDS:
+            assert not _boundary_helper(env, kind).exists(), kind
+            assert not env.ct_file(
+                FAKE_VMID, boundary_key_ct_path(kind)
+            ).exists(), kind
+            assert f"hubinet-ops-package-{kind}-vmid-{FAKE_VMID}-" not in authorized
+
+    def test_a_successful_upgrade_leaves_no_run_owned_staging_residue(
+        self, tmp_path
+    ):
+        """F1-E. Terminal cleanup sibling: after a successful upgrade, no
+        run-owned `.staged-<run>` / `.rollback-<run>` / `.restore-tmp-<run>`
+        boundary artifact remains on the PVE host filesystem.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        helper_dir = _host_root(env) / "usr" / "local" / "libexec"
+        residue = [
+            path
+            for path in helper_dir.glob("hubinet-package-*-boundary-*")
+            if ".staged-" in path.name
+            or ".rollback-" in path.name
+            or ".restore-tmp-" in path.name
+        ]
+        assert residue == []
+
+    def test_an_invalid_boundary_marker_id_fails_journal_load_closed(
+        self, tmp_path
+    ):
+        """Regression pin for the shared read/write validator itself: an
+        on-disk journal ledger line naming an id outside the closed set a
+        marker kind can legally carry must fail journal load closed,
+        exactly like any other malformed journal content -- never silently
+        accepted as a fifth, unknown boundary kind.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+
+        text = journal.read_text(encoding="utf-8")
+        assert "ledger=update-boundary-created snapshot" in text
+        corrupted = text.replace(
+            "ledger=update-boundary-created snapshot",
+            "ledger=update-boundary-created not-a-real-kind",
+        )
+        journal.write_text(corrupted, encoding="utf-8")
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "invalid rollback marker" in result.stderr
+        assert journal.exists()
+
+
+class TestActiveWorkloadJobRefusesTheUpdater:
+    """The activation invariant: an in-flight workload update fences this."""
+
+    def test_an_active_job_refuses_before_any_mutation(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"update_probe_package_update_active": True},
+        )
+        before_authorized = _authorized_keys_text(env)
+        before_unit = env.ct_file_text(
+            FAKE_VMID, "/etc/systemd/system/hubinet-ops.service"
+        )
+        state_before = env.state()
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "refusing to update: package update job" in result.stderr
+        # Refused in Phase U2, so nothing was staged, stopped, or replaced.
+        assert "Phase U3" not in result.stdout
+        assert _authorized_keys_text(env) == before_authorized
+        assert env.ct_file_text(
+            FAKE_VMID, "/etc/systemd/system/hubinet-ops.service"
+        ) == before_unit
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert state_before["vmids"][FAKE_VMID] == env.state()["vmids"][FAKE_VMID]
+
+    def test_no_active_job_proceeds_normally(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert "Active workload update job:    none" in result.stdout
+
+    def test_an_unanswerable_active_job_question_also_refuses(self, tmp_path):
+        """"We could not ask" is never read as "the answer was no"."""
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "update_probe_package_update_unavailable": True
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "pre-update live probe failed" in result.stderr
+
+    def test_a_pre_activation_backend_without_the_route_is_not_fenced(
+        self, tmp_path
+    ):
+        """A backend that cannot own a workload job has nothing to fence.
+
+        Read from the endpoint's real 404, never from a transport failure.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={"update_probe_package_update_absent": True},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# The exclusive product-update maintenance fence.
+#
+# The U2 probe answer is a courtesy. It cannot make a product update and a
+# workload update exclusive, because an operator may legitimately start one
+# between that answer and the first mutation. These tests pin the primitive
+# that does: the fence taken immediately before the mutation window, held
+# across the target service restart, and released only at a terminal point.
+# ---------------------------------------------------------------------------
+
+
+FENCE_CT_PATH = "/var/lib/hubinet-ops/product-update-maintenance.fence"
+
+
+def _fence_file(env):
+    return env.ct_file(FAKE_VMID, FENCE_CT_PATH)
+
+
+class TestProductUpdateMaintenanceFence:
+    def test_a_successful_update_takes_the_fence_and_releases_it(self, tmp_path):
+        """Witness E. Held across the whole mutation window, gone afterwards.
+
+        Release is terminal: only after acceptance passed and the `completed`
+        checkpoint is durable does workload issuance become legal again.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert "acquired the exclusive product-update maintenance fence" in result.stderr
+        assert "released the exclusive product-update maintenance fence" in result.stderr
+        assert not _fence_file(env).exists()
+
+    def test_the_fence_is_taken_only_after_every_harmless_refusal_has_passed(
+        self, tmp_path
+    ):
+        """A run that declines to proceed must not leave workload updates blocked.
+
+        The plan fence, the ownership recheck, and the CT durability preflight
+        can all still refuse harmlessly. Taking the maintenance fence before
+        them would block operator updates on behalf of a product update that
+        then did nothing at all.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"fail": ["ct_sync_preflight"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "acquired the exclusive product-update maintenance fence" not in result.stderr
+        assert not _fence_file(env).exists()
+
+    def test_a_workload_job_that_appears_before_the_mutation_window_refuses(
+        self, tmp_path
+    ):
+        """Witness C. The gap between the U2 answer and the first mutation.
+
+        The probe answered "no active job" at classification, and a workload
+        job exists by the time the updater reaches its mutation window. The
+        fence refuses, and it refuses BEFORE autostart is disabled or the
+        service is stopped -- so the existing installation is untouched.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                # The U2 courtesy check sees nothing...
+                "update_probe_package_update_active": False,
+                # ...and the atomic fence acquisition finds a job.
+                "workload_job_active": True,
+            },
+        )
+        before_unit = env.ct_file_text(
+            FAKE_VMID, "/etc/systemd/system/hubinet-ops.service"
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not take the exclusive product-update maintenance fence" in result.stderr
+        assert "Nothing has been changed" in result.stderr
+        # Refused before the first managed mutation: autostart never disabled,
+        # service never stopped, unit never replaced.
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert env.ct_file_text(
+            FAKE_VMID, "/etc/systemd/system/hubinet-ops.service"
+        ) == before_unit
+        assert not _fence_file(env).exists()
+
+    def test_a_failed_update_keeps_the_fence_until_rollback_is_proven(
+        self, tmp_path
+    ):
+        """Witness D/F. Fenced through the U5 window, released after rollback.
+
+        The target service is started in Step 10 and Phase U5 acceptance runs
+        afterwards, so the production update route is live in that window.
+        The fence is what stops a workload job being issued into it -- and it
+        is released only once the pre-update installation is restored,
+        running, and proven.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        # The acceptance failure came after the target started, so the fence
+        # was genuinely held across that window.
+        assert "acquired the exclusive product-update maintenance fence" in result.stderr
+        assert "rollback complete" in result.stderr
+        assert "released the exclusive product-update maintenance fence" in result.stderr
+        assert not _fence_file(env).exists()
+
+    def _pre_activation_env(self, tmp_path, **overrides):
+        """An installation whose backend has no fence route and no worker."""
+
+        scenario = {
+            "fence_route_absent": True,
+            "update_probe_package_update_absent": True,
+        }
+        scenario.update(overrides)
+        return seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides=scenario,
+        )
+
+    def test_a_pre_activation_update_still_establishes_the_durable_fence(
+        self, tmp_path
+    ):
+        """Witness B. The old backend has no fence route -- the fence is still taken.
+
+        "No race with the OLD backend" is not "no fence required for this
+        run". Step 10 starts the ACTIVATED target backend, whose
+        `/package-update` route is live while Phase U5 acceptance is still
+        running, so the fence has to exist before the mutation window and be
+        found already present the moment that target comes up.
+        """
+
+        env = self._pre_activation_env(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert "predates operator-triggered package updates" in result.stderr
+        assert "established the exclusive product-update maintenance fence directly" in (
+            result.stderr
+        )
+        # Witness D: released only after terminal success, and gone afterwards.
+        assert "released the exclusive product-update maintenance fence" in result.stderr
+        assert not _fence_file(env).exists()
+
+    def test_the_pre_activation_fence_exists_before_the_target_backend_starts(
+        self, tmp_path
+    ):
+        """Witness B/C, the ordering that makes the U5 window safe.
+
+        Interrupt the run after the target service has been started but
+        before acceptance is terminal, and assert the fence is already on
+        disk. That is precisely the window in which the activated backend's
+        update route is live and product rollback is still possible.
+        """
+
+        env = self._pre_activation_env(tmp_path, discovery_result="backend_unreachable")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        # Fail the rollback part-way so the run stops with the fence still
+        # held, letting the test observe the state that existed during U5.
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["ct_sync_app_restore"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "established the exclusive product-update maintenance fence directly" in (
+            result.stderr
+        )
+        # The service was started for acceptance, acceptance failed, and the
+        # fence was on disk throughout -- and still is, because this run can
+        # still be asked to roll back.
+        fence = _fence_file(env)
+        assert fence.exists()
+        assert "released the exclusive product-update maintenance fence" not in (
+            result.stderr
+        )
+
+    def test_a_failed_pre_activation_update_releases_only_after_proven_rollback(
+        self, tmp_path
+    ):
+        """Witness C. Rollback completes, and only then does the fence go."""
+
+        env = self._pre_activation_env(tmp_path, discovery_result="backend_unreachable")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "established the exclusive product-update maintenance fence directly" in (
+            result.stderr
+        )
+        assert "rollback complete" in result.stderr
+        assert "released the exclusive product-update maintenance fence" in result.stderr
+        assert not _fence_file(env).exists()
+
+    def test_a_pre_activation_run_never_steals_another_runs_fence(self, tmp_path):
+        """One product update at a time, on the direct path too."""
+
+        env = self._pre_activation_env(tmp_path)
+        fence = _fence_file(env)
+        fence.parent.mkdir(parents=True, exist_ok=True)
+        fence.write_text(
+            json.dumps({"acquired_at": "2026-01-01T00:00:00+00:00", "holder": "someone-else"}),
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not establish the exclusive product-update maintenance fence" in (
+            result.stderr
+        )
+        assert json.loads(fence.read_text())["holder"] == "someone-else"
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_an_unwritable_pre_activation_fence_refuses_before_any_mutation(
+        self, tmp_path
+    ):
+        """The positive control for the direct path's hard-fail.
+
+        Same fail-closed expectation as the backend-created fence: if it
+        cannot be made durable, the run refuses rather than proceeding
+        unfenced.
+        """
+
+        env = self._pre_activation_env(
+            tmp_path, **{"fail": ["pre_activation_fence_write"]}
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not establish the exclusive product-update maintenance fence" in (
+            result.stderr
+        )
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert not _fence_file(env).exists()
+
+    def test_a_foreign_fence_is_never_removed_by_a_terminal_run(self, tmp_path):
+        """Witness E, the half that must never happen.
+
+        Release is keyed off the fence's own recorded holder, so a run that
+        reaches a terminal point while some OTHER product update holds the
+        fence leaves it exactly where it is.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+        fence = _fence_file(env)
+
+        # A successful run acquires and releases its own fence...
+        first = _run(env.env, _base_args(target))
+        assert first.returncode == 0, first.stderr
+        assert not fence.exists()
+
+        # ...and a later run that finds a foreign fence refuses to take it,
+        # and never removes it either.
+        fence.parent.mkdir(parents=True, exist_ok=True)
+        fence.write_text(
+            json.dumps({"acquired_at": "2026-01-01T00:00:00+00:00", "holder": "someone-else"}),
+            encoding="utf-8",
+        )
+        second_target = build_update_target_checkout(tmp_path / "target2", REPO_ROOT)
+        second = _run(env.env, _base_args(second_target))
+
+        assert second.returncode != 0
+        assert json.loads(fence.read_text())["holder"] == "someone-else"
+
+    def test_a_fence_durable_before_its_bookkeeping_is_still_recoverable(
+        self, tmp_path
+    ):
+        """Witness E. The crash edge adjacent to acquisition.
+
+        The fence becomes durable before the acquiring call returns, so a
+        crash between "the fence exists" and "this run recorded that it holds
+        it" is reachable. Release is therefore keyed off the fence's OWN
+        recorded holder rather than this process's memory: the interrupted
+        run's journal carries the same run id, so its own recovery matches
+        them and releases it -- with no new durable state at all.
+
+        Modelled exactly: interrupt a run with its fence durable, then STRIP
+        the ownership marker from its journal before recovery runs. That is
+        the on-disk state such a crash leaves -- a fence that exists and a
+        journal that never recorded it -- and recovery must still release it.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
+        assert json.loads(fence.read_text())["holder"] == run_id
+
+        # The crash edge: the fence is durable, but this run never recorded
+        # that it owns it.
+        journal.write_text(
+            "\n".join(
+                line
+                for line in journal.read_text(encoding="utf-8").splitlines()
+                if "update-maintenance-fence-held" not in line
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        assert "update-maintenance-fence-held" not in journal.read_text(encoding="utf-8")
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        # Recovered by matching the fence's own recorded holder against the
+        # journal's run id -- no marker, no in-memory flag, no new state.
+        assert recovery.returncode == 0, recovery.stderr
+        assert "released the exclusive product-update maintenance fence" in (
+            recovery.stderr
+        )
+        assert not fence.exists()
+        assert not journal.exists()
+
+    def test_an_unanswerable_fence_request_refuses_before_any_mutation(
+        self, tmp_path
+    ):
+        """The positive control for the acquisition hard-fail path.
+
+        "We could not take the fence" is never "the fence was not needed".
+        An unreachable backend refuses the whole run, untouched.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"fence_unreachable": True},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not take the exclusive product-update maintenance fence" in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert not _fence_file(env).exists()
+
+    def test_a_foreign_fence_holder_refuses_rather_than_being_stolen(
+        self, tmp_path
+    ):
+        """One product update at a time.
+
+        A fence left by a crashed run is released by that run's own recovery,
+        never silently taken over by the next one.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        fence = _fence_file(env)
+        fence.parent.mkdir(parents=True, exist_ok=True)
+        fence.write_text(
+            json.dumps({"holder": "someone-else", "acquired_at": "2026-01-01T00:00:00+00:00"}),
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not take the exclusive product-update maintenance fence" in result.stderr
+        # Untouched: another run's fence is never removed by this one.
+        assert json.loads(fence.read_text())["holder"] == "someone-else"
+
+    def test_an_interrupted_fenced_run_keeps_the_fence_until_recovery_proves_it(
+        self, tmp_path
+    ):
+        """Witness G. A crash must not strand the fence, or release it early.
+
+        A run that fails and then hard-stops part-way through its own
+        rollback still owns rollback-capable state, so the fence MUST stay --
+        releasing it there would let a workload update start against an
+        installation the updater is still going to touch. The fence marker is
+        recovery-relevant, so it survives the journal reload, and the next
+        invocation's recovery releases exactly that run's fence only after
+        the pre-update installation is restored and proven.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+
+        assert interrupted.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in interrupted.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        # Still fenced: this run can still be asked to replace backend and
+        # helper material, so workload issuance must stay refused.
+        assert _fence_file(env).exists()
+        assert "released the exclusive product-update maintenance fence" not in (
+            interrupted.stderr
+        )
+
+        # The transient restore failure clears; the next invocation recovers.
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert "rollback complete" in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" in (
+            recovery.stderr
+        )
+        assert not journal.exists()
+        assert not _fence_file(env).exists()
+
+    # -----------------------------------------------------------------
+    # Family 3A (correction pass) -- a fence READ that cannot be
+    # positively answered must never be treated as ABSENT.
+    # -----------------------------------------------------------------
+
+    def test_an_unknown_fence_read_never_reports_release(self, tmp_path):
+        """F3-A. A transport failure reading the fence is UNKNOWN, not ABSENT.
+
+        Seed a same-run live fence, then inject a failure ONLY into the
+        fence-read probe (`pct exec ... sh -c '... printf EXISTS/ABSENT
+        ...'`), while every other CT operation the terminal path needs
+        still succeeds. The OLD code folded that failed read straight into
+        `raw=""`, indistinguishable from a positively empty read of a
+        genuinely absent fence -- so a following `sync -f` could falsely
+        "prove" release while the fence, for all this run actually knows,
+        still exists. The fix must instead fail closed: no release claim,
+        the fence and the journal both survive, and a later invocation
+        (once the fault clears) still recovers cleanly.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        # Let the run reach its terminal rollback point once, fenced and
+        # recorded, then hard-stop rollback part-way so the fence and
+        # journal both survive for the next invocation to recover.
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
+        assert json.loads(fence.read_text())["holder"] == run_id
+
+        # Now let rollback itself succeed, but make the fence-read probe
+        # specifically fail -- an UNKNOWN answer, never ABSENT.
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_read_transport"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        assert "could not be read" in recovery.stderr
+        assert journal.exists()
+        assert fence.exists()
+        assert json.loads(fence.read_text())["holder"] == run_id
+
+        # The fault clears; the next invocation reads EXISTS + same holder
+        # and completes the release normally.
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovered = _run(env.env, _base_args(target))
+
+        assert recovered.returncode == 0, recovered.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+
+    def test_an_attach_failure_exiting_exactly_one_is_never_read_as_absent(
+        self, tmp_path
+    ):
+        """Family 3A micro-correction: the outer exit status alone can
+        never mean ABSENT, even when it is exactly the value a legitimate
+        remote answer would also produce.
+
+        `pct exec` ultimately attaches to the container (e.g. via
+        lxc-attach), and an ATTACH failure -- the remote probe never
+        running at all -- can itself surface as a generic, unremarkable
+        outer exit status 1. An earlier version of this fix read the
+        fence-probe's OWN exit status directly (0=exists, 1=absent), which
+        could not tell that apart from a genuine "absent" answer. The
+        fix instead never trusts the outer exit status for the answer at
+        all: only exit 0 plus an exact "EXISTS"/"ABSENT" token counts, so
+        any nonzero outer status -- 1 included -- is UNKNOWN and fails
+        closed, exactly like the transport-failure witness above.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
+        assert json.loads(fence.read_text())["holder"] == run_id
+        fence_content_before = fence.read_text(encoding="utf-8")
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_read_attach_exit_1"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        assert "could not be read" in recovery.stderr
+        assert journal.exists()
+        assert fence.exists()
+        assert fence.read_text(encoding="utf-8") == fence_content_before
+
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovered = _run(env.env, _base_args(target))
+
+        assert recovered.returncode == 0, recovered.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+
+    def test_a_malformed_probe_token_is_never_read_as_either_answer(
+        self, tmp_path
+    ):
+        """The remote probe itself ran (outer exit 0) but printed neither
+        exact "EXISTS" nor "ABSENT" token -- a truncated read or any other
+        corruption of its output. Still UNKNOWN, never guessed either way.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+        fence_content_before = fence.read_text(encoding="utf-8")
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_read_malformed_token"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        assert "could not be read" in recovery.stderr
+        assert journal.exists()
+        assert fence.exists()
+        assert fence.read_text(encoding="utf-8") == fence_content_before
+
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovered = _run(env.env, _base_args(target))
+
+        assert recovered.returncode == 0, recovered.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+
+    def test_a_genuine_non_enoent_stat_failure_is_unknown_not_absent(
+        self, tmp_path
+    ):
+        """P1 correction pass: a fence that genuinely EXISTS, but whose
+        in-container metadata inspection fails for a reason OTHER than
+        ENOENT (EACCES, EIO, ...), must classify UNKNOWN -- never ABSENT.
+
+        `[ -e "$1" ]` could not tell "positively absent" apart from "could
+        not be inspected"; both evaluated to the same false result. The
+        fix delegates the in-container classification to python3's
+        os.lstat, which raises FileNotFoundError SPECIFICALLY for ENOENT
+        and any other OSError for every other failure. This exercises
+        that real ENOENT-vs-other-OSError distinction (not merely
+        injecting a final UNKNOWN state variable): the fence file is
+        still genuinely present on the fake CT filesystem throughout, and
+        only the stat-classification step itself is faulted.
+
+        Required outcome: the classifier reports UNKNOWN, release is
+        refused, the journal is preserved, and UPDATE_FENCE_HELD is never
+        cleared as a success -- exactly the same fail-closed shape as the
+        sibling outer-transport/attach/malformed-token witnesses above.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
+        assert json.loads(fence.read_text())["holder"] == run_id
+        fence_content_before = fence.read_text(encoding="utf-8")
+
+        # The fence file is genuinely still present on disk the whole
+        # time -- only the in-container stat/lstat classification of it
+        # is faulted, modelling a real EACCES/EIO rather than the file
+        # having been removed.
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_read_stat_failure"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        assert "could not be read" in recovery.stderr
+        # Journal preserved, fence untouched -- UPDATE_FENCE_HELD is never
+        # cleared as though release had succeeded.
+        assert journal.exists()
+        assert fence.exists()
+        assert fence.read_text(encoding="utf-8") == fence_content_before
+        assert json.loads(fence.read_text())["holder"] == run_id
+
+        # The fault clears; a later invocation reads the still-genuine
+        # EXISTS answer and completes the release normally.
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovered = _run(env.env, _base_args(target))
+
+        assert recovered.returncode == 0, recovered.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+
+    def test_an_existing_empty_fence_is_never_read_as_absent(self, tmp_path):
+        """F3-C. An existing-but-empty fence file is EXISTS, not ABSENT.
+
+        The old code equated `raw=""` (nothing read) with absence
+        regardless of WHY nothing was read. An existing zero-length fence
+        is a distinct, reachable state -- a partially-written file, or a
+        write that never got past `open()` -- and must fail closed exactly
+        like any other unreadable/malformed EXISTS content, never be
+        treated as "nothing to release".
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_app_restore"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and fence.exists()
+
+        # Let the rest of rollback succeed on the next invocation; only the
+        # fence's own on-disk content is under test now.
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        # The crash edge under test: the fence exists on disk but is
+        # entirely empty -- never produced by any code path here, but
+        # reachable from a real partial write, and classification must
+        # not guess it away as absence.
+        fence.write_text("", encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        assert "unreadable" in recovery.stderr
+        assert journal.exists()
+        assert fence.exists()
+        assert fence.read_text(encoding="utf-8") == ""
+
+
+# ---------------------------------------------------------------------------
+# PR #74 review finding 2 -- the maintenance fence must be positively
+# released BEFORE the recovery journal carrying this run's identity is
+# ever discarded, in every terminal/recovered ordering, and
+# `_update_release_maintenance_fence` itself must report a TRUTHFUL result
+# (never a warn-and-continue "released" claim over a failed `rm` or a
+# skipped durability barrier).
+#
+# The crash edge under test: journal cleared before the fence it still
+# names is released would leave a durable fence with no journal left to
+# reconnect it to (the fence's own recorded holder becomes unmatchable),
+# permanently refusing every future workload package update. These tests
+# pin the fixed ordering directly at the two new test-only TERM
+# checkpoints (`before_recovery_fence_release`, `after_recovery_fence_
+# release`) that bracket the release call in every terminal recovery path,
+# plus the release function's own truthful failure modes.
+# ---------------------------------------------------------------------------
+
+
+class TestFenceReleasedBeforeJournalDisposal:
+    def _completed_but_uncleaned(self, tmp_path):
+        """One run TERMed immediately after `completed` is durable, before
+        its own fence release even starts.
+
+        The checkpoint is durable, but this run's cleanup, fence release,
+        and journal clear never ran. The fence this run acquired before
+        mutation is therefore still on disk, unreleased, and the journal
+        still names this run's own id -- the fixture every test below
+        recovers from via `update_startup_recovery_gate`'s own completed/
+        recovered branch.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="before_completed_fence_release")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+        interrupted = _run(env_with_term, _base_args(target))
+        assert interrupted.returncode == 143
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists() and "state=completed" in journal.read_text(encoding="utf-8")
+        assert fence.exists()
+        return env, target, journal, fence
+
+    def test_recovery_releases_the_fence_before_clearing_its_journal(self, tmp_path):
+        """Positive control: the fixed order completes cleanly.
+
+        No fault, no interruption -- ordinary recovery of a leftover
+        `completed` journal releases the fence and only then clears the
+        journal, ending with neither artifact on disk.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert "released the exclusive product-update maintenance fence" in recovery.stderr
+        assert "was already completed" in recovery.stderr
+        assert not fence.exists()
+        assert not journal.exists()
+
+    def test_crash_after_fence_release_but_before_journal_clear_still_recovers(
+        self, tmp_path
+    ):
+        """Witness for the finding itself: interrupt EXACTLY the closed edge.
+
+        A real crash landing between "fence release is durably proven" and
+        "the journal is cleared" must leave the journal on disk (it is the
+        only record of this run's identity), but the fence must already be
+        gone -- and a THIRD invocation must still complete cleanly: the
+        fence is already absent (a legitimate no-op release), so only the
+        journal is left to clear.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_recovery_fence_release")
+
+        crashed = _run(env_with_term, _base_args(target))
+
+        assert crashed.returncode == 143
+        assert "released the exclusive product-update maintenance fence" in crashed.stderr
+        # The fix: the fence is gone, but the journal -- the only durable
+        # record of this run's identity -- was deliberately NOT yet
+        # cleared when the crash landed.
+        assert not fence.exists()
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not journal.exists()
+
+    def test_crash_before_fence_release_leaves_both_fence_and_journal(self, tmp_path):
+        """The other side of the same edge: interrupted before release even
+        starts. Both artifacts must survive, exactly as they would have
+        under the OLD buggy ordering too -- this is the ordering the fix
+        must not regress, not the one it corrects.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="before_recovery_fence_release")
+
+        crashed = _run(env_with_term, _base_args(target))
+
+        assert crashed.returncode == 143
+        assert "released the exclusive product-update maintenance fence" not in (
+            crashed.stderr
+        )
+        assert fence.exists()
+        assert journal.exists()
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not fence.exists()
+        assert not journal.exists()
+
+    def test_a_failed_fence_removal_never_rolls_back_and_retains_both_artifacts(
+        self, tmp_path
+    ):
+        """Required test 5/6 (rm failure): truthful release, not a warning.
+
+        `_update_release_maintenance_fence` must not claim success over a
+        failed `rm`. The already-proven `completed` installation is never
+        rolled back, the journal and the (untouched, still valid) fence
+        both survive, and the next invocation -- once the fault clears --
+        completes normally.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        fence_content_before = fence.read_text(encoding="utf-8")
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_release_rm"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        failed = _run(env.env, _base_args(target))
+
+        assert failed.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in failed.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            failed.stderr
+        )
+        assert journal.exists() and "state=completed" in journal.read_text(encoding="utf-8")
+        assert fence.exists()
+        # Untouched, not merely present -- a corrupted-but-present fence
+        # could never be retried successfully.
+        assert fence.read_text(encoding="utf-8") == fence_content_before
+
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not fence.exists()
+        assert not journal.exists()
+
+    def test_a_failed_durability_proof_never_rolls_back_and_retains_both_artifacts(
+        self, tmp_path
+    ):
+        """Required test 6, tightened for the durability-retry sibling: the
+        barrier itself, not just the `rm`, must be proven before release is
+        ever claimed -- and that stays true even once the `rm` has already
+        succeeded and the fence has already vanished from disk, across
+        however many retries the barrier itself keeps failing.
+
+        Witnesses, in order:
+
+        1. same-run fence exists, `rm` succeeds, the barrier fails: the
+           fence is already gone from disk, but release is NOT reported,
+           and the journal survives;
+        2. a second invocation, with the SAME fault still active, finds the
+           fence already ABSENT -- and must still positively perform (not
+           skip) the same durability barrier, fail it again, and again
+           preserve the journal without a false release;
+        3. only once the fault clears does a third invocation's barrier
+           finally succeed and the journal clear.
+        """
+
+        SYNC_LINE = f"pct exec {FAKE_VMID} -- sync -f /var/lib/hubinet-ops"
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["ct_sync_final_authority_dir"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        # --- 1: rm succeeds, the barrier that must follow it fails -------
+        first = _run(env.env, _base_args(target))
+
+        assert first.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in first.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            first.stderr
+        )
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+        # The `rm` itself already succeeded -- the fence is genuinely gone
+        # from disk -- even though the barrier that must follow it before
+        # release may be CLAIMED has not yet been proven.
+        assert not fence.exists()
+        sync_calls_after_first = env.log_lines().count(SYNC_LINE)
+        assert sync_calls_after_first >= 1
+
+        # --- 2: fence now reads ABSENT; the barrier must still run, and --
+        # --- still fails (same fault, still active) ----------------------
+        second = _run(env.env, _base_args(target))
+
+        assert second.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in second.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            second.stderr
+        )
+        assert "durably proven" in second.stderr
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+        assert not fence.exists()
+        # The load-bearing witness: an ABSENT fence must not short-circuit
+        # release without re-attempting the barrier. A second, genuinely
+        # NEW `sync -f /var/lib/hubinet-ops` call was issued this
+        # invocation -- the fix is not merely returning success for
+        # "nothing to remove".
+        sync_calls_after_second = env.log_lines().count(SYNC_LINE)
+        assert sync_calls_after_second > sync_calls_after_first
+
+        # --- 3: fault clears; the (still-absent-fence) barrier finally ---
+        # --- succeeds, and only then does the journal clear --------------
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+        sync_calls_after_recovery = env.log_lines().count(SYNC_LINE)
+        assert sync_calls_after_recovery > sync_calls_after_second
+        assert not fence.exists()
+
+    def test_a_malformed_fence_fails_closed_without_a_false_release(self, tmp_path):
+        """Required test 8: unreadable/malformed content is never read as
+        "nothing to release" -- it fails closed, exactly like a real
+        removal or durability failure, never a silent successful no-op.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        fence.write_text("not valid json at all", encoding="utf-8")
+
+        failed = _run(env.env, _base_args(target))
+
+        assert failed.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in failed.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            failed.stderr
+        )
+        assert "unreadable" in failed.stderr
+        assert journal.exists()
+        assert fence.exists()
+        assert fence.read_text(encoding="utf-8") == "not valid json at all"
+
+    def test_a_foreign_fence_found_during_recovery_is_never_removed(self, tmp_path):
+        """Required test 7: a fence some OTHER product update now holds is
+        never deleted on this run's behalf, and this run's own recovery
+        still completes -- it owes nothing to a fence that is not its own.
+        """
+
+        env, target, journal, fence = self._completed_but_uncleaned(tmp_path)
+        fence.write_text(
+            json.dumps(
+                {"acquired_at": "2026-01-01T00:00:00+00:00", "holder": "someone-else"}
+            ),
+            encoding="utf-8",
+        )
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert "held by another product update" in recovery.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            recovery.stderr
+        )
+        # Never removed, never overwritten.
+        assert json.loads(fence.read_text(encoding="utf-8"))["holder"] == "someone-else"
+        # This run owed nothing to a fence it never held -- its OWN
+        # recovery still completes and its own journal is still cleared.
+        assert not journal.exists()
+
+    def test_rollback_recovery_also_releases_the_fence_before_clearing_its_journal(
+        self, tmp_path
+    ):
+        """The same ordering fix, on `update_rollback_on_failure`'s own
+        terminal path (reached directly from a failed forward update, and
+        from startup recovery's rollback-armed branch alike).
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_recovery_fence_release")
+
+        crashed = _run(env_with_term, _base_args(target))
+
+        assert crashed.returncode == 143
+        assert "released the exclusive product-update maintenance fence" in crashed.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert not fence.exists()
+        assert journal.exists()
+        assert "state=recovered" in journal.read_text(encoding="utf-8")
+
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert not journal.exists()
+
+
+# ---------------------------------------------------------------------------
+# Family 3B (correction pass) -- the specific reachable window this family
+# closes: the maintenance fence is durably held, but the rollback boundary
+# (autostart-disable, the first mutation) has not yet been attempted. A
+# failure/TERM here takes the EXIT trap's "existing installation was never
+# touched" path, which resolves through update_journal_resolve rather than
+# update_rollback_on_failure -- and that helper used to clear the journal
+# without ever releasing the fence it may still owe.
+# ---------------------------------------------------------------------------
+
+
+class TestFenceAcquiredBeforeRollbackBoundaryCrossed:
+    def test_term_after_fence_acquired_releases_before_clearing_the_journal(
+        self, tmp_path
+    ):
+        """F3-D. The witness for the finding itself.
+
+        TERM lands after the maintenance fence is durably held but before
+        any rollback-boundary mutation is attempted. The exit trap proves
+        the untouched service healthy and resolves through
+        update_journal_resolve -- which must release the fence before
+        discarding the journal, all within this same interrupted
+        invocation.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        env_with_term = dict(
+            env.env,
+            HUBINET_OPS_TEST_TERM_AT="after_fence_acquired_before_autostart_disable",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(env_with_term, _base_args(target))
+
+        assert crashed.returncode == 143
+        assert "acquired the exclusive product-update maintenance fence" in crashed.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in crashed.stderr
+        assert "released the exclusive product-update maintenance fence" in crashed.stderr
+        # Untouched: no boundary mutation was ever attempted, so nothing
+        # here is a rollback -- just proven-healthy recovery.
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert not journal.exists()
+        assert not fence.exists()
+
+    def test_a_failed_release_in_that_window_preserves_the_journal(self, tmp_path):
+        """F3-E. Release failure in the exact same window.
+
+        If the fence release fails, `update_journal_resolve` must not go on
+        to clear the journal -- the only durable record of this run's
+        recovery identity -- and must not report a false cleanup-complete.
+        The untouched service is never rolled back either way. A later
+        invocation, once the fault clears, still recovers cleanly.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["fence_release_rm"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        env_with_term = dict(
+            env.env,
+            HUBINET_OPS_TEST_TERM_AT="after_fence_acquired_before_autostart_disable",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(env_with_term, _base_args(target))
+
+        assert crashed.returncode != 0
+        assert "acquired the exclusive product-update maintenance fence" in crashed.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in crashed.stderr
+        assert "released the exclusive product-update maintenance fence" not in (
+            crashed.stderr
+        )
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        fence = _fence_file(env)
+        assert journal.exists()
+        assert fence.exists()
+
+        scenario["fail"] = []
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        recovery = _run(env.env, _base_args(target))
+
+        assert recovery.returncode == 0, recovery.stderr
+        assert "released the exclusive product-update maintenance fence" in recovery.stderr
+        assert not journal.exists()
+        assert not fence.exists()
+
+
+class TestJournalClearNeverPrecedesFenceRelease:
+    """F3-F. Static audit pin: enumerate every direct `_update_journal_clear`
+    caller and require the fence release to appear first in the same
+    function body (or that the path is the dry-run path, which never
+    acquires a fence at all). A future edit that reorders one of these --
+    or adds a new terminal path that clears the journal without releasing
+    first -- fails this test even before any functional test catches it.
+    """
+
+    _RELEASE = "_update_release_maintenance_fence"
+    _CLEAR = "_update_journal_clear"
+
+    @staticmethod
+    def _function_body(text, name):
+        marker = f"{name}() {{\n"
+        start = text.index(marker)
+        end = text.index("\n}\n", start)
+        return text[start:end]
+
+    def test_update_journal_resolve_releases_before_clearing(self):
+        text = (REPO_ROOT / "deploy/lib/update-recovery.sh").read_text(encoding="utf-8")
+        body = self._function_body(text, "update_journal_resolve")
+        assert body.index(self._RELEASE) < body.index(self._CLEAR)
+
+    def test_startup_recovery_gate_releases_before_clearing_in_both_branches(self):
+        text = (REPO_ROOT / "deploy/lib/update-recovery.sh").read_text(encoding="utf-8")
+        body = self._function_body(text, "update_startup_recovery_gate")
+        # Two branches, two clears -- both preceded by their own release.
+        assert body.count(self._CLEAR) == 2
+        first_clear = body.index(self._CLEAR)
+        first_release = body.index(self._RELEASE)
+        assert first_release < first_clear
+        second_release = body.index(self._RELEASE, first_release + 1)
+        second_clear = body.index(self._CLEAR, first_clear + 1)
+        assert second_release < second_clear
+
+    def test_finish_summary_releases_before_clearing(self):
+        text = (REPO_ROOT / "deploy/lib/update-activate.sh").read_text(encoding="utf-8")
+        body = self._function_body(text, "_update_finish_summary")
+        assert body.index(self._RELEASE) < body.index(self._CLEAR)
+
+    def test_rollback_on_failure_releases_before_clearing(self):
+        text = (REPO_ROOT / "deploy/lib/update-activate.sh").read_text(encoding="utf-8")
+        body = self._function_body(text, "update_rollback_on_failure")
+        assert body.index(self._RELEASE) < body.index(self._CLEAR)
+
+    def test_the_dry_run_journal_clear_never_acquired_a_fence(self):
+        # The only OTHER direct _update_journal_clear caller: dry-run stops
+        # before Phase U4 and never calls _update_acquire_maintenance_fence
+        # at all, so it owes no release.
+        text = (REPO_ROOT / "deploy/update-proxmox-0.5.sh").read_text(encoding="utf-8")
+        dry_run_clear_index = text.index(self._CLEAR)
+        assert "_update_acquire_maintenance_fence" not in text[:dry_run_clear_index]

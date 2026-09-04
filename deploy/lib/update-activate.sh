@@ -85,6 +85,35 @@ _update_test_term_checkpoint() {
   return 0
 }
 
+# _update_test_kill_checkpoint <name>: test-only self-SIGKILL injection
+# point (Family 1 correction pass). Unlike _update_test_term_checkpoint
+# above -- which delivers a real SIGTERM that this script's own `trap
+# 'exit 143' TERM` still catches, still running _update_exit_trap's
+# rollback machinery synchronously in THIS SAME process, with the
+# ephemeral in-process BOOTSTRAP_LEDGER still fully intact -- some Family
+# 1 witnesses need to prove what a GENUINE crash (SIGKILL, or a real
+# PVE/CT host power loss) leaves behind: no EXIT trap, no rollback call,
+# no in-memory ledger surviving into the next invocation. Only the
+# durable on-disk journal (update_journal_checkpoint) is left for the
+# NEXT invocation's own update_startup_recovery_gate to reconstruct from
+# -- exactly the same untrappable-death shape the fake CT-mediated `mv`
+# hook (tests/_bootstrap_fake_pve.py's kill_updater_after_move) already
+# exercises for CT-side mutations. The package-update boundary helpers'
+# mv/cp run directly on the PVE HOST filesystem, never through `pct exec`,
+# so no fake command layer can intercept them the same way -- this is the
+# equivalent seam for those. Inert whenever HUBINET_OPS_TEST_MODE is not
+# "1", so production behavior never calls this at all.
+_update_test_kill_checkpoint() {
+  local name="$1" needle
+  [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]] || return 0
+  for needle in ${HUBINET_OPS_TEST_KILL_AT:-}; do
+    if [[ "${needle}" == "${name}" ]]; then
+      kill -KILL $$
+    fi
+  done
+  return 0
+}
+
 # Three-valued service-state probe. Return 0 means the service is active
 # or transitioning and therefore MUST be treated as potentially running;
 # return 1 means systemd positively reported a non-running state; return 2
@@ -417,10 +446,321 @@ _update_recheck_source_commit() {
     || die "SOURCE_DIR became dirty between confirmation and activation -- refusing to activate"
 }
 
+# _update_acquire_maintenance_fence: the EXCLUSIVE product-update
+# maintenance fence, taken immediately before the mutation window.
+#
+# This is what actually makes a Hubinet PRODUCT update and a WORKLOAD
+# package-update job mutually exclusive. The Phase U2 probe answer is a poll,
+# and a poll cannot: between it and the first mutation an authenticated
+# operator may legitimately start a workload update, and a second, later poll
+# would only move that window rather than close it -- the update API stays
+# live right up to the service stop.
+#
+# So the backend does it inside its OWN authority writer transaction: it
+# proves no workload job is ACTIVE and makes the fence durable in the same
+# critical section a workload `start_update` would have to enter to create
+# one. Exactly one of the two wins. From the moment this returns, every new
+# workload start refuses -- including against the TARGET backend started in
+# Step 10, which reads the same durable fence -- until this run releases it.
+#
+# Released only at a terminal point: a proven successful product update, or a
+# proven complete rollback/recovery. A crash anywhere in between leaves the
+# fence in place, which is exactly what keeps workload issuance refused while
+# this run still owns rollback-capable mutation state.
+_update_acquire_maintenance_fence() {
+  local output status reason detail
+  output="$(pct exec "${VMID}" -- python3 "${UPDATE_FENCE_CT_PATH}" "${UPDATE_RUN_ID}" 2>/dev/null)" \
+    && status=0 || status=$?
+  (( status == 0 )) && [[ -n "${output}" ]] \
+    || die "could not run the product-update maintenance fence tool inside container ${VMID} -- refusing to mutate"
+
+  if _json_bool_field_is_true "${output}" "ok"; then
+    UPDATE_FENCE_HELD="1"
+    update_journal_record update-maintenance-fence-held "${VMID}"
+    log_info "acquired the exclusive product-update maintenance fence (holder ${UPDATE_RUN_ID}); workload package updates are refused until this run completes or is rolled back"
+    return 0
+  fi
+
+  reason="$(_json_field_from_text "${output}" "reason")"
+  detail="$(_json_field_from_text "${output}" "detail")"
+  if [[ "${reason}" == "fence_route_absent" ]]; then
+    # A backend predating production activation has no fence route and no
+    # update worker, so no race handshake with it is possible or needed --
+    # read from the endpoint's own 404, never from a transport failure.
+    #
+    # But "no race with the OLD backend" is NOT "no fence required". The very
+    # next thing this run does is activate the new configuration and helpers
+    # and start the TARGET backend in Step 10, whose /package-update route is
+    # live while Phase U5 acceptance is still running -- and an acceptance
+    # failure there rolls product backend and helper material back underneath
+    # any workload job issued into that window. So this run establishes the
+    # SAME durable fence artifact directly, before the mutation window, and
+    # the target backend finds it already present the moment it starts.
+    _update_acquire_pre_activation_fence
+    return 0
+  fi
+  die "refusing to mutate: could not take the exclusive product-update maintenance fence (${reason:-unknown}${detail:+: ${detail}}). Nothing has been changed. Let any active workload package update finish, or resolve it through the operator controls (resume or roll back), then run this updater again."
+}
+
+# _update_acquire_pre_activation_fence: the same durable artifact, written
+# directly, for an installation whose backend has no fence route yet.
+#
+# Same holder semantics, same fail-closed durability (fsync, atomic rename,
+# directory fsync) as the backend-created fence -- there is exactly one fence
+# file, whichever side created it, and the activated target backend reads it
+# the same way. A fence another product update already holds is still never
+# stolen, and re-running for the same holder is idempotent.
+_update_acquire_pre_activation_fence() {
+  local output status reason detail
+  output="$(pct exec "${VMID}" -- python3 "${UPDATE_FENCE_CT_PATH}" "${UPDATE_RUN_ID}" --pre-activation 2>/dev/null)" \
+    && status=0 || status=$?
+  (( status == 0 )) && [[ -n "${output}" ]] \
+    || die "refusing to mutate: could not establish the product-update maintenance fence on this pre-activation installation. Nothing has been changed."
+
+  if _json_bool_field_is_true "${output}" "ok"; then
+    UPDATE_FENCE_HELD="1"
+    update_journal_record update-maintenance-fence-held "${VMID}"
+    log_info "established the exclusive product-update maintenance fence directly (holder ${UPDATE_RUN_ID}); this installation predates operator-triggered package updates, and the activated target backend will refuse workload starts from the moment it comes up"
+    return 0
+  fi
+  reason="$(_json_field_from_text "${output}" "reason")"
+  detail="$(_json_field_from_text "${output}" "detail")"
+  die "refusing to mutate: could not establish the exclusive product-update maintenance fence on this pre-activation installation (${reason:-unknown}${detail:+: ${detail}}). Nothing has been changed."
+}
+
+# _update_release_maintenance_fence: remove the fence THIS run holds.
+#
+# Deliberately a plain filesystem removal rather than another authority
+# transaction. Releasing only ever widens what is permitted, so it cannot
+# race anything into existence and needs no atomicity -- and it must keep
+# working in the one case where an API release could not: a failed activation
+# update that has rolled back to a pre-activation backend, which has no
+# maintenance-fence route at all.
+#
+# Keyed off the FENCE'''s OWN RECORDED HOLDER, not off this process's memory.
+#
+# That is deliberately the smallest mechanism that closes the crash edge
+# around acquisition. The fence becomes durable before the acquiring call
+# returns, so a crash between "the fence exists" and "this run recorded that
+# it holds it" is reachable -- and an in-memory flag or a journal marker
+# written afterwards would both miss it, orphaning a fence nobody would ever
+# release. The fence file already carries the run id that created it, and the
+# interrupted run'''s journal already carries the same run id, so recovery can
+# match them without any new durable state at all.
+#
+# The four required behaviours fall straight out of that comparison:
+#   absent          -> nothing to REMOVE, but still not automatically
+#                       "released": the removal (this run'''s or an earlier
+#                       attempt'''s) must positively cross the same
+#                       durability barrier before success is reported --
+#                       see the durability-retry correction pass below;
+#   this run'''s      -> release it (at a terminal point only), and the
+#                       result is TRUTHFUL: success is returned only once
+#                       removal AND its durability barrier are both proven,
+#                       never merely attempted;
+#   another run'''s   -> never touched (success -- not this run'''s to
+#                       release);
+#   unreadable      -> fail closed: FAILURE, left in place, reported.
+#
+# Correction pass (review finding on PR #74): this used to warn-and-continue
+# on a failed `rm` or a skipped durability barrier, and to treat an
+# unreadable fence as a successful release -- so a caller could clear its
+# own recovery journal believing release had happened when it truthfully had
+# not, orphaning the fence (see the caller-side ordering fix at every call
+# site below). This now returns non-zero for every case in which this run's
+# own release obligation was NOT positively discharged, and every caller
+# below is ordered so that failure propagates (via `set -e`) BEFORE the
+# journal carrying this run's recovery identity is ever cleared.
+#
+# Correction pass, durability-retry sibling: the ABSENT branch used to
+# report success from mere absence alone. That missed a reachable
+# sequence -- `rm` succeeds, the FOLLOWING durability barrier then fails,
+# this function correctly returns failure and the journal survives, the
+# process exits -- and on the very next invocation the fence now reads as
+# absent. Reporting success there without re-proving the barrier would let
+# the journal clear before the earlier `rm` was ever durably committed, so
+# a later power loss could resurrect the "removed" fence with no journal
+# left to reconnect it to. The absent branch below therefore performs the
+# SAME `sync -f /var/lib/hubinet-ops` barrier every other branch already
+# required before it may report success.
+# _update_fence_path_state <path>: three-valued, read-only existence check
+# for the maintenance fence (Family 3A correction pass, micro-correction).
+# Return 0=EXISTS, 1=ABSENT, 2=UNKNOWN.
+#
+# This deliberately does NOT reuse _update_ct_path_state's own mechanism
+# (the run-owned authority helper at UPDATE_TOOL_CT_PATH): that helper is
+# only ever pushed/restored on the rollback-armed recovery path (see
+# _update_recovery_restore_authority_tool's own docstring), but fence
+# release is also reached from the "no rollback armed" and "already
+# completed/recovered" recovery branches, which never restore it. A three-
+# valued answer that depended on a helper not guaranteed present at every
+# call site would itself be a new UNKNOWN-shaped hole.
+#
+# An EARLIER version of this function read the outer `pct exec ... test -e
+# <path>` exit status directly (0=exists, 1=absent, anything else=UNKNOWN),
+# reasoning that a real POSIX `test` only ever exits 0 or 1 when it
+# actually runs. That reasoning has a gap: `pct exec` ultimately attaches
+# to the container (e.g. via lxc-attach), and an ATTACH failure -- the
+# remote `test` never running at all -- can itself surface as a generic,
+# unremarkable exit status 1, indistinguishable at this level from "the
+# remote test ran and correctly reported absent". So exit-1-from-`pct
+# exec` could NOT be trusted as a positive absence proof either.
+#
+# Fixed (first pass) by never encoding the answer in the outer exit
+# status at all: a remote `sh -c 'if [ -e "$1" ]; ...'` that always exits
+# 0 once it actually RUNS, printing an exact bounded EXISTS/ABSENT token
+# instead. Any OTHER outer exit status means the remote command never ran
+# (attach/transport failure) and must fail closed as UNKNOWN; exit 0 with
+# anything other than the two exact tokens is equally untrustworthy and
+# also UNKNOWN, never a guess. That outer protocol is still exactly right
+# and is unchanged below.
+#
+# A SECOND gap remained in the in-container classifier itself (P1
+# correction pass): `[ -e "$1" ]` is a boolean test, and it evaluates to
+# the SAME false result whether the path is positively absent (ENOENT) or
+# the underlying inspection failed for any OTHER reason (EACCES, EIO, a
+# symlink loop, ...) -- POSIX `test` cannot tell the two apart. A real
+# metadata/stat failure on a fence that still EXISTS could therefore still
+# be classified ABSENT: _update_release_maintenance_fence would run its
+# ABSENT-branch durability barrier, report the fence released, and let the
+# caller clear the recovery journal, while the fence itself never actually
+# went away -- permanently blocking workload updates with no journal left
+# to reconnect the stale fence to.
+#
+# Fixed the same way the authorized_keys path classifier in
+# bootstrap-host-control.sh (_host_control_authorized_keys_path_state) was
+# fixed: delegate the in-container classification to a tiny, bounded
+# python3 script. python3's os.lstat raises FileNotFoundError SPECIFICALLY
+# for ENOENT and any other OSError subclass for every other failure --
+# exactly the distinction `[ -e ]` cannot make. This is not a new
+# dependency: _update_acquire_maintenance_fence and
+# _update_acquire_pre_activation_fence above already run a python3 script
+# unconditionally inside this SAME container to take the fence in the
+# first place, so CT-side python3 is already load-bearing for this module
+# before this classifier is ever reached, and deploy/update-proxmox-0.5.sh
+# also hard-requires python3 on the PVE host driving `pct exec`.
+#
+# Deliberately an INLINE `python3 -c` script, not a call through the
+# run-owned UPDATE_TOOL_CT_PATH authority helper (which already has its
+# own path-state subcommand): that helper is only ever pushed/restored on
+# the rollback-armed recovery path (see
+# _update_recovery_restore_authority_tool's own docstring), but fence
+# release is also reached from the "no rollback armed" and "already
+# completed/recovered" recovery branches, which never restore it. A
+# three-valued answer that depended on a helper not guaranteed present at
+# every call site would itself be a new UNKNOWN-shaped hole -- exactly the
+# reasoning this function's docstring already gave for not reusing that
+# mechanism, still true with python3 in the mix.
+#
+# The script below always exits 0 once it actually runs (an lstat failure
+# is caught and reported as a token, never left to raise/crash the
+# process) and prints exactly one of EXISTS/ABSENT/UNKNOWN; the outer
+# protocol above still fails closed as UNKNOWN on any other outer exit
+# status or any other stdout content. The fence path is this module's own
+# fixed constant, never operator/attacker input, and is still passed as
+# argv rather than interpolated into the script text.
+_update_fence_path_state() {
+  local path="$1" output status
+  # Same errexit-safe idiom used throughout this file (see
+  # _update_acquire_maintenance_fence above): capture the exit status
+  # without ever leaving this as a bare failing statement under `set -e`.
+  output="$(pct exec "${VMID}" -- python3 -c '
+import os
+import sys
+
+try:
+    os.lstat(sys.argv[1])
+except FileNotFoundError:
+    print("ABSENT")
+except OSError:
+    print("UNKNOWN")
+else:
+    print("EXISTS")
+' "${path}" 2>/dev/null)" \
+    && status=0 || status=$?
+  (( status == 0 )) || return 2
+  case "${output}" in
+    EXISTS) return 0 ;;
+    ABSENT) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+_update_release_maintenance_fence() {
+  local fence_path="/var/lib/hubinet-ops/product-update-maintenance.fence"
+  local raw holder path_state
+
+  # Same errexit-safe idiom as _update_fence_path_state's own internal
+  # call: capturing a nonzero return from a bare function call would
+  # otherwise abort here under `set -e` before `path_state` is ever read.
+  _update_fence_path_state "${fence_path}" && path_state=0 || path_state=$?
+  if (( path_state == 2 )); then
+    # UNKNOWN (correction pass, Family 3A): the OLD code folded a failed
+    # `pct exec ... cat` straight into `raw=""`, indistinguishable from a
+    # positively empty read of a genuinely absent fence -- so a transport
+    # failure here used to let a subsequent `sync -f` "prove" release while
+    # the fence, for all this run actually knows, still exists. UNKNOWN is
+    # never success: fail closed, preserve the journal, and let the next
+    # invocation retry.
+    log_warn "the product-update maintenance fence inside container ${VMID} could not be read (transport failure or unreachable container); leaving it in place. Workload package updates will keep refusing until it is resolved by hand or the next updater invocation retries."
+    return 1
+  fi
+  if (( path_state == 1 )); then
+    # Absent is not sufficient by itself (correction pass, the same
+    # review finding's durability-retry sibling). A prior invocation's
+    # `rm` can have succeeded while ITS OWN following durability barrier
+    # then failed -- that invocation correctly returned failure and kept
+    # the journal, but the directory-entry removal itself was never
+    # durably proven. Without re-proving it here, THIS invocation would
+    # report success from mere absence, the caller would clear the
+    # journal, and a subsequent power loss could resurrect the removed
+    # fence with no journal left to reconnect it to. So an absent fence
+    # still must positively cross the SAME durability barrier -- proving
+    # whichever removal (this run's or an earlier attempt's) is truly
+    # committed -- before release may ever be reported, and therefore
+    # before the caller may discard the journal.
+    if ! pct exec "${VMID}" -- sync -f /var/lib/hubinet-ops >/dev/null 2>&1; then
+      log_warn "the product-update maintenance fence inside container ${VMID} is absent, but its removal could not be durably proven; NOT recording it as released. The next updater invocation will retry."
+      return 1
+    fi
+    UPDATE_FENCE_HELD="0"
+    return 0
+  fi
+  # EXISTS: positively proven present -- parse it, and never treat an
+  # existing-but-empty/unreadable file as absence just because reading it
+  # produced no bytes (Family 3A: the path is already known to exist).
+  raw="$(pct exec "${VMID}" -- cat "${fence_path}" 2>/dev/null)" || raw=""
+  holder="$(_json_field_from_text "${raw}" "holder")" || holder=""
+  if [[ -z "${holder}" ]]; then
+    log_warn "the product-update maintenance fence inside container ${VMID} is unreadable; leaving it in place. Workload package updates will keep refusing until it is resolved by hand."
+    return 1
+  fi
+  if [[ "${holder}" != "${UPDATE_RUN_ID}" ]]; then
+    log_warn "the product-update maintenance fence inside container ${VMID} is held by another product update (holder ${holder}); leaving it untouched"
+    return 0
+  fi
+  if ! pct exec "${VMID}" -- rm -f "${fence_path}" >/dev/null 2>&1; then
+    log_warn "could not remove the product-update maintenance fence inside container ${VMID}; NOT recording it as released. Workload package updates will keep refusing until the next updater invocation retries."
+    return 1
+  fi
+  if ! pct exec "${VMID}" -- sync -f /var/lib/hubinet-ops >/dev/null 2>&1; then
+    log_warn "removed the product-update maintenance fence inside container ${VMID} but could not durably prove that removal; NOT recording it as released. The next updater invocation will retry."
+    return 1
+  fi
+  UPDATE_FENCE_HELD="0"
+  log_info "released the exclusive product-update maintenance fence; workload package updates are permitted again"
+  return 0
+}
+
 _update_revalidate_before_mutation() {
   update_ownership_verify "${VMID}" revalidate "${UPDATE_INSTALLATION_RUN_ID}"
   _update_revalidate_plan_fence
   _update_preflight_ct_sync
+  # LAST, and immediately before the first mutation: everything above may
+  # still refuse this run harmlessly, and taking the fence before those
+  # checks would leave workload updates blocked by a run that then declined
+  # to proceed.
+  _update_acquire_maintenance_fence
 }
 
 update_activate_and_accept() {
@@ -443,6 +783,15 @@ update_activate_and_accept() {
   # proves the CT durability barrier itself is usable before entering the
   # mutation window at all.
   _update_revalidate_before_mutation
+
+  # Test-only (Family 3B correction pass): the exact reachable window this
+  # family closes -- the maintenance fence is now durably held (see
+  # _update_acquire_maintenance_fence above), but no rollback-boundary
+  # mutation has been attempted yet, so _update_rollback_boundary_crossed
+  # is still false and the EXIT trap takes the "existing installation was
+  # never touched" path (update_journal_resolve) rather than
+  # update_rollback_on_failure.
+  _update_test_term_checkpoint after_fence_acquired_before_autostart_disable
 
   # Step 3a -- FIRST mutation of the window: temporarily remove
   # hubinet-ops from boot activation, so no intermediate half-swapped
@@ -533,6 +882,14 @@ update_activate_and_accept() {
       || die "failed to activate the staged PVE host helper (same-path atomic rename)"
   fi
 
+  # Step 8b -- the five package-update forced-command boundaries, their
+  # root-only operation journals, and the one configuration block that
+  # activates the lifecycle. Every artifact created here is journaled before
+  # it exists, so a failure after this point removes exactly the new
+  # privileged access paths this run created and restores exactly the ones it
+  # replaced. See update-boundaries.sh.
+  update_boundaries_activate
+
   # Step 9 -- authority action: preserve, or backup + reset.
   if [[ "${UPDATE_AUTHORITY_ACTION}" == "reset_required" ]]; then
     _update_perform_authority_reset
@@ -554,6 +911,16 @@ update_activate_and_accept() {
   _update_accept_discovery
   _update_accept_host_control
   _update_accept_firewall
+  # Family B correction pass: the same non-mutating, end-to-end proof
+  # fresh bootstrap already requires of these five boundaries before it
+  # calls itself done -- see update_boundaries_accept_all's own docstring
+  # in update-boundaries.sh. Runs after update_boundaries_activate (Step
+  # 8b, above) and after the target service is proven active and healthy,
+  # and before source marker / final accepted-target commit semantics make
+  # this run's rollback artifacts disposable -- a failure here still fails
+  # activation and lets the existing EXIT-trap recovery roll back to the
+  # prior supported installation, exactly like any other Phase U5 failure.
+  update_boundaries_accept_all
   log_pass "acceptance"
 
   _update_write_source_marker
@@ -971,6 +1338,17 @@ _update_finish_summary() {
   # these two steps is cleanup-only on the next invocation, never a false
   # request to roll an already-accepted target back.
   update_journal_checkpoint completed
+  # Test-only (PR #74 review finding 2): exercise a real TERM here, after
+  # the completed checkpoint is durable but before the fence release this
+  # journal still owes -- the fixture a later invocation's own
+  # `update_startup_recovery_gate` completed/recovered branch then recovers
+  # through.
+  _update_test_term_checkpoint before_completed_fence_release
+  # Terminal and proven: acceptance passed, the marker is coherent, and the
+  # `completed` checkpoint is durable. Only now may workload package updates
+  # start again -- releasing any earlier would re-open issuance while this
+  # run could still be asked to roll back.
+  _update_release_maintenance_fence
   # Test-only (correction pass 13, P1): exercise a real TERM here, after
   # the completed checkpoint is durable but before any rollback artifact
   # is removed -- see _update_test_term_checkpoint's own docstring.
@@ -1049,6 +1427,12 @@ update_rollback_on_failure() {
 
   _update_rollback_host_helper
 
+  # Removes exactly the privileged access paths THIS run created -- helper,
+  # forced-command authorization, and key -- and restores exactly the ones it
+  # replaced. A failed activation update must not leave a new key that can
+  # reach a root-owned mutation helper behind.
+  update_boundaries_rollback
+
   _update_rollback_unit
   _update_rollback_venv_and_requirements
   _update_rollback_app
@@ -1095,7 +1479,25 @@ update_rollback_on_failure() {
   _update_wait_until_service_active_and_healthy \
     || _update_rollback_hard_stop "restored the pre-update installation's files, but it did not prove active AND answer its own unauthenticated health probe within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (${_UPDATE_SERVICE_READINESS_DETAIL})"
 
-  update_journal_resolve recovered
+  # Terminal state first, durable and provably retained -- so a crash
+  # anywhere below is cleanup-only on the next invocation, never a false
+  # request to roll an already-restored installation back again.
+  update_journal_checkpoint recovered
+  _update_cleanup_recovered_run_artifacts
+  _update_test_term_checkpoint before_recovery_fence_release
+  # The pre-update installation is fully restored, enabled, running, and
+  # healthy, and this run owns no rollback-capable state any more. Only now
+  # is it truthful to let workload package updates start again -- and this
+  # run's own journal, the only durable record carrying its recovery
+  # identity (UPDATE_RUN_ID) that a later invocation could match the fence's
+  # recorded holder against, MUST NOT be discarded before that release is
+  # positively proven. A release failure here propagates (`set -e`) with the
+  # `recovered` journal still on disk, never re-interpreted as permission to
+  # roll back (see update-proxmox-0.5.sh's own EXIT-trap terminal-checkpoint
+  # rule) -- the next updater invocation retries release and then clears it.
+  _update_release_maintenance_fence
+  _update_test_term_checkpoint after_recovery_fence_release
+  _update_journal_clear
   log_warn "rollback complete -- the pre-update installation is enabled, running again, and healthy (exit ${exit_code})"
 }
 

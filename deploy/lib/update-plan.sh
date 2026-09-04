@@ -7,6 +7,11 @@
 
 UPDATE_TOOL_CT_PATH=""
 UPDATE_PROBE_CT_PATH=""
+UPDATE_FENCE_CT_PATH=""
+# Set once the exclusive product-update maintenance fence is genuinely held
+# by THIS run. Release is keyed off it, so a run that never acquired the
+# fence never removes one another run may hold.
+UPDATE_FENCE_HELD="0"
 
 UPDATE_INSTALLED_SHA=""
 UPDATE_REQUIREMENTS_CHANGED="0"
@@ -66,10 +71,13 @@ update_plan_push_tools() {
   [[ -n "${UPDATE_RUN_ID}" ]] || die "internal error: UPDATE_RUN_ID was not set before update_plan_push_tools"
   UPDATE_TOOL_CT_PATH="/tmp/hubinet-ops-authority-tool-${UPDATE_RUN_ID}.py"
   UPDATE_PROBE_CT_PATH="/tmp/hubinet-ops-update-probe-${UPDATE_RUN_ID}.py"
+  UPDATE_FENCE_CT_PATH="/tmp/hubinet-ops-update-fence-${UPDATE_RUN_ID}.py"
   run_logged pct push "${VMID}" "${UPDATE_SCRIPT_DIR}/hubinet-ops-authority-tool.py" "${UPDATE_TOOL_CT_PATH}" \
     || die "failed to push the authority inspection tool into container ${VMID}"
   run_logged pct push "${VMID}" "${UPDATE_SCRIPT_DIR}/hubinet-ops-update-probe.py" "${UPDATE_PROBE_CT_PATH}" \
     || die "failed to push the pre-update probe into container ${VMID}"
+  run_logged pct push "${VMID}" "${UPDATE_SCRIPT_DIR}/hubinet-ops-update-fence.py" "${UPDATE_FENCE_CT_PATH}" \
+    || die "failed to push the product-update maintenance-fence tool into container ${VMID}"
 }
 
 # _update_cleanup_plan_tools: best-effort removal of the Phase U2 planning
@@ -84,6 +92,7 @@ _update_cleanup_plan_tools() {
   [[ -n "${VMID:-}" ]] || return 0
   [[ -n "${UPDATE_TOOL_CT_PATH}" ]] && pct exec "${VMID}" -- rm -f "${UPDATE_TOOL_CT_PATH}" >/dev/null 2>&1
   [[ -n "${UPDATE_PROBE_CT_PATH}" ]] && pct exec "${VMID}" -- rm -f "${UPDATE_PROBE_CT_PATH}" >/dev/null 2>&1
+  [[ -n "${UPDATE_FENCE_CT_PATH}" ]] && pct exec "${VMID}" -- rm -f "${UPDATE_FENCE_CT_PATH}" >/dev/null 2>&1
   return 0
 }
 
@@ -320,6 +329,32 @@ _update_pre_probe() {
     reason="$(_json_field_from_text "${probe_output}" "reason")"
     die "pre-update live probe failed (${reason:-unknown}) -- refusing to update a product that does not currently prove it is live and reachable"
   fi
+  # EARLY refusal on an already-ACTIVE workload update job.
+  #
+  # This is a courtesy, not the invariant: it stops the operator being asked
+  # to confirm a plan that is going to be refused, and it stops the updater
+  # staging artifacts it will never activate. It is deliberately NOT what
+  # makes product update and workload update exclusive -- a poll cannot,
+  # because an operator may legitimately start an update between this answer
+  # and the first mutation. That exclusion is established atomically by
+  # `_update_acquire_maintenance_fence`, immediately before the mutation
+  # window; see deploy/lib/hubinet-ops-update-fence.py.
+  #
+  # There is deliberately NO bypass flag. An operator whose update is
+  # genuinely stuck resolves the job through the product's own explicit
+  # controls (resume, or rollback) and then runs the updater again.
+  local update_active update_job_id update_checkpoint
+  update_active="$(_json_field_from_text "${probe_output}" "package_update_active")"
+  if [[ "${update_active}" == "1" ]]; then
+    update_job_id="$(_json_field_from_text "${probe_output}" "package_update_job_id")"
+    update_checkpoint="$(_json_field_from_text "${probe_output}" "package_update_checkpoint")"
+    die "refusing to update: package update job ${update_job_id:-unknown} is ACTIVE at checkpoint ${update_checkpoint:-unknown} on this installation. Nothing has been changed. Let it finish, or resolve it through the operator controls (resume or roll back), then run this updater again."
+  fi
+  # An empty value is the pre-activation backend whose /package-update/active
+  # route does not exist. That backend has no update worker and no way to
+  # own a workload job, so there is nothing to fence -- and the probe only
+  # reports it for a real HTTP 404, never for an unreachable backend.
+
   UPDATE_PRE_BACKEND_INSTANCE_ID="$(_json_field_from_text "${probe_output}" "backend_instance_id")"
   UPDATE_PRE_COMMITTED_SEQUENCE="$(_json_field_from_text "${probe_output}" "last_committed_run_sequence")"
   [[ -n "${UPDATE_PRE_BACKEND_INSTANCE_ID}" ]] \
@@ -342,6 +377,7 @@ update_plan_classify() {
   _update_classify_requirements
   _update_classify_unit
   _update_classify_helper
+  update_boundaries_classify
   _update_classify_authority
   _update_pre_probe
   _update_capture_plan_fence_from_classification
@@ -369,6 +405,8 @@ Application payload:           replace (tracked files at target commit)
 requirements.txt:              ${requirements_plan}
 systemd unit:                  $( [[ "${UPDATE_UNIT_CHANGED}" == "1" ]] && printf 'changed -- will be replaced during activation' || printf 'unchanged -- left in place' )
 PVE host helper:               $( [[ "${UPDATE_HELPER_CHANGED}" == "1" ]] && printf 'changed -- content will be replaced at the SAME path (%s)' "${UPDATE_HELPER_PATH}" || printf 'unchanged -- left in place' )
+Package-update boundaries:     $(update_boundaries_plan_summary)
+Active workload update job:    none (verified before this plan was printed -- an active job refuses this updater outright)
 Authority schema:              ${UPDATE_CURRENT_SCHEMA_VERSION} -> ${UPDATE_TARGET_SCHEMA_VERSION}
 Authority action:              $( [[ "${UPDATE_AUTHORITY_ACTION}" == "preserve" ]] && printf 'preserve (schema unchanged, database and every stored fact kept as-is)' || printf 'RESET REQUIRED -- no migration exists for this schema transition' )
 Home Assistant re-enrollment:  $( [[ "${UPDATE_HA_REENROLL_REQUIRED}" == "1" ]] && printf 'REQUIRED after this update (backend_instance_id will change)' || printf 'not required (backend_instance_id is preserved)' )

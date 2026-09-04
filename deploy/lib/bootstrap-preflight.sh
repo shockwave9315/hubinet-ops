@@ -23,17 +23,24 @@ phase1_preflight() {
   require_command dpkg "PVE host Debian architecture detection"
   require_command git "source commit verification (git archive of an exact, confirmed SHA)"
 
-  # A real JSON parser is required (not optional) specifically for the
-  # security-relevant checks in this bootstrap -- the exact-set PVE
-  # effective-permission proof (bootstrap-identity.sh) and the discovery-
-  # acceptance snapshot parsing (which runs inside the CT via python3,
-  # guaranteed there by install-0.5.0-fresh.sh, so this host-side
-  # requirement is for the PVE-host-side permission check only). A lexical
-  # regex "JSON parser" is not an acceptable substitute for a security
-  # verification gate.
-  if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
-    die "neither 'jq' nor 'python3' is available on this PVE host -- one of them is required to reliably parse PVE's JSON output for the effective-permission verification gate (this bootstrap will not fall back to a regex-based JSON parser for a security check)"
-  fi
+  # python3 is a HARD host-side requirement (correction pass, dependency-
+  # contract micro-correction), not merely one of two interchangeable JSON
+  # parsers. It backs the exact-set PVE effective-permission proof
+  # (bootstrap-identity.sh) and the discovery-acceptance snapshot parsing --
+  # a lexical regex "JSON parser" is never an acceptable substitute for a
+  # security verification gate -- AND, independently of JSON parsing, the
+  # authorized_keys atomic mutation primitive's own path classifier
+  # (bootstrap-host-control.sh::_host_control_authorized_keys_path_state)
+  # unconditionally shells out to `python3 -c` to distinguish a positively
+  # proven-absent path from any other stat/metadata failure, something bash
+  # predicates cannot do. A host with `jq` but no `python3` used to pass
+  # this preflight gate (the old check accepted either) and would only
+  # discover the missing dependency later, deep inside package-scan/
+  # package-update boundary provisioning, after mutation had already begun.
+  # `jq` remains the preferred JSON parser when present (see bootstrap-
+  # common.sh's own JSON helpers) -- it is faster/simpler for that one
+  # purpose -- but it is optional, never a substitute for python3 itself.
+  require_command python3 "JSON parsing, the effective-permission verification gate, and the authorized_keys path classifier"
 
   case "${TLS_TRUST_MODE}" in
     ""|system) : ;;

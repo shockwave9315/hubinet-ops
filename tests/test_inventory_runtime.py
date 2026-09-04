@@ -182,11 +182,25 @@ def test_1_static_ast_scan_finds_no_denylisted_import_in_r0_modules() -> None:
 def test_2_only_reads_and_exact_authority_metadata_writes_exist(tmp_path: Path) -> None:
     """The R0 route table is an exact allowlist, not a shape.
 
-    Every write this API exposes changes authority metadata and nothing else:
-    the exact-plan approval, and the three per-resource health-contract
-    operations. None of them can start a job, mutate a package, take or roll
-    back a snapshot, or run a healthcheck -- and this test is what stops a
-    later route from quietly becoming the first one that can.
+    Production activation adds exactly four routes, and each one is an
+    EXPLICIT operator control: start the approved update, read the job,
+    resume a recoverable one, and roll one back. Everything else this API
+    exposes still changes authority metadata only.
+
+    The fourth POST is not an operator control at all: it is the exclusive
+    product-update maintenance fence, which the Hubinet product updater takes
+    on itself so a product update and a workload update cannot overlap. It
+    carries one opaque holder label, performs no workload action, and is
+    listed here for the same reason as the rest -- so a later route cannot
+    quietly join this set.
+
+    What this test is really pinning is the *shape* of that addition. There
+    is one POST per operator verb, and no verb that could become a generic
+    dispatcher; the update routes hang off the same
+    `/resources/{resource_id}/...` prefix the rest of the API uses, so there
+    is no second resource-selection scheme; and no route names a VMID, a
+    snapshot, a package, a probe, or a helper operation. A later route that
+    broke any of those has to change this list to land.
     """
 
     app, _config = _build_app(tmp_path)
@@ -206,6 +220,11 @@ def test_2_only_reads_and_exact_authority_metadata_writes_exist(tmp_path: Path) 
         "/r0/v1/snapshot": {"GET"},
         "/r0/v1/resources/{resource_id}/package-plan-approval": {"PUT"},
         "/r0/v1/resources/{resource_id}/health-contract": {"GET", "PUT", "DELETE"},
+        "/r0/v1/resources/{resource_id}/package-update": {"GET", "POST"},
+        "/r0/v1/resources/{resource_id}/package-update/resume": {"POST"},
+        "/r0/v1/resources/{resource_id}/package-update/rollback": {"POST"},
+        "/r0/v1/package-update/active": {"GET"},
+        "/r0/v1/package-update/maintenance-fence": {"GET", "POST"},
     }
     assert app.docs_url is None
     assert app.redoc_url is None

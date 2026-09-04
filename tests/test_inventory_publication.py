@@ -40,6 +40,8 @@ from custom_components.hubinet_ops.contract.enums import (
     NodeAvailability,
     ObservationalContinuity,
     PackagePlanApprovalStatus,
+    PackageUpdateHealthOutcome,
+    PackageUpdateJobState,
     PresenceState,
     ResourceStateLevel,
     ResourceType,
@@ -59,6 +61,7 @@ from custom_components.hubinet_ops.contract.models import (
     PackageScanPackage,
     PackageScanSnapshot,
     PackagePlanApprovalSnapshot,
+    PackageUpdateJobSummary,
     ResourceSnapshot,
     SourceContext,
 )
@@ -136,6 +139,9 @@ def contract_snapshot(view) -> HubinetOpsSnapshot:
                         probe_count=resource["health_contract"]["probe_count"],
                         updated_at=resource["health_contract"]["updated_at"],
                     ),
+                    "package_update_job": _contract_package_update_job(
+                        resource["package_update_job"]
+                    ),
                 }
             )
             for resource in view.resources
@@ -143,6 +149,25 @@ def contract_snapshot(view) -> HubinetOpsSnapshot:
         inventory_revision=view.inventory_revision,
         published_state_revision=view.published_state_revision,
         published_at=view.published_at,
+    )
+
+
+def _contract_package_update_job(value) -> PackageUpdateJobSummary:
+    value = dict(value)
+    outcome = value["health_outcome"]
+    return PackageUpdateJobSummary(
+        state=PackageUpdateJobState(value["state"]),
+        job_id=value["job_id"],
+        checkpoint=value["checkpoint"],
+        issued_at=value["issued_at"],
+        health_outcome=(
+            None if outcome is None else PackageUpdateHealthOutcome(outcome)
+        ),
+        snapshot_confirmed_at=value["snapshot_confirmed_at"],
+        mutation_completed_at=value["mutation_completed_at"],
+        rollback_completed_at=value["rollback_completed_at"],
+        terminalized_at=value["terminalized_at"],
+        terminal_reason=value["terminal_reason"],
     )
 
 

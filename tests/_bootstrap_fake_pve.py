@@ -83,6 +83,7 @@ import shutil
 import sys
 import tarfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 FAKE_STORAGE = "local-lxc"
 FAKE_TEMPLATE_STORAGE = "local"
@@ -175,6 +176,7 @@ _CT_PATH_ANCHORS = (
     "tmp/hubinet-ops-update-src.tar.gz",
     "tmp/hubinet-ops-authority-tool",  # matches both the fixed and the
     "tmp/hubinet-ops-update-probe",    # run-id-suffixed pushed path shape
+    "tmp/hubinet-ops-update-fence",
     "tmp/hubinet-ops-update-venv-stage.py",
 )
 
@@ -398,6 +400,14 @@ _ACTIVATION_MOVE_FAIL_RULES = [
     # "systemd has been told about it", the reachable state in which a
     # replayed rollback must still daemon-reload.
     ("mv", ("prefix", "/etc/systemd/system/hubinet-ops.service.rollback-"), ("exact", "/etc/systemd/system/hubinet-ops.service"), "mv_rollback_unit_to_live"),
+    # The activation config block's own preserve and ROLLBACK-restore seams.
+    # The restore side is the load-bearing one: a rollback that deleted the
+    # five package-update keys while leaving a configuration that still names
+    # them would fail the restored service's own startup closed, so a test
+    # needs to be able to make exactly that restore fail and prove the
+    # updater hard stops instead of proceeding.
+    ("cp", ("exact", "/etc/hubinet-ops/inventory.yaml"), ("prefix", "/etc/hubinet-ops/inventory.yaml.rollback-"), "cp_live_config_to_rollback"),
+    ("cp", ("prefix", "/etc/hubinet-ops/inventory.yaml.rollback-"), ("exact", "/etc/hubinet-ops/inventory.yaml"), "cp_rollback_config_to_live"),
     ("mv", ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.rollback-"), "mv_live_marker_to_rollback"),
     ("mv", ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.staged-"), ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), "mv_staged_marker_to_live"),
 ]
@@ -467,6 +477,11 @@ _ROLLBACK_REMOVE_KEYS = {
     "/opt/hubinet-ops/.hubinet-source-commit": "rm_live_marker",
 }
 
+# The exclusive product-update maintenance fence's own fixed CT path (see
+# deploy/lib/update-activate.sh::_update_release_maintenance_fence and
+# tests/test_update_proxmox_0_5_smoke.py::FENCE_CT_PATH).
+_MAINTENANCE_FENCE_CT_PATH = "/var/lib/hubinet-ops/product-update-maintenance.fence"
+
 
 def _matches_run_owned_ct_script(raw_arg, base_name):
     # deploy/lib/update-plan.sh (P2-A/small-cleanup, AGENTS.md) now pushes
@@ -512,6 +527,36 @@ def _missing_python_script(raw_arg):
     return 2
 
 
+#: Which forced command each dedicated key reaches, and the exact bounded
+#: refusal that helper answers a non-typed request with. Six separate
+#: boundaries: the unchanged scan-only one, plus the five the production
+#: update lifecycle deploys.
+_BOUNDARY_BY_KEY = {
+    "id_ed25519": ("scan", "unknown host-control operation", 2),
+    "id_ed25519_snapshot": (
+        "snapshot",
+        "request must have the exact snapshot-operation shape",
+        2,
+    ),
+    "id_ed25519_execution": ("execution", "unknown host-control operation", 2),
+    "id_ed25519_mutation": (
+        "mutation",
+        "request must have the exact package-mutation shape",
+        2,
+    ),
+    "id_ed25519_rollback": (
+        "rollback",
+        "request does not have the exact expected shape",
+        1,
+    ),
+    "id_ed25519_health": (
+        "health",
+        "request must have the exact health-evaluation shape",
+        2,
+    ),
+}
+
+
 def _exec_inner(vmid, inner, state):
     joined = " ".join(inner)
     ct = str(vmid)
@@ -537,12 +582,34 @@ def _exec_inner(vmid, inner, state):
         return 0
 
     if inner[0] == "runuser" and "ssh" in inner:
+        # The forced-command acceptance probe. Each boundary is reached with
+        # its OWN dedicated key, so the key the probe presents is what
+        # selects which helper answers -- exactly the production property
+        # this fake exists to model. Every answer is that helper's real
+        # structural refusal of a request that is not one of its typed
+        # operations: nothing here creates a snapshot, changes a package,
+        # rolls anything back, or probes a workload.
+        key_path = inner[inner.index("-i") + 1] if "-i" in inner else ""
+        boundary = _BOUNDARY_BY_KEY.get(Path(key_path).name)
+        if boundary is None:
+            sys.stdout.write(
+                '{"response_version":1,"ok":false,'
+                '"error":{"classification":"execution_failed",'
+                '"message":"no forced command is authorized for this key"}}'
+            )
+            return 255
+        kind, message, code = boundary
+        state.setdefault("boundary_probes", []).append(kind)
+        if _fail(f"boundary_probe_{kind}"):
+            # Models an unusable SSH/key/host-key policy: no structured
+            # answer at all, which the acceptance check must refuse.
+            return 255
         sys.stdout.write(
             '{"response_version":1,"ok":false,"context":{},'
             '"error":{"classification":"execution_failed",'
-            '"message":"unknown host-control operation"}}'
+            f'"message":"{message}"}}}}'
         )
-        return 2
+        return code
 
     if inner[0] == "tar" and "-xzf" in inner:
         # The in-place updater's own staging step (unlike the bootstrap
@@ -577,6 +644,22 @@ def _exec_inner(vmid, inner, state):
         for raw_target in targets:
             normalized_target = _normalize_ct_arg(raw_target)
             target_path = _ct_path(vmid, normalized_target)
+            if (
+                normalized_target == _MAINTENANCE_FENCE_CT_PATH
+                and _fail("fence_release_rm")
+            ):
+                # A clean, realistic `rm -f` failure (PR #74 review finding
+                # 2's own required test): the command fails and the fence's
+                # existing content is left completely untouched -- unlike
+                # `_ROLLBACK_REMOVE_KEYS`'s `_partial` semantics above, which
+                # deliberately corrupt a file target to model a mid-tree
+                # `rm -rf` interruption. That model is wrong for a single
+                # `rm -f` on one file: this must remain a VALID, re-readable
+                # fence (holder=<run_id>) so a later invocation -- once the
+                # simulated fault is removed -- can retry and actually
+                # succeed, exactly as `_update_release_maintenance_fence`'s
+                # own contract requires.
+                return 1
             remove_key = _ROLLBACK_REMOVE_KEYS.get(normalized_target)
             if remove_key is not None and _fail(f"{remove_key}_partial"):
                 # Realistic mutate-then-fail: remove some content while
@@ -745,14 +828,86 @@ def _exec_inner(vmid, inner, state):
         sys.stdout.write(path.read_text())
         return 0
 
+    if inner[0] == "python3" and inner[1] == "-c" and len(inner) >= 4:
+        # deploy/lib/update-activate.sh::_update_fence_path_state's own
+        # bounded existence probe (P1 correction pass: ENOENT-vs-stat-
+        # failure). An inline python3 script that always exits 0 once it
+        # actually RUNS -- EXISTS, ABSENT, and UNKNOWN are all legitimate
+        # answers the script itself can print (os.lstat's
+        # FileNotFoundError vs. any other OSError) -- and encodes the real
+        # answer via an exact stdout token instead of the outer exit
+        # status. `pct exec` itself (ultimately an lxc-attach) can ALSO
+        # surface an ATTACH failure as a generic, unremarkable exit status
+        # 1 -- indistinguishable at the outer-status level from a
+        # legitimate remote "absent" answer -- so this fake models both
+        # the outer transport taxonomy and the in-container stat-failure
+        # taxonomy distinctly, so the fix's own regression coverage can
+        # tell all of them apart from a genuine EXISTS/ABSENT answer.
+        probe_path = inner[3]
+        normalized = _normalize_ct_arg(probe_path)
+        if normalized == _MAINTENANCE_FENCE_CT_PATH:
+            if _fail("fence_read_transport"):
+                # UNKNOWN via an ordinary outer transport/attach failure
+                # with a distinctive non-1 code.
+                return 255
+            if _fail("fence_read_attach_exit_1"):
+                # An attach failure that happens to surface as outer exit
+                # status 1 -- exactly the value a legitimate remote
+                # "absent" answer would also produce. Must never be read
+                # as ABSENT.
+                return 1
+            if _fail("fence_read_malformed_token"):
+                # Exit 0 (the remote command DID run), but neither exact
+                # token -- a truncated read, a stray byte, or any other
+                # corruption of the probe's own output. Still UNKNOWN,
+                # never guessed as either EXISTS or ABSENT.
+                sys.stdout.write("nonsense")
+                return 0
+            if _fail("fence_read_stat_failure"):
+                # THE P1 regression this classifier now closes: the fence
+                # positively EXISTS on disk, but the in-container
+                # os.lstat call itself fails for a reason OTHER than
+                # ENOENT (EACCES, EIO, ...). Models python3's own
+                # `except OSError: print("UNKNOWN")` branch -- distinct
+                # from the outer transport/exit-status failures above,
+                # and must never collapse to ABSENT.
+                sys.stdout.write("UNKNOWN")
+                return 0
+        elif normalized.endswith(
+            ("id_ed25519_snapshot", "id_ed25519_execution", "id_ed25519_mutation",
+             "id_ed25519_rollback", "id_ed25519_health")
+        ):
+            # deploy/lib/update-boundaries.sh::_update_boundary_ct_path_state
+            # (Family A correction pass) -- the exact same in-container
+            # ENOENT-vs-stat-failure classifier, reused for the boundary
+            # private-key existence pre-check in _update_boundary_create_key.
+            if _fail("boundary_key_stat_failure"):
+                sys.stdout.write("UNKNOWN")
+                return 0
+        elif "/inventory.yaml.rollback-" in normalized:
+            # Same classifier, reused for the preserved-configuration-
+            # backup existence check in update_boundaries_rollback. A
+            # separate fault key from the private-key check above so a
+            # test can reach ONE of the two call sites without also
+            # tripping the other (a pre-activation run's forward
+            # activation always generates all five keys before it can
+            # ever reach the config-backup rollback check).
+            if _fail("boundary_config_backup_stat_failure"):
+                sys.stdout.write("UNKNOWN")
+                return 0
+        path = _ct_path(vmid, probe_path)
+        sys.stdout.write("EXISTS" if path.exists() else "ABSENT")
+        return 0
+
     if inner[0] == "test" and inner[1] == "-e":
+        normalized = _normalize_ct_arg(inner[2])
         path = _ct_path(vmid, inner[2])
         marker = SCENARIO.get("legacy_present", {})
         # Normalize before comparing, not just when resolving the path on
         # disk (see _normalize_ct_arg) -- an exact-literal comparison
         # against "/var/lib/hubinet-ops/ops.db" would silently never match
         # if this argument happened to arrive MSYS-mangled.
-        if _normalize_ct_arg(inner[2]) == "/var/lib/hubinet-ops/ops.db" and marker.get("ops_db"):
+        if normalized == "/var/lib/hubinet-ops/ops.db" and marker.get("ops_db"):
             return 0
         return 0 if path.exists() else 1
 
@@ -836,6 +991,11 @@ def _exec_inner(vmid, inner, state):
             return _missing_python_script(inner[1])
         return _exec_authority_tool(vmid, inner[2:], state)
 
+    if inner[0] == "python3" and _matches_run_owned_ct_script(
+        inner[1], "hubinet-ops-update-fence"
+    ):
+        return _exec_update_fence(vmid, inner[2:], state)
+
     if inner[0] == "python3" and _matches_run_owned_ct_script(inner[1], "hubinet-ops-update-probe"):
         if not _pushed_ct_script_exists(vmid, inner[1]):
             return _missing_python_script(inner[1])
@@ -845,6 +1005,15 @@ def _exec_inner(vmid, inner, state):
         if not _pushed_ct_script_exists(vmid, inner[1]):
             return _missing_python_script(inner[1])
         return _exec_venv_stage(vmid, inner[2:])
+
+    if inner[0].replace("\\", "/").endswith(
+        "/opt/hubinet-ops/.venv/bin/python3"
+    ) and len(inner) >= 2 and _matches_run_owned_ct_script(
+        inner[1], "hubinet-ops-update-host-control-fields"
+    ):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
+        return _exec_host_control_fields(vmid, inner[2:], state)
 
     _log("pct", "exec", "UNHANDLED", *inner)
     return 2
@@ -1024,6 +1193,230 @@ def _exec_venv_stage(vmid, args):
     return 0
 
 
+def _fake_parse_simple_yaml(text):
+    """Minimal, deliberately NON-semantic YAML-shaped reader for the fake
+    CT's own seeded configuration text.
+
+    NOT a stand-in for real YAML, and never meant to be: the hardened
+    update-smoke Docker sandbox installs only pytest (see
+    tests/test_update_boundary_yaml_scalar.py's own module docstring), so
+    `_exec_host_control_fields` below cannot `import yaml` the way the
+    REAL deploy/lib/hubinet-ops-update-host-control-fields.py does. This
+    only has to decode the scalar shapes the update-smoke scenarios
+    actually seed -- a double-quoted JSON-safe string, or a plain
+    (unquoted) scalar kept byte-for-byte -- nested by the same fixed
+    two-space indentation bootstrap/activation always generates. The
+    REAL script's full semantic decoding (inline comments, single-quoted
+    `#`, YAML escape sequences, non-ASCII) is proven separately, with
+    real PyYAML, by tests/test_update_boundary_yaml_scalar.py and
+    tests/test_update_authority_helpers.py on the ordinary
+    (non-sandboxed) pytest host -- never by this fake.
+    """
+    root = {}
+    stack = [(0, root)]
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        stripped = raw_line.strip()
+        if ":" not in stripped:
+            continue
+        key, _sep, inline = stripped.partition(":")
+        key = key.strip()
+        inline = inline.strip()
+        while len(stack) > 1 and indent < stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if inline == "":
+            child = {}
+            parent[key] = child
+            stack.append((indent + 2, child))
+            continue
+        if inline.startswith('"') and inline.endswith('"') and len(inline) >= 2:
+            try:
+                value = json.loads(inline)
+            except ValueError:
+                value = inline.strip('"')
+        elif inline.startswith("'") and inline.endswith("'") and len(inline) >= 2:
+            value = inline[1:-1].replace("''", "'")
+        else:
+            value = inline
+        parent[key] = value
+    return root
+
+
+def _exec_host_control_fields(vmid, args, state=None):
+    """Simulates deploy/lib/hubinet-ops-update-host-control-fields.py's
+    JSON contract, reading the fake CT's own filesystem via
+    `_fake_parse_simple_yaml` above instead of real PyYAML. `args` is
+    `[mode, config_ct_path]`, matching the real script's own argv shape.
+    """
+
+    del state
+    if len(args) != 2:
+        return 2
+    mode, config_ct_path = args
+    if not _pushed_ct_script_exists(vmid, config_ct_path):
+        return _missing_python_script(config_ct_path)
+
+    text = _ct_path(vmid, config_ct_path).read_text(encoding="utf-8")
+    root = _fake_parse_simple_yaml(text)
+
+    if mode == "package_update":
+        host_control = (root.get("package_update") or {}).get("host_control") or {}
+        print(json.dumps({
+            "ok": True,
+            "host": host_control.get("host"),
+            "port": host_control.get("port"),
+            "user": host_control.get("user"),
+            "known_hosts_path": host_control.get("known_hosts_path"),
+        }))
+        return 0
+
+    # package_scan mode -- the SAME default rules
+    # app/inventory_runtime_config.py's parse_r0_runtime_config applies.
+    host_control = (root.get("package_scan") or {}).get("host_control") or {}
+    host = host_control.get("host")
+    if host is None:
+        pve_endpoint = (root.get("source") or {}).get("pve_endpoint")
+        if not pve_endpoint:
+            print(json.dumps({"ok": False, "reason": "no_host_control_host", "detail": ""}))
+            return 0
+        hostname = urlsplit(pve_endpoint).hostname
+        if not hostname:
+            print(json.dumps({
+                "ok": False,
+                "reason": "pve_endpoint_no_hostname",
+                "detail": pve_endpoint,
+            }))
+            return 0
+        host = hostname
+    port = host_control.get("port")
+    if port is None:
+        port = 22
+    user = host_control.get("user")
+    if user is None:
+        user = "root"
+    known_hosts_path = host_control.get("known_hosts_path")
+    if known_hosts_path is None:
+        known_hosts_path = "/etc/hubinet-ops/host-control/known_hosts"
+    print(json.dumps({
+        "ok": True,
+        "host": host,
+        "port": port,
+        "user": user,
+        "known_hosts_path": known_hosts_path,
+    }))
+    return 0
+
+
+#: Where the backend keeps the exclusive product-update maintenance fence,
+#: beside its authority database. The fake models the real durable artifact
+#: rather than an in-memory flag, because surviving the backend restart a
+#: product update performs is the whole point of it being a file.
+_FENCE_CT_PATH = "/var/lib/hubinet-ops/product-update-maintenance.fence"
+
+
+def _exec_update_fence(vmid, args, state=None):
+    """Simulate deploy/lib/hubinet-ops-update-fence.py's JSON contract.
+
+    Models the backend's own atomic acquisition: it refuses while a workload
+    package-update job is ACTIVE, refuses a different holder, is idempotent
+    for the same holder, and otherwise writes the durable fence file that
+    every later workload start reads.
+    """
+
+    pre_activation = "--pre-activation" in args
+    positional = [a for a in args if a != "--pre-activation"]
+    holder = positional[0] if positional else ""
+    if not holder:
+        return 2
+
+    path = _ct_path(vmid, _FENCE_CT_PATH)
+    if pre_activation:
+        # The direct path a pre-activation installation takes: no backend
+        # handshake is possible, but the SAME durable artifact must exist
+        # before the mutation window so the activated target backend finds it
+        # already present when it starts.
+        if _fail("pre_activation_fence_write"):
+            print(json.dumps({
+                "ok": False,
+                "reason": "fence_not_writable",
+                "detail": "simulated",
+            }))
+            return 0
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text())
+            except ValueError:
+                print(json.dumps({
+                    "ok": False,
+                    "reason": "fence_unreadable",
+                    "detail": "simulated",
+                }))
+                return 0
+            if existing.get("holder") != holder:
+                print(json.dumps({
+                    "ok": False,
+                    "reason": "fence_held_by_another_run",
+                    "detail": f"holder {existing.get('holder')}",
+                }))
+                return 0
+            print(json.dumps({"ok": True, "holder": holder, "acquired_at": existing.get("acquired_at", "")}))
+            return 0
+        acquired_at = "2026-01-01T00:00:00+00:00"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"acquired_at": acquired_at, "holder": holder}, sort_keys=True)
+        )
+        print(json.dumps({"ok": True, "holder": holder, "acquired_at": acquired_at}))
+        return 0
+
+    if SCENARIO.get("fence_route_absent"):
+        # A backend predating production activation has no fence route at
+        # all -- a real 404, never a transport failure.
+        print(json.dumps({"ok": False, "reason": "fence_route_absent", "detail": ""}))
+        return 0
+    if SCENARIO.get("fence_unreachable"):
+        print(json.dumps({
+            "ok": False,
+            "reason": "fence_endpoint_unreachable",
+            "detail": "simulated",
+        }))
+        return 0
+
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except ValueError:
+            existing = {}
+        if existing.get("holder") != holder:
+            print(json.dumps({
+                "ok": False,
+                "reason": "fence_refused_http_409",
+                "detail": f"another Hubinet product update already holds the maintenance fence (holder {existing.get('holder')})",
+            }))
+            return 0
+        print(json.dumps({"ok": True, "holder": holder, "acquired_at": existing.get("acquired_at", "2026-01-01T00:00:00+00:00")}))
+        return 0
+
+    if SCENARIO.get("workload_job_active"):
+        print(json.dumps({
+            "ok": False,
+            "reason": "fence_refused_http_409",
+            "detail": "a workload package update job is ACTIVE (at checkpoint mutation_may_have_started)",
+        }))
+        return 0
+
+    acquired_at = "2026-01-01T00:00:00+00:00"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"holder": holder, "acquired_at": acquired_at}, sort_keys=True)
+    )
+    print(json.dumps({"ok": True, "holder": holder, "acquired_at": acquired_at}))
+    return 0
+
+
 def _exec_update_probe(vmid, state=None):
     # Simulates deploy/lib/hubinet-ops-update-probe.py's own observable
     # JSON contract -- one bounded, non-waiting read of current state,
@@ -1052,6 +1445,29 @@ def _exec_update_probe(vmid, state=None):
         counts[key] = counts.get(key, 0) + 1
         sequence = sequence + counts[key] - 1
         _save_state(state)
+    # The ACTIVE WORKLOAD UPDATE JOB witness, modelled with the same three
+    # genuinely different answers the real probe distinguishes:
+    #
+    #   True  -- a job owns the one global destructive slot; the updater
+    #            must refuse before touching anything;
+    #   False -- no job owns it (the ordinary case);
+    #   None  -- the /package-update/active route does not exist, so this
+    #            backend predates production activation and cannot own a
+    #            workload job at all. Read from a real 404, never inferred.
+    #
+    # And a fourth possibility that is NOT an answer: the question could
+    # not be asked, which makes the whole probe `ok: false`.
+    if SCENARIO.get("update_probe_package_update_unavailable"):
+        print(json.dumps({
+            "ok": False,
+            "reason": "package_update_endpoint_unreachable: simulated",
+        }))
+        return 0
+    active = SCENARIO.get(
+        "update_probe_package_update_active", SCENARIO.get("workload_job_active", False)
+    )
+    if SCENARIO.get("update_probe_package_update_absent"):
+        active = None
     print(json.dumps({
         "ok": True,
         "backend_instance_id": backend_id,
@@ -1059,6 +1475,13 @@ def _exec_update_probe(vmid, state=None):
         "last_committed_run_sequence": sequence,
         "health": "healthy",
         "freshness": "fresh",
+        "package_update_active": active,
+        "package_update_job_id": (
+            "3f9a1c2e-4b5d-4e6f-8a91-0b1c2d3e4f50" if active else None
+        ),
+        "package_update_checkpoint": (
+            "mutation_may_have_started" if active else None
+        ),
     }))
     return 0
 
@@ -2380,12 +2803,22 @@ def build_minimal_source_checkout(tmp_path: Path, repo_root: Path) -> Path:
         (repo_root / "deploy" / "install-0.5.0-fresh.sh").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
-    (src / "deploy" / "hubinet-package-scan-helper.py").write_text(
-        (repo_root / "deploy" / "hubinet-package-scan-helper.py").read_text(
-            encoding="utf-8"
-        ),
-        encoding="utf-8",
-    )
+    # The six privileged forced-command helpers a fresh install provisions:
+    # the unchanged scan-only boundary, plus the five the production update
+    # lifecycle deploys. Copied verbatim so `git archive <sha>` stages the
+    # exact bytes a real release checkout would.
+    for helper in (
+        "hubinet-package-scan-helper.py",
+        "hubinet-package-snapshot-helper.py",
+        "hubinet-package-update-helper.py",
+        "hubinet-package-mutation-helper.py",
+        "hubinet-package-rollback-helper.py",
+        "hubinet-package-health-helper.py",
+    ):
+        (src / "deploy" / helper).write_text(
+            (repo_root / "deploy" / helper).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
     (src / "config" / "inventory.example.yaml").write_text(
         "source:\n  display_name: example\n", encoding="utf-8"
     )

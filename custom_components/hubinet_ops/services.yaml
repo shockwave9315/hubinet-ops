@@ -60,3 +60,42 @@ clear_health_contract:
         number:
           min: 0
           mode: box
+
+start_update:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: hubinet_ops
+
+view_update_job:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: hubinet_ops
+    events:
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 200
+          mode: box
+
+resume_update:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: hubinet_ops
+
+rollback_update:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: hubinet_ops

@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v16):
+  SQLite authority database (schema v17):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -43,22 +43,36 @@
   copied probe rows -- adds the durable definitive per-probe result rows and
   the `health_completed` checkpoint, and states the terminal `succeeded`
   contract in both directions, so a job can reach it only by proving every
-  frozen probe passed (see "Job-bound healthcheck execution" below).
-- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus
-  authority-metadata-only mutations:
-  `PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
-  `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`. Bearer
-  authentication is required on every endpoint except the
-  deliberately unauthenticated minimal `/r0/v1/health` liveness probe, which
-  exposes no inventory or credential data.
+  frozen probe passed (see "Job-bound healthcheck execution" below). Schema
+  v17 adds a durable, per-resource `issuance_sequence` to package-update
+  jobs, allocated atomically at issuance and never consumed a second time by
+  a retried idempotent `request_id`; the latest-job readback and published
+  summary order by `issuance_sequence`, not wall-clock `issued_at`, so an
+  ordinary host clock correction between two issuances can never make an
+  older job outrank a genuinely later one.
+- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`;
+  authority-metadata mutations
+  (`PUT /r0/v1/resources/{resource_id}/package-plan-approval`,
+  `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`); and the
+  explicit operator update controls
+  (`POST`/`GET /r0/v1/resources/{resource_id}/package-update`,
+  `POST .../package-update/resume`, `POST .../package-update/rollback`,
+  `GET /r0/v1/package-update/active`). Bearer authentication is required on
+  every endpoint except the deliberately unauthenticated minimal
+  `/r0/v1/health` liveness probe, which exposes no inventory or credential
+  data.
 - **Home Assistant integration** — config flow, coordinator, structural
   contract validation, dynamic devices and entities, package-scan summary and
   concise approval-status sensors, diagnostics with recursive secret redaction,
-  and native `view_update_plan` / `approve_update_plan` /
-  `view_health_contract` / `set_health_contract` / `clear_health_contract`
-  actions. Every response-capable action uses the native Hubinet
-  resource-device selector and returns exact material — package rows, contract
-  probes — as response data, never as entity attributes. Distributed via HACS.
+  a concise per-resource package-update job status sensor, and native
+  `view_update_plan` / `approve_update_plan` / `view_health_contract` /
+  `set_health_contract` / `clear_health_contract` / `start_update` /
+  `view_update_job` / `resume_update` / `rollback_update` actions. Every
+  response-capable action uses the native Hubinet resource-device selector and
+  returns exact material — package rows, contract probes, job events — as
+  response data, never as entity attributes. `start_update`, `resume_update`,
+  and `rollback_update` are explicit operator actions and are unreachable from
+  coordinator polling. Distributed via HACS.
 - **Automatic Debian/Ubuntu LXC package scanning** — configurable six-hour
   default interval, one worker, typed pinned-key SSH to a forced PVE helper,
   fixed `pct exec` operations, APT metadata refresh plus upgrade simulation,
@@ -66,9 +80,13 @@
   failure-is-unknown semantics. It never installs packages.
 - **Bootstrap and deployment** — `deploy/bootstrap-proxmox-0.5.sh` provisions a
   fresh unprivileged LXC, a least-privilege PVE identity, TLS trust, a dedicated
-  forced-command scan boundary, the service, and an nftables boundary. This
-  remains the first-install/disaster-recovery/deliberate-rebuild entrypoint
-  only.
+  forced-command scan boundary, five further dedicated forced-command
+  boundaries for the update lifecycle (snapshot, plan simulation, mutation,
+  rollback, health) with one private key each and root-only operation journals,
+  the service, and an nftables boundary. Acceptance verifies every boundary
+  with a non-mutating structural refusal only: no snapshot is created, no
+  package changed, nothing rolled back, and no workload probed. This remains
+  the first-install/disaster-recovery/deliberate-rebuild entrypoint only.
 - **In-place product updates** — `deploy/update-proxmox-0.5.sh` updates an
   *existing* installation identified by `--vmid`, in place: install once,
   update many times. It cross-verifies the CT's ownership chain against the
@@ -90,24 +108,33 @@
   network, PVE identity, or other credentials — and reports that Home
   Assistant re-enrollment is required. A target failure after that reset is
   rolled back to the coherent pre-update installation, authority database
-  included, never leaving old code paired with a new schema. Package/job
-  execution updates are out of scope for this stage — see
+  included, never leaving old code paired with a new schema. It also upgrades a
+  pre-activation installation into the activated lifecycle, creating the five
+  boundaries, their keys, their journals, and the `package_update` config
+  block — and a failed activation update removes exactly the privileged access
+  paths it created while leaving unrelated `authorized_keys` entries and the
+  scan boundary untouched. It refuses outright, before touching any file, if
+  the installation has an ACTIVE package-update job. See
   `deploy/README-update-proxmox-0.5.md`.
 
-The PVE API inventory surface remains read-only. The backend's sole mutation
-route records Hubinet approval authority state only. Internal update-job
-issuance, job-owned snapshot safety, the execution-time plan equality gate,
-crash-safe package mutation, same-job rollback execution, and job-bound
-healthcheck execution are not production-reachable: there is no HTTP/HA
-creation control and no worker or scheduler consuming jobs, and no snapshot
-helper, execution helper, mutation helper, rollback helper, health helper,
-key, or PVE mutation privilege is deployed. Package scanning may write APT
-index/cache metadata but never changes workload packages, and neither does the
-execution-time gate's or the mutation stage's own metadata refresh and
-simulation. There is no production-reachable workload package mutation, no
-production-reachable rollback, and no production-reachable healthcheck
-execution, and no snapshot deletion, lifecycle mutation, compensation policy,
-or endpoint failover anywhere.
+- **Production activation of the update lifecycle** — one authenticated
+  operator action starts the currently approved update for one resource, and
+  one bounded worker composes the existing stages through to a proven health
+  verdict. Explicit operator resume and same-job rollback controls, a bounded
+  job readback, an active-job witness for the product updater, four Home
+  Assistant actions, and one concise per-resource job status entity. Five
+  separate forced-command helpers with five dedicated keys are deployed by
+  both bootstrap and the updater. See "Production activation" below.
+
+The PVE API inventory surface remains read-only, and the provisioned PVE role
+is still exactly `Sys.Audit,VM.Audit`: every workload mutation runs host-local
+behind a root-owned forced command, so the inventory API identity never needed
+a mutation privilege. Package scanning may write APT index/cache metadata but
+never changes workload packages, and neither does the execution-time gate's or
+the mutation stage's own metadata refresh and simulation. There is no
+automatic update issuance, no automatic rollback, no retry policy, no snapshot
+deletion or retention, no lifecycle mutation (start/stop/reboot), no manual
+snapshot operation, no compensation policy, and no endpoint failover anywhere.
 
 ## Human0 validation
 
@@ -142,14 +169,15 @@ sandbox.
 
 Hubinet Ops performed neither the package upgrade nor the snapshot rollback in
 the last two checks. They were manual operator actions used only to verify that
-Hubinet observes current guest state. Human0 validates only the scope that is
-actually activated in production; job-owned snapshots, the execution-time plan
-gate, crash-safe package mutation, and same-job rollback execution exist
-internally but are dark and have had no operator Human0 validation, and so
-does job-bound healthcheck execution. The per-resource health contract itself
-is implemented and production reachable, because it is configuration only; the
-execution that evaluates one is dark. No health probe has been run against any
-live guest.
+Hubinet observes current guest state.
+
+**Production activation has NOT been Human0 validated.** The whole
+operator-triggered lifecycle — explicit start, job-owned snapshot,
+execution-time plan gate, package mutation, healthcheck, and explicit same-job
+rollback — is now production reachable and has complete automated coverage,
+but no real workload has been updated, no real snapshot created, no real
+rollback performed, and no health probe run against any live guest by Hubinet
+Ops. `README.md` carries the operator runbook for that first validation.
 
 ## In-place product update lifecycle
 
@@ -168,8 +196,12 @@ first real operator Human0 validation of this updater completed against CT110
 using installed source commit
 `61d2bc6b04658db39d5120e1f52624450305e93b`: the service was enabled and
 active, health passed, the test requirement was removed, and the authority
-database was present. Workload package update execution remains a separate,
-unimplemented future stage.
+database was present, on installed source that predates this activation.
+Workload package update execution is now a separate, production-reachable
+stage (see "Human0 validation" above) with its own complete automated
+coverage; it is not exercised by this updater's own automated suite, which
+stays scoped to generic in-place product updates, and has not itself been
+Human0-validated.
 
 ## Exact update-plan approval
 
@@ -180,8 +212,9 @@ unimplemented future stage.
   source context is unchanged. Changed, failed, interrupted, unsupported, or
   unavailable plans are not effectively approved.
 - Approval is authority state only. This stage cannot install or upgrade
-  packages or create PVE snapshots. Internal job issuance copies that approval
-  provenance but is not exposed to production callers.
+  packages or create PVE snapshots. Job issuance copies that approval
+  provenance; see "Durable package-update job authority" below for its own
+  one production entry point.
 
 ## Durable package-update job authority
 
@@ -190,8 +223,9 @@ unimplemented future stage.
   immutable copied package rows, request-id retry semantics, global durable
   single-flight, current-authority revalidation, append-only events, and
   pre-mutation restart interruption.
-- **Not activated:** no HTTP or Home Assistant job control, executor, package
-  mutation, rollback, or healthcheck execution path exists. Issuance now also
+- **Production reachable, through one door.** `issue_package_update_job` has
+  exactly one production caller: the authenticated
+  `POST /r0/v1/resources/{resource_id}/package-update` route. Issuance
   requires and freezes a declared health contract; see "Job-bound healthcheck
   execution" below.
 
@@ -213,11 +247,13 @@ unimplemented future stage.
   fail-closed handling of every other ambiguity; startup recovery that fences
   an uncertain snapshot operation and keeps it owning the global slot; and the
   same-job rollback authorization contract.
-- **Not activated:** no production HTTP, Home Assistant, scheduler, bootstrap,
-  or updater path can create a PVE snapshot. The snapshot helper is a separate
-  dark file that is **not deployed**, no key or `authorized_keys` entry exists
-  for it, and no extra PVE privilege (`VM.Snapshot`) is provisioned. The
-  package-scan helper remains scan-only.
+- **Production reachable** through the explicit operator start control and the
+  one worker, and through nothing else: no scheduler, scan, approval write, or
+  Home Assistant poll can create a PVE snapshot. The snapshot helper is
+  deployed behind its OWN dedicated key and forced command, separate from
+  every other boundary, and still needs no extra PVE privilege — the
+  provisioned role stays exactly the audit-only pair. The package-scan helper
+  remains scan-only, with its own separate key.
 - **Rollback submission** is no longer deferred: the authorization and
   selection contract established here is what "Same-job rollback execution"
   below builds on, unchanged. There is still no snapshot deletion or
@@ -285,13 +321,16 @@ unimplemented future stage.
   snapshot, and avoids the host round trip when the scan is already visible
   at the pre-host check. Once that scan completes failed/unknown, the old job
   is stale and releases normally.
-- **Not activated:** no HTTP, Home Assistant, scheduler, bootstrap, or updater
-  path can invoke this gate; the execution helper is a separate dark file
-  that is **not deployed**, with no key or `authorized_keys` entry and no
-  extra PVE privilege. This stage performs zero workload package mutation,
-  and a successful equality pass is deliberately not a durable "safe to
-  mutate" permit: the future mutation stage must re-run this exact gate again
-  immediately before it mutates anything, not trust an earlier pass.
+- **Production reachable** through the one worker, which runs this gate
+  immediately before it enters the mutation stage. The execution helper is
+  deployed behind its own dedicated key and forced command and needs no extra
+  PVE privilege. This stage still performs zero workload package mutation, and
+  a successful equality pass is still deliberately not a durable "safe to
+  mutate" permit: the mutation stage re-runs this exact proof itself,
+  immediately before it mutates, in the same transaction that commits its
+  write-ahead boundary. The worker runs the gate anyway rather than relying on
+  that, because a drifted plan should never reach the stage that owns the real
+  package command.
 
 ## Crash-safe package mutation
 
@@ -394,26 +433,26 @@ unimplemented future stage.
   host's durable `sealed_not_submitted` proof, which releases the job
   `blocked` without fabricating rollback authority. A proven completion
   leaves the job ACTIVE: mutation success is not job success.
-- **Not activated:** no HTTP, Home Assistant, scheduler, bootstrap, or
-  updater path can reach any of this. The mutation helper is a separate dark
-  file that is **not deployed**, with no key, no `authorized_keys` entry, and
-  no PVE privilege, and the scan, snapshot, and execution-plan helpers gained
-  no mutation capability whatsoever. The Version 3 action gate is likewise
-  never installed by bootstrap or the updater: it is generated per operation
-  and written into one guest's tmpfs only while that operation runs.
-  Healthcheck execution, snapshot retention, and production activation remain
-  later stages. No real package mutation has
-  been performed against any live guest; operator Human0 validation of this
-  stage has not been done.
+- **Production reachable** through the one worker, which enters this stage
+  only from `snapshot_confirmed` (submitting) or `mutation_may_have_started`
+  (recovery-only, which can never submit). The mutation helper is deployed
+  behind its OWN dedicated key and forced command, and the scan, snapshot,
+  execution-plan, rollback, and health helpers gained no mutation capability
+  whatsoever. It needs no PVE privilege: the real command runs host-local
+  through `pct exec`. The Version 3 action gate is still never installed by
+  bootstrap or the updater — it is generated per operation and written into
+  one guest's tmpfs only while that operation runs. **No real package mutation
+  has been performed against any live guest**; operator Human0 validation of
+  this stage has not been done.
 - **Correction completed internally (schema v13).** Three confirmed blockers
   in this stage were closed: the real APT invocation is now bound to the
   accepted plan by its own pre-dpkg Version 3 action gate; the accepted
   preparation evidence is a durable authority fact that exactly one
   invocation can commit and only that invocation can submit with; and every
   guest command, including the detached runner's real package command,
-  revalidates its own live PVE target. The stage remains dark, no Human0
-  mutation has been performed. Healthcheck execution now exists internally;
-  see "Job-bound healthcheck execution" below.
+  revalidates its own live PVE target. No Human0 mutation has been performed
+  against a live guest (see "Production reachable" above). Healthcheck
+  execution now exists too; see "Job-bound healthcheck execution" below.
 
 ## Same-job rollback execution
 
@@ -485,12 +524,20 @@ unimplemented future stage.
   recorded task identity permanently forbids that seal. A proven rollback
   terminalizes the job `ROLLED_BACK` -- never `SUCCEEDED`: a rolled-back update
   is not a successful update.
-- **Not activated:** no HTTP, Home Assistant, scheduler, bootstrap, or updater
-  path can reach any of this. The rollback helper is a separate dark file that
-  is **not deployed**, with no key, no `authorized_keys` entry, and neither PVE
-  snapshot privilege provisioned -- the deployed role stays exactly the
-  audit-only pair. No real rollback has been performed against any live guest;
-  operator Human0 validation of this stage has not been done.
+- **Production reachable only through an explicit operator request.**
+  `arm_package_update_rollback` has exactly one production caller: the
+  authenticated `POST .../package-update/rollback` route, which obtains a
+  fresh canonical PVE listing through the existing read-only inspection, arms
+  the write-ahead boundary, and only then acknowledges — so an accepted
+  rollback is durable before the operator is told it was accepted. The worker
+  enters this stage only at `rollback_may_have_started`, a checkpoint it
+  cannot itself commit, and calls `arm_package_update_rollback` nowhere. The
+  rollback helper is deployed behind its OWN dedicated key and forced command,
+  separate from the snapshot boundary so one key never carries both create and
+  rollback, and neither PVE snapshot privilege is provisioned -- the deployed
+  role stays exactly the audit-only pair. **No real rollback has been performed
+  against any live guest**; operator Human0 validation of this stage has not
+  been done.
 - **Extended by schema v16.** Same-job rollback now has four legal entry
   points rather than two: `mutation_may_have_started`, `mutation_completed`,
   `health_started` (an interrupted or unresolved health evaluation), and
@@ -568,15 +615,17 @@ is how it is built. This stage shipped **configuration authority only**;
   for.
 - **Production reachability:** health-contract configuration is production
   reachable, because it is authority metadata only. The update *execution*
-  lifecycle stays exactly as dark as it was.
+  lifecycle is now production reachable too, but only through an explicit
+  operator action -- see "Production activation" below.
 
-## Job-bound healthcheck execution (implemented internally)
+## Job-bound healthcheck execution
 
 The last missing half of the update lifecycle: proving whether the workload an
 update job changed actually came back. `PRODUCT.md`, "What healthy means", is
 the durable product statement; `ARCHITECTURE.md`, "Job-bound healthcheck
-execution", is how it is built. This stage ships **internal execution only**.
-The full lifecycle is still dark.
+execution", is how it is built. See "Production reachable" below for this
+stage's current status -- the worker wires it into the same production
+lifecycle "Production activation" describes.
 
 - **The success criterion is frozen at issuance.** Issuance already freezes
   resource identity, source/transport authority, approval provenance, and the
@@ -655,17 +704,95 @@ The full lifecycle is still dark.
   entry points (`health_started`, and `health_completed` with a failed
   verdict) so a job that needs compensating is not fenced out -- but an
   operator, not this stage, asks for it.
-- **Not activated:** no HTTP endpoint, Home Assistant action, scheduler,
-  worker, production job issuance, or health-result sensor. The health helper
-  is a separate dark file that is **not deployed**, with no key and no
-  `authorized_keys` entry, and it needs **no new PVE privilege** at all -- it
-  reads through host-local `pct exec`, so the provisioned role stays exactly
-  the audit-only pair. No health probe has been run against any live guest;
-  operator Human0 validation of this stage has not been done.
+- **Production reachable** through the one worker, at `mutation_completed` or
+  `health_started`. One wake performs at most one truthful attempt, and PR
+  #73's deliberate absence of a retry policy is preserved exactly: an UNKNOWN
+  verdict leaves the job ACTIVE at `health_started` with its snapshot and
+  rollback authority intact and the worker idle for it, and an operator asks
+  again through the explicit `resume_update` control rather than a timer doing
+  it. A FAILED verdict leaves the job ACTIVE and rollback-capable and submits
+  nothing. The health helper is deployed behind its OWN dedicated key and
+  forced command and needs **no new PVE privilege** at all -- it reads through
+  host-local `pct exec`, so the provisioned role stays exactly the audit-only
+  pair. **No health probe has been run against any live guest**; operator
+  Human0 validation of this stage has not been done.
+
+## Production activation (implemented)
+
+The operator-triggered update lifecycle is production reachable.
+`ARCHITECTURE.md`, "Production update activation", is how it is built.
+
+- **One way in.** `issue_package_update_job` has exactly one production
+  caller: `POST /r0/v1/resources/{resource_id}/package-update`. The caller
+  supplies a `request_id` and nothing else -- `extra="forbid"` makes a body
+  naming a VMID, node, package, version, architecture, plan fingerprint,
+  snapshot, probe, contract revision, command, argv, host, or helper operation
+  a 422 rather than a field quietly ignored. The backend resolves the
+  resource's own current durable approval. The 202 means a durable job already
+  exists; a crash after it never fabricates a success.
+- **One worker, composing existing stages.** `app/package_update_worker.py`
+  owns one thread, contains no state machine of its own, and performs no
+  authority transition: it re-reads the durable job before every action and
+  runs the one stage that checkpoint calls for. It is wake-driven with no
+  timeout -- with nothing to do it blocks rather than polling -- and only an
+  explicit operator action or shutdown wakes it. Durable global single-flight
+  remains the concurrency authority; the in-process cycle lock only stops one
+  worker running two cycles at once.
+- **NO AUTO-UPDATE, structurally.** Neither scheduler issues a job, no scan
+  callback does, the approval write does not, the Home Assistant coordinator
+  does not, and the worker cannot. Continuing a job an operator started after
+  a restart is recovery, not auto-update.
+- **NO AUTO-ROLLBACK, structurally.** `arm_package_update_rollback` has
+  exactly one production caller: the authenticated rollback route. A failed
+  mutation, an unproven mutation, a FAILED health verdict, and an UNKNOWN one
+  each leave the job ACTIVE and rollback-CAPABLE with zero submissions.
+- **No retry policy.** One wake, one attempt. No interval, backoff, grace
+  period, attempt count, or threshold anywhere in the composition. Production
+  liveness for a transient uncertainty is the explicit `resume_update`
+  control, which re-reads the durable checkpoint and invokes only the existing
+  safe continuation semantics -- never "submit the destructive command again".
+- **Restart safety.** Authority startup recovery runs first and terminalizes
+  only provably pre-mutation jobs; the worker then re-observes the durable
+  uncertain states through the stage that owns each. No duplicate destructive
+  submission, and no status becomes `SUCCEEDED` because a process came back.
+- **Five separate privilege boundaries.** Snapshot, plan simulation, mutation,
+  rollback, and health each get their own root-owned forced-command helper and
+  their own dedicated key, because the key is what selects which command a
+  connection may run. The three destructive ones keep root-only operation
+  journals. The scan boundary is a sixth, separate, unchanged one.
+- **No PVE API privilege was broadened.** Every mutation runs host-local, so
+  the provisioned role stays exactly `Sys.Audit,VM.Audit` and `VM.Snapshot`
+  appears in no deployment script.
+- **Product update and workload update are mutually exclusive.** The Phase U2
+  active-job read is a courtesy that refuses early and avoids pointless
+  staging; it is not the invariant, because an operator may legitimately start
+  an update between that answer and the first mutation. Immediately before its
+  mutation window the updater takes an exclusive maintenance fence, and the
+  backend acquires it inside the same `BEGIN IMMEDIATE` writer lock
+  `issue_package_update_job` takes -- so exactly one of the two can win, with
+  no check-then-act gap. The fence is a durable file beside the authority
+  database, so it survives the backend restart the product update performs and
+  keeps refusing workload starts throughout Phase U5 acceptance. It is
+  released only at a terminal point: a proven successful update, or a proven
+  complete rollback/recovery, and only when the fence's own recorded holder is
+  this run -- which is also what makes a crash around acquisition recoverable
+  rather than orphaning it. A pre-activation installation, whose backend has
+  no fence route to ask, gets the same durable fence written directly before
+  the mutation window, so the activated target backend refuses workload starts
+  from the moment it comes up. There is no bypass flag, and a fence another
+  product update holds is never stolen or removed.
+- **This activation itself changes no schema.** The durable job is the
+  execution queue and the recovery authority; a worker wakeup is an in-memory
+  hint and needed no second durable queue. Making the lifecycle reachable
+  caused no authority migration and no reset on its own. The authority schema
+  is v17 (see "Implemented" above and "Known limitations" below for the
+  separate, already-required v16→v17 reset this branch's durable
+  `issuance_sequence` addition causes on an existing pre-release install).
+- **Human0: NOT YET VALIDATED.** See "Human0 validation" above and the
+  operator runbook in `README.md`.
 
 ## Next
 
-- Production activation of the update lifecycle.
 - Snapshot retention, then lifecycle controls (start/stop/reboot) and manual
   snapshot operations.
 
@@ -681,13 +808,17 @@ The full lifecycle is still dark.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v16 is incompatible with v15 and every earlier version, and
-  there is no in-place migration path. An existing installation now uses
-  `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible authority schema, backs it up, and
-  resets only the authority database (see "In-place product updates" below)
-  while preserving the LXC, its VMID/network, PVE identity/token, and every
-  other credential/config file. Home Assistant re-enrollment is required only
-  after that explicit reset, not for an ordinary code-only update.
+- Pre-release: schema v17 is incompatible with v16 and every earlier version,
+  and there is no in-place migration path. Schema v17 added the durable
+  per-resource `issuance_sequence` package-update jobs now use for latest-job
+  ordering (see "Implemented" above), so an existing schema-v16 (or earlier)
+  installation is incompatible even though this activation itself changed no
+  schema. An existing installation now uses `deploy/update-proxmox-0.5.sh` for
+  this: it detects the incompatible authority schema, backs it up, and resets
+  only the authority database (see "In-place product updates" below) while
+  preserving the LXC, its VMID/network, PVE identity/token, and every other
+  credential/config file. Home Assistant re-enrollment is required only after
+  that explicit reset, not for an ordinary code-only update.
 - Package origin, description, security classification, and reboot-required
   stay unknown unless reliable evidence is present. The first parser derives
   origin/security from stable-English APT simulation evidence and leaves
