@@ -107,6 +107,16 @@ class InventoryPublication:
             scan_by_resource = {
                 str(row["resource_id"]): row for row in scan_rows
             }
+            pending_post_update_resources = {
+                str(row["resource_id"])
+                for row in connection.execute(
+                    "SELECT request.resource_id "
+                    "FROM package_update_post_scan_requests request "
+                    "LEFT JOIN package_scan_runs run "
+                    "ON run.scan_run_id=request.scan_run_id "
+                    "WHERE request.scan_run_id IS NULL OR run.lifecycle='running'"
+                ).fetchall()
+            }
             approval_rows = connection.execute(
                 "SELECT * FROM package_plan_approvals ORDER BY resource_id"
             ).fetchall()
@@ -176,6 +186,7 @@ class InventoryPublication:
                     packages_by_run,
                     health_contract_by_resource.get(str(row["resource_id"])),
                     job_by_resource.get(str(row["resource_id"])),
+                    str(row["resource_id"]) in pending_post_update_resources,
                 )
                 for row in resource_rows
             )
@@ -253,6 +264,7 @@ class InventoryPublication:
         packages_by_run: Mapping[str, list[Any]],
         health_contract,
         package_update_job,
+        post_update_scan_pending: bool,
     ) -> dict[str, Any]:
         return {
             "resource_id": str(row["resource_id"]),
@@ -280,7 +292,10 @@ class InventoryPublication:
             "effective_capabilities": (),
             "state": json.loads(str(row["facts_json"])),
             "package_scan": InventoryPublication._package_scan(
-                row, scan, packages_by_run
+                row,
+                scan,
+                packages_by_run,
+                post_update_scan_pending=post_update_scan_pending,
             ),
             "package_plan_approval": self._package_plan_approval(
                 connection, row, scan, approval
@@ -297,7 +312,11 @@ class InventoryPublication:
 
     @staticmethod
     def _package_scan(
-        resource, scan, packages_by_run: Mapping[str, list[Any]]
+        resource,
+        scan,
+        packages_by_run: Mapping[str, list[Any]],
+        *,
+        post_update_scan_pending: bool = False,
     ) -> dict[str, Any]:
         base = {
             "status": "unsupported" if resource["resource_type"] == "qemu" else "not_scanned",
@@ -306,6 +325,7 @@ class InventoryPublication:
             "completed_at": None,
             "os": None,
             "pending_count": None,
+            "post_update_scan_pending": post_update_scan_pending,
             "plan_fingerprint": None,
             "reboot_required": None,
             "packages": (),

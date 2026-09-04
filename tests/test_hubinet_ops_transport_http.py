@@ -239,6 +239,7 @@ def _package_scan_json(scan: PackageScanSnapshot) -> dict[str, Any]:
             else None
         ),
         "pending_count": scan.pending_count,
+        "post_update_scan_pending": scan.post_update_scan_pending,
         "plan_fingerprint": scan.plan_fingerprint,
         "reboot_required": scan.reboot_required,
         "packages": [

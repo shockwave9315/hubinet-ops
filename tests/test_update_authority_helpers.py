@@ -785,6 +785,7 @@ def _full_raw_config(pve_endpoint="https://pve.example.internal:8006", host_cont
             "api_token_env": "HUBINET_OPS_R0_API_TOKEN",
         },
         "package_scan": {
+            "post_update_scan_pending": False,
             "host_control": {
                 "private_key_path": "/etc/hubinet-ops/host-control/id_ed25519",
                 **(host_control or {}),

@@ -261,6 +261,7 @@ def _package_scan_snapshot(payload: Any) -> PackageScanSnapshot:
             else None
         ),
         pending_count=payload.get("pending_count"),
+        post_update_scan_pending=payload["post_update_scan_pending"],
         plan_fingerprint=payload.get("plan_fingerprint"),
         reboot_required=payload.get("reboot_required"),
         packages=tuple(

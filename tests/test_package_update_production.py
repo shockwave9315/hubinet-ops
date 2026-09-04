@@ -34,6 +34,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+import sqlite3
 from threading import Barrier
 import uuid
 
@@ -512,6 +513,14 @@ def test_success_requests_one_real_scan_and_publishes_its_actual_result(
         (job.job_id, job.resource_id),
     )
     assert "post_update_scan_requested" in system.events(job.job_id)
+    before_scan = next(
+        resource
+        for resource in InventoryPublication(
+            system.store, system.authority
+        ).read().resources
+        if resource["resource_id"] == job.resource_id
+    )["package_scan"]
+    assert before_scan["post_update_scan_pending"] is True
 
     packages = system.scan.packages[:2] if mode == "nonzero" else ()
     host = _PostUpdateScanHost(
@@ -548,6 +557,7 @@ def test_success_requests_one_real_scan_and_publishes_its_actual_result(
     )["package_scan"]
     assert published["status"] == expected_status
     assert published["pending_count"] == expected_pending
+    assert published["post_update_scan_pending"] is False
     assert (
         system.authority.package_update_job(job.job_id).status
         is PackageUpdateJobStatus.SUCCEEDED
@@ -601,6 +611,14 @@ def test_restart_after_post_update_scan_claim_resumes_same_run_once(
 
     claimed = system.authority.issue_post_update_package_scan(job.job_id)
     assert claimed.lifecycle.value == "running"
+    pending = next(
+        resource
+        for resource in InventoryPublication(
+            system.store, system.authority
+        ).read().resources
+        if resource["resource_id"] == job.resource_id
+    )["package_scan"]
+    assert pending["post_update_scan_pending"] is True
 
     path = system.store.path
     system.store.close()
@@ -636,7 +654,53 @@ def test_restart_after_post_update_scan_claim_resumes_same_run_once(
     )["package_scan"]
     assert published["status"] == "success"
     assert published["pending_count"] == 0
+    assert published["post_update_scan_pending"] is False
     store.close()
+
+
+def test_v18_post_update_link_accepts_only_same_resource_running_once(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    terminal = system.authority.issue_package_scan(job.resource_id)
+    system.authority.finalize_successful_package_scan(
+        terminal.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=(),
+        reboot_required=None,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="link is invalid"):
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_post_scan_requests SET scan_run_id=? "
+                "WHERE job_id=?",
+                (terminal.scan_run_id, job.job_id),
+            )
+
+    running = system.authority.issue_package_scan(job.resource_id)
+    with system.store._transaction() as connection:
+        connection.execute(
+            "UPDATE package_update_post_scan_requests SET scan_run_id=? WHERE job_id=?",
+            (running.scan_run_id, job.job_id),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="link is invalid"):
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_post_scan_requests SET scan_run_id=NULL "
+                "WHERE job_id=?",
+                (job.job_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="link is invalid"):
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_post_scan_requests SET scan_run_id=? "
+                "WHERE job_id=?",
+                (str(uuid.uuid4()), job.job_id),
+            )
 
 
 def test_the_execution_gate_runs_before_the_mutation_stage(tmp_path: Path) -> None:

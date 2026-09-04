@@ -2424,10 +2424,14 @@ _SCHEMA_STATEMENTS = (
     -- linked exactly once when the independent scan scheduler claims it;
     -- the normal package_scan_runs row then owns 0/N/UNKNOWN publication.
     CREATE TABLE package_update_post_scan_requests (
-        job_id TEXT PRIMARY KEY,
-        resource_id TEXT NOT NULL,
-        requested_at TEXT NOT NULL,
-        scan_run_id TEXT UNIQUE,
+        job_id TEXT PRIMARY KEY CHECK(length(job_id) = 36),
+        resource_id TEXT NOT NULL CHECK(length(resource_id) = 36),
+        requested_at TEXT NOT NULL CHECK(
+            length(trim(requested_at)) > 0 AND length(requested_at) <= 64
+        ),
+        scan_run_id TEXT UNIQUE CHECK(
+            scan_run_id IS NULL OR length(scan_run_id) = 36
+        ),
         FOREIGN KEY(job_id) REFERENCES package_update_jobs(job_id),
         FOREIGN KEY(resource_id) REFERENCES resource_incarnations(resource_id),
         FOREIGN KEY(scan_run_id) REFERENCES package_scan_runs(scan_run_id)
@@ -2638,8 +2642,12 @@ _SCHEMA_STATEMENTS = (
     CREATE TRIGGER package_update_post_scan_request_link_once
     BEFORE UPDATE OF scan_run_id ON package_update_post_scan_requests
     WHEN OLD.scan_run_id IS NOT NULL OR NEW.scan_run_id IS NULL OR
-         (SELECT resource_id FROM package_scan_runs
-          WHERE scan_run_id=NEW.scan_run_id) IS NOT NEW.resource_id
+         NOT EXISTS (
+             SELECT 1 FROM package_scan_runs
+             WHERE scan_run_id=NEW.scan_run_id
+               AND resource_id=NEW.resource_id
+               AND lifecycle='running'
+         )
     BEGIN SELECT RAISE(ABORT, 'post-update scan request link is invalid'); END
     """,
     """

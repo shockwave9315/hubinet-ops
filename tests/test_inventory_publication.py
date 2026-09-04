@@ -182,6 +182,7 @@ def _contract_package_scan(value) -> PackageScanSnapshot:
         completed_at=value["completed_at"],
         os=PackageScanOs(str(os_value["id"]), str(os_value["version"])) if os_value else None,
         pending_count=value["pending_count"],
+        post_update_scan_pending=value["post_update_scan_pending"],
         plan_fingerprint=value["plan_fingerprint"],
         reboot_required=value["reboot_required"],
         packages=tuple(PackageScanPackage(**dict(package)) for package in value["packages"]),

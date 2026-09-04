@@ -219,6 +219,7 @@ class PackageScanSnapshot:
     completed_at: str | None = None
     os: PackageScanOs | None = None
     pending_count: int | None = None
+    post_update_scan_pending: bool = False
     plan_fingerprint: str | None = None
     reboot_required: bool | None = None
     packages: tuple[PackageScanPackage, ...] = ()

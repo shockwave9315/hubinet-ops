@@ -256,6 +256,7 @@ async def _view_update_plan(
         "scan_run_id": scan.scan_run_id if approvable else None,
         "plan_fingerprint": scan.plan_fingerprint if approvable else None,
         "pending_count": scan.pending_count,
+        "post_update_scan_pending": scan.post_update_scan_pending,
         "packages": [
             {
                 "name": package.name,

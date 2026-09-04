@@ -515,6 +515,141 @@ def test_automatic_scheduler_scans_current_lxc_and_uses_runtime_interval(
         scheduler.configure_interval_seconds(59)
 
 
+def test_post_update_wakes_do_not_move_the_absolute_periodic_deadline(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, _ = _system(tmp_path)
+
+    class Clock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    class StopEvent:
+        stopped = False
+
+        def wait(self, _timeout):
+            return False
+
+        def is_set(self):
+            return self.stopped
+
+    clock = Clock()
+    stop = StopEvent()
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        SuccessfulHostControl(),
+        interval_seconds=60,
+        initial_delay_seconds=0,
+        monotonic=clock,
+    )
+    wake_times = iter((10.0, 20.0, 30.0))
+    next_wake = [next(wake_times)]
+
+    class WakeEvent:
+        def wait(self, timeout):
+            deadline = clock.value + timeout
+            if next_wake and next_wake[0] < deadline:
+                clock.value = next_wake.pop()
+                with scheduler._settings_lock:
+                    scheduler._post_update_wake_pending = True
+                try:
+                    next_wake.append(next(wake_times))
+                except StopIteration:
+                    pass
+                return True
+            clock.value = deadline
+            return False
+
+        def clear(self):
+            pass
+
+    scheduler._stop_event = stop
+    scheduler._wake_event = WakeEvent()
+    periodic_at: list[float] = []
+    post_update_at: list[float] = []
+
+    def periodic():
+        periodic_at.append(clock.value)
+        if len(periodic_at) == 2:
+            stop.stopped = True
+        return ()
+
+    scheduler.run_once = periodic
+    scheduler.run_post_update_once = lambda: post_update_at.append(clock.value) or ()
+    scheduler._run_loop()
+
+    assert periodic_at == [0.0, 60.0]
+    assert post_update_at == [10.0, 20.0, 30.0]
+
+
+def test_interval_reconfiguration_reanchors_only_from_configuration_time(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, _ = _system(tmp_path)
+
+    class Clock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        SuccessfulHostControl(),
+        interval_seconds=60,
+        initial_delay_seconds=0,
+        monotonic=clock,
+    )
+
+    class StopEvent:
+        stopped = False
+
+        def wait(self, _timeout):
+            return False
+
+        def is_set(self):
+            return self.stopped
+
+    stop = StopEvent()
+
+    class WakeEvent:
+        configured = False
+
+        def wait(self, timeout):
+            if not self.configured:
+                clock.value = 10.0
+                self.configured = True
+                scheduler.configure_interval_seconds(120)
+                return True
+            clock.value += timeout
+            return False
+
+        def clear(self):
+            pass
+
+        def set(self):
+            pass
+
+    scheduler._stop_event = stop
+    scheduler._wake_event = WakeEvent()
+    periodic_at: list[float] = []
+
+    def periodic():
+        periodic_at.append(clock.value)
+        if len(periodic_at) == 2:
+            stop.stopped = True
+        return ()
+
+    scheduler.run_once = periodic
+    scheduler._run_loop()
+    assert periodic_at == [0.0, 130.0]
+
+
 def test_scheduler_stale_source_conflict_never_reaches_host_control(
     tmp_path: Path,
 ) -> None:

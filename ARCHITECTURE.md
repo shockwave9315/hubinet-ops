@@ -52,7 +52,9 @@ at issuance and never consumed a second time by a retried idempotent
 clock correction between two issuances can never outrank a genuinely later
 job. Schema v18 adds one durable, job-keyed post-update package-scan request,
 created atomically with a successful terminal health verdict and linked once
-to an ordinary package-scan run by the independent scan scheduler. There is no
+to a RUNNING same-resource ordinary package-scan run by the independent scan
+scheduler. Its identity is immutable and its link cannot be cleared or
+replaced. There is no
 migration from v9 through v17; pre-release installs use the
 product updater's explicit backed-up authority reset and require Home
 Assistant re-enrollment.
@@ -99,7 +101,13 @@ current LXC resources. A successful update also commits one durable scan
 request for that resource; the update worker only wakes this scheduler, which
 claims the request into the same real metadata-refresh/simulation path. The
 request-to-run link is write-once, so restart and repeated publication cannot
-create a scan storm. `app/package_scan_host_control.py` sends one bounded JSON
+create a scan storm; schema v18 permits it to point only to a RUNNING scan for
+the same resource. Ordinary periodic cadence uses an absolute monotonic
+deadline independent of post-update wakes. Reconfiguring the interval
+explicitly re-anchors that deadline from the reconfiguration instant; no other
+wake does. Publication retains the last real scan result and separately exposes
+`post_update_scan_pending` from durable request state until the linked fresh
+scan reaches any terminal 0/N/UNKNOWN result. `app/package_scan_host_control.py` sends one bounded JSON
 request over a dedicated pinned-key SSH connection to the bootstrap PVE node.
 The PVE forced helper accepts only `scan_packages`, rechecks live type/node/
 status before each fixed operation, and uses fixed `pct exec` shapes for OS
@@ -2368,7 +2376,10 @@ It does not run a scan and does not synthesize zero updates. The independent
 scan scheduler claims the request exactly once into a normal
 `package_scan_runs` attempt, whose real result becomes the next published
 0/N/UNKNOWN package state. A failed or interrupted scan changes no update-job
-history; the already-proven successful update remains successful.
+history; the already-proven successful update remains successful. While that
+fresh result is outstanding, publication keeps the prior real result intact
+and sets the durable `post_update_scan_pending` indicator; the indicator clears
+only when the linked scan is terminal.
 
 `package_update_job_health_probe_results` holds that evidence: one row per
 frozen probe, bound by foreign key to the exact `(job_id, probe_index)` it

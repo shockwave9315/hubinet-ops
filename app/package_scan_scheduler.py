@@ -1,10 +1,17 @@
-"""Automatic single-worker scheduler for current Debian/Ubuntu LXC scans."""
+"""Single worker with monotonic periodic and durable post-update scan lanes.
+
+Post-update wakes are latency hints only and never reset the absolute periodic
+deadline. Interval reconfiguration explicitly re-anchors that deadline from
+the configuration instant.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
 import threading
+import time
+from collections.abc import Callable
 
 from app.inventory import (
     AuthorityConflict,
@@ -38,6 +45,7 @@ class PackageScanScheduler:
         *,
         interval_seconds: int,
         initial_delay_seconds: int,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._authority = authority
         self._store = store
@@ -51,8 +59,10 @@ class PackageScanScheduler:
         ):
             raise ValueError("initial package scan delay must be from 0 through 600")
         self._initial_delay_seconds = initial_delay_seconds
+        self._monotonic = monotonic
         self._settings_lock = threading.Lock()
         self._post_update_wake_pending = False
+        self._interval_generation = 0
         self._cycle_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -64,11 +74,17 @@ class PackageScanScheduler:
             return self._interval_seconds
 
     def configure_interval_seconds(self, interval_seconds: int) -> None:
-        """Controlled-input seam; this stage has no HTTP/HA writer for it."""
+        """Set cadence and re-anchor its deadline from the current instant.
+
+        This controlled-input seam has no HTTP/HA writer. Reconfiguration is
+        the one wake that deliberately replaces the current periodic deadline;
+        post-update wakes never do.
+        """
 
         validated = validate_package_scan_interval_seconds(interval_seconds)
         with self._settings_lock:
             self._interval_seconds = validated
+            self._interval_generation += 1
         self._wake_event.set()
 
     def wake_for_post_update_scan(self) -> None:
@@ -117,22 +133,44 @@ class PackageScanScheduler:
             self.run_once()
         except Exception:  # noqa: BLE001 - never silently kill the scheduler
             _LOGGER.exception("package scan scheduler cycle failed")
+        with self._settings_lock:
+            interval = self._interval_seconds
+            interval_generation = self._interval_generation
+        next_periodic_deadline = self._monotonic() + interval
         while not self._stop_event.is_set():
-            signaled = self._wake_event.wait(self.interval_seconds)
+            remaining = max(0.0, next_periodic_deadline - self._monotonic())
+            self._wake_event.wait(remaining)
             self._wake_event.clear()
             if self._stop_event.is_set():
                 return
             with self._settings_lock:
                 post_update = self._post_update_wake_pending
                 self._post_update_wake_pending = False
+                interval = self._interval_seconds
+                current_generation = self._interval_generation
+            now = self._monotonic()
+            if current_generation != interval_generation:
+                # Explicit policy: a configured interval starts now. This is
+                # independent of the durable post-update request lane.
+                interval_generation = current_generation
+                next_periodic_deadline = now + interval
+            periodic_due = now >= next_periodic_deadline
             try:
-                if signaled and post_update:
-                    self.run_post_update_once()
-                elif not signaled:
+                if periodic_due:
+                    # run_once handles durable requests first and excludes
+                    # those resources from the periodic lane in this cycle.
                     self.run_once()
-                # A configuration wake only restarts the interval wait.
+                elif post_update:
+                    self.run_post_update_once()
             except Exception:  # noqa: BLE001 - never silently kill the scheduler
                 _LOGGER.exception("package scan scheduler cycle failed")
+            finally:
+                if periodic_due:
+                    # Preserve absolute cadence. Long work or repeated wakes
+                    # cannot shift the deadline by a fresh full interval.
+                    now = self._monotonic()
+                    while next_periodic_deadline <= now:
+                        next_periodic_deadline += interval
 
     def run_once(self) -> tuple[PackageScanCycleOutcome, ...]:
         """Run durable post-update requests, then one ordinary full cycle."""
