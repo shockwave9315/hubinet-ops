@@ -2278,19 +2278,32 @@ class InventoryAuthority:
 
         Pure and restart-stable: it reads only immutable job facts plus this
         backend instance's identity, so the same job always derives the same
-        snapshot name and operation id.
+        snapshot name and operation id. A pure read over immutable facts
+        authorizes no mutation and has nothing to serialize against another
+        writer for, so this deliberately uses the store's plain
+        `_read_transaction` (`BEGIN`), never `_transaction` (`BEGIN
+        IMMEDIATE`) -- the latter would needlessly make this call wait for
+        the authority writer lock before it could even start, which the
+        rollback route's own pre-ACK budget does not, and must not, account
+        for. See `_read_transaction`/`_transaction` in
+        `app/inventory/store.py`.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        with self._store._transaction() as connection:
+        with self._store._read_transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             return self._snapshot_identity_in_transaction(connection, job)
 
     def package_update_snapshot_ownership(self, job_id: str) -> SnapshotOwnership:
-        """Build the strict ownership metadata one job's snapshot must carry."""
+        """Build the strict ownership metadata one job's snapshot must carry.
+
+        Same reasoning as `package_update_snapshot_identity` immediately
+        above: a pure read over immutable job facts, so it uses
+        `_read_transaction`, never the writer-serializing `_transaction`.
+        """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        with self._store._transaction() as connection:
+        with self._store._read_transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             return self._snapshot_ownership_in_transaction(connection, job)
 
