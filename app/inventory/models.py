@@ -837,6 +837,17 @@ class PackageUpdateJob:
     job_id: str
     request_id: str
     issued_at: str
+    #: Durable per-resource issuance order (schema v17), allocated
+    #: atomically in the same transaction as this job's insert -- the
+    #: package_scan_runs.attempt_sequence pattern applied here. `issued_at`
+    #: is wall-clock text and is never sufficient to answer "which of this
+    #: resource's jobs is most recently issued": an ordinary host clock
+    #: step backward between two issuances can give a genuinely LATER job
+    #: an EARLIER issued_at. issuance_sequence has no such dependency --
+    #: it is written once, never reused, and strictly increasing in real
+    #: issuance order -- and every "latest job for this resource" read
+    #: must order by this field, not issued_at.
+    issuance_sequence: int
     resource_id: str
     approval_id: str
     approval_reviewed_scan_run_id: str

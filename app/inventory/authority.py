@@ -1689,6 +1689,21 @@ class InventoryAuthority:
                         ) from exc
                     job_id = _new_uuid()
                     issued_at = _timestamp(decision_time)
+                    # Durable per-resource issuance order (schema v17),
+                    # allocated atomically in this SAME transaction -- the
+                    # package_scan_runs.attempt_sequence pattern above,
+                    # applied here so "latest job for this resource" reads
+                    # never have to trust wall-clock issued_at ordering
+                    # (see PackageUpdateJob.issuance_sequence's own
+                    # docstring).
+                    previous_sequence = connection.execute(
+                        "SELECT MAX(issuance_sequence) FROM package_update_jobs "
+                        "WHERE resource_id=?",
+                        (canonical_resource_id,),
+                    ).fetchone()[0]
+                    issuance_sequence = (
+                        int(previous_sequence) if previous_sequence is not None else 0
+                    ) + 1
 
                     # The child FK is deferred specifically so immutable job
                     # package rows can be inserted before their parent. The
@@ -1729,7 +1744,8 @@ class InventoryAuthority:
                     try:
                         connection.execute(
                             "INSERT INTO package_update_jobs("
-                            "job_id, request_id, issued_at, resource_id, approval_id, "
+                            "job_id, request_id, issued_at, issuance_sequence, "
+                            "resource_id, approval_id, "
                             "approval_reviewed_scan_run_id, approved_plan_fingerprint, "
                             "approval_approved_at, current_plan_scan_run_id, "
                             "inventory_source_id, committed_source_config_revision, "
@@ -1745,11 +1761,12 @@ class InventoryAuthority:
                             "health_contract_probe_count, "
                             "status, checkpoint) "
                             "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'issued')",
+                            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'issued')",
                             (
                                 job_id,
                                 canonical_request_id,
                                 issued_at,
+                                issuance_sequence,
                                 canonical_resource_id,
                                 canonical_approval_id,
                                 str(approval["reviewed_scan_run_id"]),

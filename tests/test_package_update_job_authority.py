@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 import sqlite3
 import threading
@@ -13,6 +14,7 @@ from app.inventory import (
     HealthProbeKind,
     InventoryAuthority,
     InventoryAuthorityStore,
+    InventoryPublication,
     PackageScanFailure,
     PackageScanPackage,
     PackageUpdateCheckpoint,
@@ -238,6 +240,114 @@ def test_global_single_flight_blocks_other_resource_but_recovery_releases_slot(
     second = _issue(authority, other_resource, other_approval)
     assert second.resource_id == other_resource.resource_id
     assert len(store.list_package_update_jobs()) == 2
+
+
+# ===========================================================================
+# "Latest job for this resource" must survive an ordinary wall-clock
+# rollback (schema v17, issuance_sequence). A host clock stepping backward
+# between two issuances (an ordinary NTP correction, not hostile tampering)
+# must never make a genuinely LATER job invisible behind an older one to the
+# operator readback or the published per-resource job header.
+# ===========================================================================
+
+
+def test_latest_job_survives_a_wall_clock_rollback_between_issuances(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, resource, _, approval = _approved_system(tmp_path)
+    authority_publication = InventoryPublication(store, authority)
+
+    def _published_job_id(resource_id: str):
+        for published in authority_publication.read().resources:
+            if published["resource_id"] == resource_id:
+                return published["package_update_job"]["job_id"]
+        raise AssertionError(f"resource {resource_id} missing from publication")
+
+    # Job A, issued at wall-clock 10:03, then terminalized (freeing the one
+    # global active slot) so a second job can be issued at all. Offsets below
+    # are deliberately kept forward of `_system`'s own discovery reference
+    # (START) and within its freshness window: the witness is an ORDINARY
+    # NTP correction that nudges the clock back a couple of minutes, not a
+    # clock reset before the resource was last observed at all -- the latter
+    # is a distinct, already-defended case
+    # (`_materialize_due_expiry_in_transaction`'s own
+    # "freshness_clock_rollback_before_reference" handling), out of scope
+    # here.
+    clock.value = START + timedelta(minutes=3)
+    job_a = _issue(authority, resource, approval)
+    assert authority.recover_interrupted_package_update_jobs() == (job_a.job_id,)
+    assert store.latest_package_update_job_for_resource(resource.resource_id) == (
+        store.package_update_job(job_a.job_id)
+    )
+    assert _published_job_id(resource.resource_id) == job_a.job_id
+
+    # The host clock steps BACKWARD -- an ordinary NTP correction -- and job
+    # B, the genuinely LATER issuance in real execution order, is durably
+    # issued at wall-clock 10:01: earlier than job A's own issued_at.
+    clock.value = START + timedelta(minutes=1)
+    job_b = _issue(authority, resource, approval)
+    assert job_b.issued_at < job_a.issued_at
+
+    # issuance_sequence -- not issued_at -- is what every "latest job for
+    # this resource" read must agree on: strictly increasing in real
+    # issuance order, immutable, and indifferent to the clock rollback.
+    assert job_b.issuance_sequence == job_a.issuance_sequence + 1
+
+    # The operator/HA readback and the published per-resource job header
+    # must both now report job B, not the older, already-terminal job A.
+    assert store.latest_package_update_job_for_resource(resource.resource_id) == (
+        store.package_update_job(job_b.job_id)
+    )
+    assert _published_job_id(resource.resource_id) == job_b.job_id
+
+    # The durable global single-flight ACTIVE-job path is untouched by any
+    # of this: it already names job B correctly through `status='active'`,
+    # never through issued_at ordering.
+    active = store.active_package_update_job()
+    assert active is not None
+    assert active.job_id == job_b.job_id
+
+    # Ordinary increasing-clock issuance still works correctly AFTER a
+    # rollback has already occurred once for this resource.
+    assert authority.recover_interrupted_package_update_jobs() == (job_b.job_id,)
+    clock.value = START + timedelta(minutes=4)
+    job_c = _issue(authority, resource, approval)
+    assert job_c.issuance_sequence == job_b.issuance_sequence + 1
+    assert store.latest_package_update_job_for_resource(resource.resource_id) == (
+        store.package_update_job(job_c.job_id)
+    )
+    assert _published_job_id(resource.resource_id) == job_c.job_id
+
+
+def test_issuance_sequence_is_independent_per_resource(tmp_path: Path) -> None:
+    """Two resources' issuance orders never interfere: each starts its own
+    sequence at 1, and one resource's later issuance cannot perturb another
+    resource's independently-numbered jobs."""
+
+    clock, store, authority, resource, _, approval = _approved_system(tmp_path)
+    other_resource, _, other_approval = _add_approved_resource(store, authority)
+
+    clock.value = START
+    first = _issue(authority, resource, approval)
+    assert first.issuance_sequence == 1
+    assert authority.recover_interrupted_package_update_jobs() == (first.job_id,)
+
+    clock.value = START + timedelta(minutes=1)
+    other_first = _issue(authority, other_resource, other_approval)
+    assert other_first.issuance_sequence == 1
+    assert authority.recover_interrupted_package_update_jobs() == (other_first.job_id,)
+
+    clock.value = START + timedelta(minutes=2)
+    second = _issue(authority, resource, approval)
+    assert second.issuance_sequence == 2
+
+    assert store.latest_package_update_job_for_resource(resource.resource_id).job_id == (
+        second.job_id
+    )
+    assert (
+        store.latest_package_update_job_for_resource(other_resource.resource_id).job_id
+        == other_first.job_id
+    )
 
 
 def test_concurrent_new_requests_cannot_create_two_active_jobs(tmp_path: Path) -> None:

@@ -138,15 +138,18 @@ class InventoryPublication:
                 "j.issued_at, j.health_outcome, j.snapshot_confirmed_at, "
                 "j.mutation_completed_at, j.rollback_completed_at, "
                 "j.terminalized_at, j.terminal_reason FROM package_update_jobs j "
-                "WHERE j.issued_at=("
-                "SELECT MAX(latest.issued_at) FROM package_update_jobs latest "
+                "WHERE j.issuance_sequence=("
+                "SELECT MAX(latest.issuance_sequence) FROM package_update_jobs latest "
                 "WHERE latest.resource_id=j.resource_id) "
                 "ORDER BY j.resource_id, j.job_id"
             ).fetchall()
             job_by_resource: dict[str, Any] = {}
             for row in job_rows:
-                # `issued_at` alone can tie; keep the same deterministic
-                # (issued_at, job_id) ordering every other job read uses.
+                # `issuance_sequence` is the durable per-resource issuance
+                # order (schema v17), unique per resource by construction --
+                # not `issued_at`, which is wall-clock text and can tie or
+                # even regress across an ordinary clock correction. See
+                # PackageUpdateJob.issuance_sequence's own docstring.
                 job_by_resource[str(row["resource_id"])] = row
             package_rows = connection.execute(
                 "SELECT package.* FROM package_scan_packages package "
