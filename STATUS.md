@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v16):
+  SQLite authority database (schema v17):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -43,7 +43,13 @@
   copied probe rows -- adds the durable definitive per-probe result rows and
   the `health_completed` checkpoint, and states the terminal `succeeded`
   contract in both directions, so a job can reach it only by proving every
-  frozen probe passed (see "Job-bound healthcheck execution" below).
+  frozen probe passed (see "Job-bound healthcheck execution" below). Schema
+  v17 adds a durable, per-resource `issuance_sequence` to package-update
+  jobs, allocated atomically at issuance and never consumed a second time by
+  a retried idempotent `request_id`; the latest-job readback and published
+  summary order by `issuance_sequence`, not wall-clock `issued_at`, so an
+  ordinary host clock correction between two issuances can never make an
+  older job outrank a genuinely later one.
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`;
   authority-metadata mutations
   (`PUT /r0/v1/resources/{resource_id}/package-plan-approval`,
@@ -190,8 +196,12 @@ first real operator Human0 validation of this updater completed against CT110
 using installed source commit
 `61d2bc6b04658db39d5120e1f52624450305e93b`: the service was enabled and
 active, health passed, the test requirement was removed, and the authority
-database was present. Workload package update execution remains a separate,
-unimplemented future stage.
+database was present, on installed source that predates this activation.
+Workload package update execution is now a separate, production-reachable
+stage (see "Human0 validation" above) with its own complete automated
+coverage; it is not exercised by this updater's own automated suite, which
+stays scoped to generic in-place product updates, and has not itself been
+Human0-validated.
 
 ## Exact update-plan approval
 
@@ -202,8 +212,9 @@ unimplemented future stage.
   source context is unchanged. Changed, failed, interrupted, unsupported, or
   unavailable plans are not effectively approved.
 - Approval is authority state only. This stage cannot install or upgrade
-  packages or create PVE snapshots. Internal job issuance copies that approval
-  provenance but is not exposed to production callers.
+  packages or create PVE snapshots. Job issuance copies that approval
+  provenance; see "Durable package-update job authority" below for its own
+  one production entry point.
 
 ## Durable package-update job authority
 
@@ -439,9 +450,9 @@ unimplemented future stage.
   preparation evidence is a durable authority fact that exactly one
   invocation can commit and only that invocation can submit with; and every
   guest command, including the detached runner's real package command,
-  revalidates its own live PVE target. The stage remains dark, no Human0
-  mutation has been performed. Healthcheck execution now exists internally;
-  see "Job-bound healthcheck execution" below.
+  revalidates its own live PVE target. No Human0 mutation has been performed
+  against a live guest (see "Production reachable" above). Healthcheck
+  execution now exists too; see "Job-bound healthcheck execution" below.
 
 ## Same-job rollback execution
 
@@ -607,13 +618,14 @@ is how it is built. This stage shipped **configuration authority only**;
   lifecycle is now production reachable too, but only through an explicit
   operator action -- see "Production activation" below.
 
-## Job-bound healthcheck execution (implemented internally)
+## Job-bound healthcheck execution
 
 The last missing half of the update lifecycle: proving whether the workload an
 update job changed actually came back. `PRODUCT.md`, "What healthy means", is
 the durable product statement; `ARCHITECTURE.md`, "Job-bound healthcheck
-execution", is how it is built. This stage ships **internal execution only**.
-The full lifecycle is still dark.
+execution", is how it is built. See "Production reachable" below for this
+stage's current status -- the worker wires it into the same production
+lifecycle "Production activation" describes.
 
 - **The success criterion is frozen at issuance.** Issuance already freezes
   resource identity, source/transport authority, approval provenance, and the
@@ -769,10 +781,13 @@ The operator-triggered update lifecycle is production reachable.
   the mutation window, so the activated target backend refuses workload starts
   from the moment it comes up. There is no bypass flag, and a fence another
   product update holds is never stolen or removed.
-- **Schema is unchanged at v16.** The durable job is the execution queue and
-  the recovery authority; a worker wakeup is an in-memory hint and needed no
-  second durable queue. No authority migration and no reset is caused by this
-  activation.
+- **This activation itself changes no schema.** The durable job is the
+  execution queue and the recovery authority; a worker wakeup is an in-memory
+  hint and needed no second durable queue. Making the lifecycle reachable
+  caused no authority migration and no reset on its own. The authority schema
+  is v17 (see "Implemented" above and "Known limitations" below for the
+  separate, already-required v16→v17 reset this branch's durable
+  `issuance_sequence` addition causes on an existing pre-release install).
 - **Human0: NOT YET VALIDATED.** See "Human0 validation" above and the
   operator runbook in `README.md`.
 
@@ -793,13 +808,17 @@ The operator-triggered update lifecycle is production reachable.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v16 is incompatible with v15 and every earlier version, and
-  there is no in-place migration path. An existing installation now uses
-  `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible authority schema, backs it up, and
-  resets only the authority database (see "In-place product updates" below)
-  while preserving the LXC, its VMID/network, PVE identity/token, and every
-  other credential/config file. Home Assistant re-enrollment is required only
-  after that explicit reset, not for an ordinary code-only update.
+- Pre-release: schema v17 is incompatible with v16 and every earlier version,
+  and there is no in-place migration path. Schema v17 added the durable
+  per-resource `issuance_sequence` package-update jobs now use for latest-job
+  ordering (see "Implemented" above), so an existing schema-v16 (or earlier)
+  installation is incompatible even though this activation itself changed no
+  schema. An existing installation now uses `deploy/update-proxmox-0.5.sh` for
+  this: it detects the incompatible authority schema, backs it up, and resets
+  only the authority database (see "In-place product updates" below) while
+  preserving the LXC, its VMID/network, PVE identity/token, and every other
+  credential/config file. Home Assistant re-enrollment is required only after
+  that explicit reset, not for an ordinary code-only update.
 - Package origin, description, security classification, and reboot-required
   stay unknown unless reliable evidence is present. The first parser derives
   origin/security from stable-English APT simulation evidence and leaves

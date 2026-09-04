@@ -260,9 +260,13 @@ Run the backend locally with:
 from the environment variables that config references, currently
 `HUBINET_OPS_R0_PVE_TOKEN` and `HUBINET_OPS_R0_API_TOKEN`. The validated
 `package_scan.interval_seconds` runtime setting defaults to 21,600 seconds;
-the scheduler supports controlled interval replacement. The only Home
-Assistant write is exact-plan approval authority; it cannot execute package or
-workload mutations. See
+the scheduler supports controlled interval replacement. Home Assistant writes
+exact-plan approval authority, health-contract configuration, and the
+explicit operator update controls (start/resume/roll back one resource's
+update) — none of them executes a package or workload mutation directly:
+each durably records an authority fact or an explicit request, and only the
+backend's own worker, through its forced-command helpers, ever runs a real
+command against a guest. See
 [`config/inventory.example.yaml`](config/inventory.example.yaml) and
 [`.env.r0.example`](.env.r0.example) for the config shape and required
 variables. Never run a deployment script against a real host from a

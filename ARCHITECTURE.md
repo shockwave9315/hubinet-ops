@@ -23,7 +23,7 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v16). Schema v10 added
+database (marker `hubinet_ops_0_5_authority`, schema v17). Schema v10 added
 the job-owned snapshot operation identity, its write-ahead uncertainty
 checkpoint, the observed PVE task identity, and SQL-level state-machine
 invariants over all of them. Schema v11 added the explicit, material
@@ -44,9 +44,15 @@ exact health contract generation it froze at issuance, adds that generation's
 immutable probe rows and its durable definitive result rows, inserts the
 `health_completed` checkpoint, and states the terminal `succeeded` contract in
 both directions so a passing health verdict is the only route to it (see
-"Job-bound healthcheck execution" below). There is no migration from v9
-through v15; pre-release installs use the product updater's explicit
-backed-up authority reset and require Home Assistant re-enrollment.
+"Job-bound healthcheck execution" below). Schema v17 adds a durable
+per-resource `issuance_sequence` to package-update jobs, allocated atomically
+at issuance and never consumed a second time by a retried idempotent
+`request_id`; latest-job readback and publication order by
+`issuance_sequence` rather than wall-clock `issued_at`, so an ordinary host
+clock correction between two issuances can never outrank a genuinely later
+job. There is no migration from v9 through v16; pre-release installs use the
+product updater's explicit backed-up authority reset and require Home
+Assistant re-enrollment.
 
 - `store.py` — schema, transactions, CAS/fencing for discovery-run ownership,
   backend/source/global-revision bookkeeping.
@@ -676,8 +682,11 @@ Retention is separate future work.
 `app/package_update_snapshot.py` (orchestration) and
 `app/package_update_snapshot_host_control.py` (a purpose-specific pinned-key
 SSH client, not a revival of the removed generic `app/host_control.py`) are
-instantiated only by hermetic tests. `tests/test_r0_architecture_regression.py`
-proves production reachability did not increase.
+production-reachable, composed into the one worker by
+`app/inventory_runtime.py` -- see "Production update activation" above.
+`tests/test_r0_architecture_regression.py` proves the constrained shape:
+this module cannot itself issue a job or start an update, and nothing
+outside the worker calls into it.
 
 ## Identity
 
@@ -1110,10 +1119,12 @@ Properties that channel must have:
   binding/generation/continuity/VMID/node context, and the same fresh healthy
   committed source context captured when the scan was issued.
 
-Healthchecks, lifecycle mutation, and QEMU package execution remain future
-work; job-owned snapshot safety, the execution-time plan equality gate,
-crash-safe package mutation, and same-job rollback execution below all exist
-internally but cannot be invoked by production.
+Lifecycle mutation (start/stop/reboot) and QEMU package execution remain
+future work. Job-owned snapshot safety, the execution-time plan equality
+gate, crash-safe package mutation, same-job rollback execution, and
+job-bound healthcheck execution below are all production-reachable through
+the one operator-triggered worker -- see "Production update activation"
+above.
 
 ## Binary package identity
 
@@ -1235,8 +1246,8 @@ collapsing distinct packages into one identity.
 
 ## Execution-time plan equality
 
-This is the missing proof between a package-update job's confirmed pre-update
-snapshot and (future, unimplemented) package mutation:
+This is the proof between a package-update job's confirmed pre-update
+snapshot and package mutation:
 
 ```text
 snapshot_confirmed
@@ -1257,11 +1268,11 @@ snapshot_confirmed
        snapshot retained, global slot released, no rollback authority
 ```
 
-`app/package_update_execution.py` is the dark orchestrator
+`app/package_update_execution.py` is the orchestrator
 (`run_package_update_execution_gate`), `app/package_update_execution_host_control.py`
 is its purpose-specific pinned-key SSH transport, and
-`deploy/hubinet-package-update-helper.py` is a separate dark forced-command
-PVE boundary exposing exactly one typed, non-mutating operation
+`deploy/hubinet-package-update-helper.py` is a separate forced-command PVE
+boundary exposing exactly one typed, non-mutating operation
 (`simulate_exact_update_plan`): a fixed metadata refresh
 (`apt-get update -qq --error-on=any`), a fixed simulation
 (`apt-get -s upgrade`), fixed OS/APT inspection (`cat /etc/os-release`,
@@ -1271,8 +1282,8 @@ against the job's own frozen expected VMID/node, re-validated live before
 each guest command -- the same non-mutating contract `PRODUCT.md`, "What
 package scanning may do" already allows. It is a separate file and a
 separate logical privilege boundary from the deployed scan helper and from
-the snapshot helper, so this stage cannot accidentally make job execution
-production-reachable by extending an already-deployed boundary.
+the snapshot helper, deployed behind its own dedicated key rather than by
+extending an already-deployed boundary's capability.
 
 `InventoryAuthority.evaluate_package_update_execution_plan` is the equality
 transition. It requires the job ACTIVE at exactly `snapshot_confirmed`
@@ -1808,21 +1819,33 @@ abort before dpkg even if the check somehow passed.
 
 `app/package_update_mutation.py` (orchestration) and
 `app/package_update_mutation_host_control.py` (a purpose-specific pinned-key
-SSH client) are instantiated only by hermetic tests, exactly like the
-snapshot and execution-gate modules. Nothing on the production HTTP, Home
-Assistant, scheduler, bootstrap, or updater path can reach any of it; no
-helper, key, `authorized_keys` entry, or PVE privilege is deployed for it,
-and `tests/test_r0_architecture_regression.py` proves it.
+SSH client) are production-reachable, exactly like the snapshot and
+execution-gate modules: `app/inventory_runtime.py` composes both into the
+one worker, which enters this stage only from `snapshot_confirmed`
+(submitting) or `mutation_may_have_started` (recovery-only, which can never
+submit) -- see "Production update activation" above. The mutation helper is
+deployed behind its own dedicated key and forced command, distinct from
+every other typed host-control transport, and needs no PVE privilege: the
+real command runs host-local through `pct exec`.
+`tests/test_r0_architecture_regression.py` proves the constrained shape --
+`app/package_update_mutation.py` cannot itself issue a job or start an
+update, and nothing outside the worker calls into it.
 
 ## Same-job rollback execution
 
-The compensation half of the update lifecycle exists internally and is **not
-production-reachable**. Nothing on the HTTP, Home Assistant, scheduler,
-bootstrap, or updater path can roll anything back; the rollback helper is a
-separate dark file that is **not deployed**, with no key, no `authorized_keys`
-entry, and neither of the two PVE snapshot privileges upstream accepts for the
-rollback endpoint provisioned anywhere. The deployed role stays exactly
-`Sys.Audit` plus the VM audit privilege.
+The compensation half of the update lifecycle is production-reachable, but
+only through an explicit operator request -- see "Production update
+activation" above. `arm_package_update_rollback` has exactly one production
+caller: the authenticated rollback route, which obtains a fresh canonical
+PVE listing through the existing read-only inspection, arms the write-ahead
+boundary, and only then acknowledges. The worker enters this stage only at
+`rollback_may_have_started`, a checkpoint it cannot itself commit, and never
+calls `arm_package_update_rollback`. The rollback helper is deployed behind
+its own dedicated key and forced command, separate from the snapshot
+boundary so one key never carries both create and rollback; neither of the
+two PVE snapshot privileges upstream accepts for the rollback endpoint is
+provisioned anywhere. The deployed role stays exactly `Sys.Audit` plus the
+VM audit privilege.
 
 ```text
 mutation_may_have_started ---+
@@ -2044,9 +2067,13 @@ but nothing evaluates a contract, so no job can be shown to have succeeded.
 
 `app/package_update_rollback.py` (orchestration) and
 `app/package_update_rollback_host_control.py` (a purpose-specific pinned-key
-SSH client) are instantiated only by hermetic tests.
-`tests/test_r0_architecture_regression.py` proves production reachability did
-not increase.
+SSH client) are production-reachable, composed into the one worker by
+`app/inventory_runtime.py` exactly like the other update-lifecycle stages --
+see "Production update activation" above and this section's own opening
+paragraph for the single, explicit-operator-only entry point.
+`tests/test_r0_architecture_regression.py` proves the constrained shape:
+this module cannot itself issue a job or start an update, and nothing
+outside the worker and the explicit rollback route calls into it.
 
 ## Dynamic per-resource health contracts
 
@@ -2187,9 +2214,11 @@ is what makes that name mean something a year later.
 Schema v16 adds the last missing half of the update lifecycle: proving whether
 the workload an update job changed actually came back. `PRODUCT.md`, "What
 healthy means", is the durable product statement; this section is how it is
-built. The stage is **implemented internally and dark** — no HTTP route, Home
-Assistant action, scheduler, or worker reaches it, and its helper is not
-deployed.
+built. The stage is production-reachable through the one worker, at
+`mutation_completed` or `health_started` -- see "Production update
+activation" above. There is no HTTP route or Home Assistant action that
+triggers a health evaluation directly; the worker is the only caller, exactly
+like the other update-lifecycle stages.
 
 ### The contract is frozen at issuance
 
@@ -2352,8 +2381,9 @@ rollback that moved the job on.
 `app/package_update_health.py` (orchestrator),
 `app/package_update_health_host_control.py` (pinned-key SSH transport), and
 `deploy/hubinet-package-health-helper.py` (forced-command PVE boundary,
-**undeployed**) — a separate, purpose-specific channel, not an operation added
-to the production scan helper and not a revival of the removed generic
+deployed behind its own dedicated key by both bootstrap and the updater) —
+a separate, purpose-specific channel, not an operation added to the
+production scan helper and not a revival of the removed generic
 `app/host_control.py`. It exposes **one** typed, read-only operation,
 `evaluate_health_contract`.
 
