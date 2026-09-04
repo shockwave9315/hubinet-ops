@@ -503,175 +503,203 @@ _host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"
         )
 
 
-class TestPathStateNeverGuessesUnknownAsAbsentOrUsable:
-    """The three remaining Family 2 path-state ambiguities: a known
-    symlink whose resolution fails, an existing path whose metadata
-    cannot be positively classified during ADD, and the same during
-    REMOVE. None of these may be read as ABSENT or as a directly usable
-    file -- see _host_control_authorized_keys_path_state's own docstring.
+class TestPathStateDistinguishesEnoentFromOtherErrors:
+    """ENOENT-vs-UNKNOWN micro-correction: _host_control_authorized_keys_
+    path_state must classify ABSENT ONLY from a positively proven ENOENT,
+    and UNKNOWN from any other inspection failure -- including a symlink
+    whose target cannot be resolved/stat'd. Every fault here is a REAL
+    filesystem error (a genuinely missing path, or a real permission
+    failure from a 0o000 parent directory that even the owning, non-root
+    test process cannot traverse), never a synthetic short-circuit --
+    this exercises the classifier's own os.lstat/os.stat error handling,
+    not merely the caller's UNKNOWN branch.
     """
 
-    def _seeded_symlink(self, tmp_path):
-        real_dir = tmp_path / "real"
-        real_dir.mkdir()
-        target = real_dir / "authorized_keys"
-        original = (
-            "ssh-ed25519 AAAAoperator root@laptop\n"
-            'command="/usr/local/libexec/hubinet-package-scan-helper-x",'
-            "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty "
-            "ssh-ed25519 AAAAscan hubinet-ops-package-scan-vmid-110-x\n"
-        )
-        target.write_text(original, encoding="utf-8")
-        link = tmp_path / "authorized_keys"
-        link.symlink_to(target)
-        return link, target, original
-
-    def test_a_symlink_resolution_failure_never_falls_back_to_the_link(
-        self, tmp_path
-    ):
-        link, target, original = self._seeded_symlink(tmp_path)
-
-        script = f"""
-AUTHKEYS="{link}"
-if _host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'; then
-  echo UNEXPECTED_SUCCESS
-  exit 3
-fi
-echo "ADD_RC_NONZERO"
-"""
-        result = _run(
-            tmp_path,
-            script,
-            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "symlink_resolve"},
-        )
-        assert result.returncode == 0, result.stderr
-        assert "ADD_RC_NONZERO" in result.stdout
-        # The symlink itself was never touched (no rename onto it), and
-        # the real target is completely unchanged.
-        assert link.is_symlink()
-        assert link.readlink() == target
-        assert target.read_text(encoding="utf-8") == original
-        leftovers = list(tmp_path.rglob("hubinet-ops-authorized-keys.*"))
-        assert leftovers == []
-
-    def test_a_symlink_resolution_failure_in_remove_never_claims_absent(
-        self, tmp_path
-    ):
-        link, target, original = self._seeded_symlink(tmp_path)
-
-        script = f"""
-AUTHKEYS="{link}"
-if _host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"; then
-  echo UNEXPECTED_SUCCESS
-  exit 3
-fi
-echo "REMOVE_RC_NONZERO"
-"""
-        result = _run(
-            tmp_path,
-            script,
-            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "symlink_resolve"},
-        )
-        assert result.returncode == 0, result.stderr
-        assert "REMOVE_RC_NONZERO" in result.stdout
-        assert link.is_symlink()
-        assert link.readlink() == target
-        assert target.read_text(encoding="utf-8") == original
-
-    def test_b_unknown_metadata_during_add_never_discards_existing_content(
-        self, tmp_path
-    ):
-        """B. An existing regular authorized_keys whose own path state
-        cannot be positively classified must fail closed -- never be
-        treated as absent/new, which would silently drop every existing
-        entry when the staged replacement is later constructed.
-        """
-
+    def test_1_genuine_enoent_classifies_absent(self, tmp_path):
         authorized = tmp_path / "authorized_keys"
-        original = (
-            "ssh-ed25519 AAAAoperator root@laptop\n"
-            'command="/usr/local/libexec/hubinet-package-scan-helper-x",'
-            "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty "
-            "ssh-ed25519 AAAAscan hubinet-ops-package-scan-vmid-110-x\n"
-        )
-        authorized.write_text(original, encoding="utf-8")
-
         script = f"""
 AUTHKEYS="{authorized}"
-if _host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'; then
-  echo UNEXPECTED_SUCCESS
-  exit 3
-fi
-echo "ADD_RC_NONZERO"
-"""
-        result = _run(
-            tmp_path,
-            script,
-            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "path_state"},
-        )
-        assert result.returncode == 0, result.stderr
-        assert "ADD_RC_NONZERO" in result.stdout
-        assert authorized.read_text(encoding="utf-8") == original
-        assert "hubinet-ops-marker-0" not in authorized.read_text(encoding="utf-8")
-        leftovers = list(tmp_path.glob("hubinet-ops-authorized-keys.*"))
-        assert leftovers == []
-
-    def test_c_unknown_metadata_during_remove_never_reports_absent(
-        self, tmp_path
-    ):
-        """C. The same UNKNOWN classification during REMOVE must fail
-        closed rather than reporting a false "already absent" success --
-        the removal was never actually proven.
-        """
-
-        authorized = tmp_path / "authorized_keys"
-        original = "ssh-ed25519 AAAAoperator root@laptop\n" + _line(0) + "\n"
-        authorized.write_text(original, encoding="utf-8")
-
-        script = f"""
-AUTHKEYS="{authorized}"
-if _host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"; then
-  echo UNEXPECTED_SUCCESS
-  exit 3
-fi
-echo "REMOVE_RC_NONZERO"
-"""
-        result = _run(
-            tmp_path,
-            script,
-            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "path_state"},
-        )
-        assert result.returncode == 0, result.stderr
-        assert "REMOVE_RC_NONZERO" in result.stdout
-        assert authorized.read_text(encoding="utf-8") == original
-
-    def test_d_positive_controls_still_hold(self, tmp_path):
-        """D. The three legal classifications this correction pass must
-        never break: ABSENT still permits ADD to create a new file and
-        REMOVE to no-op; an existing regular file and a symlink-to-
-        regular file both still add/remove normally (the dedicated
-        symlink class above already proves the symlink case in full;
-        this proves the plain-regular-file case end to end once more
-        after the classifier rewrite).
-        """
-
-        authorized = tmp_path / "authorized_keys"
-        original = "ssh-ed25519 AAAAoperator root@laptop\n"
-        authorized.write_text(original, encoding="utf-8")
-
-        script = f"""
-AUTHKEYS="{authorized}"
-_host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'
+_host_control_authorized_keys_path_state "$AUTHKEYS"
 """
         result = _run(tmp_path, script)
         assert result.returncode == 0, result.stderr
-        assert original in authorized.read_text(encoding="utf-8")
-        assert _line(0) in authorized.read_text(encoding="utf-8")
+        assert result.stdout == "ABSENT"
 
+    def test_1_positive_controls_for_genuine_absence(self, tmp_path):
+        # Same witness as TestMissingAndMalformedLivePath, restated here
+        # to keep the ENOENT-vs-error positive controls in one place.
+        authorized = tmp_path / "authorized_keys"
+        add_script = f"""
+AUTHKEYS="{authorized}"
+_host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'
+"""
+        result = _run(tmp_path, add_script)
+        assert result.returncode == 0, result.stderr
+        assert authorized.read_text(encoding="utf-8") == _line(0) + "\n"
+
+        authorized.unlink()
         remove_script = f"""
 AUTHKEYS="{authorized}"
 _host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"
 """
         result = _run(tmp_path, remove_script)
         assert result.returncode == 0, result.stderr
+
+    def _seeded_blocked_regular_file(self, tmp_path):
+        """A real, existing regular authorized_keys made genuinely
+        uninspectable: it lives inside a directory with mode 0o000, which
+        denies path traversal to lstat/stat -- EACCES, never ENOENT --
+        even for the owning, non-root process running this test.
+        """
+
+        blocked_dir = tmp_path / "blocked"
+        blocked_dir.mkdir()
+        authorized = blocked_dir / "authorized_keys"
+        original = (
+            "ssh-ed25519 AAAAoperator root@laptop\n"
+            'command="/usr/local/libexec/hubinet-package-scan-helper-x",'
+            "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty "
+            "ssh-ed25519 AAAAscan hubinet-ops-package-scan-vmid-110-x\n"
+        )
+        authorized.write_text(original, encoding="utf-8")
+        blocked_dir.chmod(0o000)
+        return blocked_dir, authorized, original
+
+    def test_2_genuine_stat_error_classifies_unknown(self, tmp_path):
+        blocked_dir, authorized, original = self._seeded_blocked_regular_file(
+            tmp_path
+        )
+        try:
+            script = f"""
+AUTHKEYS="{authorized}"
+_host_control_authorized_keys_path_state "$AUTHKEYS"
+"""
+            result = _run(tmp_path, script)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout == "UNKNOWN"
+        finally:
+            blocked_dir.chmod(0o755)
+
+    def test_2_add_fails_closed_on_genuine_stat_error(self, tmp_path):
+        blocked_dir, authorized, original = self._seeded_blocked_regular_file(
+            tmp_path
+        )
+        try:
+            script = f"""
+AUTHKEYS="{authorized}"
+if _host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "ADD_RC_NONZERO"
+"""
+            result = _run(tmp_path, script)
+            assert result.returncode == 0, result.stderr
+            assert "ADD_RC_NONZERO" in result.stdout
+        finally:
+            blocked_dir.chmod(0o755)
         assert authorized.read_text(encoding="utf-8") == original
+        assert "hubinet-ops-marker-0" not in authorized.read_text(encoding="utf-8")
+        leftovers = list(tmp_path.rglob("hubinet-ops-authorized-keys.*"))
+        assert leftovers == []
+
+    def test_3_remove_fails_closed_on_genuine_stat_error(self, tmp_path):
+        blocked_dir = tmp_path / "blocked"
+        blocked_dir.mkdir()
+        authorized = blocked_dir / "authorized_keys"
+        original = "ssh-ed25519 AAAAoperator root@laptop\n" + _line(0) + "\n"
+        authorized.write_text(original, encoding="utf-8")
+        blocked_dir.chmod(0o000)
+        try:
+            script = f"""
+AUTHKEYS="{authorized}"
+if _host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "REMOVE_RC_NONZERO"
+"""
+            result = _run(tmp_path, script)
+            assert result.returncode == 0, result.stderr
+            assert "REMOVE_RC_NONZERO" in result.stdout
+        finally:
+            blocked_dir.chmod(0o755)
+        # Never a false "already absent" -- the marker is still there
+        # because removal was never actually proven.
+        assert authorized.read_text(encoding="utf-8") == original
+
+    def test_4_symlink_target_stat_error_classifies_unknown_not_absent(
+        self, tmp_path
+    ):
+        """A known symlink whose TARGET cannot be inspected (the target's
+        own containing directory is genuinely inaccessible) must classify
+        UNKNOWN -- never fall back to treating the symlink's own path as
+        its target, and never ABSENT (a dangling/uninspectable symlink is
+        a target-side problem, not proof <path> itself does not exist).
+
+        ADD/REMOVE are proven here only to fail closed and leave the
+        symlink and its target completely untouched -- NOT via the
+        `if cmd; then ... fi` pattern the other tests use, because
+        `_host_control_validate_authorized_keys`'s own pre-existing
+        dangling-symlink check (a bash `[[ -L ]] && ! [[ -e ]]` predicate
+        with the identical ENOENT-vs-EACCES ambiguity this correction
+        pass closes in the classifier, but out of THIS fix's bounded
+        scope) reaches this exact target-permission-denied shape first
+        and hard-stops via `die` (an immediate `exit`, never a `return`)
+        rather than reaching the classifier at all. Either way the
+        process exits nonzero and nothing is ever staged or renamed --
+        this test asserts exactly that outcome, not which guard produced
+        it.
+        """
+
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        target = real_dir / "authorized_keys"
+        original = "ssh-ed25519 AAAAoperator root@laptop\n" + _line(0) + "\n"
+        target.write_text(original, encoding="utf-8")
+        link = tmp_path / "authorized_keys"
+        link.symlink_to(target)
+        real_dir.chmod(0o000)
+        try:
+            state_script = f"""
+AUTHKEYS="{link}"
+_host_control_authorized_keys_path_state "$AUTHKEYS"
+"""
+            result = _run(tmp_path, state_script)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout == "UNKNOWN"
+
+            add_script = f"""
+AUTHKEYS="{link}"
+_host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-1" '{_line(1)}'
+"""
+            result = _run(tmp_path, add_script)
+            assert result.returncode != 0
+
+            remove_script = f"""
+AUTHKEYS="{link}"
+_host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"
+"""
+            result = _run(tmp_path, remove_script)
+            assert result.returncode != 0
+        finally:
+            real_dir.chmod(0o755)
+        assert link.is_symlink()
+        assert link.readlink() == target
+        assert target.read_text(encoding="utf-8") == original
+
+    def test_5_positive_symlink_to_regular_classifies_correctly(self, tmp_path):
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        target = real_dir / "authorized_keys"
+        target.write_text("ssh-ed25519 AAAAoperator root@laptop\n", encoding="utf-8")
+        link = tmp_path / "authorized_keys"
+        link.symlink_to(target)
+
+        script = f"""
+AUTHKEYS="{link}"
+_host_control_authorized_keys_path_state "$AUTHKEYS"
+"""
+        result = _run(tmp_path, script)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == f"SYMLINK_TO_REGULAR {target}"

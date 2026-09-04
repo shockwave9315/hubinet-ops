@@ -116,12 +116,15 @@ _host_control_authorized_keys_rename_should_fail() {
 }
 
 # _host_control_authorized_keys_test_fail_stage <point>: narrow test-only
-# fault-injection seam (Family 2 correction pass, P1 and path-state
-# micro-corrections) for the fallible reads/writes that CONSTRUCT the
-# staged replacement, distinct from HUBINET_OPS_TEST_FAIL_AUTHORIZED_
-# KEYS_RENAME above (which models the atomic-replace half). <point> is
-# one of: grep_read, grep_read_remove, copy_partial, trailing_read,
-# entry_write, path_state, symlink_resolve -- see each call site. Inert
+# fault-injection seam (Family 2 correction pass, P1 micro-correction)
+# for the fallible reads/writes that CONSTRUCT the staged replacement,
+# distinct from HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_RENAME above (which
+# models the atomic-replace half). <point> is one of: grep_read,
+# grep_read_remove, copy_partial, trailing_read, entry_write -- see each
+# call site. (Path-state UNKNOWN/ABSENT classification is exercised
+# through REAL filesystem errors instead -- ENOENT and genuine permission
+# failures -- rather than a synthetic seam here; see
+# _host_control_authorized_keys_path_state's own docstring.) Inert
 # whenever HUBINET_OPS_TEST_MODE is not "1".
 _host_control_authorized_keys_test_fail_stage() {
   local point="$1" needle
@@ -198,40 +201,64 @@ _host_control_authorized_keys_write_entry() {
 
 # _host_control_authorized_keys_path_state <path>: closed, positively-
 # proven classification of the live authorized_keys path (Family 2
-# correction pass, path-state micro-correction). Replaces an EARLIER
-# _host_control_authorized_keys_real_path, which resolved a known symlink
-# via `readlink -f ... || resolved="${path}"` -- a resolution FAILURE
-# fell back to the symlink's own path, which the rest of this module's
-# rename/stage logic would then treat as a definite, safe target. A live
-# authorized_keys is commonly a symlink (PVE's own /root/.ssh/
+# correction pass, ENOENT-vs-error micro-correction). Replaces an EARLIER
+# version built on bash `[[ -L ]]`/`[[ -e ]]`/`[[ -f ]]` predicates, which
+# had the exact same structural bug the two before it did: those
+# predicates evaluate to the SAME false result whether the path is
+# positively absent (ENOENT) or the underlying inspection failed for any
+# OTHER reason (EACCES, EIO, a symlink loop, ...) -- bash itself cannot
+# tell the two apart, so a real metadata/stat failure could still be
+# reported as ABSENT and let ADD silently start from an empty file,
+# discarding an operator key or the package-scan authorization that this
+# run genuinely could not read, or let REMOVE report a false idempotent
+# "already gone".
+#
+# The classification is now delegated to a tiny, bounded python3 helper.
+# python3 is ALREADY a hard preflight requirement for both entrypoints
+# that source this module -- deploy/bootstrap-proxmox-0.5.sh
+# (phase1_preflight; see bootstrap-common.sh's own JSON-helper header:
+# "`python3` is a hard preflight requirement... so this repository never
+# has to fall back to a lexical regex parser") and deploy/update-
+# proxmox-0.5.sh (its own `require_command python3`) -- so this adds no
+# new dependency. The reason for reaching for it here specifically:
+# Python's os.lstat/os.stat raise FileNotFoundError SPECIFICALLY for
+# ENOENT and any other OSError subclass for everything else, which is
+# exactly the one distinction bash's boolean tests cannot make. Nothing
+# else about this primitive changes: no TOCTOU protection between this
+# classification and the later stage/rename, no generation numbers, no
+# fd-based rename, no lock -- the contract stays "classify the state at
+# THIS point truthfully, and fail closed when it cannot be classified".
+#
+# A live authorized_keys is commonly a symlink (PVE's own /root/.ssh/
 # authorized_keys is conventionally -> /etc/pve/priv/authorized_keys),
 # and `mv`/`rename()` replaces whatever is named at its DESTINATION
 # argument's own directory entry -- renaming a staged file directly onto
 # the symlink path itself would delete the symlink and put a plain
 # regular file in its place, breaking whatever the symlink was for. So an
-# unresolved symlink must never be silently treated as its own target.
+# unresolved symlink (or a resolution/target-stat failure, INCLUDING a
+# dangling symlink -- a target-side ENOENT, never conflated with <path>
+# itself being absent) is never silently treated as its own target.
 #
-# The same ambiguity existed twice more: ADD's bare `[[ -f "${real_path}"
-# ]]` treated ANY false answer -- proven absence, or an unprovable
-# metadata/stat failure -- as "create a brand-new file", discarding
-# whatever existing content this run could not actually inspect; REMOVE's
-# bare `[[ -e "${path}" ]] || return 0` did the same for "already
-# absent". This one shared classifier is the single place all three
-# calls now go through, so they cannot drift apart again.
-#
-# Prints exactly one of, on stdout:
-#   ABSENT                    -- <path> is positively proven not to
-#                                 exist at all.
-#   REGULAR                   -- <path> itself is an ordinary, directly
+# Prints exactly one line on stdout:
+#   ABSENT                    -- lstat(<path>) positively raised ENOENT.
+#                                 No other lstat failure is ever reported
+#                                 this way.
+#   REGULAR                   -- lstat(<path>) succeeded and <path> is
+#                                 itself a usable regular file.
+#   SYMLINK_TO_REGULAR <real> -- lstat(<path>) succeeded and shows a
+#                                 symlink; its target <real> was
+#                                 positively resolved AND stat'd as a
 #                                 usable regular file.
-#   SYMLINK_TO_REGULAR <real> -- <path> is a symlink whose resolved
-#                                 target <real> was positively obtained
-#                                 and is itself a usable regular file.
-#   UNKNOWN                   -- anything that could not be positively
-#                                 proven either way: a symlink resolution
-#                                 failure, or a resolved/direct target
-#                                 whose own type could not be proven
-#                                 usable. Never guessed as ABSENT or
+#   UNKNOWN                   -- lstat(<path>) failed for any reason
+#                                 OTHER than ENOENT; or <path> is a
+#                                 symlink whose target could not be
+#                                 positively resolved/stat'd; or the
+#                                 (resolved) path exists but is neither
+#                                 absent nor a regular file (a directory,
+#                                 a device, ...); or the helper itself
+#                                 could not be run or produced anything
+#                                 other than one of the three answers
+#                                 above. Never guessed as ABSENT or
 #                                 REGULAR.
 #
 # _host_control_validate_authorized_keys has already hard-stopped on a
@@ -239,55 +266,54 @@ _host_control_authorized_keys_write_entry() {
 # two shapes never reach here as call sites always run it first; this
 # only has to keep ABSENT/REGULAR/SYMLINK_TO_REGULAR from ever being
 # reported for a state this function could not actually prove.
-#
-# HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE's "path_state" token forces
-# UNKNOWN outright, modelling a general metadata/stat failure on <path>
-# itself (real bash `[[ -e ]]`/`[[ -L ]]` cannot themselves distinguish
-# "positively absent" from "the underlying stat failed for some other
-# reason" -- this seam is what lets the hermetic test suite exercise that
-# UNKNOWN branch deterministically). "symlink_resolve" forces UNKNOWN
-# specifically at the resolution step for a path already positively
-# proven to BE a symlink -- the exact case that must never fall back to
-# the symlink's own path.
 _host_control_authorized_keys_path_state() {
-  local path="$1" resolved
+  local path="$1" output status
+  output="$(python3 -c '
+import os
+import stat
+import sys
 
-  if _host_control_authorized_keys_test_fail_stage "path_state"; then
+target = sys.argv[1]
+try:
+    st = os.lstat(target)
+except FileNotFoundError:
+    print("ABSENT")
+    sys.exit(0)
+except OSError:
+    print("UNKNOWN")
+    sys.exit(0)
+
+if stat.S_ISLNK(st.st_mode):
+    try:
+        real = os.path.realpath(target)
+        real_st = os.stat(real)
+    except OSError:
+        print("UNKNOWN")
+        sys.exit(0)
+    if stat.S_ISREG(real_st.st_mode):
+        print("SYMLINK_TO_REGULAR " + real)
+    else:
+        print("UNKNOWN")
+    sys.exit(0)
+
+if stat.S_ISREG(st.st_mode):
+    print("REGULAR")
+else:
+    print("UNKNOWN")
+' "${path}" 2>/dev/null)" && status=0 || status=$?
+  if (( status != 0 )); then
     printf 'UNKNOWN'
     return 0
   fi
-
-  if [[ -L "${path}" ]]; then
-    if _host_control_authorized_keys_test_fail_stage "symlink_resolve"; then
+  case "${output}" in
+    ABSENT|REGULAR) printf '%s' "${output}" ;;
+    'SYMLINK_TO_REGULAR '*) printf '%s' "${output}" ;;
+    *)
+      # Includes bare "UNKNOWN" and any malformed/unexpected output --
+      # never guessed as one of the three positive answers.
       printf 'UNKNOWN'
-      return 0
-    fi
-    resolved="$(readlink -f -- "${path}" 2>/dev/null)"
-    if [[ -z "${resolved}" ]]; then
-      printf 'UNKNOWN'
-      return 0
-    fi
-    if [[ -f "${resolved}" ]]; then
-      printf 'SYMLINK_TO_REGULAR %s' "${resolved}"
-      return 0
-    fi
-    # Resolved, but the target is not a usable regular file -- missing, a
-    # directory, a device, or otherwise unprovable. Not a shape this
-    # primitive can stage onto safely.
-    printf 'UNKNOWN'
-    return 0
-  fi
-
-  if [[ -e "${path}" ]]; then
-    if [[ -f "${path}" ]]; then
-      printf 'REGULAR'
-      return 0
-    fi
-    printf 'UNKNOWN'
-    return 0
-  fi
-
-  printf 'ABSENT'
+      ;;
+  esac
 }
 
 # _host_control_authorized_keys_add <path> <marker> <line>: idempotently
