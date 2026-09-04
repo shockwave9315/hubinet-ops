@@ -74,13 +74,17 @@ no real snapshot rolled back by Hubinet Ops. The runbook for that first
 operator validation is below.
 
 Pre-release authority schema versions are not migrated in place: the current
-schema is v16 and has no migration from v15 or earlier. An existing
-pre-release deployment uses
-`deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
-authority schema, backs it up, and resets only the authority database (with
-explicit operator authorization) while preserving the LXC, its VMID/network,
-PVE identity/token, and every other credential/config file. Home Assistant
-re-enrollment is required only after that explicit reset.
+schema is v17. Schema v17 adds a per-resource durable `issuance_sequence` to
+package-update jobs, so "latest job" readback is ordered by issuance rather
+than wall-clock `issued_at`. An existing schema-v16 pre-release deployment is
+therefore incompatible in place. `deploy/update-proxmox-0.5.sh` reports
+`reset_required`, makes and validates a coherent authority backup, and resets
+only the authority database after explicit operator authorization. The LXC,
+its VMID/network, PVE identity/token, HA bearer, config, TLS material and
+host-control credentials are preserved; authority identities/history,
+package-scan/job history and exact-plan approvals are recreated with the fresh
+database. Home Assistant re-enrollment is required after that reset because
+`backend_instance_id` and resource identities are regenerated.
 
 ## Installation
 
