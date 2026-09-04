@@ -501,3 +501,177 @@ _host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"
         assert target.read_text(encoding="utf-8") == (
             "ssh-ed25519 AAAAoperator root@laptop\n"
         )
+
+
+class TestPathStateNeverGuessesUnknownAsAbsentOrUsable:
+    """The three remaining Family 2 path-state ambiguities: a known
+    symlink whose resolution fails, an existing path whose metadata
+    cannot be positively classified during ADD, and the same during
+    REMOVE. None of these may be read as ABSENT or as a directly usable
+    file -- see _host_control_authorized_keys_path_state's own docstring.
+    """
+
+    def _seeded_symlink(self, tmp_path):
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        target = real_dir / "authorized_keys"
+        original = (
+            "ssh-ed25519 AAAAoperator root@laptop\n"
+            'command="/usr/local/libexec/hubinet-package-scan-helper-x",'
+            "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty "
+            "ssh-ed25519 AAAAscan hubinet-ops-package-scan-vmid-110-x\n"
+        )
+        target.write_text(original, encoding="utf-8")
+        link = tmp_path / "authorized_keys"
+        link.symlink_to(target)
+        return link, target, original
+
+    def test_a_symlink_resolution_failure_never_falls_back_to_the_link(
+        self, tmp_path
+    ):
+        link, target, original = self._seeded_symlink(tmp_path)
+
+        script = f"""
+AUTHKEYS="{link}"
+if _host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "ADD_RC_NONZERO"
+"""
+        result = _run(
+            tmp_path,
+            script,
+            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "symlink_resolve"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ADD_RC_NONZERO" in result.stdout
+        # The symlink itself was never touched (no rename onto it), and
+        # the real target is completely unchanged.
+        assert link.is_symlink()
+        assert link.readlink() == target
+        assert target.read_text(encoding="utf-8") == original
+        leftovers = list(tmp_path.rglob("hubinet-ops-authorized-keys.*"))
+        assert leftovers == []
+
+    def test_a_symlink_resolution_failure_in_remove_never_claims_absent(
+        self, tmp_path
+    ):
+        link, target, original = self._seeded_symlink(tmp_path)
+
+        script = f"""
+AUTHKEYS="{link}"
+if _host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "REMOVE_RC_NONZERO"
+"""
+        result = _run(
+            tmp_path,
+            script,
+            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "symlink_resolve"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "REMOVE_RC_NONZERO" in result.stdout
+        assert link.is_symlink()
+        assert link.readlink() == target
+        assert target.read_text(encoding="utf-8") == original
+
+    def test_b_unknown_metadata_during_add_never_discards_existing_content(
+        self, tmp_path
+    ):
+        """B. An existing regular authorized_keys whose own path state
+        cannot be positively classified must fail closed -- never be
+        treated as absent/new, which would silently drop every existing
+        entry when the staged replacement is later constructed.
+        """
+
+        authorized = tmp_path / "authorized_keys"
+        original = (
+            "ssh-ed25519 AAAAoperator root@laptop\n"
+            'command="/usr/local/libexec/hubinet-package-scan-helper-x",'
+            "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty "
+            "ssh-ed25519 AAAAscan hubinet-ops-package-scan-vmid-110-x\n"
+        )
+        authorized.write_text(original, encoding="utf-8")
+
+        script = f"""
+AUTHKEYS="{authorized}"
+if _host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "ADD_RC_NONZERO"
+"""
+        result = _run(
+            tmp_path,
+            script,
+            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "path_state"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ADD_RC_NONZERO" in result.stdout
+        assert authorized.read_text(encoding="utf-8") == original
+        assert "hubinet-ops-marker-0" not in authorized.read_text(encoding="utf-8")
+        leftovers = list(tmp_path.glob("hubinet-ops-authorized-keys.*"))
+        assert leftovers == []
+
+    def test_c_unknown_metadata_during_remove_never_reports_absent(
+        self, tmp_path
+    ):
+        """C. The same UNKNOWN classification during REMOVE must fail
+        closed rather than reporting a false "already absent" success --
+        the removal was never actually proven.
+        """
+
+        authorized = tmp_path / "authorized_keys"
+        original = "ssh-ed25519 AAAAoperator root@laptop\n" + _line(0) + "\n"
+        authorized.write_text(original, encoding="utf-8")
+
+        script = f"""
+AUTHKEYS="{authorized}"
+if _host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"; then
+  echo UNEXPECTED_SUCCESS
+  exit 3
+fi
+echo "REMOVE_RC_NONZERO"
+"""
+        result = _run(
+            tmp_path,
+            script,
+            env_extra={"HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE": "path_state"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "REMOVE_RC_NONZERO" in result.stdout
+        assert authorized.read_text(encoding="utf-8") == original
+
+    def test_d_positive_controls_still_hold(self, tmp_path):
+        """D. The three legal classifications this correction pass must
+        never break: ABSENT still permits ADD to create a new file and
+        REMOVE to no-op; an existing regular file and a symlink-to-
+        regular file both still add/remove normally (the dedicated
+        symlink class above already proves the symlink case in full;
+        this proves the plain-regular-file case end to end once more
+        after the classifier rewrite).
+        """
+
+        authorized = tmp_path / "authorized_keys"
+        original = "ssh-ed25519 AAAAoperator root@laptop\n"
+        authorized.write_text(original, encoding="utf-8")
+
+        script = f"""
+AUTHKEYS="{authorized}"
+_host_control_authorized_keys_add "$AUTHKEYS" "hubinet-ops-marker-0" '{_line(0)}'
+"""
+        result = _run(tmp_path, script)
+        assert result.returncode == 0, result.stderr
+        assert original in authorized.read_text(encoding="utf-8")
+        assert _line(0) in authorized.read_text(encoding="utf-8")
+
+        remove_script = f"""
+AUTHKEYS="{authorized}"
+_host_control_authorized_keys_remove "$AUTHKEYS" "hubinet-ops-marker-0"
+"""
+        result = _run(tmp_path, remove_script)
+        assert result.returncode == 0, result.stderr
+        assert authorized.read_text(encoding="utf-8") == original

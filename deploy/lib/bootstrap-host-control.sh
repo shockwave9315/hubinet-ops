@@ -116,11 +116,12 @@ _host_control_authorized_keys_rename_should_fail() {
 }
 
 # _host_control_authorized_keys_test_fail_stage <point>: narrow test-only
-# fault-injection seam (Family 2 correction pass, P1) for the fallible
-# reads/writes that CONSTRUCT the staged replacement, distinct from
-# HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_RENAME above (which models the
-# atomic-replace half). <point> is one of: grep_read, grep_read_remove,
-# copy_partial, trailing_read, entry_write -- see each call site. Inert
+# fault-injection seam (Family 2 correction pass, P1 and path-state
+# micro-corrections) for the fallible reads/writes that CONSTRUCT the
+# staged replacement, distinct from HUBINET_OPS_TEST_FAIL_AUTHORIZED_
+# KEYS_RENAME above (which models the atomic-replace half). <point> is
+# one of: grep_read, grep_read_remove, copy_partial, trailing_read,
+# entry_write, path_state, symlink_resolve -- see each call site. Inert
 # whenever HUBINET_OPS_TEST_MODE is not "1".
 _host_control_authorized_keys_test_fail_stage() {
   local point="$1" needle
@@ -195,26 +196,98 @@ _host_control_authorized_keys_write_entry() {
   printf '%s\n' "${text}" >>"${dst}"
 }
 
-# _host_control_authorized_keys_real_path <path>: the real regular-file
-# location a mutation must stage and rename onto. A live authorized_keys
-# is commonly a symlink -- PVE's own /root/.ssh/authorized_keys is
-# conventionally -> /etc/pve/priv/authorized_keys -- and `mv`/`rename()`
-# replaces whatever is named at its DESTINATION argument's own directory
-# entry; renaming a staged file directly onto a symlink location would
-# delete the symlink and put a plain regular file in its place, breaking
-# whatever the symlink was for (cluster-wide sync, in PVE's case).
-# Resolving to the real target first, and staging/renaming there instead,
-# replaces the target's content atomically while leaving the symlink
-# itself completely untouched. A path that does not exist yet, or is not
-# a symlink, resolves to itself.
-_host_control_authorized_keys_real_path() {
+# _host_control_authorized_keys_path_state <path>: closed, positively-
+# proven classification of the live authorized_keys path (Family 2
+# correction pass, path-state micro-correction). Replaces an EARLIER
+# _host_control_authorized_keys_real_path, which resolved a known symlink
+# via `readlink -f ... || resolved="${path}"` -- a resolution FAILURE
+# fell back to the symlink's own path, which the rest of this module's
+# rename/stage logic would then treat as a definite, safe target. A live
+# authorized_keys is commonly a symlink (PVE's own /root/.ssh/
+# authorized_keys is conventionally -> /etc/pve/priv/authorized_keys),
+# and `mv`/`rename()` replaces whatever is named at its DESTINATION
+# argument's own directory entry -- renaming a staged file directly onto
+# the symlink path itself would delete the symlink and put a plain
+# regular file in its place, breaking whatever the symlink was for. So an
+# unresolved symlink must never be silently treated as its own target.
+#
+# The same ambiguity existed twice more: ADD's bare `[[ -f "${real_path}"
+# ]]` treated ANY false answer -- proven absence, or an unprovable
+# metadata/stat failure -- as "create a brand-new file", discarding
+# whatever existing content this run could not actually inspect; REMOVE's
+# bare `[[ -e "${path}" ]] || return 0` did the same for "already
+# absent". This one shared classifier is the single place all three
+# calls now go through, so they cannot drift apart again.
+#
+# Prints exactly one of, on stdout:
+#   ABSENT                    -- <path> is positively proven not to
+#                                 exist at all.
+#   REGULAR                   -- <path> itself is an ordinary, directly
+#                                 usable regular file.
+#   SYMLINK_TO_REGULAR <real> -- <path> is a symlink whose resolved
+#                                 target <real> was positively obtained
+#                                 and is itself a usable regular file.
+#   UNKNOWN                   -- anything that could not be positively
+#                                 proven either way: a symlink resolution
+#                                 failure, or a resolved/direct target
+#                                 whose own type could not be proven
+#                                 usable. Never guessed as ABSENT or
+#                                 REGULAR.
+#
+# _host_control_validate_authorized_keys has already hard-stopped on a
+# dangling symlink or an existing-but-not-regular <path> itself, so those
+# two shapes never reach here as call sites always run it first; this
+# only has to keep ABSENT/REGULAR/SYMLINK_TO_REGULAR from ever being
+# reported for a state this function could not actually prove.
+#
+# HUBINET_OPS_TEST_FAIL_AUTHORIZED_KEYS_STAGE's "path_state" token forces
+# UNKNOWN outright, modelling a general metadata/stat failure on <path>
+# itself (real bash `[[ -e ]]`/`[[ -L ]]` cannot themselves distinguish
+# "positively absent" from "the underlying stat failed for some other
+# reason" -- this seam is what lets the hermetic test suite exercise that
+# UNKNOWN branch deterministically). "symlink_resolve" forces UNKNOWN
+# specifically at the resolution step for a path already positively
+# proven to BE a symlink -- the exact case that must never fall back to
+# the symlink's own path.
+_host_control_authorized_keys_path_state() {
   local path="$1" resolved
-  if [[ -L "${path}" ]]; then
-    resolved="$(readlink -f -- "${path}")" && [[ -n "${resolved}" ]] || resolved="${path}"
-  else
-    resolved="${path}"
+
+  if _host_control_authorized_keys_test_fail_stage "path_state"; then
+    printf 'UNKNOWN'
+    return 0
   fi
-  printf '%s' "${resolved}"
+
+  if [[ -L "${path}" ]]; then
+    if _host_control_authorized_keys_test_fail_stage "symlink_resolve"; then
+      printf 'UNKNOWN'
+      return 0
+    fi
+    resolved="$(readlink -f -- "${path}" 2>/dev/null)"
+    if [[ -z "${resolved}" ]]; then
+      printf 'UNKNOWN'
+      return 0
+    fi
+    if [[ -f "${resolved}" ]]; then
+      printf 'SYMLINK_TO_REGULAR %s' "${resolved}"
+      return 0
+    fi
+    # Resolved, but the target is not a usable regular file -- missing, a
+    # directory, a device, or otherwise unprovable. Not a shape this
+    # primitive can stage onto safely.
+    printf 'UNKNOWN'
+    return 0
+  fi
+
+  if [[ -e "${path}" ]]; then
+    if [[ -f "${path}" ]]; then
+      printf 'REGULAR'
+      return 0
+    fi
+    printf 'UNKNOWN'
+    return 0
+  fi
+
+  printf 'ABSENT'
 }
 
 # _host_control_authorized_keys_add <path> <marker> <line>: idempotently
@@ -228,15 +301,29 @@ _host_control_authorized_keys_real_path() {
 # already did.
 _host_control_authorized_keys_add() {
   local path="$1" marker="$2" line="$3"
-  local real_path dir tmp count
+  local state kind real_path dir tmp count
   local grep_output grep_status trailing_byte trailing_status
 
   _host_control_validate_authorized_keys "${path}"
-  real_path="$(_host_control_authorized_keys_real_path "${path}")"
+  # Family 2 correction pass (path-state micro-correction): a positively
+  # closed classification, never a bare `[[ -f ]]` that cannot itself
+  # distinguish "proven absent" from "could not be proven either way" --
+  # see _host_control_authorized_keys_path_state's own docstring.
+  state="$(_host_control_authorized_keys_path_state "${path}")"
+  kind="${state%% *}"
+  case "${kind}" in
+    ABSENT) real_path="${path}" ;;
+    REGULAR) real_path="${path}" ;;
+    SYMLINK_TO_REGULAR) real_path="${state#* }" ;;
+    *)
+      log_warn "could not positively classify ${path} (metadata/stat failure or unresolved symlink); refusing to add the '${marker}' entry"
+      return 1
+      ;;
+  esac
   dir="$(dirname -- "${real_path}")"
 
   count=0
-  if [[ -f "${real_path}" ]]; then
+  if [[ "${kind}" != "ABSENT" ]]; then
     # Family 2 correction pass (P1 sibling): a read failure here must
     # never be folded into "zero matches" -- see this module's header.
     # 0 = matched (the printed count is trustworthy), 1 = grep's own
@@ -274,7 +361,7 @@ _host_control_authorized_keys_add() {
   esac
 
   tmp="$(mktemp "${dir}/hubinet-ops-authorized-keys.XXXXXX")" || return 1
-  if [[ -f "${real_path}" ]]; then
+  if [[ "${kind}" != "ABSENT" ]]; then
     # Family 2 correction pass (P1): mode setup must not silently
     # continue if BOTH the reference chmod and the safe fallback fail --
     # a staged file left at the wrong mode could still be renamed live.
@@ -352,11 +439,25 @@ _host_control_authorized_keys_add() {
 # rename may already have removed it while its own following barrier
 # failed).
 _host_control_authorized_keys_remove() {
-  local path="$1" marker="$2" real_path dir tmp present_status
+  local path="$1" marker="$2" state kind real_path dir tmp present_status
 
-  [[ -e "${path}" ]] || return 0
   _host_control_validate_authorized_keys "${path}"
-  real_path="$(_host_control_authorized_keys_real_path "${path}")"
+  # Family 2 correction pass (path-state micro-correction): "could not be
+  # proven to exist" is not the same as "positively proven absent" -- see
+  # _host_control_authorized_keys_path_state's own docstring. Only a
+  # genuine ABSENT answer is a no-op; anything unresolved fails closed
+  # rather than reporting removal complete.
+  state="$(_host_control_authorized_keys_path_state "${path}")"
+  kind="${state%% *}"
+  case "${kind}" in
+    ABSENT) return 0 ;;
+    REGULAR) real_path="${path}" ;;
+    SYMLINK_TO_REGULAR) real_path="${state#* }" ;;
+    *)
+      log_warn "could not positively classify ${path} (metadata/stat failure or unresolved symlink); refusing to remove the '${marker}' entry"
+      return 1
+      ;;
+  esac
   dir="$(dirname -- "${real_path}")"
 
   # Family 2 correction pass (P1 direct sibling): the same fail-closed
