@@ -30,6 +30,27 @@ SERVICE_UNIT = REPO_ROOT / "deploy" / "hubinet-ops-0.5.service"
 FIREWALL_DOC = REPO_ROOT / "deploy" / "README-0.5-firewall.md"
 
 
+def test_operator_entrypoint_git_modes_match_documented_invocations() -> None:
+    expected_modes = {
+        "deploy/bootstrap-proxmox-0.5.sh": "100644",  # invoked through bash
+        "deploy/install-0.5.0-fresh.sh": "100644",  # invoked through bash
+        "deploy/update-proxmox-0.5.sh": "100755",  # documented as ./script
+    }
+    result = subprocess.run(
+        ["git", "ls-files", "--stage", "--", *expected_modes],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    actual_modes = {
+        line.split(maxsplit=1)[1].split("\t", maxsplit=1)[1]: line.split(maxsplit=1)[0]
+        for line in result.stdout.splitlines()
+    }
+    assert actual_modes == expected_modes
+
+
 def test_install_script_syntax_is_valid() -> None:
     if shutil.which("bash") is None:
         import pytest
