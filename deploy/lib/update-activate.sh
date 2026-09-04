@@ -911,6 +911,16 @@ update_activate_and_accept() {
   _update_accept_discovery
   _update_accept_host_control
   _update_accept_firewall
+  # Family B correction pass: the same non-mutating, end-to-end proof
+  # fresh bootstrap already requires of these five boundaries before it
+  # calls itself done -- see update_boundaries_accept_all's own docstring
+  # in update-boundaries.sh. Runs after update_boundaries_activate (Step
+  # 8b, above) and after the target service is proven active and healthy,
+  # and before source marker / final accepted-target commit semantics make
+  # this run's rollback artifacts disposable -- a failure here still fails
+  # activation and lets the existing EXIT-trap recovery roll back to the
+  # prior supported installation, exactly like any other Phase U5 failure.
+  update_boundaries_accept_all
   log_pass "acceptance"
 
   _update_write_source_marker

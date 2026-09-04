@@ -4788,6 +4788,223 @@ class TestPreActivationInstallationUpgrade:
 
 
 # ---------------------------------------------------------------------------
+# Family A (correction pass) -- an UNKNOWN metadata/stat classification of a
+# boundary path must never be silently read as a definite answer, at any of
+# the three points update-boundaries.sh classifies one: the installed
+# helper (update_boundaries_classify), the boundary private key inside the
+# container (_update_boundary_create_key), and the preserved rollback
+# copy/backup on either side (update_boundaries_rollback). Only positively
+# proven ENOENT may mean ABSENT; anything else fails closed before
+# mutation.
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryClassificationFailsClosed:
+    def test_a_stat_failure_classifying_an_installed_helper_fails_closed_before_mutation(
+        self, tmp_path
+    ):
+        """The exact Codex witness: a genuinely present, unusable-to-
+        inspect helper must never be planned as "absent" -- that would
+        stage a fresh provision over it and let rollback later remove it
+        as though this run had created it. Real EACCES/stat-failure
+        coverage for this classifier in isolation lives in
+        tests/test_update_boundary_path_classification.py; a genuine
+        directory-permission denial cannot be used HERE (see
+        HUBINET_OPS_TEST_FAIL_BOUNDARY_ROLLBACK_COPY_STATE's own docstring
+        in _update_boundary_helper_path_state for why: every boundary
+        helper lives in the SAME shared /usr/local/libexec directory as
+        the package-scan helper update-ownership.sh's own unrelated,
+        always-checked Phase U1 verification depends on). This must fail
+        with no journal ever created and nothing mutated at all --
+        classification happens during PLANNING, well before the
+        maintenance window opens.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        before_authorized = _authorized_keys_text(env)
+        before_helpers = {
+            kind: _boundary_helper(env, kind).read_text(encoding="utf-8")
+            for kind in BOUNDARY_KINDS
+        }
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(
+            dict(env.env, HUBINET_OPS_TEST_FAIL_BOUNDARY_INSTALLED_HELPER_STATE="1"),
+            _base_args(target),
+        )
+
+        assert result.returncode != 0
+        assert "could not positively classify" in result.stderr
+        assert _authorized_keys_text(env) == before_authorized
+        for kind in BOUNDARY_KINDS:
+            assert _boundary_helper(env, kind).read_text(encoding="utf-8") == (
+                before_helpers[kind]
+            ), kind
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert not journal.exists()
+
+    def test_a_non_regular_installed_helper_fails_closed_not_absent(self, tmp_path):
+        """A directory sitting where a helper file should be is UNKNOWN,
+        never ABSENT -- classifying it "absent" would stage a fresh
+        provision on top of whatever that directory actually is."""
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        helper = _boundary_helper(env, "health")
+        before_authorized = _authorized_keys_text(env)
+        helper.unlink()
+        helper.mkdir()
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "could not positively classify" in result.stderr
+        assert _authorized_keys_text(env) == before_authorized
+        assert helper.is_dir()
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert not journal.exists()
+
+    def test_a_stat_failure_on_the_boundary_key_refuses_to_generate_a_new_one(
+        self, tmp_path
+    ):
+        """_update_boundary_create_key must never generate a new key while
+        it cannot positively prove none already exists at that path --
+        doing so on a false ABSENT could silently overwrite key material
+        an existing authorization trusts. Pre-activation, so this is also
+        the "no new privileged access path" witness: the failed run must
+        leave nothing behind for ANY of the five boundaries.
+        """
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        before_authorized = _authorized_keys_text(env)
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["boundary_key_stat_failure"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "refusing to generate a new key while its state is unproven" in (
+            result.stderr
+        )
+        assert _authorized_keys_text(env) == before_authorized
+        for kind in BOUNDARY_KINDS:
+            assert not _boundary_helper(env, kind).exists(), kind
+            assert not env.ct_file(FAKE_VMID, boundary_key_ct_path(kind)).exists(), kind
+
+    def test_a_stat_failure_on_the_rollback_copy_hard_stops_instead_of_guessing(
+        self, tmp_path
+    ):
+        """The confirmed P1 sibling: the OLD `[[ -e "${rollback_copy}" ]]`
+        branch selector could not distinguish "genuinely absent" from
+        "could not be inspected". A false negative there fell through to
+        the "already restored" replay branch, which only checks whether
+        the LIVE path is SOME executable regular file -- and on a genuine
+        first rollback attempt, the live path still holds the NEW
+        (post-activation) helper at that point, which passes that check
+        too. Rollback would then silently believe this boundary was fully
+        undone while the target helper stayed live.
+
+        Reached via a real two-invocation restart (HUBINET_OPS_TEST_KILL_AT)
+        rather than the in-process EXIT trap, so the rollback_copy this
+        run created is genuinely durable on disk before the second
+        invocation's classification of it is faulted.
+
+        The fault itself (HUBINET_OPS_TEST_FAIL_BOUNDARY_ROLLBACK_COPY_
+        STATE, consulted only under HUBINET_OPS_TEST_MODE=1) is a real
+        EACCES/stat-failure witness for `_update_boundary_helper_path_
+        state` in isolation -- see
+        tests/test_update_boundary_path_classification.py -- but genuine
+        directory-permission denial cannot be used HERE: rollback_copy
+        lives in the SAME shared /usr/local/libexec directory as the
+        package-scan helper update-ownership.sh's own (unrelated, always-
+        checked) re-verification depends on, so blocking that directory
+        would trip ownership re-verification before recovery ever reaches
+        this classifier at all.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            boundary_helper_text={"mutation": "#!/usr/bin/env python3\n# stale\n"},
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        crashed = _run(
+            dict(env.env, HUBINET_OPS_TEST_KILL_AT="boundary-replaced-mutation"),
+            _base_args(target),
+        )
+        assert crashed.returncode < 0, crashed.stderr  # killed by a real signal
+
+        live = _boundary_helper(env, "mutation")
+        libexec = live.parent
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        journal_text = journal.read_text(encoding="utf-8")
+        run_id = _journal_run_id(journal_text)
+        rollback_copy = libexec / f"{live.name}.rollback-{run_id}"
+        assert rollback_copy.is_file(), "the fixture: preserved before the kill"
+        target_content = live.read_text(encoding="utf-8")
+        assert target_content != rollback_copy.read_text(encoding="utf-8")
+
+        recovery = _run(
+            dict(env.env, HUBINET_OPS_TEST_FAIL_BOUNDARY_ROLLBACK_COPY_STATE="1"),
+            _base_args(target),
+        )
+
+        assert recovery.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in recovery.stderr
+        assert "could not be positively classified" in recovery.stderr
+        # Never silently accepted as "already restored": the target
+        # content is still live, and the journal survives for a real retry.
+        assert live.read_text(encoding="utf-8") == target_content
+        assert journal.exists()
+
+        # The fault clears; a later invocation genuinely restores the
+        # preserved pre-update content.
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert not journal.exists()
+        assert live.read_text(encoding="utf-8") == "#!/usr/bin/env python3\n# stale\n"
+
+    def test_a_stat_failure_on_the_config_backup_hard_stops_the_rollback(
+        self, tmp_path
+    ):
+        """update_boundaries_rollback's config-restore step must never
+        proceed past a preserved-backup existence check it cannot
+        positively answer -- a false ABSENT there already hard-stops (the
+        message just used to claim "absent" even when it was really
+        unproven); this proves the UNKNOWN path is genuinely reached and
+        still hard-stops, never silently treated as EXISTS either.
+        """
+
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            activated=False,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["boundary_config_backup_stat_failure"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "could not be positively classified" in result.stderr
+        # The hard stop happens BEFORE the restore is even attempted: the
+        # live configuration still activates the lifecycle, exactly as
+        # activation itself left it -- never silently treated as restored.
+        assert "package_update:" in env.ct_file_text(
+            FAKE_VMID, "/etc/hubinet-ops/inventory.yaml"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Family 1 (correction pass) -- durable run ownership for package-update
 # boundary artifacts. update_journal_checkpoint used to persist a ledger
 # marker only when its id matched VMID exactly, silently dropping every
@@ -4802,6 +5019,118 @@ class TestPreActivationInstallationUpgrade:
 # own in-process rollback (which already had the ephemeral ledger intact
 # and would mask this bug).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Family B (correction pass) -- the in-place updater must prove the same
+# end-to-end usability of all five package-update forced-command boundaries
+# that fresh bootstrap already proves (bootstrap-update-boundaries.sh's own
+# _accept_update_boundaries) before it may declare the target accepted.
+# update_boundaries_accept_all uses the SAME non-mutating structured-
+# refusal probe (bootstrap-host-control.sh's shared
+# _host_control_probe_forced_command_boundary), against THIS installation's
+# own active endpoint values rather than bootstrap's defaults.
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryAcceptanceParity:
+    @pytest.mark.parametrize("kind", BOUNDARY_KINDS)
+    def test_each_boundary_failing_acceptance_fails_the_update(self, tmp_path, kind):
+        """Every one of the five boundaries is independently load-bearing:
+        a helper/key/authorization that exists but does not actually work
+        end to end must still fail the update, before the source marker
+        and before final acceptance, and roll back to the prior supported
+        installation -- exactly as though the boundary had never been
+        provisioned. Boundaries themselves are UNCHANGED here (an ordinary
+        code-only update): only the new acceptance probe touches them.
+        """
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        before_marker = env.ct_file_text(
+            FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit"
+        ).strip()
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = [f"boundary_probe_{kind}"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert (
+            f"the {kind} forced-command SSH boundary did not reject the "
+            "typed acceptance probe as expected"
+        ) in result.stderr
+        assert "rollback complete" in result.stderr
+        # Before source marker / final acceptance: the pre-update marker
+        # survives untouched.
+        assert env.ct_file_text(
+            FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit"
+        ).strip() == before_marker
+        # The probe triggers no real destructive operation of any kind.
+        for journal_dir in UPDATE_BOUNDARY_JOURNAL_DIRS:
+            assert list(env.ct_file(FAKE_VMID, journal_dir).glob("*")) == []
+
+    def test_non_default_endpoint_is_used_for_the_acceptance_probe(self, tmp_path):
+        """host/port/user/known_hosts_path come from THIS installation's
+        own now-active package_update.host_control, never bootstrap's
+        root@22 defaults -- an already-running installation may have an
+        explicit, non-default configured endpoint."""
+
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="1" * 40, activated=False
+        )
+        inventory_path = env.ct_file(FAKE_VMID, "/etc/hubinet-ops/inventory.yaml")
+        inventory_path.write_text(
+            'source:\n'
+            '  display_name: "Home Proxmox"\n'
+            '  provider_kind: proxmox_ve\n'
+            "\npackage_scan:\n"
+            "  interval_seconds: 21600\n"
+            "  initial_delay_seconds: 30\n"
+            "  host_control:\n"
+            '    host: "pve.example.internal"\n'
+            "    port: 2222\n"
+            '    user: "svc-deploy"\n'
+            '    private_key_path: "/etc/hubinet-ops/host-control/id_ed25519"\n'
+            '    known_hosts_path: "/custom/known_hosts"\n'
+            "    timeout_seconds: 900\n"
+            "    max_result_bytes: 8388608\n",
+            encoding="utf-8",
+        )
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+        before_lines = len(env.log_lines())
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        probe_lines = [
+            line
+            for line in env.log_lines()[before_lines:]
+            if "runuser" in line and "ssh" in line and "id_ed25519_" in line
+        ]
+        assert len(probe_lines) == len(BOUNDARY_KINDS)
+        for line in probe_lines:
+            assert "svc-deploy@pve.example.internal" in line, line
+            assert " -p 2222 " in line, line
+            assert "UserKnownHostsFile=/custom/known_hosts" in line, line
+
+    def test_package_scan_boundary_acceptance_is_unaffected(self, tmp_path):
+        """The pre-existing, separate package-scan acceptance
+        (_update_accept_host_control) is untouched by this correction
+        pass: it still succeeds and still runs, independent of the five
+        package-update boundaries' own new acceptance."""
+
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        target = build_update_target_checkout(tmp_path / "target", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert any(
+            "runuser" in line and "ssh" in line and "id_ed25519_" not in line
+            for line in env.log_lines()
+        )
 
 
 class TestBoundaryRecoveryOwnershipAcrossRestart:

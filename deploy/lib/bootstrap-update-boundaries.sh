@@ -109,13 +109,25 @@ phase8d_provision_update_boundaries() {
   # Root-owned, root-only durable journals. These are what make the
   # destructive stages at-most-once across a crash, so their ownership and
   # mode are part of the boundary, not incidental.
+  local journal_state
   for journal_dir in ${UPDATE_BOUNDARY_JOURNAL_DIRS}; do
     journal_path="$(_host_control_host_path "${journal_dir}")"
-    if [[ ! -d "${journal_path}" ]]; then
-      _host_control_install_dir 0700 "${journal_path}" \
-        || die "failed to create the Hubinet operation journal ${journal_dir}"
-      ledger_record update-boundary-journal-dir "${journal_path}"
-    fi
+    # Positively classified (Family A correction pass): see
+    # _host_control_dir_state's own docstring -- a false ABSENT here would
+    # make this run wrongly claim (and durably record) ownership of a
+    # journal directory it did not create.
+    journal_state="$(_host_control_dir_state "${journal_path}")"
+    case "${journal_state}" in
+      ABSENT)
+        _host_control_install_dir 0700 "${journal_path}" \
+          || die "failed to create the Hubinet operation journal ${journal_dir}"
+        ledger_record update-boundary-journal-dir "${journal_path}"
+        ;;
+      DIRECTORY) ;;
+      *)
+        die "could not positively classify the Hubinet operation journal directory ${journal_dir} (${journal_state}) -- refusing to guess whether this run would be creating it before mutation"
+        ;;
+    esac
   done
 
   local kind helper_path marker key_path public_key_tmp
@@ -171,21 +183,17 @@ phase8d_provision_update_boundaries() {
 # no generic "ping" operation, because this existing refusal is already the
 # proof that the key reached exactly this forced command.
 _accept_update_boundaries() {
-  local kind key_path probe_output probe_status probe_request
-  probe_request='{"request_version":1,"operation":"probe","target":{},"context":{}}'
+  local kind key_path
   for kind in ${UPDATE_BOUNDARY_KINDS}; do
     key_path="$(update_boundary_ct_private_key "${kind}")"
-    probe_output="$(printf '%s' "${probe_request}" | pct exec "${VMID}" -- runuser -u hubinetops -- \
-      ssh -T -p 22 -i "${key_path}" \
-      -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-      -o "UserKnownHostsFile=${HOST_CONTROL_CT_KNOWN_HOSTS}" \
-      -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
-      -o ForwardAgent=no -o ClearAllForwardings=yes \
-      "root@$(_endpoint_host "${PVE_ENDPOINT}")" 2>/dev/null)" && probe_status=0 || probe_status=$?
-    # A structured refusal proves the forced command ran. Exit 255 or an
-    # empty body would instead mean SSH/key/host-key policy is unusable.
-    (( probe_status != 0 && probe_status != 255 )) \
-      && printf '%s' "${probe_output}" | grep -qF "$(_update_boundary_probe_marker "${kind}")" \
+    # Shared mechanism (bootstrap-host-control.sh's own
+    # _host_control_probe_forced_command_boundary) -- see its docstring.
+    # Fresh bootstrap always uses its own just-written defaults (root@22,
+    # the pinned host-control known_hosts) because there is no existing
+    # installation to inherit an endpoint from yet.
+    _host_control_probe_forced_command_boundary \
+      "${key_path}" "$(_endpoint_host "${PVE_ENDPOINT}")" 22 root "${HOST_CONTROL_CT_KNOWN_HOSTS}" \
+      "$(_update_boundary_probe_marker "${kind}")" \
       || die "the ${kind} forced-command SSH boundary did not reject the typed probe as expected (check PVE sshd root public-key policy and the pinned host key)"
   done
 }

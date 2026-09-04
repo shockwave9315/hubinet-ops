@@ -40,6 +40,49 @@ _host_control_install_file() {
   fi
 }
 
+# _host_control_dir_state <path>: three-valued, read-only classification
+# of a directory path on the PVE HOST filesystem (Family A correction
+# pass). Prints exactly one of ABSENT / DIRECTORY / UNKNOWN.
+#
+# Shared by fresh bootstrap and the in-place updater's own journal-
+# directory creation gates (bootstrap-update-boundaries.sh's
+# phase8d_provision_update_boundaries, and update-boundaries.sh's
+# update_boundaries_activate): both used a bare `[[ ! -d "${path}" ]]` to
+# decide whether THIS run is creating a NEW root-only operation journal
+# (and therefore owns removing it on rollback) or reusing one that already
+# existed. `[[ ! -d ]]` cannot distinguish genuine ENOENT from any other
+# stat failure -- a transient one on an EXISTING journal directory would
+# make this run wrongly believe (and durably record) that it created a
+# directory it does not own, so a later rollback could `rmdir` another
+# operation's still-durable at-most-once evidence.
+_host_control_dir_state() {
+  local path="$1" output status
+  output="$(python3 -c '
+import os
+import stat
+import sys
+
+try:
+    st = os.lstat(sys.argv[1])
+except FileNotFoundError:
+    print("ABSENT")
+    sys.exit(0)
+except OSError:
+    print("UNKNOWN")
+    sys.exit(0)
+
+print("DIRECTORY" if stat.S_ISDIR(st.st_mode) else "UNKNOWN")
+' "${path}" 2>/dev/null)" && status=0 || status=$?
+  if (( status != 0 )); then
+    printf 'UNKNOWN'
+    return 0
+  fi
+  case "${output}" in
+    ABSENT|DIRECTORY) printf '%s' "${output}" ;;
+    *) printf 'UNKNOWN' ;;
+  esac
+}
+
 _host_control_validate_authorized_keys() {
   local path="$1"
   if [[ -L "${path}" && ! -e "${path}" ]]; then
@@ -537,6 +580,52 @@ _host_control_authorized_keys_remove() {
   else
     return 1
   fi
+}
+
+# _host_control_probe_forced_command_boundary <key_path> <host> <port>
+# <user> <known_hosts_path> <expected_refusal_substring>: the non-mutating
+# acceptance primitive for one host-control forced-command boundary (P1
+# correction pass, Family B).
+#
+# Shared by fresh bootstrap (bootstrap-update-boundaries.sh's own
+# _accept_update_boundaries, and this module's own package-scan boundary
+# probe above) and the in-place updater (update-boundaries.sh) so both
+# entrypoints prove the SAME end-to-end property through ONE mechanism
+# rather than two copies that could quietly drift apart: sends exactly one
+# deliberately malformed typed request over SSH using the boundary's OWN
+# dedicated key, which the forced command on the PVE host side refuses
+# structurally before doing anything else. This proves key validity, host-
+# key pinning, sshd forced-command policy, and that the intended helper
+# actually executes and can load its runtime -- all without creating a
+# snapshot, mutating a package, submitting a rollback, or evaluating health
+# against any real workload. There is no generic "ping" operation: this
+# existing structural refusal already proves the key reached exactly this
+# forced command.
+#
+# host/port/user/known_hosts_path are always taken from the CALLER, never
+# assumed to be bootstrap's own defaults: an already-running installation
+# being updated may have an explicit, non-default configured endpoint, and
+# the acceptance probe must prove THAT exact configuration is usable, not
+# merely that bootstrap's defaults would have been.
+#
+# Returns 0 when the expected structured-refusal substring is found in the
+# response; non-zero otherwise (prints nothing -- callers supply their own
+# diagnostic, since bootstrap's and the updater's failure messages differ).
+_host_control_probe_forced_command_boundary() {
+  local key_path="$1" host="$2" port="$3" user="$4" known_hosts_path="$5" expected_marker="$6"
+  local probe_output probe_status
+  local probe_request='{"request_version":1,"operation":"probe","target":{},"context":{}}'
+  probe_output="$(printf '%s' "${probe_request}" | pct exec "${VMID}" -- runuser -u hubinetops -- \
+    ssh -T -p "${port}" -i "${key_path}" \
+    -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+    -o "UserKnownHostsFile=${known_hosts_path}" \
+    -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+    -o ForwardAgent=no -o ClearAllForwardings=yes \
+    "${user}@${host}" 2>/dev/null)" && probe_status=0 || probe_status=$?
+  # A structured refusal proves the forced command ran. Exit 255 or an
+  # empty body would instead mean SSH/key/host-key policy is unusable.
+  (( probe_status != 0 && probe_status != 255 )) \
+    && printf '%s' "${probe_output}" | grep -qF "${expected_marker}"
 }
 
 phase2c_plan_host_control() {

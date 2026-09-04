@@ -872,6 +872,28 @@ def _exec_inner(vmid, inner, state):
                 # and must never collapse to ABSENT.
                 sys.stdout.write("UNKNOWN")
                 return 0
+        elif normalized.endswith(
+            ("id_ed25519_snapshot", "id_ed25519_execution", "id_ed25519_mutation",
+             "id_ed25519_rollback", "id_ed25519_health")
+        ):
+            # deploy/lib/update-boundaries.sh::_update_boundary_ct_path_state
+            # (Family A correction pass) -- the exact same in-container
+            # ENOENT-vs-stat-failure classifier, reused for the boundary
+            # private-key existence pre-check in _update_boundary_create_key.
+            if _fail("boundary_key_stat_failure"):
+                sys.stdout.write("UNKNOWN")
+                return 0
+        elif "/inventory.yaml.rollback-" in normalized:
+            # Same classifier, reused for the preserved-configuration-
+            # backup existence check in update_boundaries_rollback. A
+            # separate fault key from the private-key check above so a
+            # test can reach ONE of the two call sites without also
+            # tripping the other (a pre-activation run's forward
+            # activation always generates all five keys before it can
+            # ever reach the config-backup rollback check).
+            if _fail("boundary_config_backup_stat_failure"):
+                sys.stdout.write("UNKNOWN")
+                return 0
         path = _ct_path(vmid, probe_path)
         sys.stdout.write("EXISTS" if path.exists() else "ABSENT")
         return 0

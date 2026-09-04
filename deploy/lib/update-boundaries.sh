@@ -62,6 +62,26 @@ _update_boundary_source_name() {
   esac
 }
 
+# Each helper's own bounded structural refusal of a request that is not one
+# of its typed operations -- the exact same table bootstrap-update-
+# boundaries.sh's own _update_boundary_probe_marker uses (duplicated, not
+# shared, the same way the two modules already duplicate the kind-name ->
+# helper-source-file mapping above: a tiny, stable lookup intrinsic to the
+# helper scripts themselves, not to bootstrap or the updater). Used by
+# _update_boundary_accept_all below (Family B correction pass) to prove
+# each forced-command boundary is genuinely usable before this run may
+# declare the target accepted.
+_update_boundary_probe_marker() {
+  case "$1" in
+    snapshot) printf 'request must have the exact snapshot-operation shape' ;;
+    execution) printf 'unknown host-control operation' ;;
+    mutation) printf 'request must have the exact package-mutation shape' ;;
+    rollback) printf 'request does not have the exact expected shape' ;;
+    health) printf 'request must have the exact health-evaluation shape' ;;
+    *) die "unknown package-update boundary kind '$1'" ;;
+  esac
+}
+
 _update_boundary_key_path() {
   case "$1" in
     snapshot) printf '%s/id_ed25519_snapshot' "${UPDATE_BOUNDARY_CT_DIR}" ;;
@@ -114,24 +134,170 @@ _update_boundary_set_plan() {
   printf -v "${name}" '%s' "$2"
 }
 
+# _update_boundary_helper_path_state <path>: three-valued, read-only
+# classification of a boundary HELPER path on the PVE HOST filesystem
+# (Family A correction pass). Prints exactly one of ABSENT / REGULAR /
+# UNKNOWN.
+#
+# update_boundaries_classify used to collapse this into a bare `[[ ! -f
+# "${installed_path}" ]]`, which evaluates to the SAME false result
+# whether the path is positively absent (ENOENT) or the underlying
+# inspection failed for any OTHER reason (EACCES, EIO, ...) -- POSIX test
+# cannot tell the two apart. A transient metadata/stat failure on an
+# EXISTING helper could therefore still be classified "absent": the
+# updater would then plan this boundary as a NEW privileged access path
+# and move the staged target directly onto the live path without ever
+# preserving the old helper, `_update_boundary_create_key` would then
+# refuse (an existing key with no matching helper), and rollback would
+# follow the "created" branch and remove the live helper/key as though
+# THIS run had provisioned them -- leaving an already-activated
+# installation without its configured credentials/helper.
+#
+# Fixed the same way the CT-side maintenance-fence and authorized_keys
+# classifiers already were: delegate to a tiny, bounded, LOCAL python3
+# script (this path lives on the PVE host itself -- see
+# _update_boundary_host_path -- so no `pct exec` is involved at all,
+# unlike _update_boundary_ct_path_state below). os.lstat raises
+# FileNotFoundError specifically for ENOENT and any other OSError for
+# every other failure -- the one distinction a boolean `[[ -f ]]` cannot
+# make.
+#
+# Deliberately narrower than bootstrap-host-control.sh's own
+# _host_control_authorized_keys_path_state: a boundary helper path is
+# never a supported symlink target (it is created once, directly, by
+# `_host_control_install_file`/`mv`, and never aliased), so a symlink here
+# is not a usable answer either way -- ABSENT/REGULAR/UNKNOWN is the whole
+# contract, and a symlink (or a directory, device, ...) is UNKNOWN, never
+# silently resolved.
+_update_boundary_helper_path_state() {
+  local path="$1" output status
+  # Test-only (Family A correction pass), consulted only when
+  # HUBINET_OPS_TEST_MODE=1: a real, genuine stat/EACCES failure on a
+  # boundary helper path cannot be modelled through the fake CT/PVE
+  # command dispatcher this test suite otherwise relies on, because this
+  # classifier runs directly against the PVE HOST filesystem (no `pct
+  # exec` involved) in the SAME shared directory
+  # (_update_boundary_host_path) that update-ownership.sh's own
+  # unrelated, always-checked scan-helper presence proof also lives in --
+  # denying that whole directory's permissions to model ONE file's stat
+  # failure would trip ownership verification first, on every invocation
+  # (forward AND recovery), never reaching this classifier at all. The
+  # same narrow HUBINET_OPS_TEST_FAIL_* idiom already used throughout
+  # update-recovery.sh (e.g. HUBINET_OPS_TEST_FAIL_CT_CLEANUP) applied
+  # here, bounded to exactly the two path shapes this classifier is
+  # actually called with: the bare installed/live helper path
+  # (update_boundaries_classify, before any mutation), and a preserved
+  # rollback copy (".rollback-<run-id>", during update_boundaries_
+  # rollback). Inert whenever HUBINET_OPS_TEST_MODE is not "1", so
+  # production behavior is always the real os.lstat call below.
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]]; then
+    if [[ "${HUBINET_OPS_TEST_FAIL_BOUNDARY_ROLLBACK_COPY_STATE:-0}" == "1" \
+      && "${path}" == *.rollback-* ]]; then
+      printf 'UNKNOWN'
+      return 0
+    fi
+    if [[ "${HUBINET_OPS_TEST_FAIL_BOUNDARY_INSTALLED_HELPER_STATE:-0}" == "1" \
+      && "${path}" != *.rollback-* && "${path}" != *.staged-* ]]; then
+      printf 'UNKNOWN'
+      return 0
+    fi
+  fi
+  output="$(python3 -c '
+import os
+import stat
+import sys
+
+try:
+    st = os.lstat(sys.argv[1])
+except FileNotFoundError:
+    print("ABSENT")
+    sys.exit(0)
+except OSError:
+    print("UNKNOWN")
+    sys.exit(0)
+
+print("REGULAR" if stat.S_ISREG(st.st_mode) else "UNKNOWN")
+' "${path}" 2>/dev/null)" && status=0 || status=$?
+  if (( status != 0 )); then
+    printf 'UNKNOWN'
+    return 0
+  fi
+  case "${output}" in
+    ABSENT|REGULAR) printf '%s' "${output}" ;;
+    *) printf 'UNKNOWN' ;;
+  esac
+}
+
+# _update_boundary_ct_path_state <path>: three-valued, read-only existence
+# check of a path INSIDE the container (Family A correction pass). Return
+# 0=EXISTS, 1=ABSENT, 2=UNKNOWN -- the exact contract and mechanism
+# deploy/lib/update-activate.sh's own _update_fence_path_state already
+# established for the maintenance fence (inline `python3 -c`, never a
+# bare `pct exec ... test -e`, whose boolean answer cannot distinguish
+# genuine ENOENT from a metadata/stat failure or an attach/transport
+# failure). A new sibling rather than a call to that function directly:
+# the fence classifier's own docstring is a fence-specific history: the
+# MECHANISM below is identical, but reusing the literal function across an
+# unrelated module for an unrelated path would read as though this were
+# still about the fence. Used for the boundary private-key existence
+# check (_update_boundary_create_key must never guess before generating a
+# key that could silently overwrite one already in use) and the
+# preserved-configuration-backup existence check during rollback.
+_update_boundary_ct_path_state() {
+  local path="$1" output status
+  output="$(pct exec "${VMID}" -- python3 -c '
+import os
+import sys
+
+try:
+    os.lstat(sys.argv[1])
+except FileNotFoundError:
+    print("ABSENT")
+except OSError:
+    print("UNKNOWN")
+else:
+    print("EXISTS")
+' "${path}" 2>/dev/null)" \
+    && status=0 || status=$?
+  (( status == 0 )) || return 2
+  case "${output}" in
+    EXISTS) return 0 ;;
+    ABSENT) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Phase U2 -- classification. Reads only; mutates nothing.
 # ---------------------------------------------------------------------------
 
 update_boundaries_classify() {
-  local kind installed_tmp target_tmp installed_path
+  local kind installed_tmp target_tmp installed_path installed_state
   for kind in $(_update_boundary_kinds); do
     installed_path="$(_update_boundary_host_path "${kind}")"
     target_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-boundary.XXXXXX")"
     _update_target_file_to_file "$(_update_boundary_source_name "${kind}")" "${target_tmp}" \
       || die "target commit ${SOURCE_HEAD_SHA} has no $(_update_boundary_source_name "${kind}") -- refusing to plan an update against an unreadable target"
-    if [[ ! -f "${installed_path}" ]]; then
-      # A pre-activation installation, or one whose boundary was removed.
-      # Provisioning it is a NEW privileged access path, and is tracked and
-      # rolled back as one.
-      _update_boundary_set_plan "${kind}" absent
-      continue
-    fi
+    installed_state="$(_update_boundary_helper_path_state "${installed_path}")"
+    case "${installed_state}" in
+      ABSENT)
+        # A pre-activation installation, or one whose boundary was removed.
+        # Provisioning it is a NEW privileged access path, and is tracked
+        # and rolled back as one.
+        _update_boundary_set_plan "${kind}" absent
+        continue
+        ;;
+      REGULAR) ;;
+      *)
+        # UNKNOWN (correction pass, Family A): never guessed as absent.
+        # Planning against an unproven state could stage a "new"
+        # provision over a helper that actually still exists, or classify
+        # a genuinely present helper as unchanged/changed from stale
+        # content -- either way, mutation must not proceed until this
+        # installation's own boundary state can be positively read.
+        die "could not positively classify the installed ${kind} boundary helper at ${installed_path} (${installed_state}) -- refusing to plan an update while its state is unproven"
+        ;;
+    esac
     installed_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-boundary.XXXXXX")"
     cat "${installed_path}" >"${installed_tmp}" 2>/dev/null || : >"${installed_tmp}"
     if _update_files_differ_exact "${installed_tmp}" "${target_tmp}"; then
@@ -211,18 +377,29 @@ update_boundaries_stage_cleanup() {
 # ---------------------------------------------------------------------------
 
 update_boundaries_activate() {
-  local kind plan live staged rollback_copy journal_dir journal_path
+  local kind plan live staged rollback_copy journal_dir journal_path journal_state
   for journal_dir in ${UPDATE_BOUNDARY_JOURNAL_DIRS}; do
     journal_path="$(_host_control_host_path "${journal_dir}")"
-    if [[ ! -d "${journal_path}" ]]; then
-      update_journal_record update-boundary-journal-created "${journal_path}"
-      # Test-only (Family 1 correction pass): the journal-created marker is
-      # now durable, but the directory it describes does not exist yet --
-      # proves a restart can reconstruct that this run owns creating it.
-      _update_test_kill_checkpoint "boundary-journal-created-${journal_dir##*/}"
-      _host_control_install_dir 0700 "${journal_path}" \
-        || die "failed to create the Hubinet operation journal ${journal_dir}"
-    fi
+    # Positively classified (Family A correction pass): see
+    # _host_control_dir_state's own docstring -- a false ABSENT here would
+    # make this run wrongly claim (and durably record) ownership of a
+    # journal directory it did not create.
+    journal_state="$(_host_control_dir_state "${journal_path}")"
+    case "${journal_state}" in
+      ABSENT)
+        update_journal_record update-boundary-journal-created "${journal_path}"
+        # Test-only (Family 1 correction pass): the journal-created marker is
+        # now durable, but the directory it describes does not exist yet --
+        # proves a restart can reconstruct that this run owns creating it.
+        _update_test_kill_checkpoint "boundary-journal-created-${journal_dir##*/}"
+        _host_control_install_dir 0700 "${journal_path}" \
+          || die "failed to create the Hubinet operation journal ${journal_dir}"
+        ;;
+      DIRECTORY) ;;
+      *)
+        die "could not positively classify the Hubinet operation journal directory ${journal_dir} (${journal_state}) -- refusing to guess whether this run would be creating it before mutation"
+        ;;
+    esac
   done
 
   for kind in $(_update_boundary_kinds); do
@@ -275,16 +452,26 @@ update_boundaries_activate() {
 }
 
 _update_boundary_create_key() {
-  local kind="$1" key_path
+  local kind="$1" key_path key_state
   key_path="$(_update_boundary_key_path "${kind}")"
   run_logged pct exec "${VMID}" -- install -d -o hubinetops -g hubinetops -m 0700 "${UPDATE_BOUNDARY_CT_DIR}" \
     || die "failed to ensure the host-control directory inside container ${VMID}"
   # Never overwrite an existing private key: a key file already at this path
   # may be the one an existing authorization trusts, and replacing it would
   # silently break that boundary while leaving its authorization in place.
-  if pct exec "${VMID}" -- test -e "${key_path}" >/dev/null 2>&1; then
-    die "the ${kind} boundary private key already exists at ${key_path} inside container ${VMID} but its forced-command helper does not -- refusing to overwrite key material; resolve this manually"
-  fi
+  # Positively classified (Family A correction pass): a bare `test -e`
+  # cannot distinguish genuine ENOENT from a metadata/stat failure, and an
+  # UNKNOWN here must never be read as "safe to generate a new key" --
+  # see _update_boundary_ct_path_state's own docstring.
+  # Same errexit-safe idiom used throughout the update-activate.sh sibling
+  # this classifier mirrors: capture the exit status without ever leaving
+  # this as a bare failing statement under `set -e`.
+  _update_boundary_ct_path_state "${key_path}" && key_state=0 || key_state=$?
+  case "${key_state}" in
+    1) ;; # ABSENT -- safe to generate.
+    0) die "the ${kind} boundary private key already exists at ${key_path} inside container ${VMID} but its forced-command helper does not -- refusing to overwrite key material; resolve this manually" ;;
+    *) die "could not positively classify the ${kind} boundary private key path ${key_path} inside container ${VMID} -- refusing to generate a new key while its state is unproven" ;;
+  esac
   run_logged pct exec "${VMID}" -- ssh-keygen -q -t ed25519 -N '' -C "$(_update_boundary_marker "${kind}")" -f "${key_path}" \
     || die "failed to generate the dedicated ${kind} boundary SSH key inside container ${VMID}"
   run_logged pct exec "${VMID}" -- chown hubinetops:hubinetops "${key_path}" "${key_path}.pub" \
@@ -537,6 +724,66 @@ YAML
 }
 
 # ---------------------------------------------------------------------------
+# Phase U5 -- acceptance. Non-mutating; runs after activation has proven the
+# target service active and healthy, and before this run may declare the
+# target accepted (Family B correction pass).
+# ---------------------------------------------------------------------------
+
+# update_boundaries_accept_all: end-to-end, non-mutating proof that every
+# one of the five package-update forced-command boundaries is actually
+# usable, not merely that their helper/key/authorization files exist.
+#
+# Fresh bootstrap already proves exactly this property for the boundaries
+# it provisions (bootstrap-update-boundaries.sh's own
+# _accept_update_boundaries) before ever calling itself done -- but until
+# this correction pass, the in-place updater activated or replaced the
+# same five boundaries and declared the target accepted without ever
+# exercising them. A host whose target helper could not actually run (a
+# missing interpreter feature, a broken forced-command mapping, ...) would
+# only discover that at the first real operator-triggered package update,
+# after durable job/journal ownership had already begun.
+#
+# Uses the SAME non-mutating mechanism bootstrap uses
+# (_host_control_probe_forced_command_boundary, in bootstrap-host-
+# control.sh): one deliberately malformed typed request per boundary,
+# structurally refused by the helper before it can do anything else. No
+# snapshot, package mutation, rollback, or real health evaluation is ever
+# triggered.
+#
+# Unlike bootstrap -- which is establishing the FIRST configuration and so
+# always uses its own just-written root@22 default -- this reads the
+# endpoint host/port/user/known_hosts_path back from the installation's OWN
+# now-live package_update.host_control block (update_boundaries_activate
+# has already run: activation writes it explicitly, so there is nothing to
+# default here) rather than assuming any of bootstrap's defaults. An
+# already-running installation may have an explicit, non-default endpoint,
+# and this proves THAT exact configuration, not merely what a fresh install
+# would have used.
+update_boundaries_accept_all() {
+  local config_tmp endpoint_host endpoint_port endpoint_user endpoint_known_hosts
+  local kind key_path marker
+
+  config_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-boundary-accept.XXXXXX")"
+  pct exec "${VMID}" -- cat "${UPDATE_BOUNDARY_CONFIG_PATH}" >"${config_tmp}" \
+    || die "could not read ${UPDATE_BOUNDARY_CONFIG_PATH} from container ${VMID} to verify the package-update forced-command boundaries"
+
+  endpoint_host="$(_update_boundary_config_scalar "${config_tmp}" package_update host_control host)"
+  endpoint_port="$(_update_boundary_config_scalar "${config_tmp}" package_update host_control port)"
+  endpoint_user="$(_update_boundary_config_scalar "${config_tmp}" package_update host_control user)"
+  endpoint_known_hosts="$(_update_boundary_config_scalar "${config_tmp}" package_update host_control known_hosts_path)"
+  [[ -n "${endpoint_host}" && -n "${endpoint_port}" && -n "${endpoint_user}" && -n "${endpoint_known_hosts}" ]] \
+    || die "cannot verify the package-update forced-command boundaries: ${UPDATE_BOUNDARY_CONFIG_PATH} has no complete package_update.host_control endpoint even though activation just wrote it"
+
+  for kind in $(_update_boundary_kinds); do
+    key_path="$(_update_boundary_key_path "${kind}")"
+    marker="$(_update_boundary_probe_marker "${kind}")"
+    _host_control_probe_forced_command_boundary \
+      "${key_path}" "${endpoint_host}" "${endpoint_port}" "${endpoint_user}" "${endpoint_known_hosts}" "${marker}" \
+      || die "the ${kind} forced-command SSH boundary did not reject the typed acceptance probe as expected inside container ${VMID} (check the ${kind} key, PVE sshd root public-key policy, and the pinned host key) -- refusing to accept the target installation"
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Rollback. Undoes exactly what THIS run created or replaced.
 # ---------------------------------------------------------------------------
 
@@ -555,8 +802,17 @@ update_boundaries_rollback() {
   # strictly safer than proceeding to delete keys a live config still names.
   if ledger_has update-boundary-config-activated "${VMID}"; then
     local backup_ct_path="${UPDATE_BOUNDARY_CONFIG_PATH}.rollback-${UPDATE_RUN_ID}"
-    pct exec "${VMID}" -- test -e "${backup_ct_path}" >/dev/null 2>&1 \
-      || _update_rollback_hard_stop "the preserved pre-activation ${UPDATE_BOUNDARY_CONFIG_PATH} (${backup_ct_path}) is absent inside container ${VMID}; restore it manually before retrying -- the activated configuration still names key material this rollback is about to remove"
+    # Positively classified (Family A correction pass): a bare `test -e`
+    # cannot distinguish genuine ENOENT from a metadata/stat failure, and
+    # both this branch's ABSENT and UNKNOWN outcomes must hard-stop the
+    # same way here -- the difference matters only for the diagnostic.
+    local backup_state
+    _update_boundary_ct_path_state "${backup_ct_path}" && backup_state=0 || backup_state=$?
+    case "${backup_state}" in
+      0) ;; # EXISTS
+      1) _update_rollback_hard_stop "the preserved pre-activation ${UPDATE_BOUNDARY_CONFIG_PATH} (${backup_ct_path}) is absent inside container ${VMID}; restore it manually before retrying -- the activated configuration still names key material this rollback is about to remove" ;;
+      *) _update_rollback_hard_stop "the preserved pre-activation ${UPDATE_BOUNDARY_CONFIG_PATH} (${backup_ct_path}) inside container ${VMID} could not be positively classified; resolve this manually before retrying -- the activated configuration still names key material this rollback is about to remove" ;;
+    esac
     pct exec "${VMID}" -- cp "${backup_ct_path}" "${UPDATE_BOUNDARY_CONFIG_PATH}" >/dev/null 2>&1 \
       || _update_rollback_hard_stop "could not restore the pre-activation ${UPDATE_BOUNDARY_CONFIG_PATH} from ${backup_ct_path} inside container ${VMID}"
     _update_durability_barrier_ct_or_hard_stop "${UPDATE_BOUNDARY_CONFIG_PATH}" "restoring the pre-activation configuration"
@@ -592,24 +848,49 @@ update_boundaries_rollback() {
 
     # A boundary this run REPLACED: restore the exact preserved content.
     if ledger_has update-boundary-activated "${kind}"; then
-      if [[ -e "${rollback_copy}" ]]; then
-        [[ -f "${rollback_copy}" && -s "${rollback_copy}" ]] \
-          || _update_rollback_hard_stop "the preserved pre-update ${kind} boundary helper (${rollback_copy}) is not a usable non-empty regular file -- restore it manually before retrying"
-        rm -f -- "${restore_tmp}" \
-          || _update_rollback_hard_stop "could not clear the run-owned ${kind} boundary restore temporary ${restore_tmp}"
-        _host_control_install_file 0755 "${rollback_copy}" "${restore_tmp}" \
-          || _update_rollback_hard_stop "could not stage the preserved pre-update ${kind} boundary helper for restoration"
-        if ! mv "${restore_tmp}" "${live}" 2>/dev/null; then
-          rm -f -- "${restore_tmp}" 2>/dev/null || true
-          _update_rollback_hard_stop "could not atomically restore the pre-update ${kind} boundary helper onto ${live}"
-        fi
-        _update_durability_barrier_host_or_hard_stop "${live}" "restoring the pre-update ${kind} boundary helper"
-      else
-        # Replay of an already-restored artifact.
-        [[ -f "${live}" && -x "${live}" ]] \
-          || _update_rollback_hard_stop "the preserved pre-update ${kind} boundary helper is absent and ${live} is not an executable regular file -- restore it manually before retrying"
-        _update_durability_barrier_host_or_hard_stop "${live}" "replaying the already-restored ${kind} boundary helper"
-      fi
+      # Positively classified (Family A correction pass): the OLD `[[ -e
+      # "${rollback_copy}" ]]` branch selector could not distinguish
+      # "genuinely absent" from "could not be inspected" -- a transient
+      # stat failure on a rollback_copy that actually EXISTS would fall
+      # through to the "already restored" replay branch instead, which
+      # only checks whether ${live} is SOME executable regular file. If
+      # this is genuinely the first rollback attempt, ${live} still holds
+      # the NEW (post-activation) helper at that point -- itself a usable
+      # executable regular file -- so that branch would silently accept
+      # it as "already restored" and move on, leaving the wrong (target,
+      # not pre-update) helper live while rollback believes this boundary
+      # is fully undone.
+      local rollback_copy_state
+      rollback_copy_state="$(_update_boundary_helper_path_state "${rollback_copy}")"
+      case "${rollback_copy_state}" in
+        REGULAR)
+          [[ -s "${rollback_copy}" ]] \
+            || _update_rollback_hard_stop "the preserved pre-update ${kind} boundary helper (${rollback_copy}) is empty -- restore it manually before retrying"
+          rm -f -- "${restore_tmp}" \
+            || _update_rollback_hard_stop "could not clear the run-owned ${kind} boundary restore temporary ${restore_tmp}"
+          _host_control_install_file 0755 "${rollback_copy}" "${restore_tmp}" \
+            || _update_rollback_hard_stop "could not stage the preserved pre-update ${kind} boundary helper for restoration"
+          if ! mv "${restore_tmp}" "${live}" 2>/dev/null; then
+            rm -f -- "${restore_tmp}" 2>/dev/null || true
+            _update_rollback_hard_stop "could not atomically restore the pre-update ${kind} boundary helper onto ${live}"
+          fi
+          _update_durability_barrier_host_or_hard_stop "${live}" "restoring the pre-update ${kind} boundary helper"
+          ;;
+        ABSENT)
+          # Replay of an already-restored artifact: genuinely proven
+          # absent, so ${live} must already BE the restored pre-update
+          # helper (an executable regular file), not merely some
+          # executable regular file.
+          local live_state
+          live_state="$(_update_boundary_helper_path_state "${live}")"
+          [[ "${live_state}" == "REGULAR" && -x "${live}" ]] \
+            || _update_rollback_hard_stop "the preserved pre-update ${kind} boundary helper is absent and ${live} is not a provably usable executable regular file (${live_state}) -- restore it manually before retrying"
+          _update_durability_barrier_host_or_hard_stop "${live}" "replaying the already-restored ${kind} boundary helper"
+          ;;
+        *)
+          _update_rollback_hard_stop "the preserved pre-update ${kind} boundary helper (${rollback_copy}) could not be positively classified -- refusing to guess whether it exists before restoring ${live}"
+          ;;
+      esac
     fi
   done
 
