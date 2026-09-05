@@ -57,7 +57,14 @@
       "resource_detail_status": {"name": "Stan szczegółów"},
       "resource_lifecycle": {"name": "Cykl życia"},
       "resource_observational_continuity": {"name": "Ciągłość obserwacyjna"},
-      "resource_security_continuity": {"name": "Ciągłość bezpieczeństwa"},
+      "resource_security_continuity": {
+        "name": "Starsza obserwacja ciągłości",
+        "state": {
+          "unverified": "Obserwacja niezweryfikowana (to nie jest błąd aktualizacji)",
+          "trusted": "Zaufana",
+          "revoked": "Odwołana"
+        }
+      },
       "resource_type": {"name": "Typ"},
       "resource_package_scan_status": {"name": "Stan skanowania pakietów"},
       "resource_package_plan_approval": {
@@ -65,7 +72,8 @@
         "state": {
           "none": "Brak",
           "approved": "Zatwierdzony",
-          "stale": "Nieaktualny"
+          "stale": "Nieaktualny",
+          "consumed": "Wykorzystany"
         }
       },
       "resource_health_contract": {
@@ -78,9 +86,9 @@
       },
       "resource_pending_updates": {"name": "Oczekujące aktualizacje"},
       "resource_last_package_scan": {"name": "Ostatnie skanowanie pakietów"},
-      "resource_reboot_required": {"name": "Wymagany restart"},
+      "resource_reboot_required": {"name": "Wymagany restart (nieznany, gdy niedostępny)"},
       "resource_package_update_job": {
-        "name": "Zadanie aktualizacji pakietów",
+        "name": "Ostatnie zadanie aktualizacji pakietów",
         "state": {
           "unsupported": "Nieobsługiwane",
           "not_started": "Nierozpoczęte",

@@ -203,6 +203,24 @@ def test_unknown_unsupported_and_unavailable_plans_are_not_approvable(
         qemu_authority.issue_package_scan(qemu.resource_id)
 
 
+def test_successful_zero_package_plan_is_not_approvable(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    empty = _successful_plan(authority, resource.resource_id, ())
+
+    view = _approval_view(store, authority, resource.resource_id)
+    assert empty.pending_count == 0
+    assert empty.packages == ()
+    assert view["status"] == "none"
+    assert view["approvable"] is False
+    with pytest.raises(AuthorityConflict, match="current context"):
+        authority.approve_package_plan(
+            resource.resource_id, empty.scan_run_id, empty.plan_fingerprint
+        )
+    assert store.package_plan_approval(resource.resource_id) is None
+
+
 def test_resource_binding_generation_continuity_and_replacement_do_not_inherit(
     tmp_path: Path,
 ) -> None:

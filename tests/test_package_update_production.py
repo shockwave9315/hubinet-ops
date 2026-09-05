@@ -473,6 +473,70 @@ def test_explicit_start_drives_the_whole_lifecycle_to_succeeded(
     # Nothing rolled anything back on the way to success.
     assert final.rollback_operation_id is None
     assert "submit_same_job_rollback" not in system.rollback_host.calls
+    assert _published_resource(
+        system.store, system.authority, job.resource_id
+    )["package_plan_approval"]["status"] == "consumed"
+
+
+def test_success_consumption_survives_restart_and_same_plan_requires_reapproval(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    first = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    system.restart()
+    consumed = _published_resource(
+        system.store, system.authority, first.resource_id
+    )["package_plan_approval"]
+    assert consumed["status"] == "consumed"
+    assert consumed["approval_id"] == first.approval_id
+
+    refresh = system.authority.issue_post_update_package_scan(first.job_id)
+    refreshed = system.authority.finalize_successful_package_scan(
+        refresh.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=system.scan.packages,
+        reboot_required=None,
+    )
+    assert refreshed.plan_fingerprint == first.approved_plan_fingerprint
+    after_refresh = _published_resource(
+        system.store, system.authority, first.resource_id
+    )["package_plan_approval"]
+    assert after_refresh["status"] == "consumed"
+    assert after_refresh["approvable"] is True
+
+    with pytest.raises(PackageUpdateIssuanceRefused) as refusal:
+        _issue(system.authority, system.resource, system.approval)
+    assert refusal.value.reason == "approval_consumed"
+
+    renewed = system.authority.approve_package_plan(
+        first.resource_id, refreshed.scan_run_id, refreshed.plan_fingerprint
+    )
+    assert renewed.approval_id != first.approval_id
+    assert _published_resource(
+        system.store, system.authority, first.resource_id
+    )["package_plan_approval"]["status"] == "approved"
+    second = _issue(system.authority, system.resource, renewed)
+    assert second.approval_id == renewed.approval_id
+    system.bind_hosts(second.job_id)
+    system.build_worker()
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    assert system.job(second.job_id).status is PackageUpdateJobStatus.SUCCEEDED
+
+
+def test_failed_health_does_not_consume_the_approval(tmp_path: Path) -> None:
+    system = _system(tmp_path, health=["failed"])
+    job = _start(system)
+
+    assert system.worker.run_once().stop_reason == "health_failed"
+    assert system.job(job.job_id).status is PackageUpdateJobStatus.ACTIVE
+    approval = _published_resource(
+        system.store, system.authority, job.resource_id
+    )["package_plan_approval"]
+    assert approval["status"] == "approved"
+    assert approval["approval_id"] == job.approval_id
 
 
 class _PostUpdateScanHost:
@@ -2319,7 +2383,7 @@ def test_unclaimed_post_update_refresh_retains_observation_but_fences_authority(
     assert published["package_scan"]["scan_run_id"] == system.scan.scan_run_id
     assert published["package_scan"]["pending_count"] == len(system.scan.packages)
     assert published["package_scan"]["post_update_scan_pending"] is True
-    assert published["package_plan_approval"]["status"] == "stale"
+    assert published["package_plan_approval"]["status"] == "consumed"
     assert published["package_plan_approval"]["approvable"] is False
     assert (
         published["package_plan_approval"]["approval_id"]
@@ -2365,7 +2429,7 @@ def test_linked_running_post_update_refresh_retains_observation_but_fences_autho
     assert published["package_scan"]["scan_run_id"] == system.scan.scan_run_id
     assert published["package_scan"]["scan_run_id"] != claimed.scan_run_id
     assert published["package_scan"]["post_update_scan_pending"] is True
-    assert published["package_plan_approval"]["status"] == "stale"
+    assert published["package_plan_approval"]["status"] == "consumed"
     assert published["package_plan_approval"]["approvable"] is False
 
     before = system.store.package_plan_approval(job.resource_id)
@@ -2433,12 +2497,12 @@ def test_successful_post_update_refresh_restores_authority_to_its_new_exact_plan
     )
     assert published["package_scan"]["scan_run_id"] == refreshed.scan_run_id
     assert published["package_scan"]["post_update_scan_pending"] is False
-    assert published["package_plan_approval"]["status"] == "stale"
+    assert published["package_plan_approval"]["status"] == "consumed"
     assert published["package_plan_approval"]["approvable"] is True
 
     with pytest.raises(PackageUpdateIssuanceRefused) as refusal:
         _issue(system.authority, system.resource, system.approval)
-    assert refusal.value.reason == "plan_not_approved"
+    assert refusal.value.reason == "approval_consumed"
 
     refreshed_approval = system.authority.approve_package_plan(
         first_job.resource_id,
@@ -2467,7 +2531,7 @@ def test_failed_post_update_refresh_clears_fence_without_granting_authority(
     assert published["package_scan"]["scan_run_id"] == failed.scan_run_id
     assert published["package_scan"]["status"] == "failed"
     assert published["package_scan"]["post_update_scan_pending"] is False
-    assert published["package_plan_approval"]["status"] == "stale"
+    assert published["package_plan_approval"]["status"] == "consumed"
     assert published["package_plan_approval"]["approvable"] is False
 
     with pytest.raises(AuthorityConflict, match="latest attempt"):
@@ -2478,7 +2542,7 @@ def test_failed_post_update_refresh_clears_fence_without_granting_authority(
         )
     with pytest.raises(PackageUpdateIssuanceRefused) as refusal:
         _issue(system.authority, system.resource, system.approval)
-    assert refusal.value.reason == "plan_not_approved"
+    assert refusal.value.reason == "approval_consumed"
 
 
 def test_post_update_refresh_fence_is_scoped_to_the_immutable_resource_id(
@@ -2577,6 +2641,9 @@ def test_repaired_authority_stops_a_preexisting_v18_gap_job_before_snapshot(
         """Model the exact v18 authority behavior repaired by this change."""
 
         def _post_update_package_scan_is_pending(self, connection, resource_id):
+            return False
+
+        def _package_plan_approval_is_consumed(self, connection, approval_id):
             return False
 
     legacy = LegacyGapAuthority(system.store, now=system.clock)
@@ -2714,7 +2781,7 @@ def test_pending_without_a_selected_terminal_scan_is_honestly_not_scanned() -> N
     """
 
     published = InventoryPublication._package_scan(
-        {"resource_type": "lxc"},
+        {"resource_type": "lxc", "status": "running"},
         None,
         {},
         post_update_scan_pending=True,

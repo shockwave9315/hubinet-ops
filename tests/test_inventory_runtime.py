@@ -397,7 +397,7 @@ def test_32_health_is_unauthenticated_and_minimal(tmp_path: Path) -> None:
     assert response.json() == {"status": "ok"}
 
 
-def _discover_lxc_plan(app, config, monkeypatch):
+def _discover_lxc_plan(app, config, monkeypatch, *, packages=None):
     source_id = app.state.store.list_source_states()[0].source.inventory_source_id
     _run_discovery(
         monkeypatch,
@@ -414,7 +414,11 @@ def _discover_lxc_plan(app, config, monkeypatch):
         run.scan_run_id,
         os_id="debian",
         os_version="12",
-        packages=(PackageScanPackage("apt", "amd64", "2.6.1", "2.6.2"),),
+        packages=(
+            (PackageScanPackage("apt", "amd64", "2.6.1", "2.6.2"),)
+            if packages is None
+            else tuple(packages)
+        ),
         reboot_required=None,
     )
     return resource, completed
@@ -514,6 +518,33 @@ def test_package_plan_approval_route_accepts_exact_reference_and_refuses_stale_r
         },
     )
     assert stale.status_code == 409
+
+
+def test_zero_package_plan_is_not_approvable_through_the_http_api(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app, config = _build_app(tmp_path)
+    resource, empty = _discover_lxc_plan(
+        app, config, monkeypatch, packages=()
+    )
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    client = TestClient(app)
+
+    published = client.get("/r0/v1/snapshot", headers=headers).json()
+    approval = published["resources"][0]["package_plan_approval"]
+    assert empty.pending_count == 0
+    assert approval["status"] == "none"
+    assert approval["approvable"] is False
+
+    response = client.put(
+        f"/r0/v1/resources/{resource.resource_id}/package-plan-approval",
+        headers=headers,
+        json={
+            "scan_run_id": empty.scan_run_id,
+            "plan_fingerprint": empty.plan_fingerprint,
+        },
+    )
+    assert response.status_code == 409
 
 
 # ---------------------------------------------------------------------------

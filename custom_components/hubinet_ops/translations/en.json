@@ -57,7 +57,14 @@
       "resource_detail_status": {"name": "Detail status"},
       "resource_lifecycle": {"name": "Lifecycle"},
       "resource_observational_continuity": {"name": "Observational continuity"},
-      "resource_security_continuity": {"name": "Security continuity"},
+      "resource_security_continuity": {
+        "name": "Legacy continuity observation",
+        "state": {
+          "unverified": "Unverified observation (not an update failure)",
+          "trusted": "Trusted",
+          "revoked": "Revoked"
+        }
+      },
       "resource_type": {"name": "Type"},
       "resource_package_scan_status": {"name": "Package scan status"},
       "resource_package_plan_approval": {
@@ -65,7 +72,8 @@
         "state": {
           "none": "None",
           "approved": "Approved",
-          "stale": "Stale"
+          "stale": "Stale",
+          "consumed": "Consumed"
         }
       },
       "resource_health_contract": {
@@ -78,9 +86,9 @@
       },
       "resource_pending_updates": {"name": "Pending updates"},
       "resource_last_package_scan": {"name": "Last package scan"},
-      "resource_reboot_required": {"name": "Reboot required"},
+      "resource_reboot_required": {"name": "Reboot required (unknown if unavailable)"},
       "resource_package_update_job": {
-        "name": "Package update job",
+        "name": "Last package update job",
         "state": {
           "unsupported": "Unsupported",
           "not_started": "Not started",

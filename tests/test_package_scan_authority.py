@@ -515,6 +515,69 @@ def test_automatic_scheduler_scans_current_lxc_and_uses_runtime_interval(
         scheduler.configure_interval_seconds(59)
 
 
+def test_periodic_scheduler_skips_a_known_stopped_lxc(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    _reconcile(authority, resource.inventory_source_id, status="stopped")
+
+    class CountingHostControl(SuccessfulHostControl):
+        calls = 0
+
+        def scan_packages(self, run):
+            self.calls += 1
+            return super().scan_packages(run)
+
+    host = CountingHostControl()
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+
+    assert scheduler.run_once() == ()
+    assert host.calls == 0
+    assert store.list_package_scan_runs(resource.resource_id) == ()
+    published = dict(InventoryPublication(store, authority).read().resources[0])
+    assert published["status"] == "stopped"
+    assert published["package_scan"]["status"] == "unavailable"
+    assert published["package_scan"]["pending_count"] is None
+
+
+def test_periodic_scheduler_still_fences_a_running_to_stopped_race(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+
+    class StopDuringHostCall(SuccessfulHostControl):
+        calls = 0
+
+        def scan_packages(self, run):
+            self.calls += 1
+            _reconcile(authority, resource.inventory_source_id, status="stopped")
+            return super().scan_packages(run)
+
+    host = StopDuringHostCall()
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+
+    outcomes = scheduler.run_once()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].status == "failed"
+    assert host.calls == 1
+    failed = store.package_scan_run(outcomes[0].scan_run_id)
+    assert failed.failure_class is PackageScanFailure.STALE_TARGET
+    assert failed.pending_count is None
+
+
 def test_post_update_wakes_do_not_move_the_absolute_periodic_deadline(
     tmp_path: Path,
 ) -> None:

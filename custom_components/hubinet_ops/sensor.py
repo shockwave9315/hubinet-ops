@@ -32,6 +32,7 @@ from .api import (
     PackageUpdateJobState,
     PresenceState,
     ResourceSnapshot,
+    SecurityContinuity,
 )
 from .coordinator import HubinetOpsConfigEntry
 from .entity import (
@@ -157,6 +158,8 @@ RESOURCE_SENSORS = (
         key="security_continuity",
         translation_key="resource_security_continuity",
         entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.ENUM,
+        options=[state.value for state in SecurityContinuity],
         value_fn=lambda resource: resource.security_continuity.value,
     ),
     HubinetOpsResourceSensorDescription(

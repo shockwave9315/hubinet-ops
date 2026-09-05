@@ -357,7 +357,13 @@ class InventoryPublication:
         post_update_scan_pending: bool = False,
     ) -> dict[str, Any]:
         base = {
-            "status": "unsupported" if resource["resource_type"] == "qemu" else "not_scanned",
+            "status": (
+                "unsupported"
+                if resource["resource_type"] == "qemu"
+                else "unavailable"
+                if resource["status"] != "running"
+                else "not_scanned"
+            ),
             "scan_run_id": None,
             "started_at": None,
             "completed_at": None,
@@ -556,6 +562,10 @@ class InventoryPublication:
                 "approved_at": None,
             }
 
+        consumed = self._authority._package_plan_approval_is_consumed(
+            connection, str(approval["approval_id"])
+        )
+
         effective = False
         if approvable and current_scan is not None:
             reviewed = connection.execute(
@@ -584,7 +594,9 @@ class InventoryPublication:
             )
 
         return {
-            "status": "approved" if effective else "stale",
+            "status": (
+                "consumed" if consumed else "approved" if effective else "stale"
+            ),
             "approvable": approvable,
             "approval_id": str(approval["approval_id"]),
             "reviewed_scan_run_id": str(approval["reviewed_scan_run_id"]),

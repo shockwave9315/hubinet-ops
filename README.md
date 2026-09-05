@@ -68,17 +68,22 @@ and an unknown one each leave the job owning its snapshot and waiting to be
 asked. Snapshots a job created are kept — there is no automatic deletion or
 retention policy yet. See `PRODUCT.md` and `STATUS.md`.
 
-**The update lifecycle has not yet been validated against a real workload.**
-Its automated coverage is complete, but no real package has been changed and
-no real snapshot rolled back by Hubinet Ops. The runbook for that first
-operator validation is below.
+**The Human0 production lifecycle is complete.** A real 24-package update
+passed through explicit approval, a fresh same-job snapshot, exact-plan
+revalidation, proven mutation, frozen health PASS, and `SUCCEEDED`. A fresh
+post-update scan observed zero pending packages. A second real update produced
+a deterministic health failure, did not auto-rollback, and reached
+`ROLLED_BACK` only after the operator explicitly requested the exact same-job
+snapshot. See `STATUS.md` for the completed evidence and current product stage.
 
 Pre-release authority schema versions are not migrated in place: the current
-schema is v18. Schema v17 added the per-resource durable `issuance_sequence`
+schema is v19. Schema v17 added the per-resource durable `issuance_sequence`
 that orders "latest job" readback by issuance rather than wall-clock
 `issued_at`. Schema v18 adds the durable job-keyed post-success package-scan
-request and its write-once same-resource RUNNING scan link. An existing
-schema-v17 (or earlier) pre-release deployment is therefore incompatible in
+request and its write-once same-resource RUNNING scan link. Schema v19 makes a
+successful job the durable consumption fact for its exact approval and permits
+at most one successful job per approval. An existing schema-v18 (or earlier)
+pre-release deployment is therefore incompatible in
 place. `deploy/update-proxmox-0.5.sh` reports
 `reset_required`, makes and validates a coherent authority backup, and resets
 only the authority database after explicit operator authorization. The LXC,
@@ -130,85 +135,23 @@ updater again. See [`deploy/README-update-proxmox-0.5.md`](deploy/README-update-
 That bearer token is **not** the Proxmox API token. Home Assistant never
 receives, stores, or handles a Proxmox credential — the integration has no
 PVE-facing code path at all, and HACS distributes code only.
+Today bootstrap stores the backend bearer in root-readable
+`/etc/hubinet-ops/agent.env`; Human1 includes a deliberate operator-facing
+handoff/retrieval path that does not expose it in ordinary logs or snapshots.
 
 For integration development you may symlink `custom_components/hubinet_ops/`
 into a Home Assistant `config/custom_components/` directory instead. That is a
 development fallback, not a supported installation method.
 
-## Running your first real update
+## Operator update workflow
 
-The update lifecycle is production reachable but has never touched a real
-workload. This is the operator procedure for that first validation. Use a
-disposable Debian LXC you are willing to roll back — not a guest you care
-about.
-
-Everything below is done from Home Assistant (**Developer tools → Actions**)
-except step 1.
-
-1. **Update the backend to an activation build.** On the Proxmox host, run
-   `deploy/update-proxmox-0.5.sh --vmid <N>`. Confirm the plan; it will report
-   the five package-update boundaries it creates or leaves alone. Afterwards
-   check the service is enabled, active, and healthy, and that Home Assistant
-   still shows the backend's resources.
-
-2. **Pick a disposable Debian/Ubuntu LXC** that is running and appears in Home
-   Assistant with a successful package scan.
-
-3. **Declare its health contract.** `hubinet_ops.set_health_contract`, naming
-   the resource device and one or more probes that are genuinely true right
-   now, for example `{"kind": "systemd_unit_active", "target": "ssh.service"}`.
-   Read it back with `view_health_contract`. Without a contract the guest
-   cannot be given an update job at all.
-
-4. **Get a real, small plan.** Wait for (or wait out) an automatic scan so the
-   guest has pending updates. A handful of packages is ideal.
-
-5. **View the plan.** `hubinet_ops.view_update_plan`. Read the exact package
-   rows: name, architecture, installed version, candidate version.
-
-6. **Approve exactly that plan.** `hubinet_ops.approve_update_plan`, using the
-   `approval_reference` the previous step returned. This still installs
-   nothing.
-
-7. **Start the update.** `hubinet_ops.start_update`, naming the resource
-   device. This is the first action in the product's history that can change a
-   real workload package. It returns the job it created.
-
-8. **Watch it.** `hubinet_ops.view_update_job` (or the resource's *Package
-   update job* sensor). Expect `snapshot_confirmed` → `mutation_completed` →
-   `health_completed` with `health_outcome: passed`, and a final status of
-   `succeeded`.
-
-9. **Verify on the Proxmox host, independently of Hubinet:**
-   - `pct listsnapshot <vmid>` shows exactly one new Hubinet-owned snapshot,
-     created before the update, and every snapshot you took by hand is
-     untouched;
-   - `pct exec <vmid> -- apt list --upgradable` no longer lists the packages
-     from step 5;
-   - your health probe's subject really is up.
-
-10. **Then test a failure, deliberately.** Repeat steps 4-7 on the same
-    disposable guest, but first set the health contract to something that will
-    NOT hold after the update — for example a systemd unit you stop by hand
-    while the update runs. Expect the job to end ACTIVE at `health_completed`
-    with `health_outcome: failed`, `rollback_available: true`, and **no
-    rollback attempted**. Confirm nothing rolled back on its own.
-
-11. **Roll it back explicitly.** `hubinet_ops.rollback_update`, naming the
-    resource device. Expect the job to reach `rolled_back`.
-
-12. **Verify the rollback:** the guest is **stopped** — that is the documented
-    final state, because Proxmox force-stops a container to roll it back and
-    Hubinet deliberately does not restart it; the packages are back at their
-    pre-update versions; the job's own snapshot is still present; and no
-    unrelated or manual snapshot was touched.
-
-13. **Start the guest again** yourself (`pct start <vmid>`) when you are done.
-
-If anything is uncertain rather than wrong — an unknown health verdict, an
-unproven package operation — the job stays ACTIVE and owned and the backend
-waits. `hubinet_ops.resume_update` asks it to look again; it never re-runs a
-destructive step.
+The current integration exposes the proven lifecycle through explicit Home
+Assistant actions: declare a health contract, view and approve a non-empty
+exact plan, start the update, inspect the last job, and explicitly request
+same-job rollback when appropriate. Approval still performs no mutation, one
+successful job consumes that approval, and UNKNOWN never authorizes success or
+retry. Human1 will turn these actions into a normal per-resource operator UX;
+Developer Tools remain a current interface, not the finished experience.
 
 ## Development
 
