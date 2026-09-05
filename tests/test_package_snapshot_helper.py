@@ -8,8 +8,10 @@ mutation and no snapshot delete operation to exercise in the first place.
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
+import os
 import re
 from pathlib import Path
 import sys
@@ -36,17 +38,40 @@ def _load_helper() -> ModuleType:
 
 
 helper = _load_helper()
-REAL_DETACHED_SPAWN = helper._spawn_detached_runner
+REAL_PREPARE_DETACHED_RUNNER = helper._prepare_detached_runner
+
+
+class _SynchronousExecutor:
+    """An in-process stand-in that keeps the production RELEASE ordering.
+
+    Like the real executor it runs nothing when it is prepared: the capture
+    happens only when `release()` is called, which the helper does strictly
+    after the durable `submitted` write. `abandon()` runs nothing at all.
+    """
+
+    def __init__(self, run) -> None:
+        self._run = run
+        self.released = False
+        self.abandoned = False
+
+    def release(self) -> None:
+        self.released = True
+        self._run()
+
+    def abandon(self) -> None:
+        self.abandoned = True
 
 
 @pytest.fixture(autouse=True)
 def _synchronous_detached_runner(monkeypatch):
     """Keep fake-runner state in-process; production spawn is tested separately."""
 
-    def synchronous(runner, journal, operation_id, argv, _lease):
-        helper._run_capture_child(runner, journal, operation_id, argv)
+    def prepare(runner, journal, operation_id, argv, _lease):
+        return _SynchronousExecutor(
+            lambda: helper._run_capture_child(runner, journal, operation_id, argv)
+        )
 
-    monkeypatch.setattr(helper, "_spawn_detached_runner", synchronous)
+    monkeypatch.setattr(helper, "_prepare_detached_runner", prepare)
 
 NODE = "pve-a"
 VMID = 112
@@ -960,13 +985,14 @@ def test_real_detached_snapshot_runner_returns_while_physical_task_is_alive(
 
     began = time.monotonic()
     with helper.VmidMutationLock(VMID, journal.directory) as lease:
-        REAL_DETACHED_SPAWN(
+        executor = REAL_PREPARE_DETACHED_RUNNER(
             slow_runner,
             journal,
             operation_id,
             ("pvesh", "create", "/fixed", "--noproxy"),
             lease,
         )
+        executor.release()
     assert time.monotonic() - began < 1
     deadline = time.monotonic() + 2
     while not started.exists() and time.monotonic() < deadline:
@@ -1434,28 +1460,50 @@ def test_the_submission_proof_defaults_to_unknown() -> None:
     assert helper.SnapshotError("x", "y").submission == helper.SUBMISSION_UNKNOWN
 
 
-def test_not_submitted_is_emitted_from_exactly_one_pre_submission_site() -> None:
+def test_not_submitted_is_only_reachable_before_physical_submission() -> None:
     """Structural guard on the only value that may release a fenced job.
 
-    It must be produced in exactly one place, and that place must lie before
-    the journal's `intent -> submitted` transition -- otherwise a failure
-    after submission could inherit it.
+    Every emission must lie on a path that provably precedes physical PVE
+    work -- otherwise a failure after submission could inherit it. Since the
+    detached executor is gated on a release byte, "before physical work" is
+    now precisely "before `executor.release()`", which is a strictly stronger
+    barrier than the journal write it follows.
     """
 
     source = HELPER_PATH.read_text(encoding="utf-8")
-    body = source[source.index("def _ensure_submitted"):]
-    body = body[: body.index("def _extract_upid")]
+    marker = "submission=SUBMISSION_NOT_SUBMITTED"
 
-    # One emission, in the create flow only.
-    assert source.count("submission=SUBMISSION_NOT_SUBMITTED") == 1
-    assert body.count("submission=SUBMISSION_NOT_SUBMITTED") == 1
+    def _slice(start: str, end: str) -> str:
+        return source[source.index(start) : source.index(end)]
 
-    emission = body.index("submission=SUBMISSION_NOT_SUBMITTED")
-    boundary = body.index('"phase": "submitted"')
-    submission = body.index('"pvesh", "create"')
-    assert emission < boundary < submission
+    prepare = _slice("def _prepare_detached_runner", "def _reap")
+    ensure = _slice("def _ensure_submitted", "def _extract_upid")
 
-    # And the default is the fail-closed value, so nothing inherits it.
+    # Emissions exist in exactly two functions and nowhere else: the executor
+    # preparation, and the create flow itself.
+    assert prepare.count(marker) > 0
+    assert ensure.count(marker) > 0
+    assert source.count(marker) == prepare.count(marker) + ensure.count(marker)
+
+    # In the create flow every emission precedes the ONE thing that permits
+    # physical PVE work.
+    barrier = ensure.index("executor.release()")
+    offset = 0
+    while True:
+        found = ensure.find(marker, offset)
+        if found < 0:
+            break
+        assert found < barrier
+        offset = found + 1
+
+    # And the executor is always prepared BEFORE the durable submitted write,
+    # so every preparation failure is provably pre-submission as well.
+    assert ensure.index("_prepare_detached_runner(") < ensure.index(
+        '"phase": "submitted"'
+    )
+    assert ensure.index('"phase": "submitted"') < barrier
+
+    # The default is the fail-closed value, so nothing inherits it.
     assert 'submission: str = SUBMISSION_UNKNOWN' in source
 
 
@@ -1951,3 +1999,326 @@ def test_an_over_bound_capture_is_never_promoted_even_with_a_valid_upid(
     assert inspected.get("task_upid") is None
     assert journal.read(operation_id)["phase"] == "submitted"
     assert pve.submissions == 1
+
+
+# ---------------------------------------------------------------------------
+# THE SUBMISSION BARRIER.
+#
+# `submitted` is the durable record that says "a physical mutation may now
+# exist, and must never be blindly repeated". Creating it merely because a
+# detached runner was INTENDED is how an ordinary `fork` EAGAIN on a loaded
+# host used to strand an operation forever: journal submitted, no executor,
+# no capture, no possible completion, and no permission to resubmit.
+#
+# The repair is a two-phase handoff. The executor is established FIRST and
+# proves it exists (READY), but is blocked and cannot reach `pvesh`. Only
+# after the durable `submitted` write is it released (GO). So both halves
+# hold: physical work can never precede the write-ahead record, and the
+# write-ahead record is never created without a runner that can complete it.
+#
+# These exercise the REAL forks, the REAL pipes, and the REAL lease.
+# ---------------------------------------------------------------------------
+
+
+def _wait_until(predicate, seconds: float = 3.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def _lease_is_free(directory: Path) -> bool:
+    try:
+        with helper.VmidMutationLock(VMID, directory):
+            return True
+    except helper.SnapshotError:
+        return False
+
+
+def _marker_runner(marker: Path):
+    def runner(argv, timeout, max_output):
+        marker.touch()
+        return helper.CommandResult(0, b'"' + UPID.encode() + b'"', b"")
+
+    return runner
+
+
+def test_a_prepared_executor_exists_holds_the_lease_and_has_run_nothing(
+    tmp_path: Path,
+) -> None:
+    """Cases 4 and 5. READY proves existence, never permission."""
+
+    journal = _journal(tmp_path)
+    operation_id, _ = _identity(_ownership())
+    ran = tmp_path / "ran"
+
+    with helper.VmidMutationLock(VMID, journal.directory) as lease:
+        executor = REAL_PREPARE_DETACHED_RUNNER(
+            _marker_runner(ran),
+            journal,
+            operation_id,
+            ("pvesh", "create", "/fixed", "--noproxy"),
+            lease,
+        )
+        # The executor is alive -- it inherited and still holds the lease --
+        # and it has not touched PVE, because it has not been released.
+        assert not _lease_is_free(journal.directory)
+        assert not ran.exists()
+        assert journal.read_completed_capture(operation_id) is None
+
+        # Case 5: only the release byte lets physical work begin.
+        executor.release()
+        assert _wait_until(ran.exists)
+        assert _wait_until(
+            lambda: journal.read_completed_capture(operation_id) is not None
+        )
+    assert _wait_until(lambda: _lease_is_free(journal.directory))
+
+
+def test_an_abandoned_executor_exits_having_submitted_nothing(
+    tmp_path: Path,
+) -> None:
+    """Case 7. A controller that never crosses its durable boundary leaves an
+    executor that reads EOF and mutates nothing -- deterministically, because
+    the lease is only freed when that executor has exited."""
+
+    journal = _journal(tmp_path)
+    operation_id, _ = _identity(_ownership())
+    ran = tmp_path / "ran"
+
+    with helper.VmidMutationLock(VMID, journal.directory) as lease:
+        executor = REAL_PREPARE_DETACHED_RUNNER(
+            _marker_runner(ran),
+            journal,
+            operation_id,
+            ("pvesh", "create", "/fixed", "--noproxy"),
+            lease,
+        )
+        executor.abandon()
+
+    # The executor has exited (it released the inherited lease), so if it were
+    # ever going to run `pvesh` it already would have.
+    assert _wait_until(lambda: _lease_is_free(journal.directory))
+    assert not ran.exists()
+    assert journal.read_completed_capture(operation_id) is None
+
+
+def _detached_request(pve, journal, monkeypatch):
+    """Drive the helper's REAL detached path with a fake `pvesh`.
+
+    `handle_request` picks `detach = runner is None`, so the module-level
+    `_run_bounded` is patched instead of injecting a runner -- otherwise the
+    whole two-phase handoff under test is bypassed.
+    """
+
+    # Undo the module-wide synchronous seam: this is the one place that must
+    # run the genuine two-phase handoff, forks and pipes included.
+    monkeypatch.setattr(
+        helper, "_prepare_detached_runner", REAL_PREPARE_DETACHED_RUNNER
+    )
+    monkeypatch.setattr(helper, "_run_bounded", pve)
+    monkeypatch.setattr(helper, "DETACHED_READY_TIMEOUT_SECONDS", 2.0)
+    return helper.handle_request(_request(), journal=journal)
+
+
+def _failing_fork(monkeypatch, *, after: int):
+    """Make `os.fork` raise EAGAIN on the (after+1)-th call in this process.
+
+    A forked child inherits its own copy of the counter, so `after=1` fails
+    the intermediate's second fork while letting the first one really happen.
+    """
+
+    calls = [0]
+    real_fork = os.fork
+
+    def fork():
+        calls[0] += 1
+        if calls[0] > after:
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+        return real_fork()
+
+    monkeypatch.setattr(os, "fork", fork)
+
+
+@pytest.mark.parametrize("after", [0, 1])
+def test_a_fork_failure_never_creates_a_submitted_operation(
+    tmp_path: Path, monkeypatch, after: int
+) -> None:
+    """Cases 1 and 2. Either fork failing is provably pre-submission.
+
+    ``after=0`` fails the first fork in the controlling helper; ``after=1``
+    lets that one really happen and fails the intermediate's second fork --
+    the exact case whose `finally: os._exit(0)` used to look to the parent
+    exactly like a successful handoff.
+    """
+
+    journal = _journal(tmp_path)
+    operation_id, _ = _identity(_ownership())
+    pve = FakePve()
+    _failing_fork(monkeypatch, after=after)
+
+    response = _detached_request(pve, journal, monkeypatch)
+
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "execution_failed"
+    # The one token that may release a fenced job, and it is honest here:
+    # the executor is gated on a release byte this path never writes.
+    assert response["error"]["submission"] == "not_submitted"
+    # No durable submission was created, so a later attempt is still free to
+    # submit exactly once -- and nothing was submitted now.
+    assert journal.read(operation_id)["phase"] == "intent"
+    assert pve.submissions == 0
+    assert journal.read_completed_capture(operation_id) is None
+    assert _wait_until(lambda: _lease_is_free(journal.directory))
+
+
+def test_an_executor_that_dies_before_ready_never_creates_a_submitted_operation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Case 3. Any grandchild setup failure lands on the same safe side."""
+
+    journal = _journal(tmp_path)
+    operation_id, _ = _identity(_ownership())
+    pve = FakePve()
+
+    def die_before_ready(*_args, **_kwargs):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(helper, "_detached_executor", die_before_ready)
+
+    response = _detached_request(pve, journal, monkeypatch)
+
+    assert response["ok"] is False
+    assert response["error"]["submission"] == "not_submitted"
+    assert journal.read(operation_id)["phase"] == "intent"
+    assert pve.submissions == 0
+    assert _wait_until(lambda: _lease_is_free(journal.directory))
+
+
+def test_a_journal_failure_after_ready_still_submits_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The other side of the barrier: READY was proved, but the durable write
+    failed, so the executor is abandoned rather than released."""
+
+    journal = _journal(tmp_path)
+    operation_id, _ = _identity(_ownership())
+    pve = FakePve()
+    real_write = helper.OperationJournal.write
+
+    def refuse_submitted(self, record):
+        if record.get("phase") == "submitted":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(self, record)
+
+    monkeypatch.setattr(helper.OperationJournal, "write", refuse_submitted)
+
+    response = _detached_request(pve, journal, monkeypatch)
+
+    assert response["ok"] is False
+    assert response["error"]["submission"] == "not_submitted"
+    assert journal.read(operation_id)["phase"] == "intent"
+    assert pve.submissions == 0
+    assert journal.read_completed_capture(operation_id) is None
+    assert _wait_until(lambda: _lease_is_free(journal.directory))
+
+
+def _physical_invocations(marker: Path) -> list[str]:
+    if not marker.exists():
+        return []
+    return [
+        line for line in marker.read_text(encoding="ascii").splitlines() if line
+    ]
+
+
+def test_the_real_two_phase_handoff_submits_exactly_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Case 6 plus cases 9, 11 and 12. The whole production path: one
+    destructive pvesh, the lease held across it, a durable capture, the
+    ordinary exact-UPID promotion, and no wall clock on the physical work."""
+
+    journal = _journal(tmp_path)
+    operation_id, _ = _identity(_ownership())
+    pve = FakePve()
+    marker = tmp_path / "physical.log"
+
+    def counting_runner(argv, timeout, max_output):
+        # Ordinary reads keep the faithful fake; only the DESTRUCTIVE call is
+        # counted on disk, because the executor that makes it is a forked
+        # grandchild whose in-memory effects never come back here.
+        if tuple(argv)[:2] == ("pvesh", "create"):
+            with marker.open("a", encoding="ascii") as handle:
+                # `ascii()` so the snapshot description's own newlines
+                # cannot masquerade as extra invocations.
+                handle.write(f"{timeout!r}|{ascii(tuple(argv))}\n")
+        return pve(argv, timeout, max_output)
+
+    response = _detached_request(counting_runner, journal, monkeypatch)
+
+    assert response["ok"] is True
+    assert response["submission_state"] in ("submitted", "task_known")
+    assert _wait_until(lambda: _lease_is_free(journal.directory))
+    # The executor really ran, in its own process, and left exact evidence.
+    assert _wait_until(
+        lambda: journal.read(operation_id)["phase"] == "task_known"
+        or journal.read_completed_capture(operation_id) is not None
+    )
+    recovered = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert recovered["task_upid"] == UPID
+    assert journal.read(operation_id)["phase"] == "task_known"
+
+    # Exactly ONE physical invocation, counted on disk across the fork.
+    invocations = _physical_invocations(marker)
+    assert len(invocations) == 1
+    deadline_text, argv_text = invocations[0].split("|", 1)
+    # Cases 11 and 12: no wall-clock deadline, still `--noproxy`.
+    assert deadline_text == "None"
+    assert "'--noproxy'" in argv_text
+
+    # Case 9: repeated resume/inspection never submits a second time.
+    for _ in range(3):
+        assert _handle(_request(), pve, journal)["ok"] is True
+        _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert _physical_invocations(marker) == invocations
+
+
+def test_a_submitted_operation_with_no_executor_stays_unknown_and_fenced(
+    tmp_path: Path,
+) -> None:
+    """Case 8. The irreducible window -- a controller lost after the durable
+    write -- stays UNKNOWN. It is never resubmitted and never released."""
+
+    journal = _journal(tmp_path)
+    operation_id, snapshot_name = _identity(_ownership())
+    journal.write(
+        {
+            "journal_version": 1,
+            "snapshot_operation_id": operation_id,
+            "request_fingerprint": helper.request_fingerprint(
+                helper.validate_request(_request())
+            ),
+            "vmid": VMID,
+            "expected_node": NODE,
+            "snapshot_name": snapshot_name,
+            "phase": "submitted",
+        }
+    )
+    pve = FakePve()
+
+    for _ in range(3):
+        inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+        assert inspected["submission_state"] == "submitted"
+        assert inspected.get("task_upid") is None
+        resumed = _handle(_request(), pve, journal)
+        assert resumed["submission_state"] == "submitted"
+        assert resumed["outcome"] == "uncertain"
+
+    # Never resubmitted, never sealed away as a non-submission.
+    assert pve.submissions == 0
+    assert journal.read(operation_id)["phase"] == "submitted"
+    sealed = _handle(_request("seal_operation_never_submitted"), pve, journal)
+    assert sealed["outcome"] == "uncertain"
+    assert sealed["submission_state"] == "submitted"

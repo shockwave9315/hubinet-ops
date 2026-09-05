@@ -150,6 +150,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import selectors
 import subprocess
 import sys
@@ -580,6 +581,22 @@ Runner = Callable[..., CommandResult]
 
 class RequestError(ValueError):
     """The request itself is not a well-formed package-mutation request."""
+
+
+#: Bounded wait for the detached runner's one READY byte.
+#:
+#: This is NOT a deadline on any physical work, and it never becomes one: the
+#: runner cannot mutate anything before it is released, and it is released
+#: only after `submitted` is durable. Giving up here is therefore still PROOF
+#: that no mutation was submitted for this attempt -- the release byte is
+#: never written on that path. It exists so that a wedged local handoff cannot
+#: hang the forced-command request forever.
+DETACHED_READY_TIMEOUT_SECONDS = 30.0
+#: The two bytes of the detached-runner handshake. READY is the runner proving
+#: it exists; GO is the ONLY thing that permits physical work, and is written
+#: only after the durable `submitted` record.
+_DETACHED_READY = b"R"
+_DETACHED_GO = b"G"
 
 
 class MutationError(RuntimeError):
@@ -2067,17 +2084,23 @@ def _execute(
         # final target revalidation.
         stage_action_set_gate(runner, request, local_node)
 
-        journal.write(
-            {
-                "journal_version": 1,
-                "mutation_operation_id": request["mutation_operation_id"],
-                "request_fingerprint": fingerprint,
-                "vmid": vmid,
-                "expected_node": expected_node,
-                "phase": "submitted",
-            }
-        )
-        _spawn_detached_runner(
+        # -------------------------------------------------------------------
+        # THE SUBMISSION BARRIER
+        #
+        #   prepare runner -> READY (exists, holds the lease, cannot mutate)
+        #     -> durable `submitted` write
+        #       -> GO (the only thing that permits physical mutation)
+        #
+        # Both halves of the safety property hold at once. Physical work
+        # cannot begin before the write-ahead record is durable, because the
+        # runner blocks until the GO byte. And the write-ahead record is not
+        # created merely because a runner was INTENDED: an ordinary local
+        # handoff failure raises above it, while the journal is still at
+        # `intent` and therefore still sealable, rather than leaving an
+        # operation durably `submitted` that no runner can ever complete and
+        # that may never be resubmitted.
+        # -------------------------------------------------------------------
+        detached = _prepare_detached_runner(
             request,
             journal,
             lease,
@@ -2086,6 +2109,26 @@ def _execute(
             pre_installed_inventory=pre_inventory,
             runner=runner,
         )
+        try:
+            journal.write(
+                {
+                    "journal_version": 1,
+                    "mutation_operation_id": request["mutation_operation_id"],
+                    "request_fingerprint": fingerprint,
+                    "vmid": vmid,
+                    "expected_node": expected_node,
+                    "phase": "submitted",
+                }
+            )
+        except Exception as exc:
+            # Still provably pre-submission: the runner is released by
+            # nothing but the byte below, and now never receives one.
+            detached.abandon()
+            raise MutationError(
+                "execution_failed",
+                "host could not durably journal this mutation submission",
+            ) from exc
+        detached.release()
         return _response(
             request,
             "submitted",
@@ -2094,7 +2137,119 @@ def _execute(
         )
 
 
-def _spawn_detached_runner(
+class DetachedRunner:
+    """A prepared detached runner that cannot touch the guest until released.
+
+    Between :func:`_prepare_detached_runner` returning and :meth:`release`,
+    the runner process exists, has inherited this operation's VMID lease, has
+    proved both by sending its READY byte, and is blocked reading its release
+    pipe. It has mutated nothing and cannot mutate anything.
+
+    :meth:`release` writes the single GO byte and is the ONLY thing that lets
+    physical work begin, so it must be called strictly AFTER the durable
+    ``submitted`` write. :meth:`abandon` closes the pipe instead, which the
+    runner reads as EOF and answers by exiting having mutated nothing.
+    """
+
+    __slots__ = ("_release_write",)
+
+    def __init__(self, release_write: int) -> None:
+        self._release_write = release_write
+
+    def release(self) -> None:
+        """Permit the physical mutation. ONLY after `submitted` is durable."""
+
+        descriptor, self._release_write = self._release_write, -1
+        if descriptor < 0:
+            return
+        try:
+            os.write(descriptor, _DETACHED_GO)
+        except OSError:
+            # The runner died before consuming its release byte, so it ran
+            # nothing -- but `submitted` is already durable and this process
+            # cannot prove which side of the boundary the failure fell on.
+            # Deliberately left as durable uncertainty: never resubmitted.
+            pass
+        finally:
+            _close_quietly(descriptor)
+
+    def abandon(self) -> None:
+        """Refuse the runner permission to mutate, and let it exit."""
+
+        descriptor, self._release_write = self._release_write, -1
+        if descriptor >= 0:
+            _close_quietly(descriptor)
+
+
+def _close_quietly(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _await_ready(ready_read: int, timeout: float) -> bool:
+    """Wait, bounded, for the runner's one READY byte. EOF means it died."""
+
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            readable, _, _ = select.select([ready_read], [], [], remaining)
+        except OSError:
+            return False
+        if not readable:
+            return False
+        try:
+            chunk = os.read(ready_read, 1)
+        except OSError:
+            return False
+        if chunk == _DETACHED_READY:
+            return True
+        if not chunk:
+            return False
+
+
+def _detached_runner_main(
+    request: Mapping[str, Any],
+    journal: OperationJournal,
+    *,
+    local_node: str,
+    pre_native_architecture: str,
+    pre_installed_inventory: str,
+    runner: Runner,
+    ready_write: int,
+    release_read: int,
+) -> None:
+    """The grandchild: prove existence, then WAIT to be allowed to mutate."""
+
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    if devnull > 2:
+        os.close(devnull)
+    # READY: this process exists, owns the inherited VMID lease, and holds
+    # everything it needs. It still may NOT mutate anything.
+    os.write(ready_write, _DETACHED_READY)
+    os.close(ready_write)
+    # GO, or EOF. EOF means the controlling helper never crossed its durable
+    # submission boundary, so this runner exits having mutated nothing.
+    if os.read(release_read, 1) != _DETACHED_GO:
+        return
+    run_mutation(
+        request,
+        journal,
+        local_node=local_node,
+        pre_native_architecture=pre_native_architecture,
+        pre_installed_inventory=pre_installed_inventory,
+        runner=runner,
+    )
+
+
+def _prepare_detached_runner(
     request: Mapping[str, Any],
     journal: OperationJournal,
     lease: VmidMutationLease,
@@ -2103,8 +2258,8 @@ def _spawn_detached_runner(
     pre_native_architecture: str,
     pre_installed_inventory: str,
     runner: Runner,
-) -> None:
-    """Double-fork the runner that owns this mutation's fate.
+) -> DetachedRunner:
+    """Double-fork the runner that owns this mutation's fate, WITHOUT starting it.
 
     The grandchild is a session leader's child, reparented to PID 1, with
     stdio on `/dev/null`, so closing the SSH channel neither signals it nor
@@ -2113,49 +2268,98 @@ def _spawn_detached_runner(
     concurrent invocation can observe "a mutation is running right now"
     without any PID bookkeeping.
 
-    Correctness never depends on the runner surviving. If it is killed
-    anyway (a host reboot, say), the journal simply stays at `submitted`
-    with the lease free, which is durably UNCERTAIN and is never retried.
+    Returns only once the runner has proved it exists, and it still cannot
+    mutate anything until it is released. Every ordinary local handoff
+    failure -- either fork hitting EAGAIN/ENOMEM, `setsid`, pipe or
+    descriptor exhaustion, the grandchild dying during setup -- raises here
+    instead, while the journal is still at `intent` and therefore still
+    sealable. That is what stops a fork failure from leaving an operation
+    durably `submitted` that no runner can ever complete and that may never
+    be resubmitted.
+
+    Correctness still never depends on the runner SURVIVING. If it is killed
+    after release (a host reboot, say), the journal simply stays at
+    `submitted` with the lease free, which is durably UNCERTAIN and is never
+    retried.
     """
 
-    pid = os.fork()
-    if pid > 0:
-        # Parent: hand the lease over WITHOUT unlocking (the lock lives on
-        # the open file description both processes now share), and reap the
-        # intermediate child so no zombie is left on the PVE host.
-        lease.detach()
-        os.waitpid(pid, 0)
-        return
-
-    # Intermediate child.
     try:
-        os.setsid()
-        if os.fork() > 0:
-            os._exit(0)
-    except BaseException:
-        os._exit(1)
-
-    # Runner. From here on nothing may reach the SSH channel.
+        ready_read, ready_write = os.pipe()
+    except OSError as exc:
+        raise MutationError(
+            "execution_failed", "host could not establish the detached runner"
+        ) from exc
     try:
-        devnull = os.open(os.devnull, os.O_RDWR)
-        os.dup2(devnull, 0)
-        os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
-        if devnull > 2:
-            os.close(devnull)
-        run_mutation(
-            request,
-            journal,
-            local_node=local_node,
-            pre_native_architecture=pre_native_architecture,
-            pre_installed_inventory=pre_installed_inventory,
-            runner=runner,
+        release_read, release_write = os.pipe()
+    except OSError as exc:
+        _close_quietly(ready_read)
+        _close_quietly(ready_write)
+        raise MutationError(
+            "execution_failed", "host could not establish the detached runner"
+        ) from exc
+
+    try:
+        pid = os.fork()
+    except OSError as exc:
+        for descriptor in (ready_read, ready_write, release_read, release_write):
+            _close_quietly(descriptor)
+        raise MutationError(
+            "execution_failed", "host could not establish the detached runner"
+        ) from exc
+
+    if pid == 0:
+        # Intermediate child, then the runner. From here on nothing may reach
+        # the SSH channel, and any failure exits WITHOUT sending READY --
+        # which is exactly how the controlling helper learns no runner exists.
+        try:
+            os.close(ready_read)
+            os.close(release_write)
+            os.setsid()
+            if os.fork() > 0:
+                os._exit(0)
+            _detached_runner_main(
+                request,
+                journal,
+                local_node=local_node,
+                pre_native_architecture=pre_native_architecture,
+                pre_installed_inventory=pre_installed_inventory,
+                runner=runner,
+                ready_write=ready_write,
+                release_read=release_read,
+            )
+        except BaseException:
+            # A runner that cannot even journal its own outcome leaves the
+            # operation at `submitted`: durably uncertain, never resubmitted.
+            os._exit(1)
+        os._exit(0)
+
+    _close_quietly(ready_write)
+    _close_quietly(release_read)
+    if not _await_ready(ready_read, DETACHED_READY_TIMEOUT_SECONDS):
+        _close_quietly(ready_read)
+        # Closing the release pipe is what guarantees the claim above: a
+        # grandchild that exists but was slow reads EOF and exits having
+        # mutated nothing, because the GO byte is never written on this path.
+        _close_quietly(release_write)
+        _reap(pid, block=False)
+        raise MutationError(
+            "execution_failed", "detached runner did not confirm it was ready"
         )
-    except BaseException:
-        # A runner that cannot even journal its own outcome leaves the
-        # operation at `submitted`: durably uncertain, never resubmitted.
-        os._exit(1)
-    os._exit(0)
+    _close_quietly(ready_read)
+    _reap(pid, block=True)
+    # Hand the lease over WITHOUT unlocking: the lock lives on the open file
+    # description both processes now share. Only now is this irreversible.
+    lease.detach()
+    return DetachedRunner(release_write)
+
+
+def _reap(pid: int, *, block: bool) -> None:
+    """Collect the intermediate child. Never blocks on a failed handoff."""
+
+    try:
+        os.waitpid(pid, 0 if block else os.WNOHANG)
+    except OSError:
+        pass
 
 
 def run_mutation(

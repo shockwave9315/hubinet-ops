@@ -1957,3 +1957,70 @@ def test_home_assistant_entities_carry_no_plan_events_or_probe_material() -> Non
         "package_update_job_health_probe_results",
     ):
         assert forbidden not in publication, forbidden
+
+
+# ===========================================================================
+# THE SUBMISSION BARRIER, ACROSS EVERY DETACHED DESTRUCTIVE BOUNDARY.
+#
+# All three boundaries that hand physical work to a detached runner must
+# order it the same way, because both halves of the safety property depend on
+# that order:
+#
+#   prepare runner -> READY  (it exists, holds the lease, cannot act)
+#     -> durable `submitted` write
+#       -> GO  (the only thing that permits physical work)
+#
+# Writing the durable record FIRST is what used to let an ordinary `fork`
+# EAGAIN strand an operation permanently `submitted` with no runner that
+# could ever complete it and no permission to resubmit. Releasing the runner
+# first would let physical work precede the write-ahead record. Neither
+# reordering may be reintroduced, in any of the three.
+# ===========================================================================
+
+
+_DETACHED_DESTRUCTIVE_HELPERS = (
+    "hubinet-package-snapshot-helper.py",
+    "hubinet-package-rollback-helper.py",
+    "hubinet-package-mutation-helper.py",
+)
+
+
+@pytest.mark.parametrize("source_name", _DETACHED_DESTRUCTIVE_HELPERS)
+def test_every_detached_boundary_prepares_before_it_journals_and_releases_after(
+    source_name: str,
+) -> None:
+    source = (REPO_ROOT / "deploy" / source_name).read_text(encoding="utf-8")
+
+    prepared = source.index("_prepare_detached_runner(\n            ")
+    # Each boundary journals its own way; what matters is that the durable
+    # `submitted` record is written between preparation and release.
+    submitted = min(
+        index
+        for index in (
+            source.find('"phase": "submitted"', prepared),
+            source.find('_journal_record(request, "submitted")', prepared),
+        )
+        if index >= 0
+    )
+    released = source.index(".release()", prepared)
+
+    assert prepared < submitted < released
+
+    # The runner is gated on a byte, and that byte has exactly one writer.
+    assert source.count("os.write(descriptor, _DETACHED_GO)") == 1
+    assert source.count("_DETACHED_GO:") == 1
+    # Giving up on the handshake is bounded, and abandoning is what a failure
+    # before that byte does -- it never becomes a wall clock on physical work.
+    assert "DETACHED_READY_TIMEOUT_SECONDS" in source
+    assert "def abandon" in source
+    # And the physical runner still has no wall-clock deadline of its own.
+    if "DETACHED_CAPTURE_NO_DEADLINE" in source:
+        assert "runner(\n            argv, DETACHED_CAPTURE_NO_DEADLINE" in source
+
+
+@pytest.mark.parametrize("source_name", _DETACHED_DESTRUCTIVE_HELPERS)
+def test_no_detached_boundary_keeps_the_old_unchecked_spawn(source_name: str) -> None:
+    """The old shape returned normally whether or not a runner existed."""
+
+    source = (REPO_ROOT / "deploy" / source_name).read_text(encoding="utf-8")
+    assert "_spawn_detached_runner" not in source

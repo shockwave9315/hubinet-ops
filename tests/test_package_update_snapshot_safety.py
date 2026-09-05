@@ -4890,7 +4890,33 @@ class _HeldVmidLease:
             self._descriptor = None
 
 
-def _detached_dark_channel(fake_pve, journal, monkeypatch, lease_holder, detached):
+class _StagedExecutor:
+    """A prepared executor that mirrors the production release contract.
+
+    `release()` does NOT run the physical work: it only records that the
+    helper crossed its durable submission boundary and handed over
+    permission. The test then runs the deferred work itself, so the window
+    between "submitted, executor released" and "capture durable, lease free"
+    is under the test's control exactly as the real detached child's is.
+    """
+
+    def __init__(self, physical_work) -> None:
+        self._physical_work = physical_work
+        self.released = False
+        self.abandoned = False
+
+    def release(self) -> None:
+        self.released = True
+
+    def abandon(self) -> None:
+        self.abandoned = True
+
+    def run_physical_work(self) -> None:
+        assert self.released, "physical pvesh ran before the submission boundary"
+        self._physical_work()
+
+
+def _detached_dark_channel(fake_pve, journal, monkeypatch, lease_holder, executors):
     """A dark channel whose helper takes its REAL detached submission path.
 
     `handle_request` picks `detach = runner is None`, so patching the module
@@ -4911,7 +4937,10 @@ def _detached_dark_channel(fake_pve, journal, monkeypatch, lease_holder, detache
 
     real_capture = snapshot_helper._run_capture_child
 
-    def spawn_like_production(runner, host_journal, operation_id, argv, lease):
+    def prepare_like_production(runner, host_journal, operation_id, argv, lease):
+        # READY: the executor exists and has taken over the lease, but is
+        # blocked and has run nothing. `_ensure_submitted` may now write its
+        # durable record; only `release()` lets pvesh start.
         lease.detach()
         lease_holder.acquire()
 
@@ -4921,11 +4950,13 @@ def _detached_dark_channel(fake_pve, journal, monkeypatch, lease_holder, detache
             real_capture(runner, host_journal, operation_id, argv)
             lease_holder.release()
 
-        detached.append(finish_physical_work)
+        executor = _StagedExecutor(finish_physical_work)
+        executors.append(executor)
+        return executor
 
     monkeypatch.setattr(snapshot_helper, "_run_bounded", fake_pve)
     monkeypatch.setattr(
-        snapshot_helper, "_spawn_detached_runner", spawn_like_production
+        snapshot_helper, "_prepare_detached_runner", prepare_like_production
     )
 
     def runner(argv, input_bytes, timeout, max_output):
@@ -4966,8 +4997,8 @@ def test_a_detached_snapshot_survives_the_whole_lease_busy_window(
         _owned_listing_entry(identity, ownership)
     )
     lease_holder = _HeldVmidLease(journal.directory / f"vmid-{job.expected_vmid}.lock")
-    detached: list = []
-    channel = _detached_dark_channel(pve, journal, monkeypatch, lease_holder, detached)
+    executors: list = []
+    channel = _detached_dark_channel(pve, journal, monkeypatch, lease_holder, executors)
 
     clock = [0.0]
     sleep_calls: list[float] = []
@@ -4979,7 +5010,7 @@ def test_a_detached_snapshot_survives_the_whole_lease_busy_window(
         if len(sleep_calls) == 3:
             # The physical pvesh ends here: capture written, lease released.
             assert lease_holder.held
-            detached.pop()()
+            executors[0].run_physical_work()
             assert not lease_holder.held
 
     orchestrator = PackageUpdateSnapshotOrchestrator(
@@ -5017,7 +5048,11 @@ def test_a_detached_snapshot_survives_the_whole_lease_busy_window(
     assert journal.read(identity.snapshot_operation_id)["phase"] == "task_known"
     # Exactly one destructive submission, and the helper really detached.
     assert pve.submissions == 1
-    assert detached == []
+    # Exactly one executor was ever prepared, and it was released -- never
+    # abandoned -- because the durable submission write succeeded.
+    assert len(executors) == 1
+    assert executors[0].released is True
+    assert executors[0].abandoned is False
 
 
 # ---------------------------------------------------------------------------

@@ -398,14 +398,14 @@ class HelperBackedHostControl:
         payload = build_host_request(
             request, operation, prepared_evidence_digest=prepared_evidence_digest
         )
-        original_spawn = helper._spawn_detached_runner
-        helper._spawn_detached_runner = self._spawn
+        original_spawn = helper._prepare_detached_runner
+        helper._prepare_detached_runner = self._spawn
         try:
             response = helper.handle_request(
                 payload, runner=self.guest.runner, journal=self.journal
             )
         finally:
-            helper._spawn_detached_runner = original_spawn
+            helper._prepare_detached_runner = original_spawn
         # Prove the whole answer survives a real serialization boundary.
         response = json.loads(json.dumps(response, ensure_ascii=True))
         if operation in self.drop_response:
@@ -422,13 +422,17 @@ class HelperBackedHostControl:
         pre_native_architecture,
         pre_installed_inventory,
         runner,
-    ) -> None:
+    ):
         """Stand in for the double-forked runner, without forking.
 
         Hands the per-VMID lease over exactly the way the real code does --
         the lock lives on the open file description, so duplicating the
         descriptor keeps it held after the caller detaches -- so the
         "a mutation is running right now" evidence path is the real one.
+
+        And, like the real runner, it mutates NOTHING until it is released:
+        `release()` is what the helper calls after its durable `submitted`
+        write, so the production ordering is preserved rather than collapsed.
         """
 
         self._captured_pre_state = (pre_native_architecture, pre_installed_inventory)
@@ -436,23 +440,45 @@ class HelperBackedHostControl:
         assert descriptor is not None
         duplicate = os.dup(descriptor)
         lease.detach()
-        if self.runner_mode == "die":
-            os.close(duplicate)
-            return
-        if self.runner_mode == "hold":
-            self._held_descriptors.append(duplicate)
-            return
-        try:
-            helper.run_mutation(
-                request,
-                journal,
-                local_node=local_node,
-                pre_native_architecture=pre_native_architecture,
-                pre_installed_inventory=pre_installed_inventory,
-                runner=runner,
-            )
-        finally:
-            os.close(duplicate)
+
+        def _physical_work() -> None:
+            if self.runner_mode == "die":
+                os.close(duplicate)
+                return
+            if self.runner_mode == "hold":
+                self._held_descriptors.append(duplicate)
+                return
+            try:
+                helper.run_mutation(
+                    request,
+                    journal,
+                    local_node=local_node,
+                    pre_native_architecture=pre_native_architecture,
+                    pre_installed_inventory=pre_installed_inventory,
+                    runner=runner,
+                )
+            finally:
+                os.close(duplicate)
+
+        return _PreparedFakeRunner(_physical_work, duplicate)
+
+
+class _PreparedFakeRunner:
+    """A prepared runner that mirrors the production release contract."""
+
+    def __init__(self, physical_work, duplicate: int) -> None:
+        self._physical_work = physical_work
+        self._duplicate = duplicate
+        self.released = False
+        self.abandoned = False
+
+    def release(self) -> None:
+        self.released = True
+        self._physical_work()
+
+    def abandon(self) -> None:
+        self.abandoned = True
+        os.close(self._duplicate)
 
 
 def _armed_system(tmp_path: Path, *, packages=None):

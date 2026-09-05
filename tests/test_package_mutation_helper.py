@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import errno
 import os
 from pathlib import Path
 import re
@@ -248,14 +249,40 @@ def host():
 
 
 def _handle(payload, host, journal, *, spawn=None):
-    original = helper._spawn_detached_runner
-    helper._spawn_detached_runner = spawn if spawn is not None else _synchronous_spawn(
-        host
+    original = helper._prepare_detached_runner
+    helper._prepare_detached_runner = (
+        spawn if spawn is not None else _synchronous_spawn(host)
     )
     try:
         return helper.handle_request(payload, runner=host, journal=journal)
     finally:
-        helper._spawn_detached_runner = original
+        helper._prepare_detached_runner = original
+
+
+class _SynchronousDetachedRunner:
+    """An in-process stand-in that keeps the production RELEASE ordering.
+
+    Like the real runner it mutates nothing when it is prepared: the work
+    happens only when `release()` is called, which the helper does strictly
+    after the durable `submitted` write. `abandon()` runs nothing at all.
+    """
+
+    def __init__(self, run, duplicate: int) -> None:
+        self._run = run
+        self._duplicate = duplicate
+        self.released = False
+        self.abandoned = False
+
+    def release(self) -> None:
+        self.released = True
+        try:
+            self._run()
+        finally:
+            os.close(self._duplicate)
+
+    def abandon(self) -> None:
+        self.abandoned = True
+        os.close(self._duplicate)
 
 
 def _synchronous_spawn(host):
@@ -269,19 +296,22 @@ def _synchronous_spawn(host):
         pre_installed_inventory,
         runner,
     ):
+        # READY: the lease is handed over exactly the way the real code does
+        # -- the lock lives on the open file description, so duplicating the
+        # descriptor keeps it held after the caller detaches.
         duplicate = os.dup(lease.descriptor)
         lease.detach()
-        try:
-            helper.run_mutation(
+        return _SynchronousDetachedRunner(
+            lambda: helper.run_mutation(
                 request,
                 journal,
                 local_node=local_node,
                 pre_native_architecture=pre_native_architecture,
                 pre_installed_inventory=pre_installed_inventory,
                 runner=runner,
-            )
-        finally:
-            os.close(duplicate)
+            ),
+            duplicate,
+        )
 
     return _spawn
 
@@ -2288,10 +2318,14 @@ def test_an_incomplete_submitted_write_never_launches_a_mutation(
 
     The `intent` record (a different phase, a different payload) still
     writes normally; only the `submitted` record's write is made to fail,
-    exactly at the boundary `_execute` crosses immediately before spawning
-    the detached runner. `spawn=_never_spawn` additionally proves the
-    runner is never reached, not merely that its count stayed at 0 by
-    coincidence.
+    exactly at the boundary `_execute` crosses.
+
+    A runner is now PREPARED before that write, so the property under test is
+    the stronger one the barrier provides: the prepared runner is ABANDONED
+    rather than released, and a runner that is never released mutates
+    nothing. Proving the runner "was never reached" would be weaker -- the
+    whole point of preparing it first is that a `fork` failure can no longer
+    strand a durably `submitted` operation with no runner at all.
     """
 
     real_write = os.write
@@ -2307,17 +2341,183 @@ def test_an_incomplete_submitted_write_never_launches_a_mutation(
     assert prepared["ok"] is True
     digest = prepared["evidence"]["prepared_evidence_digest"]
 
-    with pytest.raises(OSError):
-        _handle(
-            _request(
-                "execute_exact_package_mutation", prepared_evidence_digest=digest
-            ),
-            host,
-            journal,
-            spawn=_never_spawn,
-        )
+    prepared_runners: list = []
 
+    def _recording_spawn(*args, **kwargs):
+        runner = _synchronous_spawn(host)(*args, **kwargs)
+        prepared_runners.append(runner)
+        return runner
+
+    response = _handle(
+        _request("execute_exact_package_mutation", prepared_evidence_digest=digest),
+        host,
+        journal,
+        spawn=_recording_spawn,
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "execution_failed"
+    # Prepared, then abandoned -- never released, so it mutated nothing.
+    assert len(prepared_runners) == 1
+    assert prepared_runners[0].released is False
+    assert prepared_runners[0].abandoned is True
     assert host.mutations == 0
     stored = journal.read(OPERATION_ID)
     assert stored is not None
     assert stored["phase"] == "intent"
+
+
+# ---------------------------------------------------------------------------
+# THE SUBMISSION BARRIER (same defect family as the snapshot and rollback
+# boundaries).
+#
+# `submitted` is the durable record that says "a package mutation may now be
+# running, and must never be blindly repeated". Creating it merely because a
+# detached runner was INTENDED is how an ordinary `fork` EAGAIN on a loaded
+# host strands an operation forever: journal submitted, no runner, no
+# outcome, no possible completion, and no permission to resubmit. The old
+# intermediate child's `os._exit(1)` was invisible to the parent, which only
+# reaped it and returned.
+#
+# The repair is a two-phase handoff: the runner is established FIRST and
+# proves it exists (READY) while blocked, and only the durable `submitted`
+# write releases it (GO).
+# ---------------------------------------------------------------------------
+
+
+REAL_PREPARE_DETACHED_RUNNER = helper._prepare_detached_runner
+
+
+def _wait_until(predicate, seconds: float = 3.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def _lease_is_free(journal) -> bool:
+    try:
+        with helper.VmidMutationLease(VMID, journal.directory, anchor=journal.anchor):
+            return True
+    except helper.MutationError:
+        return False
+
+
+def _failing_fork(monkeypatch, *, after: int):
+    """Make `os.fork` raise EAGAIN on the (after+1)-th call in this process.
+
+    A forked child inherits its own copy of the counter, so `after=1` fails
+    the intermediate's second fork while letting the first one really happen.
+    """
+
+    calls = [0]
+    real_fork = os.fork
+
+    def fork():
+        calls[0] += 1
+        if calls[0] > after:
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+        return real_fork()
+
+    monkeypatch.setattr(os, "fork", fork)
+
+
+def _execute_with_real_handoff(host, journal, monkeypatch):
+    monkeypatch.setattr(helper, "DETACHED_READY_TIMEOUT_SECONDS", 2.0)
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    assert prepared["ok"] is True
+    digest = prepared["evidence"]["prepared_evidence_digest"]
+    return _handle(
+        _request("execute_exact_package_mutation", prepared_evidence_digest=digest),
+        host,
+        journal,
+        spawn=REAL_PREPARE_DETACHED_RUNNER,
+    )
+
+
+@pytest.mark.parametrize("after", [0, 1])
+def test_a_fork_failure_never_creates_a_submitted_mutation(
+    host, journal, monkeypatch, after: int
+) -> None:
+    """Either fork failing is provably pre-submission, and still sealable.
+
+    ``after=1`` is the exact case whose intermediate `os._exit` used to look
+    to the controlling helper exactly like a successful handoff.
+    """
+
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    assert prepared["ok"] is True
+    digest = prepared["evidence"]["prepared_evidence_digest"]
+    _failing_fork(monkeypatch, after=after)
+    monkeypatch.setattr(helper, "DETACHED_READY_TIMEOUT_SECONDS", 2.0)
+
+    response = _handle(
+        _request("execute_exact_package_mutation", prepared_evidence_digest=digest),
+        host,
+        journal,
+        spawn=REAL_PREPARE_DETACHED_RUNNER,
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "execution_failed"
+    # No durable submission, so the operation is still sealable and a later
+    # attempt is still free to submit exactly once.
+    assert journal.read(OPERATION_ID)["phase"] == "intent"
+    assert host.mutations == 0
+    assert _wait_until(lambda: _lease_is_free(journal))
+
+    sealed = _handle(_request("seal_mutation_never_submitted"), host, journal)
+    assert sealed["ok"] is True
+    assert journal.read(OPERATION_ID)["phase"] == "sealed_not_submitted"
+
+
+def test_a_mutation_runner_dying_before_ready_creates_no_submission(
+    host, journal, monkeypatch
+) -> None:
+    def die_before_ready(*_args, **_kwargs):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(helper, "_detached_runner_main", die_before_ready)
+
+    response = _execute_with_real_handoff(host, journal, monkeypatch)
+
+    assert response["ok"] is False
+    assert journal.read(OPERATION_ID)["phase"] == "intent"
+    assert host.mutations == 0
+    assert _wait_until(lambda: _lease_is_free(journal))
+
+
+def test_a_prepared_mutation_runner_has_mutated_nothing_until_released(
+    host, journal
+) -> None:
+    """READY proves existence, never permission."""
+
+    prepared_runners: list = []
+
+    def _recording_spawn(*args, **kwargs):
+        runner = _synchronous_spawn(host)(*args, **kwargs)
+        prepared_runners.append(runner)
+        # Observed at exactly the moment the helper is about to write its
+        # durable `submitted` record: the runner exists and has done nothing.
+        assert runner.released is False
+        assert host.mutations == 0
+        return runner
+
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    response = _handle(
+        _request(
+            "execute_exact_package_mutation",
+            prepared_evidence_digest=prepared["evidence"]["prepared_evidence_digest"],
+        ),
+        host,
+        journal,
+        spawn=_recording_spawn,
+    )
+
+    assert response["ok"] is True
+    assert len(prepared_runners) == 1
+    assert prepared_runners[0].released is True
+    assert prepared_runners[0].abandoned is False
+    assert host.mutations == 1

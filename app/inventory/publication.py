@@ -104,9 +104,7 @@ class InventoryPublication:
                 "WHERE latest.resource_id=p.resource_id) "
                 "ORDER BY p.resource_id"
             ).fetchall()
-            scan_by_resource = {
-                str(row["resource_id"]): row for row in scan_rows
-            }
+            latest_by_resource = {str(row["resource_id"]): row for row in scan_rows}
             pending_post_update_resources = {
                 str(row["resource_id"])
                 for row in connection.execute(
@@ -117,6 +115,50 @@ class InventoryPublication:
                     "WHERE request.scan_run_id IS NULL OR run.lifecycle='running'"
                 ).fetchall()
             }
+            # The exact scan runs a post-update refresh is currently occupying.
+            # Keyed by scan_run_id, NOT by resource: an ordinary periodic scan
+            # that happens to be running must keep publishing `scanning`, so
+            # retention is only ever triggered by the one run a post-update
+            # request is actually linked to.
+            running_post_update_runs = {
+                str(row["scan_run_id"])
+                for row in connection.execute(
+                    "SELECT request.scan_run_id "
+                    "FROM package_update_post_scan_requests request "
+                    "JOIN package_scan_runs run "
+                    "ON run.scan_run_id=request.scan_run_id "
+                    "WHERE run.lifecycle='running'"
+                ).fetchall()
+            }
+            retained_by_resource: dict[str, Any] = {}
+            if running_post_update_runs:
+                # The newest run that actually REACHED a terminal result.
+                retained_by_resource = {
+                    str(row["resource_id"]): row
+                    for row in connection.execute(
+                        "SELECT p.* FROM package_scan_runs p "
+                        "WHERE p.lifecycle='completed' AND p.attempt_sequence=("
+                        "SELECT MAX(done.attempt_sequence) FROM package_scan_runs done "
+                        "WHERE done.resource_id=p.resource_id "
+                        "AND done.lifecycle='completed') "
+                        "ORDER BY p.resource_id"
+                    ).fetchall()
+                }
+            # F2's post-success refresh contract: while the refresh this
+            # update requested is still RUNNING, the resource keeps publishing
+            # its last real terminal 0/N/UNKNOWN result, and the refresh is
+            # exposed independently through `post_update_scan_pending`. A
+            # running refresh must never erase the observation it is
+            # refreshing. Nothing is synthesized: if no terminal run exists at
+            # all the resource simply publishes `not_scanned`.
+            scan_by_resource: dict[str, Any] = {}
+            for resource_id, row in latest_by_resource.items():
+                if str(row["scan_run_id"]) in running_post_update_runs:
+                    retained = retained_by_resource.get(resource_id)
+                    if retained is not None:
+                        scan_by_resource[resource_id] = retained
+                    continue
+                scan_by_resource[resource_id] = row
             approval_rows = connection.execute(
                 "SELECT * FROM package_plan_approvals ORDER BY resource_id"
             ).fetchall()
@@ -161,12 +203,19 @@ class InventoryPublication:
                 # even regress across an ordinary clock correction. See
                 # PackageUpdateJob.issuance_sequence's own docstring.
                 job_by_resource[str(row["resource_id"])] = row
+            # Keyed by the run they belong to, and selected over TERMINAL runs
+            # only -- the same rule `scan_by_resource` publishes by, so the
+            # displayed header, pending count, fingerprint and package list
+            # always describe one single scan_run_id. Keying on the global
+            # newest attempt instead would silently yield no package rows the
+            # moment any newer run was still running.
             package_rows = connection.execute(
                 "SELECT package.* FROM package_scan_packages package "
                 "JOIN package_scan_runs run USING(scan_run_id) "
                 "WHERE run.outcome='success' AND run.attempt_sequence=("
                 "SELECT MAX(latest.attempt_sequence) FROM package_scan_runs latest "
-                "WHERE latest.resource_id=run.resource_id) "
+                "WHERE latest.resource_id=run.resource_id "
+                "AND latest.lifecycle='completed') "
                 "ORDER BY run.resource_id, package.package_index"
             ).fetchall()
             packages_by_run: dict[str, list[Any]] = {}

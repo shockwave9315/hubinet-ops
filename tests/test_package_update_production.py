@@ -2251,3 +2251,262 @@ def test_the_fence_route_refuses_while_a_workload_job_is_active(api) -> None:
     assert response.status_code == 409
     assert response.json()["detail"]["error"] == "product_update_fence_unavailable"
     assert api.get("/r0/v1/package-update/maintenance-fence").json()["held"] is False
+
+
+# ===========================================================================
+# F2 POST-SUCCESS REFRESH: A RUNNING REFRESH MUST NOT ERASE THE LAST REAL
+# TERMINAL RESULT.
+#
+# The refresh a successful update requests is published INDEPENDENTLY through
+# `post_update_scan_pending`. While it is still running, the resource keeps
+# showing the last real terminal 0/N/UNKNOWN observation it actually has --
+# publishing `scanning` there would blank `pending_count`, the plan
+# fingerprint and the whole package list, which is precisely the state an
+# operator has just been told the update changed.
+# ===========================================================================
+
+
+def _published_scan(store, authority, resource_id: str):
+    return next(
+        resource
+        for resource in InventoryPublication(store, authority).read().resources
+        if resource["resource_id"] == resource_id
+    )["package_scan"]
+
+
+def _terminalize_a_fresh_scan(system, resource_id: str, *, packages=None, failure=None):
+    """Give the resource one more REAL terminal scan before the refresh."""
+
+    run = system.authority.issue_package_scan(resource_id)
+    if failure is not None:
+        return system.authority.finalize_failed_package_scan(
+            run.scan_run_id,
+            failure_class=failure,
+            error_message="scan failed for this test",
+        )
+    return system.authority.finalize_successful_package_scan(
+        run.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=tuple(packages or ()),
+        reboot_required=None,
+    )
+
+
+def _claim_post_update_refresh(system, job_id: str):
+    claimed = system.authority.issue_post_update_package_scan(job_id)
+    assert claimed.lifecycle.value == "running"
+    return claimed
+
+
+def test_a_running_post_update_refresh_retains_the_previous_success_with_packages(
+    tmp_path: Path,
+) -> None:
+    """Case 1. Previous terminal SUCCESS with N>0 is retained whole."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    before = _published_scan(system.store, system.authority, job.resource_id)
+    assert before["status"] == "success"
+    assert before["pending_count"] == 2
+    assert len(before["packages"]) == 2
+    assert before["post_update_scan_pending"] is True
+
+    claimed = _claim_post_update_refresh(system, job.job_id)
+
+    during = _published_scan(system.store, system.authority, job.resource_id)
+    assert during["status"] == "success"
+    assert during["pending_count"] == 2
+    assert during["packages"] == before["packages"]
+    assert during["plan_fingerprint"] == before["plan_fingerprint"]
+    assert during["post_update_scan_pending"] is True
+    # The retained result is the PREVIOUS run, never the running refresh, and
+    # header and packages describe one single scan_run_id.
+    assert during["scan_run_id"] == before["scan_run_id"]
+    assert during["scan_run_id"] != claimed.scan_run_id
+
+
+def test_a_running_post_update_refresh_retains_a_previous_zero_success(
+    tmp_path: Path,
+) -> None:
+    """Case 2. SUCCESS/0 is a real terminal observation, not an absence."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    zero = _terminalize_a_fresh_scan(system, job.resource_id, packages=())
+
+    _claim_post_update_refresh(system, job.job_id)
+
+    during = _published_scan(system.store, system.authority, job.resource_id)
+    assert during["status"] == "success"
+    assert during["pending_count"] == 0
+    assert during["packages"] == ()
+    assert during["scan_run_id"] == zero.scan_run_id
+    assert during["post_update_scan_pending"] is True
+
+
+def test_a_running_post_update_refresh_retains_a_previous_unknown(
+    tmp_path: Path,
+) -> None:
+    """Case 3. A real failed/UNKNOWN terminal result is retained as-is --
+    never softened into `scanning`, never synthesized into success."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    failed = _terminalize_a_fresh_scan(
+        system,
+        job.resource_id,
+        failure=PackageScanFailure.METADATA_REFRESH_FAILED,
+    )
+
+    _claim_post_update_refresh(system, job.job_id)
+
+    during = _published_scan(system.store, system.authority, job.resource_id)
+    assert during["status"] == "failed"
+    assert during["pending_count"] is None
+    assert during["packages"] == ()
+    assert during["error"]["classification"] == "metadata_refresh_failed"
+    assert during["scan_run_id"] == failed.scan_run_id
+    assert during["post_update_scan_pending"] is True
+
+
+def test_the_refreshed_result_replaces_the_retained_one_once_it_terminalizes(
+    tmp_path: Path,
+) -> None:
+    """Cases 4 and 5. The retention lasts exactly as long as the refresh is
+    running: whatever it really proves -- success or failure -- is published
+    the moment it terminalizes, and pending drops to False."""
+
+    for failure, expected_status, expected_pending in (
+        (None, "success", 0),
+        (PackageScanFailure.METADATA_REFRESH_FAILED, "failed", None),
+    ):
+        system = _system(tmp_path / f"case-{expected_status}")
+        job = _start(system)
+        assert (
+            system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+        )
+        claimed = _claim_post_update_refresh(system, job.job_id)
+        retained = _published_scan(system.store, system.authority, job.resource_id)
+        assert retained["pending_count"] == 2
+        assert retained["post_update_scan_pending"] is True
+
+        if failure is None:
+            system.authority.finalize_successful_package_scan(
+                claimed.scan_run_id,
+                os_id="debian",
+                os_version="12",
+                packages=(),
+                reboot_required=None,
+            )
+        else:
+            system.authority.finalize_failed_package_scan(
+                claimed.scan_run_id,
+                failure_class=failure,
+                error_message="fresh post-update scan failed",
+            )
+
+        published = _published_scan(system.store, system.authority, job.resource_id)
+        assert published["status"] == expected_status
+        assert published["pending_count"] == expected_pending
+        assert published["scan_run_id"] == claimed.scan_run_id
+        assert published["post_update_scan_pending"] is False
+        system.store.close()
+
+
+def test_restart_while_the_linked_refresh_runs_still_retains_the_result(
+    tmp_path: Path,
+) -> None:
+    """Case 6. The contract is durable state, not in-process memory."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    claimed = _claim_post_update_refresh(system, job.job_id)
+    before = _published_scan(system.store, system.authority, job.resource_id)
+
+    path = system.store.path
+    system.store.close()
+    store = InventoryAuthorityStore(path, now=system.clock)
+    authority = InventoryAuthority(store, now=system.clock)
+    try:
+        assert authority.recover_interrupted_package_scans() == ()
+        after = _published_scan(store, authority, job.resource_id)
+        assert after["status"] == "success"
+        assert after["pending_count"] == 2
+        assert after["packages"] == before["packages"]
+        assert after["scan_run_id"] == before["scan_run_id"]
+        assert after["scan_run_id"] != claimed.scan_run_id
+        assert after["post_update_scan_pending"] is True
+    finally:
+        store.close()
+
+
+def test_an_ordinary_periodic_running_scan_still_publishes_scanning(
+    tmp_path: Path,
+) -> None:
+    """Case 7. The retention is scoped to the post-update refresh contract.
+
+    With no post-update request occupying this run, an ordinary periodic scan
+    keeps its intended `scanning` semantics -- this fix must not silently turn
+    every running scan into "show the old numbers".
+    """
+
+    system = _system(tmp_path)
+    resource, _scan, _approval = _add_approved_resource(system.store, system.authority)
+
+    baseline = _published_scan(system.store, system.authority, resource.resource_id)
+    assert baseline["status"] == "success"
+    assert baseline["post_update_scan_pending"] is False
+
+    running = system.authority.issue_package_scan(resource.resource_id)
+
+    during = _published_scan(system.store, system.authority, resource.resource_id)
+    assert during["status"] == "scanning"
+    assert during["pending_count"] is None
+    assert during["packages"] == ()
+    assert during["plan_fingerprint"] is None
+    assert during["scan_run_id"] == running.scan_run_id
+    assert during["post_update_scan_pending"] is False
+
+
+def test_every_published_scan_header_and_package_list_share_one_run_id(
+    tmp_path: Path,
+) -> None:
+    """The 2B invariant, asserted directly against the store.
+
+    Whatever run the header names, the published package list must be exactly
+    that run's frozen rows -- never another run's, and never a truncated view
+    of one because a newer run happened to be in flight.
+    """
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    _claim_post_update_refresh(system, job.job_id)
+
+    for resource in InventoryPublication(
+        system.store, system.authority
+    ).read().resources:
+        scan = resource["package_scan"]
+        if scan["scan_run_id"] is None:
+            assert scan["packages"] == ()
+            continue
+        with system.store._transaction() as connection:
+            rows = connection.execute(
+                "SELECT package_name FROM package_scan_packages "
+                "WHERE scan_run_id=? ORDER BY package_index",
+                (scan["scan_run_id"],),
+            ).fetchall()
+        if scan["status"] != "success":
+            # Only a successful run publishes packages at all.
+            assert scan["packages"] == ()
+            continue
+        assert [entry["name"] for entry in scan["packages"]] == [
+            str(row["package_name"]) for row in rows
+        ]
+        assert scan["pending_count"] == len(rows)
