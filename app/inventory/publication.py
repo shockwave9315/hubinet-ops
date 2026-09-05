@@ -115,23 +115,8 @@ class InventoryPublication:
                     "WHERE request.scan_run_id IS NULL OR run.lifecycle='running'"
                 ).fetchall()
             }
-            # The exact scan runs a post-update refresh is currently occupying.
-            # Keyed by scan_run_id, NOT by resource: an ordinary periodic scan
-            # that happens to be running must keep publishing `scanning`, so
-            # retention is only ever triggered by the one run a post-update
-            # request is actually linked to.
-            running_post_update_runs = {
-                str(row["scan_run_id"])
-                for row in connection.execute(
-                    "SELECT request.scan_run_id "
-                    "FROM package_update_post_scan_requests request "
-                    "JOIN package_scan_runs run "
-                    "ON run.scan_run_id=request.scan_run_id "
-                    "WHERE run.lifecycle='running'"
-                ).fetchall()
-            }
             retained_by_resource: dict[str, Any] = {}
-            if running_post_update_runs:
+            if pending_post_update_resources:
                 # The newest run that actually REACHED a terminal result.
                 retained_by_resource = {
                     str(row["resource_id"]): row
@@ -144,16 +129,20 @@ class InventoryPublication:
                         "ORDER BY p.resource_id"
                     ).fetchall()
                 }
-            # F2's post-success refresh contract: while the refresh this
-            # update requested is still RUNNING, the resource keeps publishing
-            # its last real terminal 0/N/UNKNOWN result, and the refresh is
-            # exposed independently through `post_update_scan_pending`. A
-            # running refresh must never erase the observation it is
-            # refreshing. Nothing is synthesized: if no terminal run exists at
-            # all the resource simply publishes `not_scanned`.
+            # F2's post-success refresh contract: while any durable refresh
+            # request for this resource is pending, a newer RUNNING attempt
+            # must not erase the last real terminal 0/N/UNKNOWN result. This
+            # covers both an unclaimed request blocked behind an ordinary
+            # single-flight scan and the request's own linked running scan.
+            # The pending fact is exposed independently. Nothing is
+            # synthesized: without any terminal run, publication remains
+            # honestly `not_scanned`.
             scan_by_resource: dict[str, Any] = {}
             for resource_id, row in latest_by_resource.items():
-                if str(row["scan_run_id"]) in running_post_update_runs:
+                if (
+                    resource_id in pending_post_update_resources
+                    and str(row["lifecycle"]) == "running"
+                ):
                     retained = retained_by_resource.get(resource_id)
                     if retained is not None:
                         scan_by_resource[resource_id] = retained

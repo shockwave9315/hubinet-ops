@@ -200,14 +200,18 @@ class ScriptedSnapshotHostControl:
 class ScriptedHealthHostControl:
     """A read-only health boundary with a scripted verdict per attempt."""
 
-    def __init__(self, *outcomes):
+    def __init__(self, *outcomes, before_evaluate=None):
         #: One entry per attempt: "passed", "failed", "unknown", or an
         #: exception instance to raise.
         self._outcomes = list(outcomes) or ["passed"]
+        self._before_evaluate = before_evaluate
         self.calls = 0
 
     def evaluate_health_contract(self, request):
         self.calls += 1
+        if self._before_evaluate is not None:
+            before_evaluate, self._before_evaluate = self._before_evaluate, None
+            before_evaluate()
         outcome = self._outcomes.pop(0) if self._outcomes else "passed"
         if isinstance(outcome, BaseException):
             raise outcome
@@ -2297,6 +2301,231 @@ def _claim_post_update_refresh(system, job_id: str):
     claimed = system.authority.issue_post_update_package_scan(job_id)
     assert claimed.lifecycle.value == "running"
     return claimed
+
+
+def _succeed_while_an_ordinary_scan_is_running(
+    system,
+    job_id: str,
+    *,
+    previous: str = "approved",
+):
+    state = {}
+
+    def prepare_publication_race() -> None:
+        if previous == "zero":
+            state["terminal"] = _terminalize_a_fresh_scan(
+                system, system.resource.resource_id, packages=()
+            )
+        elif previous == "failed":
+            state["terminal"] = _terminalize_a_fresh_scan(
+                system,
+                system.resource.resource_id,
+                failure=PackageScanFailure.METADATA_REFRESH_FAILED,
+            )
+        else:
+            assert previous == "approved"
+            state["terminal"] = system.scan
+        state["running"] = system.authority.issue_package_scan(
+            system.resource.resource_id
+        )
+
+    system.health_host._before_evaluate = prepare_publication_race
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    with system.store._read_transaction() as connection:
+        request = connection.execute(
+            "SELECT scan_run_id FROM package_update_post_scan_requests WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+    assert request is not None
+    assert request["scan_run_id"] is None
+    return state["terminal"], state["running"]
+
+
+def test_an_unclaimed_refresh_retains_the_previous_success_with_packages(
+    tmp_path: Path,
+) -> None:
+    """An ordinary scan already RUNNING cannot erase the terminal result
+    when health PASS creates a still-unclaimed post-update refresh request."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id
+    )
+
+    published = _published_scan(system.store, system.authority, job.resource_id)
+    assert published["scan_run_id"] == previous.scan_run_id
+    assert published["scan_run_id"] != ordinary_running.scan_run_id
+    assert published["status"] == "success"
+    assert published["pending_count"] == len(previous.packages)
+    assert published["packages"] == tuple(
+        {
+            "name": package.package_name,
+            "architecture": package.architecture,
+            "installed_version": package.installed_version,
+            "candidate_version": package.candidate_version,
+            "origin": package.origin,
+            "description": package.description,
+            "security": package.security,
+        }
+        for package in previous.packages
+    )
+    assert published["plan_fingerprint"] == previous.plan_fingerprint
+    assert published["post_update_scan_pending"] is True
+
+
+def test_an_unclaimed_refresh_retains_the_previous_zero_success(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id, previous="zero"
+    )
+
+    published = _published_scan(system.store, system.authority, job.resource_id)
+    assert published["scan_run_id"] == previous.scan_run_id
+    assert published["scan_run_id"] != ordinary_running.scan_run_id
+    assert published["status"] == "success"
+    assert published["pending_count"] == 0
+    assert published["packages"] == ()
+    assert published["plan_fingerprint"] == previous.plan_fingerprint
+    assert published["post_update_scan_pending"] is True
+
+
+def test_an_unclaimed_refresh_retains_the_previous_unknown(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id, previous="failed"
+    )
+
+    published = _published_scan(system.store, system.authority, job.resource_id)
+    assert published["scan_run_id"] == previous.scan_run_id
+    assert published["scan_run_id"] != ordinary_running.scan_run_id
+    assert published["status"] == "failed"
+    assert published["pending_count"] is None
+    assert published["packages"] == ()
+    assert published["plan_fingerprint"] is None
+    assert published["error"]["classification"] == "metadata_refresh_failed"
+    assert published["post_update_scan_pending"] is True
+
+
+def test_pending_without_a_selected_terminal_scan_is_honestly_not_scanned() -> None:
+    """The renderer never fabricates a zero/success fallback.
+
+    Coherent authority cannot create this database state: a post-update
+    request requires a SUCCEEDED job, and job issuance requires an approved
+    completed scan for this same immutable resource. This direct renderer
+    control covers the honest fallback without manufacturing impossible SQL.
+    """
+
+    published = InventoryPublication._package_scan(
+        {"resource_type": "lxc"},
+        None,
+        {},
+        post_update_scan_pending=True,
+    )
+    assert published["status"] == "not_scanned"
+    assert published["scan_run_id"] is None
+    assert published["pending_count"] is None
+    assert published["packages"] == ()
+    assert published["plan_fingerprint"] is None
+    assert published["post_update_scan_pending"] is True
+
+
+def test_unclaimed_refresh_waits_for_ordinary_single_flight_then_gets_its_own_run(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    _previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id
+    )
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        system.authority,
+        system.store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+
+    conflicted = scheduler.run_post_update_once()
+    assert len(conflicted) == 1
+    assert conflicted[0].status == "conflict"
+    assert conflicted[0].scan_run_id is None
+    assert host.calls == 0
+    assert system.authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+
+    system.authority.finalize_failed_package_scan(
+        ordinary_running.scan_run_id,
+        failure_class=PackageScanFailure.METADATA_REFRESH_FAILED,
+        error_message="ordinary scan failed for this test",
+    )
+    completed = scheduler.run_post_update_once()
+    assert len(completed) == 1
+    assert completed[0].status == "success"
+    assert completed[0].scan_run_id not in {None, ordinary_running.scan_run_id}
+    assert host.calls == 1
+    assert system.authority.pending_post_update_package_scans() == ()
+    published = _published_scan(system.store, system.authority, job.resource_id)
+    assert published["scan_run_id"] == completed[0].scan_run_id
+    assert published["status"] == "success"
+    assert published["pending_count"] == 0
+    assert published["post_update_scan_pending"] is False
+
+
+def test_restart_terminalizes_unlinked_ordinary_scan_but_preserves_request(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    _previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id
+    )
+
+    path = system.store.path
+    system.store.close()
+    store = InventoryAuthorityStore(path, now=system.clock)
+    authority = InventoryAuthority(store, now=system.clock)
+    try:
+        assert authority.recover_interrupted_package_scans() == (
+            ordinary_running.scan_run_id,
+        )
+        assert authority.pending_post_update_package_scans() == (
+            (job.job_id, job.resource_id),
+        )
+        published = _published_scan(store, authority, job.resource_id)
+        assert published["scan_run_id"] == ordinary_running.scan_run_id
+        assert published["status"] == "interrupted"
+        assert published["pending_count"] is None
+        assert published["packages"] == ()
+        assert published["plan_fingerprint"] is None
+        assert published["post_update_scan_pending"] is True
+
+        host = _PostUpdateScanHost()
+        scheduler = PackageScanScheduler(
+            authority,
+            store,
+            host,
+            interval_seconds=21_600,
+            initial_delay_seconds=0,
+        )
+        completed = scheduler.run_post_update_once()
+        assert len(completed) == 1
+        assert completed[0].scan_run_id not in {
+            None,
+            ordinary_running.scan_run_id,
+        }
+        assert host.calls == 1
+        assert authority.pending_post_update_package_scans() == ()
+    finally:
+        store.close()
 
 
 def test_a_running_post_update_refresh_retains_the_previous_success_with_packages(
