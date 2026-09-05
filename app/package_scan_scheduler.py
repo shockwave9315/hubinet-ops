@@ -227,6 +227,7 @@ class PackageScanScheduler:
                     for resource in self._store.list_resources()
                     if resource.resource_id not in requested_resources
                     and resource.resource_type == "lxc"
+                    and resource.status == "running"
                     and resource.presence == "present"
                     and resource.lifecycle == "active"
                     and resource.active_binding_id is not None

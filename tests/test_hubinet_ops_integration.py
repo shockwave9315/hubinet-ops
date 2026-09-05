@@ -1726,6 +1726,25 @@ async def test_approval_sensor_follows_changed_plan_stale_publication(
 
 
 @pytest.mark.asyncio
+async def test_approval_sensor_distinguishes_consumed_from_stale(
+    hass: HomeAssistant,
+) -> None:
+    approved = exact_plan_resource(approved=True)
+    consumed = replace(
+        approved,
+        package_plan_approval=replace(
+            approved.package_plan_approval,
+            status=PackagePlanApprovalStatus.CONSUMED,
+        ),
+    )
+    entry = await setup_entry(hass, FakeTransport([snapshot((consumed,))]))
+
+    assert resource_entity_states(hass, entry, RESOURCE_CT)[
+        "package_plan_approval"
+    ] == "consumed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("context_kind", ("resource", "source"))
 async def test_approval_sensor_uses_backend_stale_state_during_context_failure(
     hass: HomeAssistant, context_kind: str
@@ -1799,7 +1818,23 @@ def test_update_plan_action_metadata_and_polish_translations_are_structural() ->
         "none": "Brak",
         "approved": "Zatwierdzony",
         "stale": "Nieaktualny",
+        "consumed": "Wykorzystany",
     }
+    assert strings["entity"] == english["entity"]
+    assert english["entity"]["sensor"]["resource_security_continuity"] == {
+        "name": "Legacy continuity observation",
+        "state": {
+            "unverified": "Unverified observation (not an update failure)",
+            "trusted": "Trusted",
+            "revoked": "Revoked",
+        },
+    }
+    assert english["entity"]["sensor"]["resource_reboot_required"]["name"] == (
+        "Reboot required (unknown if unavailable)"
+    )
+    assert english["entity"]["sensor"]["resource_package_update_job"]["name"] == (
+        "Last package update job"
+    )
 
 
 @pytest.mark.asyncio

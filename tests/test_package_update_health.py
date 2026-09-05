@@ -44,7 +44,9 @@ from app.inventory import (
     HealthProbeKind,
     HealthProbeObservation,
     HealthProbeOutcome,
+    InventoryAuthority,
     InventoryAuthorityStore,
+    InventoryPublication,
     PackageUpdateCheckpoint,
     PackageUpdateEventType,
     PackageUpdateJobStatus,
@@ -545,6 +547,59 @@ def test_E_a_cleared_contract_after_mutation_still_evaluates_the_frozen_one(
     )
     assert decided.status is PackageUpdateJobStatus.SUCCEEDED
     assert decided.health_outcome is HealthOutcome.PASSED
+
+
+def test_success_and_approval_consumption_rollback_together_on_transaction_failure(
+    tmp_path: Path,
+) -> None:
+    clock, store, _, resource, _, approval, job = _mutated_job(tmp_path)
+
+    class FailingSuccessAuthority(InventoryAuthority):
+        def _append_package_update_job_event(self, connection, **kwargs):
+            InventoryAuthority._append_package_update_job_event(connection, **kwargs)
+            if kwargs["event_type"] is PackageUpdateEventType.HEALTH_PASSED:
+                raise RuntimeError("injected failure after successful terminalization")
+
+    failing = FailingSuccessAuthority(store, now=clock)
+    started = failing.start_package_update_health(job.job_id)
+    observations = _observations(
+        started, (HealthProbeOutcome.PASSED,) * len(started.health_probes)
+    )
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        failing.complete_package_update_health(job.job_id, observations)
+
+    after = store.package_update_job(job.job_id)
+    assert after.status is PackageUpdateJobStatus.ACTIVE
+    assert after.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert after.health_completed_at is None
+    assert after.health_probe_results == ()
+    published = next(
+        item
+        for item in InventoryPublication(store, failing).read().resources
+        if item["resource_id"] == resource.resource_id
+    )
+    assert published["package_plan_approval"]["status"] == "approved"
+    assert published["package_plan_approval"]["approval_id"] == approval.approval_id
+
+    path = store.path
+    store.close()
+    reopened = InventoryAuthorityStore(path, now=clock)
+    restarted = InventoryAuthority(reopened, now=clock)
+    try:
+        durable = reopened.package_update_job(job.job_id)
+        assert durable.status is PackageUpdateJobStatus.ACTIVE
+        assert durable.health_completed_at is None
+        completed = restarted.complete_package_update_health(job.job_id, observations)
+        assert completed.status is PackageUpdateJobStatus.SUCCEEDED
+        consumed = next(
+            item
+            for item in InventoryPublication(reopened, restarted).read().resources
+            if item["resource_id"] == resource.resource_id
+        )["package_plan_approval"]
+        assert consumed["status"] == "consumed"
+    finally:
+        reopened.close()
 
 
 # ===========================================================================

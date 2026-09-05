@@ -23,7 +23,7 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v18). Schema v10 added
+database (marker `hubinet_ops_0_5_authority`, schema v19). Schema v10 added
 the job-owned snapshot operation identity, its write-ahead uncertainty
 checkpoint, the observed PVE task identity, and SQL-level state-machine
 invariants over all of them. Schema v11 added the explicit, material
@@ -54,8 +54,12 @@ job. Schema v18 adds one durable, job-keyed post-update package-scan request,
 created atomically with a successful terminal health verdict and linked once
 to a RUNNING same-resource ordinary package-scan run by the independent scan
 scheduler. Its identity is immutable and its link cannot be cleared or
-replaced. There is no
-migration from v9 through v17; pre-release installs use the
+replaced. Schema v19 makes a successful job the durable consumption fact for
+the exact approval copied into that job and adds a partial unique index
+permitting at most one `succeeded` job per `approval_id`. Because consumption
+is derived from the same terminal job row, success and consumption cannot be
+split by a crash or restart. There is no migration from v9 through v18;
+pre-release installs use the
 product updater's explicit backed-up authority reset and require Home
 Assistant re-enrollment.
 
@@ -97,8 +101,8 @@ describes how to reach a Proxmox **source**. It never enumerates workloads.
 `app/package_scan_scheduler.py` is an independent single-worker scheduler. It
 reads the validated runtime interval (default six hours), issues durable
 per-resource scan ownership through `InventoryAuthority`, and scans only
-current LXC resources. A successful update also commits one durable scan
-request for that resource; the update worker only wakes this scheduler, which
+current, observed-running LXC resources. A successful update also commits one
+durable scan request for that resource; the update worker only wakes this scheduler, which
 claims the request into the same real metadata-refresh/simulation path. The
 request-to-run link is write-once, so restart and repeated publication cannot
 create a scan storm; schema v18 permits it to point only to a RUNNING scan for
@@ -109,8 +113,9 @@ wake does. Publication retains the last real scan result and separately exposes
 `post_update_scan_pending` from durable request state until the linked fresh
 scan reaches any terminal 0/N/UNKNOWN result. While that durable request is
 unclaimed or its linked scan is still RUNNING, the retained result is
-observation only: publication marks its approval stale/non-approvable and the
-authority refuses both approval and new update-job issuance. The same
+observation only: publication makes approval non-approvable (while preserving
+`consumed` when applicable), and the authority refuses both approval and new
+update-job issuance. The same
 transaction that commits a job SUCCEEDED creates the request, and both that
 transaction and issuance take SQLite's one writer lock, so there is no
 post-success authority gap. `app/package_scan_host_control.py` sends one
@@ -757,6 +762,8 @@ compatibility only, and neither is a requirement:
   constrains it to exactly that. There is no trust-granting state machine and
   no code path produces any other value. The HA contract's enum still lists
   `trusted`/`revoked` so the wire format did not have to change.
+  Home Assistant labels this as a legacy observational field and renders
+  `unverified` explicitly as informational rather than as an update failure.
 - **`presence = confirmed_removed`** — retained in the HA contract enum and its
   validators. The backend has no writer for it: the operation that used to
   produce it was removed, and the backend's own schema no longer permits the
@@ -775,8 +782,11 @@ native Hubinet resource-device selection, resolves its backend-owned
 package rows plus the exact approval reference. `approve_update_plan` forwards
 that caller-supplied reference unchanged to the backend and refreshes the
 coordinator after success. One concise resource sensor displays the
-backend-published `none | approved | stale` approval state. Package rows do not
-become entity attributes or package-per-entity state.
+backend-published `none | approved | stale | consumed` approval state. A
+successful job consumes its exact approval; `consumed` never collapses into
+`stale`, and a new explicit approval creates a new approval identity even when
+the current plan fingerprint is unchanged. Package rows do not become entity
+attributes or package-per-entity state.
 
 `view_health_contract`, `set_health_contract`, and `clear_health_contract` use
 that same resource-device selector rather than a second selection model. All
@@ -785,6 +795,12 @@ data only, never entity attributes. A second concise resource sensor displays
 the backend-published `unsupported | unconfigured | configured` contract state,
 which is a statement about configuration and never a health result: no health
 result exists to publish.
+
+Diagnostic labels preserve those distinctions rather than inventing answers:
+an unavailable reboot-required sensor is explicitly labelled as unknown, the
+inert continuity field is presented as a legacy observation rather than an
+update verdict, and the concise job sensor is labelled **Last package update
+job** because a terminal job is immutable history, not current workload state.
 
 The coordinator is **not** a reconciler. It never infers `missing` from a diff
 between two polls, and it never assumes revision `N -> N+1` means backend
@@ -1150,11 +1166,16 @@ Properties that channel must have:
   the backend/coordinator snapshot but never become HA entity attributes.
 - **Approval is an exact durable fact.** One per-resource row records the
   reviewed scan, its material fingerprint, and approval time. Effective
-  `none`/`approved`/`stale` state is derived rather than persisted. Approval
+  `none`/`approved`/`stale`/`consumed` state is derived rather than persisted.
+  The immutable copied `approval_id` on a `succeeded` package-update job is the
+  consumption fact, and schema v19 permits at most one successful job for an
+  approval. Non-successful jobs do not consume it. Approval
   atomically requires the latest successful scan, a recomputed exact-row
   fingerprint matching stored and caller-supplied values, current resource
   binding/generation/continuity/VMID/node context, and the same fresh healthy
   committed source context captured when the scan was issued.
+  A successful empty plan remains a truthful zero-package observation but is
+  not approvable and cannot manufacture update authority.
 
 Lifecycle mutation (start/stop/reboot) and QEMU package execution remain
 future work. Job-owned snapshot safety, the execution-time plan equality
@@ -2390,6 +2411,12 @@ history; the already-proven successful update remains successful. While that
 fresh result is outstanding, publication keeps the prior real result intact
 and sets the durable `post_update_scan_pending` indicator; the indicator clears
 only when the linked scan is terminal.
+
+The same `succeeded` row is also the exact approval-consumption fact. There is
+no later cleanup write: publication and issuance resolve consumption from that
+terminal row, and schema v19's partial unique index rejects a second successful
+job carrying the same approval. A later identical scan can be approved only by
+a new explicit operator action, which replaces the current approval identity.
 
 `package_update_job_health_probe_results` holds that evidence: one row per
 frozen probe, bound by foreign key to the exact `(job_id, probe_index)` it

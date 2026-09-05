@@ -82,7 +82,12 @@
         "name": "Observational continuity"
       },
       "resource_security_continuity": {
-        "name": "Security continuity"
+        "name": "Legacy continuity observation",
+        "state": {
+          "unverified": "Unverified observation (not an update failure)",
+          "trusted": "Trusted",
+          "revoked": "Revoked"
+        }
       },
       "resource_type": {
         "name": "Type"
@@ -95,7 +100,8 @@
         "state": {
           "none": "None",
           "approved": "Approved",
-          "stale": "Stale"
+          "stale": "Stale",
+          "consumed": "Consumed"
         }
       },
       "resource_health_contract": {
@@ -113,10 +119,10 @@
         "name": "Last package scan"
       },
       "resource_reboot_required": {
-        "name": "Reboot required"
+        "name": "Reboot required (unknown if unavailable)"
       },
       "resource_package_update_job": {
-        "name": "Package update job",
+        "name": "Last package update job",
         "state": {
           "unsupported": "Unsupported",
           "not_started": "Not started",

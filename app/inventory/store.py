@@ -60,7 +60,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 18
+AUTHORITY_SCHEMA_VERSION = 19
 
 #: Every authority connection's writer wait policy -- both `PRAGMA
 #: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
@@ -148,6 +148,7 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "one_package_update_job_snapshot_operation",
         "one_package_update_job_mutation_operation",
         "one_package_update_job_rollback_operation",
+        "one_successful_package_update_job_per_approval",
         "package_update_job_health_contract_immutable",
         "package_update_job_health_start_immutable",
         "package_update_job_health_completion_immutable",
@@ -2307,6 +2308,16 @@ _SCHEMA_STATEMENTS = (
     CREATE UNIQUE INDEX one_package_update_job_rollback_operation
     ON package_update_jobs(rollback_operation_id)
     WHERE rollback_operation_id IS NOT NULL
+    """,
+    """
+    -- A durable SUCCEEDED job is the consumption fact for the explicit
+    -- approval it copied at issuance.  Keeping consumption derived from that
+    -- same terminal row makes the two atomic by construction: there is no
+    -- second flag a crash could fail to write.  Failed, blocked, interrupted,
+    -- rolled-back, and otherwise non-successful jobs do not consume it.
+    CREATE UNIQUE INDEX one_successful_package_update_job_per_approval
+    ON package_update_jobs(approval_id)
+    WHERE status = 'succeeded'
     """,
     """
     CREATE TABLE package_update_job_packages (

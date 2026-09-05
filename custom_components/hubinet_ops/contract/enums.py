@@ -112,6 +112,7 @@ class PackagePlanApprovalStatus(StrEnum):
     NONE = "none"
     APPROVED = "approved"
     STALE = "stale"
+    CONSUMED = "consumed"
 
 
 class PackageUpdateJobState(StrEnum):

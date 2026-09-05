@@ -541,7 +541,9 @@ def test_binding_generation_continuity_and_replacement_fail_issuance(
         assert store.list_package_update_jobs() == ()
 
 
-def test_unsupported_type_and_empty_exact_plan_fail_issuance(tmp_path: Path) -> None:
+def test_unsupported_type_and_empty_exact_plan_fail_before_issuance(
+    tmp_path: Path,
+) -> None:
     qemu_path = tmp_path / "qemu"
     qemu_path.mkdir()
     _, qemu_store, qemu_authority, qemu, _, _ = _approved_system(
@@ -555,11 +557,13 @@ def test_unsupported_type_and_empty_exact_plan_fail_issuance(tmp_path: Path) -> 
 
     empty_path = tmp_path / "empty"
     empty_path.mkdir()
-    _, store, authority, resource, _, approval = _approved_system(
-        empty_path, packages=()
-    )
-    with pytest.raises(AuthorityConflict, match="non-empty"):
-        _issue(authority, resource, approval)
+    _, store, authority, resource = _system(empty_path)
+    empty = _successful_plan(authority, resource.resource_id, ())
+    with pytest.raises(AuthorityConflict, match="current context"):
+        authority.approve_package_plan(
+            resource.resource_id, empty.scan_run_id, empty.plan_fingerprint
+        )
+    assert store.package_plan_approval(resource.resource_id) is None
     assert store.list_package_update_jobs() == ()
 
 

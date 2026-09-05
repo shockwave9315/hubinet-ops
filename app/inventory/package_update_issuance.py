@@ -38,6 +38,10 @@ PACKAGE_UPDATE_ISSUANCE_REFUSALS: frozenset[str] = frozenset(
         #: An approval exists, but it is not the one this backend currently
         #: holds for the resource.
         "approval_not_current",
+        #: This exact approval already authorized one successfully completed
+        #: package-update job. A new explicit approval is required even when
+        #: a later scan has the same material fingerprint.
+        "approval_consumed",
         #: An approval exists and is current, but it no longer describes the
         #: current exact plan or its source context -- `PRODUCT.md` rule 2.
         "plan_not_approved",

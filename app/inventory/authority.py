@@ -1281,6 +1281,9 @@ class InventoryAuthority:
                     and str(existing["reviewed_scan_run_id"]) == canonical_scan_run_id
                     and str(existing["approved_plan_fingerprint"])
                     == canonical_fingerprint
+                    and not self._package_plan_approval_is_consumed(
+                        connection, str(existing["approval_id"])
+                    )
                 ):
                     result = PackagePlanApproval(
                         approval_id=str(existing["approval_id"]),
@@ -1715,6 +1718,14 @@ class InventoryAuthority:
                     raise PackageUpdateIssuanceRefused(
                         "approval_not_current",
                         "approval_id does not identify the current package plan approval",
+                    )
+                if self._package_plan_approval_is_consumed(
+                    connection, canonical_approval_id
+                ):
+                    raise PackageUpdateIssuanceRefused(
+                        "approval_consumed",
+                        "package plan approval was already consumed by a successful "
+                        "package update job; approve the current plan again",
                     )
 
                 reviewed = self._require_package_scan_run_row(
@@ -5968,9 +5979,29 @@ class InventoryAuthority:
         ):
             return False
         self._successful_package_scan_fingerprint(connection, run)
+        if int(run["pending_count"]) == 0:
+            return False
         return self._package_scan_context_is_current(
             connection, run
         ) and self._package_scan_source_context_is_current(connection, run)
+
+    @staticmethod
+    def _package_plan_approval_is_consumed(
+        connection: sqlite3.Connection, approval_id: str
+    ) -> bool:
+        """Whether this exact approval authorized a successful job.
+
+        Consumption is intentionally derived from the immutable job's
+        successful terminal state.  That makes APPROVED -> SUCCEEDED ->
+        CONSUMED one atomic durable fact instead of two writes that could be
+        separated by a crash.
+        """
+
+        return connection.execute(
+            "SELECT 1 FROM package_update_jobs "
+            "WHERE approval_id=? AND status='succeeded' LIMIT 1",
+            (approval_id,),
+        ).fetchone() is not None
 
     @staticmethod
     def _package_scan_context_matches_reviewed(

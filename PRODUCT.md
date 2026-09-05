@@ -50,6 +50,9 @@ identity").
 **Update plan and approval.** Scanning produces a concrete plan: exactly which
 packages would change, from which version to which version. The operator reads
 that plan and approves it explicitly. Nothing installs without that approval.
+One approval may authorize at most one successfully completed package-update
+job. Once such a job succeeds, that approval is consumed; even a later scan
+with the identical material fingerprint requires a new explicit approval.
 
 **Job, snapshot, live output.** An approved update runs as a job. The job takes
 its own fresh pre-update snapshot first, then runs the update with live output
@@ -57,10 +60,9 @@ the operator can watch.
 
 **Healthcheck and rollback.** After the update, the job health-checks the guest
 against the health contract it froze when it was issued (below). On failure the
-operator may roll back, or a configured same-job compensation policy may roll
-back — always and only to the snapshot this job created. No such policy exists
-yet: today a failed healthcheck leaves the job able to roll back and waits to
-be asked.
+operator may explicitly roll back — always and only to the snapshot this job
+created. A failed healthcheck leaves the job able to roll back and waiting to
+be asked; Hubinet never rolls it back automatically.
 
 **Who starts an update, and who continues one.** An update begins for exactly
 one reason: an authenticated operator explicitly asked for this resource's
@@ -168,16 +170,19 @@ These are requirements, not preferences.
    differs at execution time from the plan that was approved, fail closed and
    ask for approval of the new plan. Never execute a plan the operator did not
    approve.
-3. **Every update job creates its own fresh Hubinet-owned snapshot** on the
+3. **An approval is one-shot on success.** One explicit approval may authorize
+   at most one successfully completed package-update job. Success consumes it
+   durably; an identical later plan still needs a new explicit approval.
+4. **Every update job creates its own fresh Hubinet-owned snapshot** on the
    actual current guest, before touching any package.
-4. **Rollback goes only to that same job's snapshot,** and only when an
+5. **Rollback goes only to that same job's snapshot,** and only when an
    authenticated operator explicitly asks. Never to an arbitrary older
    snapshot, never days later, and never automatically.
-5. **Hubinet cleanup never deletes ordinary or manual PVE snapshots.**
+6. **Hubinet cleanup never deletes ordinary or manual PVE snapshots.**
    Automatic retention applies only to snapshots Hubinet created and owns.
-6. **A failed or unavailable scan means unknown, never zero updates.** Absence
+7. **A failed or unavailable scan means unknown, never zero updates.** Absence
    of evidence is reported as unknown.
-7. **Failed or partial PVE discovery never means resource deletion.** A guest
+8. **Failed or partial PVE discovery never means resource deletion.** A guest
    missing from an incomplete scan is retained and marked uncertain, not
    removed.
 
@@ -279,7 +284,9 @@ Hubinet Ops itself is installed once and updated in place. Fresh bootstrap
 and deliberate-rebuild path; ordinary code updates use
 `deploy/update-proxmox-0.5.sh` against the existing installation and must
 not require destroying it. See `ARCHITECTURE.md`, "In-place product
-updates".
+updates". A later first-class product stage will add one supported uninstall
+flow with an explicit preserve-or-purge policy for Hubinet-owned state,
+evidence, and snapshots; ad-hoc shell snippets are not that product flow.
 
 ## Current state
 
