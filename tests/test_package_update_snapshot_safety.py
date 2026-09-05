@@ -1629,7 +1629,7 @@ def test_the_whole_dark_chain_creates_and_confirms_exactly_one_snapshot(
 
     def real_pve_framing(argv, timeout, max_output):
         result = original(argv, timeout, max_output)
-        if tuple(argv)[:2] == ("pvesh", "create") and result.returncode == 0:
+        if tuple(argv)[:3] == ("pvesh", "--noproxy", "create") and result.returncode == 0:
             return snapshot_helper.CommandResult(
                 returncode=0,
                 stdout=b"200 OK\n" + result.stdout + b"\n",
