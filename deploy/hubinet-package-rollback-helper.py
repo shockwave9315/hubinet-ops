@@ -154,7 +154,8 @@ product's threat model (see `AGENTS.md`).
   snapshots.
 - Current package-update mutation is single-node only. PVE's fixed
   `/cluster/status` local-node fact must equal `expected_node` before
-  `submitted`, and the destructive argv includes `--noproxy`.
+  `submitted`, and the destructive argv uses pvesh's leading global
+  `--noproxy` option (before the `create` verb).
 """
 
 from __future__ import annotations
@@ -1878,12 +1879,15 @@ def submit_same_job_rollback(
         # that is never resubmitted from.
         argv = (
             "pvesh",
+            # `--noproxy` is global pvesh syntax. After the API path it would
+            # be forwarded as a rollback endpoint property and rejected by
+            # that endpoint's closed schema.
+            "--noproxy",
             "create",
             f"/nodes/{request['expected_node']}/lxc/{request['vmid']}"
             f"/snapshot/{request['snapshot_name']}/rollback",
             "--start",
             str(ROLLBACK_START_AFTER),
-            "--noproxy",
             "--output-format",
             "json",
         )

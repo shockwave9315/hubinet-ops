@@ -21,6 +21,8 @@ import uuid
 
 import pytest
 
+from tests.pve_9_2_3_cli_schema import PveshSchemaError, parse_pvesh_9_2_3
+
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_PATH = ROOT / "deploy" / "hubinet-package-snapshot-helper.py"
@@ -169,19 +171,29 @@ class FakePve:
         self.on_submit = None
 
     def __call__(self, argv, timeout, max_output):
-        self.argvs.append(tuple(argv))
-        self.deadlines.append((tuple(argv), timeout))
+        argv = tuple(argv)
+        self.argvs.append(argv)
+        self.deadlines.append((argv, timeout))
+        try:
+            parse_pvesh_9_2_3(argv)
+        except PveshSchemaError as exc:
+            return helper.CommandResult(
+                255,
+                b"",
+                f"400 Parameter verification failed.\n{exc}\n".encode("utf-8"),
+            )
         return helper.CommandResult(*self._dispatch(argv))
 
     def _json(self, payload):
         return 0, json.dumps(payload).encode("utf-8"), b""
 
     def _dispatch(self, argv):
-        if argv[:3] == ("pvesh", "get", "/cluster/status"):
+        call = parse_pvesh_9_2_3(argv)
+        if call.verb == "get" and call.path == "/cluster/status":
             return self._json(
                 [{"type": "node", "name": self.local_node, "local": 1}]
             )
-        if argv[:3] == ("pvesh", "get", "/cluster/resources"):
+        if call.verb == "get" and call.path == "/cluster/resources":
             rows = []
             if self.present:
                 rows.append(
@@ -193,9 +205,9 @@ class FakePve:
                     }
                 )
             return self._json(rows)
-        if argv[:2] == ("pvesh", "get"):
+        if call.verb == "get":
             lxc_read = re.fullmatch(
-                r"/nodes/([^/]+)/lxc/(\d+)/(config|snapshot)", argv[2]
+                r"/nodes/([^/]+)/lxc/(\d+)/(config|snapshot)", call.path
             )
             if lxc_read is not None:
                 requested_node, requested_vmid, kind = lxc_read.groups()
@@ -208,16 +220,16 @@ class FakePve:
                 if kind == "config":
                     return self._json({"lock": self.lock} if self.lock else {})
                 return self._json(self.snapshots)
-        if argv[:2] == ("pvesh", "get") and "/tasks/" in argv[2]:
+        if call.verb == "get" and "/tasks/" in call.path:
             payload = (
                 self.task_sequence.pop(0)
                 if len(self.task_sequence) > 1
                 else self.task_sequence[0]
             )
             return self._json(payload)
-        if argv[:2] == ("pvesh", "create"):
+        if call.verb == "create":
             match = re.fullmatch(
-                r"/nodes/([^/]+)/lxc/(\d+)/snapshot", argv[2]
+                r"/nodes/([^/]+)/lxc/(\d+)/snapshot", call.path
             )
             if (
                 match is None
@@ -232,7 +244,15 @@ class FakePve:
             if self.submit_returncode != 0:
                 return self.submit_returncode, b"", b"submission failed"
             return self._json(self.submit_upid)
-        raise AssertionError(f"unexpected argv {argv!r}")
+        raise AssertionError(f"unexpected pvesh call {call!r}")
+
+
+def _pvesh_call(argv: tuple[str, ...]):
+    return parse_pvesh_9_2_3(argv)
+
+
+def _is_pvesh(argv: tuple[str, ...], verb: str) -> bool:
+    return _pvesh_call(argv).verb == verb
 
 
 def _completed_snapshot(ownership: dict, name: str, **extra) -> dict:
@@ -358,7 +378,10 @@ def test_the_helper_source_contains_no_mutation_or_delete_operation() -> None:
     assert source.count("rollback") == 1
     assert '_IN_FLIGHT_LOCKS = frozenset({"snapshot", "snapshot-delete", "rollback"})' in source
     # The only PVE verbs used at all are `get` and `create`.
-    assert set(re.findall(r'"pvesh", "([a-z]+)"', source)) == {"get", "create"}
+    assert set(re.findall(r'"pvesh", (?:"--noproxy", )?"([a-z]+)"', source)) == {
+        "get",
+        "create",
+    }
 
 
 def test_every_pvesh_path_is_built_from_fixed_constants(tmp_path: Path) -> None:
@@ -370,12 +393,12 @@ def test_every_pvesh_path_is_built_from_fixed_constants(tmp_path: Path) -> None:
     operation_id, snapshot_name = _identity(_ownership())
     for argv in pve.argvs:
         assert argv[0] == "pvesh"
-        assert argv[1] in ("get", "create")
+        assert _pvesh_call(argv).verb in ("get", "create")
         # No shell, no command string, and no request-provided free text.
         assert not any("&&" in item or ";" in item or "|" in item for item in argv[:3])
-    submissions = [argv for argv in pve.argvs if argv[1] == "create"]
+    submissions = [argv for argv in pve.argvs if _is_pvesh(argv, "create")]
     assert len(submissions) == 1
-    assert submissions[0][2] == f"/nodes/{NODE}/lxc/{VMID}/snapshot"
+    assert _pvesh_call(submissions[0]).path == f"/nodes/{NODE}/lxc/{VMID}/snapshot"
     assert "--snapname" in submissions[0]
     assert submissions[0][submissions[0].index("--snapname") + 1] == snapshot_name
 
@@ -607,7 +630,7 @@ def test_inspecting_a_known_task_reads_it_exactly_once_and_never_submits(
     assert response["outcome"] == "completed"
     assert response["task_upid"] == UPID
     assert response["submission_state"] == "task_known"
-    assert len([argv for argv in pve.argvs if "/tasks/" in argv[2]]) == 1
+    assert len([argv for argv in pve.argvs if "/tasks/" in _pvesh_call(argv).path]) == 1
 
 
 def test_a_running_task_is_reported_without_polling(tmp_path: Path) -> None:
@@ -621,14 +644,18 @@ def test_a_running_task_is_reported_without_polling(tmp_path: Path) -> None:
     assert submitted["submission_state"] == "task_known"
     assert pve.submissions == 1
 
-    assert not any("/tasks/" in argv[2] for argv in pve.argvs if argv[1] == "get")
+    assert not any(
+        "/tasks/" in _pvesh_call(argv).path
+        for argv in pve.argvs
+        if _is_pvesh(argv, "get")
+    )
 
     inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
     assert inspected["outcome"] == "absent"
     assert inspected["submission_state"] == "task_known"
     assert pve.submissions == 1
     # Exactly one task-status read: never an internal poll loop.
-    assert len([argv for argv in pve.argvs if "/tasks/" in argv[2]]) == 1
+    assert len([argv for argv in pve.argvs if "/tasks/" in _pvesh_call(argv).path]) == 1
 
 
 def test_an_identical_retry_never_resubmits_and_inspect_replays_the_outcome(
@@ -838,7 +865,7 @@ def test_pvesh_status_prefix_then_exact_json_upid_reaches_task_known(
 
     def prefixed(argv, timeout, max_output):
         result = original(argv, timeout, max_output)
-        if tuple(argv)[:2] == ("pvesh", "create") and result.returncode == 0:
+        if _is_pvesh(tuple(argv), "create") and result.returncode == 0:
             return helper.CommandResult(
                 returncode=0,
                 stdout=b"200 OK\n" + result.stdout + b"\n",
@@ -908,8 +935,33 @@ def test_remote_owner_refuses_before_submitted_and_create_is_noproxy(
 
     local = FakePve()
     _handle(_request(), local, _journal(tmp_path / "local"))
-    create = next(argv for argv in local.argvs if argv[:2] == ("pvesh", "create"))
-    assert "--noproxy" in create
+    create = next(argv for argv in local.argvs if _is_pvesh(argv, "create"))
+    assert create[:3] == ("pvesh", "--noproxy", "create")
+    assert _pvesh_call(create).noproxy is True
+
+
+def test_pve_9_2_3_schema_rejects_human0_noproxy_as_endpoint_property() -> None:
+    """Reproduce the real schema boundary, not a changed string assertion."""
+
+    snapshot_name = _identity(_ownership())[1]
+    historical_rc6 = (
+        "pvesh",
+        "create",
+        f"/nodes/{NODE}/lxc/{VMID}/snapshot",
+        "--snapname",
+        snapshot_name,
+        "--description",
+        helper.build_snapshot_description(_ownership()),
+        "--noproxy",
+        "--output-format",
+        "json",
+    )
+    with pytest.raises(PveshSchemaError, match="noproxy: property is not defined"):
+        parse_pvesh_9_2_3(historical_rc6)
+
+    result = FakePve()(historical_rc6, None, helper.MAX_CAPTURE_OUTPUT_BYTES)
+    assert result.returncode == 255
+    assert b"schema does not allow additional properties" in result.stderr
 
 
 def test_submitted_capture_is_promoted_later_without_resubmission(
@@ -989,7 +1041,7 @@ def test_real_detached_snapshot_runner_returns_while_physical_task_is_alive(
             slow_runner,
             journal,
             operation_id,
-            ("pvesh", "create", "/fixed", "--noproxy"),
+            ("pvesh", "--noproxy", "create", "/fixed"),
             lease,
         )
         executor.release()
@@ -1087,7 +1139,7 @@ def test_inspect_never_submits_anything(tmp_path: Path) -> None:
     pve = FakePve()
     _handle(_request("inspect_job_snapshot_state"), pve, _journal(tmp_path))
     assert pve.submissions == 0
-    assert not any(argv[1] == "create" for argv in pve.argvs)
+    assert not any(_is_pvesh(argv, "create") for argv in pve.argvs)
 
 
 # ---------------------------------------------------------------------------
@@ -1172,7 +1224,7 @@ def test_an_existing_owned_snapshot_is_never_submitted_for_again(
 
     assert response["outcome"] == "completed"
     assert pve.submissions == 0
-    assert not any(argv[1] == "create" for argv in pve.argvs)
+    assert not any(_is_pvesh(argv, "create") for argv in pve.argvs)
     assert journal.read(operation_id)["phase"] == "terminal"
 
 
@@ -1259,9 +1311,9 @@ def test_only_the_intent_phase_can_ever_reach_a_submission() -> None:
     source = HELPER_PATH.read_text(encoding="utf-8")
     body = source[source.index("def _ensure_submitted"):]
     body = body[: body.index("def _extract_upid")]
-    assert body.count('"pvesh", "create"') == 1
+    assert body.count('"pvesh", "--noproxy", "create"') == 1
     guard = body.index('if phase != "intent":')
-    submission = body.index('"pvesh", "create"')
+    submission = body.index('"pvesh", "--noproxy", "create"')
     assert guard < submission
     for phase in ("terminal", "task_known", "submitted"):
         assert body.index(f'phase == "{phase}"') < submission
@@ -1312,7 +1364,7 @@ def test_a_failed_pre_submission_pve_read_is_still_not_submitted(
 
     class BrokenReads(FakePve):
         def _dispatch(self, argv):
-            if argv[2].endswith("/config"):
+            if _pvesh_call(tuple(argv)).path.endswith("/config"):
                 return 1, b"", b"permission denied"
             return super()._dispatch(argv)
 
@@ -1373,7 +1425,7 @@ def test_failures_at_or_after_the_submission_boundary_are_never_not_submitted(
 
     class BrokenReads(FakePve):
         def _dispatch(self, argv):
-            if argv[1] == "get":
+            if _is_pvesh(tuple(argv), "get"):
                 return 1, b"", b"pve read failed"
             return super()._dispatch(argv)
 
@@ -1542,7 +1594,7 @@ def test_inspect_reports_operation_in_progress_while_the_mutator_holds_the_lease
 
     class PausingPve(FakePve):
         def _dispatch(self, argv):
-            if argv[:3] == ("pvesh", "get", "/cluster/resources"):
+            if _pvesh_call(tuple(argv)).path == "/cluster/resources":
                 entered_live_check.set()
                 assert resume_mutator.wait(timeout=10)
             return super()._dispatch(argv)
@@ -1606,7 +1658,7 @@ def test_the_lease_release_after_failure_still_lets_inspect_prove_intent(
 
     class FailingPausingPve(FakePve):
         def _dispatch(self, argv):
-            if argv[:3] == ("pvesh", "get", "/cluster/resources"):
+            if _pvesh_call(tuple(argv)).path == "/cluster/resources":
                 entered_live_check.set()
                 assert resume_mutator.wait(timeout=10)
                 # The guest is gone by the time this resumes: live-target
@@ -1667,7 +1719,7 @@ def test_the_lease_release_after_submission_lets_inspect_see_task_known(
 
     class PausingPve(FakePve):
         def _dispatch(self, argv):
-            if argv[:3] == ("pvesh", "get", "/cluster/resources"):
+            if _pvesh_call(tuple(argv)).path == "/cluster/resources":
                 entered_live_check.set()
                 assert resume_mutator.wait(timeout=10)
             return super()._dispatch(argv)
@@ -1874,12 +1926,12 @@ def test_reads_stay_bounded_but_the_destructive_capture_has_no_wall_clock(
     reads = [
         (argv, deadline)
         for argv, deadline in pve.deadlines
-        if argv[:2] != ("pvesh", "create")
+        if not _is_pvesh(argv, "create")
     ]
     submissions = [
         (argv, deadline)
         for argv, deadline in pve.deadlines
-        if argv[:2] == ("pvesh", "create")
+        if _is_pvesh(argv, "create")
     ]
     # Every read/preflight command keeps its ordinary bounded deadline...
     assert reads
@@ -1892,7 +1944,7 @@ def test_reads_stay_bounded_but_the_destructive_capture_has_no_wall_clock(
     assert deadline is None
     assert deadline is helper.DETACHED_CAPTURE_NO_DEADLINE
     assert helper.COMMAND_TIMEOUT_SECONDS == 120.0
-    assert "--noproxy" in argv
+    assert argv[:3] == ("pvesh", "--noproxy", "create")
     assert pve.submissions == 1
 
     # And it is still at-most-once: a replay resubmits nothing.
@@ -2059,7 +2111,7 @@ def test_a_prepared_executor_exists_holds_the_lease_and_has_run_nothing(
             _marker_runner(ran),
             journal,
             operation_id,
-            ("pvesh", "create", "/fixed", "--noproxy"),
+            ("pvesh", "--noproxy", "create", "/fixed"),
             lease,
         )
         # The executor is alive -- it inherited and still holds the lease --
@@ -2093,7 +2145,7 @@ def test_an_abandoned_executor_exits_having_submitted_nothing(
             _marker_runner(ran),
             journal,
             operation_id,
-            ("pvesh", "create", "/fixed", "--noproxy"),
+            ("pvesh", "--noproxy", "create", "/fixed"),
             lease,
         )
         executor.abandon()
@@ -2249,7 +2301,7 @@ def test_the_real_two_phase_handoff_submits_exactly_once(
         # Ordinary reads keep the faithful fake; only the DESTRUCTIVE call is
         # counted on disk, because the executor that makes it is a forked
         # grandchild whose in-memory effects never come back here.
-        if tuple(argv)[:2] == ("pvesh", "create"):
+        if _is_pvesh(tuple(argv), "create"):
             with marker.open("a", encoding="ascii") as handle:
                 # `ascii()` so the snapshot description's own newlines
                 # cannot masquerade as extra invocations.

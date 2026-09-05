@@ -72,6 +72,7 @@ from tests.test_package_update_snapshot_safety import (
     _foreign_entry,
     _owned_entry,
 )
+from tests.pve_9_2_3_cli_schema import PveshSchemaError, parse_pvesh_9_2_3
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -215,7 +216,19 @@ class FakePve:
         argv = tuple(argv)
         self.argvs.append(argv)
         self.deadlines.append((argv, timeout))
-        result = self._dispatch(argv)
+        try:
+            call = parse_pvesh_9_2_3(argv)
+        except PveshSchemaError as exc:
+            return helper.CommandResult(
+                returncode=255,
+                stdout=b"",
+                stderr=f"400 Parameter verification failed.\n{exc}\n".encode(
+                    "utf-8"
+                ),
+                timed_out=False,
+                output_exceeded=False,
+            )
+        result = self._dispatch(call)
         if result is None:
             raise AssertionError(f"fake PVE received an unexpected command: {argv}")
         return result
@@ -238,12 +251,12 @@ class FakePve:
             output_exceeded=False,
         )
 
-    def _dispatch(self, argv):
-        if argv[:3] == ("pvesh", "get", "/cluster/status"):
+    def _dispatch(self, call):
+        if call.verb == "get" and call.path == "/cluster/status":
             return self._ok(
                 [{"type": "node", "name": self.local_node, "local": 1}]
             )
-        if argv[:3] == ("pvesh", "get", "/cluster/resources"):
+        if call.verb == "get" and call.path == "/cluster/resources":
             if "resources" in self.fail_reads:
                 return self._fail()
             rows = []
@@ -256,7 +269,7 @@ class FakePve:
                     }
                 )
             return self._ok(rows)
-        if argv[:2] == ("pvesh", "get") and argv[2].endswith("/config"):
+        if call.verb == "get" and call.path.endswith("/config"):
             if "config" in self.fail_reads:
                 return self._fail()
             config = {"hostname": "guest"}
@@ -265,24 +278,24 @@ class FakePve:
             if self.template is not None:
                 config["template"] = self.template
             return self._ok(config)
-        if argv[:2] == ("pvesh", "get") and argv[2].endswith("/snapshot"):
+        if call.verb == "get" and call.path.endswith("/snapshot"):
             if "snapshot" in self.fail_reads:
                 return self._fail()
             return self._ok(self._snapshot_rows())
-        if argv[:2] == ("pvesh", "get") and argv[2].endswith("/status"):
+        if call.verb == "get" and call.path.endswith("/status"):
             if "task" in self.fail_reads:
                 return self._fail()
             status = {"upid": UPID, "status": self.task_status}
             if self.task_exitstatus is not None:
                 status["exitstatus"] = self.task_exitstatus
             return self._ok(status)
-        if argv[:2] == ("pvesh", "create") and "/rollback" in argv[2]:
+        if call.verb == "create" and "/rollback" in call.path:
             # The one real destructive submission.
-            assert "--start" in argv, "rollback must always pin PVE's start param"
-            assert argv[argv.index("--start") + 1] == "0", (
+            assert "start" in call.parameters, "rollback must always pin PVE's start param"
+            assert call.parameters["start"] == "0", (
                 "this stage must always roll back with start=0"
             )
-            self.rollbacks.append({"path": argv[2]})
+            self.rollbacks.append({"path": call.path})
             if self.rollback_returncode != 0:
                 return self._fail()
             # Upstream force-stops the guest and sets parent = snapname.
@@ -291,6 +304,14 @@ class FakePve:
                 return self._ok(None)
             return self._ok(self.returned_upid)
         return None
+
+
+def _pvesh_call(argv: tuple[str, ...]):
+    return parse_pvesh_9_2_3(argv)
+
+
+def _is_pvesh(argv: tuple[str, ...], verb: str) -> bool:
+    return _pvesh_call(argv).verb == verb
 
 
 class HelperBackedHostControl:
@@ -990,7 +1011,7 @@ def test_submission_journals_submitted_before_pvesh_runs(tmp_path: Path) -> None
     original = pve.runner
 
     def _watching(argv, timeout, max_output):
-        if tuple(argv)[:2] == ("pvesh", "create"):
+        if _is_pvesh(tuple(argv), "create"):
             record = host.journal.read(request.rollback_operation_id)
             observed_phases.append(record["phase"] if record else None)
         return original(argv, timeout, max_output)
@@ -1030,7 +1051,7 @@ def test_real_pvesh_framing_captures_rollback_task_and_completes_once(
 
     def prefixed(argv, timeout, max_output):
         result = original(argv, timeout, max_output)
-        if tuple(argv)[:2] == ("pvesh", "create") and result.returncode == 0:
+        if _is_pvesh(tuple(argv), "create") and result.returncode == 0:
             return helper.CommandResult(
                 returncode=0,
                 stdout=b"200 OK\n" + result.stdout + b"\n",
@@ -1109,8 +1130,26 @@ def test_remote_owner_refuses_before_submitted_and_rollback_is_noproxy(
 
     pve.local_node = NODE
     host.submit_same_job_rollback(request)
-    create = next(argv for argv in pve.argvs if argv[:2] == ("pvesh", "create"))
-    assert "--noproxy" in create
+    create = next(argv for argv in pve.argvs if _is_pvesh(argv, "create"))
+    assert create[:3] == ("pvesh", "--noproxy", "create")
+    assert _pvesh_call(create).noproxy is True
+
+
+def test_pve_9_2_3_schema_rejects_rc6_noproxy_as_rollback_property() -> None:
+    """Reproduce the rollback sibling of the Human0 schema rejection."""
+
+    historical_rc6 = (
+        "pvesh",
+        "create",
+        f"/nodes/{NODE}/lxc/110/snapshot/job-owned/rollback",
+        "--start",
+        "0",
+        "--noproxy",
+        "--output-format",
+        "json",
+    )
+    with pytest.raises(PveshSchemaError, match="noproxy: property is not defined"):
+        parse_pvesh_9_2_3(historical_rc6)
 
 
 def test_rollback_submitted_capture_promotes_later_without_resubmission(
@@ -1215,7 +1254,7 @@ def test_real_detached_rollback_runner_returns_while_physical_task_is_alive(
             slow_runner,
             journal,
             operation_id,
-            ("pvesh", "create", "/fixed", "--noproxy"),
+            ("pvesh", "--noproxy", "create", "/fixed"),
             lease,
         )
         executor.release()
@@ -3279,12 +3318,12 @@ def test_rollback_reads_stay_bounded_but_the_destructive_capture_has_no_clock(
     reads = [
         (argv, deadline)
         for argv, deadline in pve.deadlines
-        if argv[:2] != ("pvesh", "create")
+        if not _is_pvesh(argv, "create")
     ]
     submissions = [
         (argv, deadline)
         for argv, deadline in pve.deadlines
-        if argv[:2] == ("pvesh", "create")
+        if _is_pvesh(argv, "create")
     ]
     # Every read/preflight command keeps its ordinary bounded deadline...
     assert reads
@@ -3297,8 +3336,8 @@ def test_rollback_reads_stay_bounded_but_the_destructive_capture_has_no_clock(
     assert deadline is None
     assert deadline is helper.DETACHED_CAPTURE_NO_DEADLINE
     assert helper.COMMAND_TIMEOUT_SECONDS == 120.0
-    assert argv[2].endswith("/rollback")
-    assert "--noproxy" in argv
+    assert _pvesh_call(argv).path.endswith("/rollback")
+    assert argv[:3] == ("pvesh", "--noproxy", "create")
     assert len(pve.rollbacks) == 1
 
     # At-most-once is untouched: a replay resubmits nothing.
@@ -4064,7 +4103,7 @@ def test_a_prepared_rollback_executor_holds_the_lease_and_has_run_nothing(
             _rollback_marker_runner(ran),
             journal,
             operation_id,
-            ("pvesh", "create", "/fixed", "--noproxy"),
+            ("pvesh", "--noproxy", "create", "/fixed"),
             lease,
         )
         assert not _rollback_lease_is_free(directory, tmp_path, ROLLBACK_VMID)
@@ -4099,7 +4138,7 @@ def test_an_abandoned_rollback_executor_exits_having_rolled_nothing_back(
             _rollback_marker_runner(ran),
             journal,
             operation_id,
-            ("pvesh", "create", "/fixed", "--noproxy"),
+            ("pvesh", "--noproxy", "create", "/fixed"),
             lease,
         )
         executor.abandon()
@@ -4250,7 +4289,7 @@ def test_the_real_two_phase_rollback_handoff_submits_exactly_once(
         # Ordinary reads keep the faithful fake; only the DESTRUCTIVE call is
         # counted on disk, because the executor that makes it is a forked
         # grandchild whose in-memory effects never come back here.
-        if tuple(argv)[:2] == ("pvesh", "create"):
+        if _is_pvesh(tuple(argv), "create"):
             with marker.open("a", encoding="ascii") as handle:
                 # `ascii()` so no argument's own newlines can masquerade as
                 # extra invocations.
