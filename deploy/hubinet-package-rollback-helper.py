@@ -172,6 +172,12 @@ from typing import Any
 MAX_REQUEST_BYTES = 8192
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 120.0
+#: The deadline the detached destructive capture child runs under: none.
+#: Read/preflight commands keep :data:`COMMAND_TIMEOUT_SECONDS`; only the
+#: already-detached physical `pvesh create ... /snapshot/<name>/rollback`
+#: uses this, so its exact terminal UPID survives a rollback slower than any
+#: local clock.
+DETACHED_CAPTURE_NO_DEADLINE: float | None = None
 MAX_CAPTURE_OUTPUT_BYTES = 512 * 1024
 
 JOURNAL_DIRECTORY = Path("/var/lib/hubinet-ops/rollback-operations")
@@ -265,17 +271,27 @@ class CommandResult:
     output_exceeded: bool
 
 
-Runner = Callable[..., CommandResult]
+Runner = Callable[[tuple[str, ...], float | None, int], CommandResult]
 
 
 def _run_bounded(
-    argv: tuple[str, ...], timeout: float, max_output: int
+    argv: tuple[str, ...], timeout: float | None, max_output: int
 ) -> CommandResult:
-    """Run one fixed argv under a single wall-clock deadline.
+    """Run one fixed argv, optionally under a single wall-clock deadline.
 
     Deliberately no stdin: every operation this helper runs takes its whole
     input from its own validated argv, so there is no payload to deliver and
     no blocking `stdin.write()` path to get wrong.
+
+    ``timeout=None`` means NO local wall clock, and exists for exactly one
+    caller: the already-detached destructive rollback `pvesh` child
+    (:func:`_run_capture_child`). A physical rollback force-stops a container
+    and replaces its volumes and config, which legitimately outlives any
+    arbitrary local submission deadline; killing that `pvesh` would destroy
+    the exact terminal UPID while the PVE worker carries on, and the
+    operation may never be resubmitted. Every ordinary read/preflight caller
+    keeps its bounded deadline. The output bound is not a deadline and is
+    enforced identically in both modes.
     """
 
     started = time.monotonic()
@@ -296,12 +312,16 @@ def _run_bounded(
     exceeded = False
     try:
         while selector.get_map():
-            remaining = timeout - (time.monotonic() - started)
-            if remaining <= 0:
-                timed_out = True
-                process.kill()
-                break
-            for key, _ in selector.select(min(remaining, 0.2)):
+            if timeout is None:
+                wait_for = 0.2
+            else:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    timed_out = True
+                    process.kill()
+                    break
+                wait_for = min(remaining, 0.2)
+            for key, _ in selector.select(wait_for):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -315,11 +335,15 @@ def _run_bounded(
                 break
     finally:
         selector.close()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        if timeout is None and not exceeded:
+            # No wall clock anywhere on this path: reap the natural exit.
             process.wait()
+        else:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         for stream in (process.stdout, process.stderr):
             try:
                 stream.close()
@@ -1324,8 +1348,27 @@ def _run_capture_child(
     operation_id: str,
     argv: tuple[str, ...],
 ) -> None:
+    """Run the already-detached destructive rollback `pvesh` to its natural end.
+
+    Deliberately passes ``DETACHED_CAPTURE_NO_DEADLINE`` (``None``) rather
+    than :data:`COMMAND_TIMEOUT_SECONDS`: nothing is waiting on this wall
+    clock -- the backend's writer transaction already returned after the
+    double-fork handoff -- and killing this `pvesh` because a local deadline
+    elapsed would discard the exact terminal UPID of a rollback that PVE
+    keeps executing anyway, leaving a ``submitted`` operation that may never
+    be resubmitted permanently unattributable.
+
+    The output bound still applies unchanged and excessive output still fails
+    closed. Host crash/reboot still leaves durable ``submitted`` uncertainty
+    and is deliberately not made retryable. No PID becomes authority, and
+    at-most-once submission is untouched: this only observes an
+    already-submitted operation.
+    """
+
     try:
-        result = runner(argv, COMMAND_TIMEOUT_SECONDS, MAX_CAPTURE_OUTPUT_BYTES)
+        result = runner(
+            argv, DETACHED_CAPTURE_NO_DEADLINE, MAX_CAPTURE_OUTPUT_BYTES
+        )
         journal.write_completed_capture(operation_id, result)
     except Exception:
         return

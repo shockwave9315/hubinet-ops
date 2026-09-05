@@ -136,12 +136,16 @@ class FakePve:
         self.resource_type = resource_type
         self.present = present
         self.argvs: list[tuple[str, ...]] = []
+        #: Every (argv, timeout) pair, so a test can prove WHICH deadline
+        #: each command class was actually run under.
+        self.deadlines: list[tuple[tuple[str, ...], float | None]] = []
         self.submissions = 0
         #: What a successful submission adds to the canonical listing.
         self.on_submit = None
 
     def __call__(self, argv, timeout, max_output):
         self.argvs.append(tuple(argv))
+        self.deadlines.append((tuple(argv), timeout))
         return helper.CommandResult(*self._dispatch(argv))
 
     def _json(self, payload):
@@ -1797,3 +1801,153 @@ def test_taskless_inspect_uses_the_same_no_in_flight_lock_bar(
     assert completed["outcome"] == "completed"
     assert completed["submission_state"] == "submitted"
     assert pve.submissions == 0
+
+
+# ---------------------------------------------------------------------------
+# P1-A. The detached destructive `pvesh` must outlive the ordinary bounded
+# submission deadline. A physical snapshot legitimately slower than
+# COMMAND_TIMEOUT_SECONDS must not have its `pvesh` killed: PVE's worker keeps
+# running regardless, and killing the local process destroys the only channel
+# through which the exact terminal UPID is still recoverable -- leaving a
+# `submitted` operation that may NEVER be resubmitted permanently
+# unattributable.
+# ---------------------------------------------------------------------------
+
+
+def test_reads_stay_bounded_but_the_destructive_capture_has_no_wall_clock(
+    tmp_path: Path,
+) -> None:
+    pve = FakePve()
+    journal = _journal(tmp_path)
+
+    response = _handle(_request(), pve, journal)
+
+    assert response["ok"] is True
+    reads = [
+        (argv, deadline)
+        for argv, deadline in pve.deadlines
+        if argv[:2] != ("pvesh", "create")
+    ]
+    submissions = [
+        (argv, deadline)
+        for argv, deadline in pve.deadlines
+        if argv[:2] == ("pvesh", "create")
+    ]
+    # Every read/preflight command keeps its ordinary bounded deadline...
+    assert reads
+    assert all(
+        deadline == helper.COMMAND_TIMEOUT_SECONDS for _argv, deadline in reads
+    )
+    # ...and the one destructive submission runs under no wall clock at all.
+    assert len(submissions) == 1
+    argv, deadline = submissions[0]
+    assert deadline is None
+    assert deadline is helper.DETACHED_CAPTURE_NO_DEADLINE
+    assert helper.COMMAND_TIMEOUT_SECONDS == 120.0
+    assert "--noproxy" in argv
+    assert pve.submissions == 1
+
+    # And it is still at-most-once: a replay resubmits nothing.
+    replay = _handle(_request(), pve, journal)
+    assert replay["ok"] is True
+    assert pve.submissions == 1
+
+
+def _late_writer_argv(seconds: float, payload: str) -> tuple[str, ...]:
+    """A child that writes only AFTER outliving a short bounded deadline."""
+
+    return (
+        sys.executable,
+        "-c",
+        f"import sys, time; time.sleep({seconds}); "
+        f"sys.stdout.write({payload!r}); sys.stdout.flush()",
+    )
+
+
+def test_no_deadline_mode_lets_a_slow_child_reach_its_terminal_result() -> None:
+    """Structural proof, in fractions of a second rather than 121 of them.
+
+    The point is not the specific numbers: it is that the SAME child which a
+    bounded deadline kills mid-flight (losing its output entirely) runs to its
+    natural end and yields its exact stdout when the deadline is absent.
+    """
+
+    argv = _late_writer_argv(0.4, UPID)
+
+    killed = helper._run_bounded(argv, 0.05, helper.MAX_CAPTURE_OUTPUT_BYTES)
+    assert killed.timed_out is True
+    assert helper._extract_upid(killed) is None
+
+    survived = helper._run_bounded(
+        argv, helper.DETACHED_CAPTURE_NO_DEADLINE, helper.MAX_CAPTURE_OUTPUT_BYTES
+    )
+    assert survived.timed_out is False
+    assert survived.returncode == 0
+    assert helper._extract_upid(survived) == UPID
+
+
+def test_the_output_bound_still_fails_closed_without_a_deadline() -> None:
+    argv = (
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.write('x' * 200000); sys.stdout.flush()",
+    )
+
+    result = helper._run_bounded(argv, helper.DETACHED_CAPTURE_NO_DEADLINE, 1024)
+
+    assert result.output_exceeded is True
+    assert result.timed_out is False
+    # Fail closed: an over-bound capture never yields a task identity.
+    assert helper._extract_upid(result) is None
+
+
+def test_the_detached_capture_child_asks_for_no_deadline(tmp_path: Path) -> None:
+    """The seam itself: `_run_capture_child` must not pass the ordinary 120s."""
+
+    seen: list[tuple[tuple[str, ...], float | None, int]] = []
+
+    def recording_runner(argv, timeout, max_output):
+        seen.append((tuple(argv), timeout, max_output))
+        return helper.CommandResult(
+            0, json.dumps(UPID).encode("utf-8"), b"", False, False
+        )
+
+    journal = _journal(tmp_path)
+    operation_id, _name = _identity(_ownership())
+    helper._run_capture_child(
+        recording_runner, journal, operation_id, ("pvesh", "create", "/x")
+    )
+
+    assert len(seen) == 1
+    _argv, timeout, max_output = seen[0]
+    assert timeout is None
+    assert max_output == helper.MAX_CAPTURE_OUTPUT_BYTES
+    recovered = journal.read_completed_capture(operation_id)
+    assert recovered is not None
+    assert helper._extract_upid(recovered) == UPID
+
+
+def test_an_over_bound_capture_is_never_promoted_even_with_a_valid_upid(
+    tmp_path: Path,
+) -> None:
+    """The output bound is not a deadline, and removing the deadline must not
+    weaken it: a capture that blew its size bound stays UNKNOWN, and nothing
+    is resubmitted."""
+
+    journal = _journal(tmp_path)
+    pve = FakePve(submit_upid="malformed")
+    operation_id, _ = _identity(_ownership())
+    _handle(_request(), pve, journal)
+    journal.write_completed_capture(
+        operation_id,
+        helper.CommandResult(
+            0, b'"' + UPID.encode() + b'"', b"", False, True
+        ),
+    )
+
+    inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+
+    assert inspected["submission_state"] == "submitted"
+    assert inspected.get("task_upid") is None
+    assert journal.read(operation_id)["phase"] == "submitted"
+    assert pve.submissions == 1

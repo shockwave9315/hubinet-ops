@@ -149,6 +149,11 @@ from typing import Any
 MAX_REQUEST_BYTES = 8192
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 120.0
+#: The deadline the detached destructive capture child runs under: none.
+#: Read/preflight commands keep :data:`COMMAND_TIMEOUT_SECONDS`; only the
+#: already-detached physical `pvesh create ... /snapshot` uses this, so that
+#: its exact terminal UPID survives an operation slower than any local clock.
+DETACHED_CAPTURE_NO_DEADLINE: float | None = None
 MAX_CAPTURE_OUTPUT_BYTES = 512 * 1024
 
 JOURNAL_DIRECTORY = Path("/var/lib/hubinet-ops/snapshot-operations")
@@ -200,7 +205,7 @@ class CommandResult:
     output_exceeded: bool = False
 
 
-Runner = Callable[[tuple[str, ...], float, int], CommandResult]
+Runner = Callable[[tuple[str, ...], float | None, int], CommandResult]
 
 
 class RequestError(ValueError):
@@ -238,8 +243,28 @@ class SnapshotError(RuntimeError):
 
 
 def _run_bounded(
-    argv: tuple[str, ...], timeout: float, max_output: int
+    argv: tuple[str, ...], timeout: float | None, max_output: int
 ) -> CommandResult:
+    """Run one fixed argv, optionally under a single wall-clock deadline.
+
+    ``timeout=None`` means NO local wall clock at all. It exists for exactly
+    one caller: the already-detached destructive `pvesh create ... /snapshot`
+    child (:func:`_run_capture_child`). A physical PVE snapshot legitimately
+    outlives any arbitrary local submission deadline, and killing that
+    `pvesh` mid-flight destroys the only channel through which its exact
+    terminal UPID can still be captured -- while the PVE worker itself keeps
+    running. Since the operation is already journaled ``submitted`` and can
+    NEVER be resubmitted, a local timeout buys nothing and costs task
+    attribution, so the detached child is allowed to reach its natural
+    terminal result instead.
+
+    Every ordinary read/preflight caller keeps its bounded deadline: they run
+    inline in the backend's request and must not be able to hang it.
+
+    The output bound is NOT a deadline and is enforced identically in both
+    modes: excessive output still kills the process and still fails closed.
+    """
+
     process = subprocess.Popen(  # noqa: S603 - every argv shape is fixed below
         argv,
         stdin=subprocess.DEVNULL,
@@ -258,12 +283,16 @@ def _run_bounded(
     exceeded = False
     try:
         while selector.get_map():
-            remaining = timeout - (time.monotonic() - started)
-            if remaining <= 0:
-                timed_out = True
-                process.kill()
-                break
-            for key, _ in selector.select(min(remaining, 0.2)):
+            if timeout is None:
+                wait_for = 0.2
+            else:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    timed_out = True
+                    process.kill()
+                    break
+                wait_for = min(remaining, 0.2)
+            for key, _ in selector.select(wait_for):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -277,7 +306,11 @@ def _run_bounded(
                 break
     finally:
         selector.close()
-        process.wait(timeout=5)
+        if timeout is None and not exceeded:
+            # No wall clock anywhere on this path: reap the natural exit.
+            process.wait()
+        else:
+            process.wait(timeout=5)
     return CommandResult(
         process.returncode,
         bytes(output["stdout"][: max_output + 1]),
@@ -1294,8 +1327,29 @@ def _run_capture_child(
     operation_id: str,
     argv: tuple[str, ...],
 ) -> None:
+    """Run the already-detached destructive `pvesh` to its natural end.
+
+    Deliberately passes ``DETACHED_CAPTURE_NO_DEADLINE`` (``None``) instead of
+    :data:`COMMAND_TIMEOUT_SECONDS`. This child is not in the backend's
+    request path -- the writer transaction already returned after the
+    double-fork handoff -- so no caller is waiting on this wall clock, and a
+    physical snapshot that legitimately runs longer than any local submission
+    deadline must not have its `pvesh` killed: doing so throws away the exact
+    terminal UPID while the PVE worker carries on regardless, leaving a
+    permanently unattributable ``submitted`` operation that may never be
+    resubmitted.
+
+    The output bound still applies unchanged, and excessive output still
+    fails closed. A host crash or reboot still leaves durable ``submitted``
+    uncertainty; that case is deliberately NOT made retryable here. No PID
+    ever becomes authority, and at-most-once submission is untouched: this
+    function only observes an already-submitted operation.
+    """
+
     try:
-        result = runner(argv, COMMAND_TIMEOUT_SECONDS, MAX_CAPTURE_OUTPUT_BYTES)
+        result = runner(
+            argv, DETACHED_CAPTURE_NO_DEADLINE, MAX_CAPTURE_OUTPUT_BYTES
+        )
         journal.write_completed_capture(operation_id, result)
     except Exception:
         # No completion marker means UNKNOWN. The submitted journal is retained.

@@ -43,6 +43,7 @@ from app.inventory.snapshot_identity import (
     SNAPSHOT_METADATA_MARKER,
 )
 from app.package_update_snapshot import (
+    DEFAULT_TASK_POLL_INTERVAL_SECONDS,
     HostSnapshotResult,
     HostSubmissionState,
     PackageUpdateSnapshotOrchestrator,
@@ -2283,8 +2284,14 @@ def test_a_crash_leaving_no_snapshot_stays_uncertain_and_fenced(
         raise KeyboardInterrupt("caller died; PVE may or may not have started")
 
     pve.on_submit = die_without_creating
+    # `submitted` is a POLLABLE in-flight state now that submission detaches
+    # the physical pvesh, so the retry below legitimately re-reads until its
+    # bounded deadline. This detached child is gone for good and no capture
+    # will ever appear, so the test clock closes that bound after one poll
+    # instead of spending the real configured timeout proving it.
+    sleep, sleep_calls, monotonic = _bounded_clock_sleep()
     orchestrator = PackageUpdateSnapshotOrchestrator(
-        authority, _dark_channel(pve, journal)
+        authority, _dark_channel(pve, journal), sleep=sleep, monotonic=monotonic
     )
     with pytest.raises(KeyboardInterrupt):
         orchestrator.ensure_job_owned_snapshot(job.job_id)
@@ -2300,6 +2307,8 @@ def test_a_crash_leaving_no_snapshot_stays_uncertain_and_fenced(
     assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
     assert fenced.snapshot_confirmed_at is None
     assert authority.recover_interrupted_package_update_jobs() == ()
+    # Bounded, and it really did look again before giving up.
+    assert sleep_calls == [DEFAULT_TASK_POLL_INTERVAL_SECONDS]
 
 
 # ===========================================================================
@@ -4677,3 +4686,151 @@ def test_resolve_pre_submission_block_never_terminalizes_while_the_remote_mutato
     assert final_pve.submissions == 0
     assert recovered.outcome is SnapshotOperationOutcome.COMPLETED
     assert recovered.job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+
+
+# ---------------------------------------------------------------------------
+# P1-B. `submitted` WITHOUT a task identity is a POLLABLE in-flight state.
+#
+# Submission hands the physical `pvesh` to a detached host child and returns
+# immediately, so the first response routinely reports `submitted` with no
+# UPID: the durable capture does not exist yet. Polling used to start only at
+# `task_known`, so the worker ended the cycle `snapshot_uncertain` and an
+# operator RESUME was needed purely to notice a capture that landed moments
+# later. The poll is read-only and must never resubmit.
+# ---------------------------------------------------------------------------
+
+
+def _owned_listing_entry(identity, ownership):
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    return {
+        "name": identity.snapshot_name,
+        "description": snapshot_helper.build_snapshot_description(
+            {
+                "job_id": ownership.job_id,
+                "resource_id": ownership.resource_id,
+                "resource_continuity_revision": (
+                    ownership.resource_continuity_revision
+                ),
+                "inventory_source_id": ownership.inventory_source_id,
+                "backend_instance_id": ownership.backend_instance_id,
+            }
+        )
+        + "\n",
+        "snaptime": 1_700_000_000,
+    }
+
+
+def test_submitted_without_a_capture_is_polled_until_the_capture_appears(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    pve.on_submit = lambda p: p.snapshots.append(
+        _owned_listing_entry(identity, ownership)
+    )
+
+    # Model the real detached child faithfully: submission returns BEFORE the
+    # physical `pvesh` has run at all, so no durable capture exists yet.
+    detached: list = []
+    real_capture = snapshot_helper._run_capture_child
+
+    def defer_capture(runner, host_journal, operation_id, argv):
+        detached.append(
+            lambda: real_capture(runner, host_journal, operation_id, argv)
+        )
+
+    monkeypatch.setattr(snapshot_helper, "_run_capture_child", defer_capture)
+
+    clock = [0.0]
+    sleep_calls: list[float] = []
+    phases_when_polling: list[tuple[str, object]] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 1.0
+        record = journal.read(identity.snapshot_operation_id)
+        phases_when_polling.append((record["phase"], record.get("task_upid")))
+        if detached:
+            # The detached physical pvesh finishes now, writes its crash-safe
+            # completion marker, and exits -- after the backend already saw
+            # `submitted`.
+            detached.pop()()
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority,
+        _dark_channel(pve, journal),
+        sleep=sleep,
+        monotonic=lambda: clock[0],
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    # The FIRST poll ran while the operation was `submitted` with no identity
+    # at all -- the exact state that used to stop polling dead.
+    assert phases_when_polling == [("submitted", None)]
+    assert sleep_calls == [2.0]
+    # One ordinary worker cycle got all the way to a confirmed snapshot: no
+    # operator RESUME was needed merely to notice the capture had appeared.
+    assert result.outcome is SnapshotOperationOutcome.COMPLETED
+    assert result.job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert result.job.snapshot_task_upid == upid
+    assert store.package_update_job(job.job_id).snapshot_task_upid == upid
+    assert journal.read(identity.snapshot_operation_id)["phase"] == "task_known"
+    # Exactly one destructive snapshot submission ever happened.
+    assert pve.submissions == 1
+
+
+def test_a_submitted_operation_whose_capture_never_lands_stays_uncertain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The poll is bounded and fails closed: no capture, no identity, no
+    resubmission, and never a fabricated success."""
+
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+
+    # The detached child ran the physical `pvesh` and then died before it
+    # could write its crash-safe completion marker.
+    def lose_the_capture(runner, host_journal, operation_id, argv):
+        runner(
+            argv,
+            snapshot_helper.DETACHED_CAPTURE_NO_DEADLINE,
+            snapshot_helper.MAX_CAPTURE_OUTPUT_BYTES,
+        )
+
+    monkeypatch.setattr(snapshot_helper, "_run_capture_child", lose_the_capture)
+
+    clock = [0.0]
+    sleep_calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 400.0
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority,
+        _dark_channel(pve, journal),
+        sleep=sleep,
+        monotonic=lambda: clock[0],
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    # Bounded: it gave up on its own deadline rather than looping forever.
+    assert sleep_calls == [2.0, 2.0]
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert result.job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert store.package_update_job(job.job_id).snapshot_task_upid is None
+    assert journal.read(identity.snapshot_operation_id)["phase"] == "submitted"
+    assert pve.submissions == 1

@@ -394,8 +394,10 @@ class SnapshotStageResult:
     reason: str | None = None
 
 
-#: Bounded polling of one journaled PVE task. A task still running when this
-#: elapses stays UNCERTAIN -- never failed, and never a licence to resubmit.
+#: Bounded polling of one in-flight snapshot operation: a journaled PVE task,
+#: or a `submitted` operation whose detached host capture has not yet yielded
+#: the exact UPID. Either still in flight when this elapses stays UNCERTAIN --
+#: never failed, and never a licence to resubmit.
 DEFAULT_TASK_POLL_TIMEOUT_SECONDS = 900.0
 DEFAULT_TASK_POLL_INTERVAL_SECONDS = 2.0
 
@@ -701,33 +703,50 @@ class PackageUpdateSnapshotOrchestrator:
         ownership: SnapshotOwnership,
         result: HostSnapshotResult,
     ) -> HostSnapshotResult:
-        """Bounded-poll a known PVE task purely through read-only inspection.
+        """Bounded-poll one in-flight operation purely through read-only inspection.
 
         Never opens a database transaction and never resubmits anything: it
-        only re-reads the host's durable state until the task the submission
-        boundary already crossed for reaches a terminal outcome or this
-        bound elapses. A ``submitted``-without-a-task-identity operation is
-        deliberately never looped on here: that window resolves, if at all,
-        from one bounded canonical read, not from repeating an identical read
-        that cannot change on its own.
+        only re-reads the host's durable state until the operation the
+        submission boundary already crossed for reaches a terminal outcome or
+        this bound elapses.
 
-        The durable journal phase alone is not a fresh signal: it stays
-        ``task_known`` forever once a task identity is captured, whatever the
-        live PVE task itself later does. So once a read observes the task
-        ITSELF has reached a terminal PVE state (``running`` vs ``stopped``,
-        never inferred from anything else), further polling cannot make that
-        same task "more terminal" -- repeating an identical bounded read for
-        up to the whole configured timeout would be pure waste. The current
-        canonical evidence, not more waiting, decides completed/failed/
-        uncertain from here, using the existing strict rules unchanged: a
-        canonical absence is never turned into failure, and nothing here ever
-        resubmits.
+        TWO states are in-flight and therefore pollable, both strictly
+        read-only:
+
+        ``submitted`` without a task identity is one of them. It used to be
+        skipped, on the reasoning that repeating an identical read could not
+        change it -- that reasoning is now false. Submission hands the
+        physical `pvesh` to a DETACHED host child and returns immediately, so
+        the very first response routinely reports ``submitted`` before the
+        durable capture exists at all. That child later writes a crash-safe
+        completion marker, and a subsequent inspect promotes it to
+        ``task_known`` with the exact UPID. Refusing to look again would end
+        the worker cycle as ``snapshot_uncertain`` and demand an operator
+        RESUME purely to notice a capture that had already landed.
+
+        ``task_known`` whose task is not yet terminal is the other, exactly as
+        before. The durable journal phase alone is not a fresh signal there:
+        it stays ``task_known`` forever once a task identity is captured,
+        whatever the live PVE task later does. So once a read observes the
+        task ITSELF has reached a terminal PVE state (``running`` vs
+        ``stopped``, never inferred from anything else), further polling
+        cannot make that same task "more terminal" and the loop stops.
+
+        Everything else -- a terminal, sealed, malformed, or otherwise
+        non-uncertain result -- stops immediately and is decided by the
+        existing strict rules, unchanged: the current canonical evidence
+        decides completed/failed/uncertain, a canonical absence is never
+        turned into failure, and nothing here ever resubmits.
         """
 
         def _pending(candidate: HostSnapshotResult) -> bool:
-            if candidate.submission_state is not HostSubmissionState.TASK_KNOWN:
-                return False
             if candidate.outcome is not SnapshotOperationOutcome.UNCERTAIN:
+                return False
+            if candidate.submission_state is HostSubmissionState.SUBMITTED:
+                # The detached capture may still land and yield the exact
+                # UPID. Looking again is a read; it never resubmits.
+                return True
+            if candidate.submission_state is not HostSubmissionState.TASK_KNOWN:
                 return False
             if candidate.task is not None and candidate.task.terminal:
                 return False

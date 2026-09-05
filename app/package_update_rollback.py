@@ -197,8 +197,10 @@ class RollbackStageResult:
     reason: str | None = None
 
 
-#: Bounded polling of one journaled PVE rollback task. A task still running
-#: when this elapses stays UNCERTAIN -- never failed, never resubmitted. The
+#: Bounded polling of one in-flight rollback: a journaled PVE task, or a
+#: `submitted` rollback whose detached host capture has not yet yielded the
+#: exact UPID. Either still in flight when this elapses stays UNCERTAIN --
+#: never failed, never resubmitted. The
 #: default is generous because a rollback force-stops the container and then
 #: rolls back every volume, which on a large mountpoint is not quick.
 DEFAULT_TASK_POLL_TIMEOUT_SECONDS = 1800.0
@@ -517,19 +519,38 @@ class PackageUpdateRollbackOrchestrator:
         request: PackageUpdateRollbackRequest,
         result: HostRollbackResult,
     ) -> HostRollbackResult:
-        """Bounded-poll a known PVE task purely through read-only inspection.
+        """Bounded-poll one in-flight rollback purely through read-only inspection.
 
-        Never opens a database transaction and never resubmits. Once a read
-        observes the task ITSELF has reached a terminal PVE state, further
-        polling cannot make that same task more terminal, so it stops: the
-        durable journal phase alone is not a fresh signal, since it stays
-        ``task_known`` forever once a task identity is captured.
+        Never opens a database transaction and never resubmits. Two states
+        are in-flight and therefore pollable, both strictly read-only.
+
+        ``submitted`` without a task identity is one of them. Submission hands
+        the physical `pvesh` to a DETACHED host child and returns at once, so
+        the first response routinely reports ``submitted`` before the durable
+        capture exists. The child later writes a crash-safe completion marker
+        and a subsequent inspect promotes it to ``task_known`` with the exact
+        UPID. Not looking again would end the cycle as ``rollback_uncertain``
+        and demand an operator RESUME purely to notice a capture that had
+        already landed. Promotion still requires a COMPLETE, exact capture:
+        rollback never infers success from canonical state, so a rollback
+        that never yields an exact UPID stays uncertain and fenced.
+
+        ``task_known`` whose task is not yet terminal is the other, exactly as
+        before. Once a read observes the task ITSELF has reached a terminal
+        PVE state, further polling cannot make that same task more terminal,
+        so it stops: the durable journal phase alone is not a fresh signal,
+        since it stays ``task_known`` forever once a task identity is
+        captured.
         """
 
         def _pending(candidate: HostRollbackResult) -> bool:
-            if candidate.rollback_state is not HostRollbackState.TASK_KNOWN:
-                return False
             if candidate.outcome is not RollbackOperationOutcome.UNCERTAIN:
+                return False
+            if candidate.rollback_state is HostRollbackState.SUBMITTED:
+                # The detached capture may still land and yield the exact
+                # UPID. Looking again is a read; it never resubmits.
+                return True
+            if candidate.rollback_state is not HostRollbackState.TASK_KNOWN:
                 return False
             if candidate.task is not None and candidate.task.terminal:
                 return False

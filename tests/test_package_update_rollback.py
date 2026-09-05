@@ -149,6 +149,9 @@ class FakePve:
         #: Extra listing rows, for ambiguity cases.
         self.extra_rows: list[dict] = []
         self.argvs: list[tuple[str, ...]] = []
+        #: Every (argv, timeout) pair, so a test can prove WHICH deadline
+        #: each command class was actually run under.
+        self.deadlines: list[tuple[tuple[str, ...], float | None]] = []
 
     # -- rendering -----------------------------------------------------
 
@@ -185,6 +188,7 @@ class FakePve:
     def runner(self, argv, timeout, max_output):
         argv = tuple(argv)
         self.argvs.append(argv)
+        self.deadlines.append((argv, timeout))
         result = self._dispatch(argv)
         if result is None:
             raise AssertionError(f"fake PVE received an unexpected command: {argv}")
@@ -3217,4 +3221,285 @@ def test_the_legal_authority_completion_still_reaches_rolled_back(
     # Written as ONE atomic statement, so the checkpoint and the terminal
     # status can never disagree even momentarily.
     assert result.job.terminalized_at is not None
+    assert len(pve.rollbacks) == 1
+
+
+# ===========================================================================
+# P1-A. The detached destructive rollback `pvesh` must outlive the ordinary
+# bounded submission deadline.
+#
+# A rollback force-stops the container and replaces every volume; on a large
+# mountpoint that legitimately runs longer than COMMAND_TIMEOUT_SECONDS.
+# Killing the local `pvesh` there does NOT stop PVE's worker -- it only
+# destroys the channel the exact terminal UPID still arrives through, leaving
+# a `submitted` rollback that may never be resubmitted permanently
+# unattributable and the job permanently fenced.
+# ===========================================================================
+
+
+def test_rollback_reads_stay_bounded_but_the_destructive_capture_has_no_clock(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, orchestrator = (
+        _mutating_job(tmp_path)
+    )
+
+    first = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert first.job.rollback_task_upid == UPID
+    reads = [
+        (argv, deadline)
+        for argv, deadline in pve.deadlines
+        if argv[:2] != ("pvesh", "create")
+    ]
+    submissions = [
+        (argv, deadline)
+        for argv, deadline in pve.deadlines
+        if argv[:2] == ("pvesh", "create")
+    ]
+    # Every read/preflight command keeps its ordinary bounded deadline...
+    assert reads
+    assert all(
+        deadline == helper.COMMAND_TIMEOUT_SECONDS for _argv, deadline in reads
+    )
+    # ...and the one destructive rollback runs under no wall clock at all.
+    assert len(submissions) == 1
+    argv, deadline = submissions[0]
+    assert deadline is None
+    assert deadline is helper.DETACHED_CAPTURE_NO_DEADLINE
+    assert helper.COMMAND_TIMEOUT_SECONDS == 120.0
+    assert argv[2].endswith("/rollback")
+    assert "--noproxy" in argv
+    assert len(pve.rollbacks) == 1
+
+    # At-most-once is untouched: a replay resubmits nothing.
+    orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    assert len(pve.rollbacks) == 1
+
+
+def test_rollback_no_deadline_mode_lets_a_slow_child_finish() -> None:
+    """Structural proof in fractions of a second, not 121 of them."""
+
+    argv = (
+        sys.executable,
+        "-c",
+        f"import sys, time; time.sleep(0.4); sys.stdout.write({UPID!r}); "
+        "sys.stdout.flush()",
+    )
+
+    killed = helper._run_bounded(argv, 0.05, helper.MAX_CAPTURE_OUTPUT_BYTES)
+    assert killed.timed_out is True
+    assert helper._extract_upid(killed.stdout) is None
+
+    survived = helper._run_bounded(
+        argv, helper.DETACHED_CAPTURE_NO_DEADLINE, helper.MAX_CAPTURE_OUTPUT_BYTES
+    )
+    assert survived.timed_out is False
+    assert survived.returncode == 0
+    assert helper._extract_upid(survived.stdout) == UPID
+
+
+def test_rollback_output_bound_still_fails_closed_without_a_deadline() -> None:
+    argv = (
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.write('x' * 200000); sys.stdout.flush()",
+    )
+
+    result = helper._run_bounded(argv, helper.DETACHED_CAPTURE_NO_DEADLINE, 1024)
+
+    assert result.output_exceeded is True
+    assert result.timed_out is False
+    # Fail closed: an over-bound capture is never promoted to a task identity.
+    assert result.output_exceeded and helper._extract_upid(result.stdout) is None
+
+
+def test_the_rollback_capture_child_asks_for_no_deadline(tmp_path: Path) -> None:
+    seen: list[tuple[tuple[str, ...], float | None, int]] = []
+
+    def recording_runner(argv, timeout, max_output):
+        seen.append((tuple(argv), timeout, max_output))
+        return helper.CommandResult(
+            returncode=0,
+            stdout=json.dumps(UPID).encode("utf-8"),
+            stderr=b"",
+            timed_out=False,
+            output_exceeded=False,
+        )
+
+    journal = helper.OperationJournal(tmp_path / "journal", anchor=tmp_path)
+    operation_id = str(uuid.uuid4())
+    helper._run_capture_child(
+        recording_runner, journal, operation_id, ("pvesh", "create", "/x")
+    )
+
+    assert len(seen) == 1
+    _argv, timeout, max_output = seen[0]
+    assert timeout is None
+    assert max_output == helper.MAX_CAPTURE_OUTPUT_BYTES
+    recovered = journal.read_completed_capture(operation_id)
+    assert recovered is not None
+    assert helper._extract_upid(recovered.stdout) == UPID
+
+
+def test_an_over_bound_rollback_capture_is_never_promoted(tmp_path: Path) -> None:
+    """The output bound is not a deadline, and removing the deadline must not
+    weaken it: a capture that blew its size bound stays UNKNOWN, and nothing
+    is resubmitted."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.returned_upid = None
+    host.submit_same_job_rollback(request)
+    host.journal.write_completed_capture(
+        request.rollback_operation_id,
+        helper.CommandResult(0, b'"' + UPID.encode() + b'"', b"", False, True),
+    )
+
+    inspected = host.inspect_rollback_state(request)
+
+    assert inspected.rollback_state is HostRollbackState.SUBMITTED
+    assert inspected.task_upid is None
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"
+    assert len(pve.rollbacks) == 1
+
+
+# ===========================================================================
+# P1-B. `submitted` WITHOUT a task identity is a POLLABLE in-flight state.
+#
+# Submission hands the physical rollback `pvesh` to a detached host child and
+# returns immediately, so the first response routinely reports `submitted`
+# with no UPID. Polling used to start only at `task_known`, so the cycle ended
+# `rollback_uncertain` and an operator RESUME was needed purely to notice a
+# capture that landed moments later. The poll is read-only, never resubmits,
+# and rollback still refuses to infer success from canonical state alone.
+# ===========================================================================
+
+
+def test_submitted_rollback_is_polled_until_the_detached_capture_appears(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    observed = _canonical_before_rollback(ownership, identity)
+
+    # Model the real detached child: submission returns BEFORE the physical
+    # `pvesh` has run at all, so no durable capture exists yet.
+    detached: list = []
+    real_capture = helper._run_capture_child
+
+    def defer_capture(runner, journal, operation_id, argv):
+        detached.append(
+            lambda: real_capture(runner, journal, operation_id, argv)
+        )
+
+    monkeypatch.setattr(helper, "_run_capture_child", defer_capture)
+
+    clock = [0.0]
+    sleep_calls: list[float] = []
+    phases_when_polling: list[tuple[str, object]] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 1.0
+        request = authority.package_update_rollback_request(job.job_id)
+        record = host.journal.read(request.rollback_operation_id)
+        phases_when_polling.append((record["phase"], record.get("task_upid")))
+        if detached:
+            # The detached physical rollback finishes now, writes its
+            # crash-safe completion marker, and exits -- after the backend
+            # already saw `submitted`.
+            detached.pop()()
+            _complete_rollback(pve)
+
+    orchestrator = PackageUpdateRollbackOrchestrator(
+        authority,
+        host,
+        sleep=sleep,
+        monotonic=lambda: clock[0],
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    # The FIRST poll ran while the rollback was `submitted` with no identity
+    # at all -- the exact state that used to stop polling dead.
+    assert phases_when_polling == [("submitted", None)]
+    assert sleep_calls == [2.0]
+    # One ordinary cycle reached exact-task terminal success evidence without
+    # an operator RESUME.
+    assert result.outcome is RollbackOperationOutcome.COMPLETED
+    assert result.job.status is PackageUpdateJobStatus.ROLLED_BACK
+    assert result.job.rollback_task_upid == UPID
+    request = authority.package_update_rollback_request(job.job_id)
+    assert host.journal.read(request.rollback_operation_id)["task_upid"] == UPID
+    # Exactly one destructive rollback submission ever happened.
+    assert len(pve.rollbacks) == 1
+
+
+def test_a_submitted_rollback_without_a_capture_never_infers_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The heart of the rollback contract: canonical state is NOT a witness.
+
+    Even with the guest showing exactly the post-rollback canonical state, a
+    rollback with no exact task attribution stays UNCERTAIN and fenced. The
+    poll is bounded, read-only, and resubmits nothing.
+    """
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    observed = _canonical_before_rollback(ownership, identity)
+
+    # The detached child ran the physical `pvesh` and then died before it
+    # could write its crash-safe completion marker.
+    def lose_the_capture(runner, journal, operation_id, argv):
+        runner(
+            argv,
+            helper.DETACHED_CAPTURE_NO_DEADLINE,
+            helper.MAX_CAPTURE_OUTPUT_BYTES,
+        )
+
+    monkeypatch.setattr(helper, "_run_capture_child", lose_the_capture)
+    # Canonical state that a canonical-only inference would misread as proof.
+    _complete_rollback(pve)
+    pve.current_parent = identity.snapshot_name
+
+    clock = [0.0]
+    sleep_calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 400.0
+
+    orchestrator = PackageUpdateRollbackOrchestrator(
+        authority,
+        host,
+        sleep=sleep,
+        monotonic=lambda: clock[0],
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    # Bounded: it gave up on its own deadline rather than looping forever.
+    assert sleep_calls == [2.0, 2.0]
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert result.job.status is not PackageUpdateJobStatus.ROLLED_BACK
+    assert authority.package_update_job(job.job_id).rollback_task_upid is None
+    request = authority.package_update_rollback_request(job.job_id)
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"
     assert len(pve.rollbacks) == 1
