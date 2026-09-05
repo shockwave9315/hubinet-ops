@@ -185,6 +185,16 @@ but no real workload has been updated, no real snapshot created, no real
 rollback performed, and no health probe run against any live guest by Hubinet
 Ops. `README.md` carries the operator runbook for that first validation.
 
+The first RC6 activation attempt reached the snapshot helper's durable
+`submitted` boundary, then real PVE rejected `--noproxy` because RC6 placed the
+global pvesh option after the API path, where the snapshot endpoint's closed
+schema interpreted it as an unknown property. No PVE task or snapshot was
+created and package mutation never began. The repaired helper uses the
+supported `pvesh --noproxy create ...` form; rollback carried the same argv
+defect and is repaired with the same rule. The already-submitted operation
+remains UNKNOWN and fenced: this repair does not reinterpret a non-zero exit or
+human-readable stderr as retry authority.
+
 ## In-place product update lifecycle
 
 Generic (non-workload) in-place Hubinet Ops updates are implemented and have
@@ -264,6 +274,9 @@ Human0-validated.
   snapshot, mutation, or rollback connection must currently own the LXC. Each
   helper proves the local node through fixed read-only PVE state and refuses a
   mismatch before `submitted`; snapshot and rollback also use `--noproxy`.
+  The option is passed in pvesh's supported leading-global position
+  (`pvesh --noproxy create ...`), never after the API path where a closed
+  endpoint schema would interpret it as an unsupported property.
 - **Production reachable** through the explicit operator start control and the
   one worker, and through nothing else: no scheduler, scan, approval write, or
   Home Assistant poll can create a PVE snapshot. The snapshot helper is

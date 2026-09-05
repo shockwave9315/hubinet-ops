@@ -119,7 +119,8 @@ Mutations are serialized per VMID with a kernel `flock`.
   final machine-readable UPID and the command waits for physical completion.
 - Current package-update mutation is single-node only. PVE's fixed
   `/cluster/status` local-node fact must equal `expected_node` before
-  `submitted`, and the destructive argv includes `--noproxy`.
+  `submitted`, and the destructive argv uses pvesh's leading global
+  `--noproxy` option (before the `create` verb).
 - `GET /nodes/{node}/tasks/{upid}/status` gives `status` in
   `running`/`stopped` plus an optional `exitstatus`; PVE's own rule treats
   `OK` and `WARNINGS: <n>` as non-errors.
@@ -1782,11 +1783,13 @@ def _ensure_submitted(
 
         description = build_snapshot_description(request["ownership"])
         argv = (
-            "pvesh", "create",
+            # `--noproxy` is a pvesh GLOBAL compatibility option. PVE consumes
+            # it only before the verb; after the API path it becomes an
+            # endpoint property, which the closed snapshot schema rejects.
+            "pvesh", "--noproxy", "create",
             f"/nodes/{request['expected_node']}/lxc/{request['vmid']}/snapshot",
             "--snapname", request["snapshot_name"],
             "--description", description,
-            "--noproxy",
             "--output-format", "json",
         )
         # -------------------------------------------------------------------

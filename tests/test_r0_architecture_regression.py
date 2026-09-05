@@ -844,7 +844,9 @@ def test_the_snapshot_helper_exposes_no_delete_or_rollback_operation() -> None:
         "ensure_pre_update_snapshot_submitted",
         "seal_operation_never_submitted",
     )
-    # `pvesh` is only ever invoked with a read or a create verb.
+    # `pvesh` is only ever invoked with a read or a create verb. The one
+    # global option is deliberately before the create verb; after the API
+    # path PVE would validate it as an unsupported endpoint property.
     verbs = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Tuple) and node.elts:
@@ -852,8 +854,37 @@ def test_the_snapshot_helper_exposes_no_delete_or_rollback_operation() -> None:
             if isinstance(first, ast.Constant) and first.value == "pvesh":
                 second = node.elts[1]
                 assert isinstance(second, ast.Constant), ast.dump(node)
-                verbs.add(second.value)
+                if second.value == "--noproxy":
+                    third = node.elts[2]
+                    assert isinstance(third, ast.Constant), ast.dump(node)
+                    verbs.add(third.value)
+                else:
+                    verbs.add(second.value)
     assert verbs == {"get", "create"}
+
+
+def test_destructive_pvesh_uses_only_the_supported_global_noproxy_position() -> None:
+    """Snapshot and rollback must not leak CLI flags into closed API schemas."""
+
+    for relative in (
+        "deploy/hubinet-package-snapshot-helper.py",
+        "deploy/hubinet-package-rollback-helper.py",
+    ):
+        tree = ast.parse((REPO_ROOT / relative).read_text(encoding="utf-8"))
+        create_prefixes: list[tuple[str, ...]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Tuple) or len(node.elts) < 3:
+                continue
+            prefix: list[str] = []
+            for element in node.elts[:3]:
+                if not isinstance(element, ast.Constant) or not isinstance(
+                    element.value, str
+                ):
+                    break
+                prefix.append(element.value)
+            if prefix and prefix[0] == "pvesh" and "create" in prefix:
+                create_prefixes.append(tuple(prefix))
+        assert create_prefixes == [("pvesh", "--noproxy", "create")], relative
 
 
 def test_no_package_or_apt_mutation_exists_anywhere_in_the_backend() -> None:

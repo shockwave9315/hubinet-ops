@@ -294,10 +294,13 @@ them at-most-once across a crash.
 by each privileged mutation connection must currently own the target LXC.
 Snapshot, package mutation, and explicit rollback derive the local node from
 PVE's fixed read-only `/cluster/status` result and refuse a mismatch before
-their durable `submitted` boundary. Snapshot and rollback additionally pass
-`--noproxy` on the destructive `pvesh create`. Remote-node mutation through
-PVE proxying or inter-node SSH is not a supported current path. Package scan,
-execution-time simulation, and health remain distinct read-only boundaries.
+their durable `submitted` boundary. Snapshot and rollback additionally invoke
+the destructive command as `pvesh --noproxy create ...`: `--noproxy` is a
+leading pvesh global option, not an endpoint property. PVE therefore aborts if
+the explicit `/nodes/<expected_node>/...` path would resolve to a non-local
+node instead of proxying it over inter-node SSH. Remote-node mutation is not a
+supported current path. Package scan, execution-time simulation, and health
+remain distinct read-only boundaries.
 
 **No PVE API privilege was broadened.** Every mutation runs host-local behind
 a root-owned forced command, so the inventory API identity never needs one:
