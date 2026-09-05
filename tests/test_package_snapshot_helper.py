@@ -684,8 +684,8 @@ def test_journal_writes_are_atomic_and_leave_no_temporary_file(
     _handle(_request(), pve, journal)
     assert not list(journal.directory.glob("*.tmp"))
     record = json.loads((journal.directory / f"op-{operation_id}.json").read_text())
-    # The submission-only operation returns promptly once the task is
-    # journaled; it does not itself finalize the operation.
+    # The injected hermetic runner completes inline and promotes the capture;
+    # production detaches before the synchronous pvesh work begins.
     assert record["phase"] == "task_known"
     assert record["snapshot_operation_id"] == operation_id
 
@@ -912,6 +912,27 @@ def test_incomplete_capture_stays_submitted_and_never_resubmits(tmp_path: Path) 
     _handle(_request(), pve, journal)
     journal._capture_path(operation_id, "complete.json").unlink()
 
+    inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert inspected["submission_state"] == "submitted"
+    assert journal.read(operation_id)["phase"] == "submitted"
+    assert pve.submissions == 1
+
+
+def test_ambiguous_completed_capture_stays_submitted_and_never_resubmits(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    pve = FakePve(submit_upid="malformed")
+    operation_id, _ = _identity(_ownership())
+    _handle(_request(), pve, journal)
+    journal.write_completed_capture(
+        operation_id,
+        helper.CommandResult(
+            0,
+            UPID.encode() + b'\n"' + OTHER_UPID.encode() + b'"\n',
+            b"",
+        ),
+    )
     inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
     assert inspected["submission_state"] == "submitted"
     assert journal.read(operation_id)["phase"] == "submitted"

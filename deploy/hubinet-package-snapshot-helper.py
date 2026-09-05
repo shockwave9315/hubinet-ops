@@ -660,7 +660,10 @@ class OperationJournal:
             try:
                 offset = 0
                 while offset < len(payload):
-                    offset += os.write(descriptor, payload[offset:])
+                    written = os.write(descriptor, payload[offset:])
+                    if written <= 0:
+                        raise OSError("capture write made no progress")
+                    offset += written
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
@@ -676,7 +679,10 @@ class OperationJournal:
             payload = _canonical_json(metadata).encode("ascii")
             offset = 0
             while offset < len(payload):
-                offset += os.write(descriptor, payload[offset:])
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("capture marker write made no progress")
+                offset += written
             os.fsync(descriptor)
         finally:
             os.close(descriptor)

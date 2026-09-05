@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+import re
 import sqlite3
 import uuid
 
@@ -12,6 +13,7 @@ from app.inventory import (
     InventoryAuthority,
     InventoryAuthorityStore,
 )
+from app.inventory import store as store_module
 from app.inventory.store import AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION
 
 
@@ -20,6 +22,23 @@ FIXED_NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 
 def fixed_now() -> datetime:
     return FIXED_NOW
+
+
+def test_updater_static_schema_extraction_matches_final_v18_contract() -> None:
+    """Exercise update-plan.sh's non-executing lexical extraction shape."""
+
+    text = Path(store_module.__file__).read_text(encoding="utf-8")
+    version = re.search(
+        r"^AUTHORITY_SCHEMA_VERSION\s*=\s*(\d+)", text, re.MULTILINE
+    )
+    start = text.find("_REQUIRED_TABLES")
+    end = text.find("_LEGACY_TABLES")
+    extracted = set(re.findall(r'"([A-Za-z0-9_]+)"', text[start:end]))
+    assert version is not None and int(version.group(1)) == 18
+    assert start != -1 and end > start
+    assert extracted == store_module._REQUIRED_SCHEMA_OBJECTS
+    assert "package_update_post_scan_requests" in extracted
+    assert "package_update_post_scan_request_link_once" in extracted
 
 
 def test_fresh_authority_database_initializes_one_persistent_backend(

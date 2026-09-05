@@ -30,6 +30,7 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import time
 from types import ModuleType
 import uuid
@@ -1134,6 +1135,34 @@ def test_rollback_incomplete_capture_stays_submitted_without_resubmission(
     assert len(pve.rollbacks) == 1
 
 
+def test_rollback_ambiguous_capture_stays_submitted_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.returned_upid = None
+    host.submit_same_job_rollback(request)
+    host.journal.write_completed_capture(
+        request.rollback_operation_id,
+        helper.CommandResult(
+            0,
+            UPID.encode() + b'\n"' + OTHER_UPID.encode() + b'"\n',
+            b"",
+            False,
+            False,
+        ),
+    )
+    inspected = host.inspect_rollback_state(request)
+    assert inspected.rollback_state is HostRollbackState.SUBMITTED
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"
+    assert len(pve.rollbacks) == 1
+
+
 def test_real_detached_rollback_runner_returns_while_physical_task_is_alive(
     tmp_path: Path,
 ) -> None:
@@ -1640,6 +1669,38 @@ def test_an_interleaving_writer_cannot_race_the_submission_boundary(
     )
 
     assert seen == ["seam", "submit"]
+
+
+def test_rollback_writer_releases_while_detached_physical_work_remains_alive(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, _, job, ownership, identity, *_ = _mutating_job(tmp_path)
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    started = threading.Event()
+    release = threading.Event()
+    physical: list[threading.Thread] = []
+
+    def submit():
+        thread = threading.Thread(
+            target=lambda: (started.set(), release.wait(timeout=5)), daemon=True
+        )
+        physical.append(thread)
+        thread.start()
+        assert started.wait(timeout=1)
+        return "submitted"
+
+    assert authority.execute_rollback_submission_if_current(job.job_id, submit) == "submitted"
+    assert physical[0].is_alive()
+    other = sqlite3.connect(store.path, timeout=0.2, isolation_level=None)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute("ROLLBACK")
+    finally:
+        other.close()
+        release.set()
+        physical[0].join(timeout=1)
 
 
 # ===========================================================================

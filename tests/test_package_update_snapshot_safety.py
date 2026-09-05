@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import sqlite3
+import threading
 import uuid
 
 import pytest
@@ -3305,6 +3306,35 @@ def test_writer_cannot_interleave_inside_the_submission_critical_section(
 
     assert result == "submitted-under-lock"
     assert attempted == [job.job_id]
+
+
+def test_writer_can_proceed_after_detached_submission_while_physical_work_lives(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, _, job, _, _ = _prepared(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    physical: list[threading.Thread] = []
+
+    def submit():
+        thread = threading.Thread(
+            target=lambda: (started.set(), release.wait(timeout=5)), daemon=True
+        )
+        physical.append(thread)
+        thread.start()
+        assert started.wait(timeout=1)
+        return "submitted"
+
+    assert authority.execute_snapshot_submission_if_current(job.job_id, submit) == "submitted"
+    assert physical[0].is_alive()
+    other = sqlite3.connect(store.path, timeout=0.2, isolation_level=None)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute("ROLLBACK")
+    finally:
+        other.close()
+        release.set()
+        physical[0].join(timeout=1)
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,7 @@ from tests.test_package_update_execution_gate import (
 )
 from tests.test_package_update_job_authority import (
     HEALTH_PROBES,
+    _add_approved_resource,
     _approved_system,
     _issue,
 )
@@ -102,6 +103,7 @@ from tests.test_package_update_rollback import (
     HelperBackedHostControl as RollbackHostControl,
 )
 from tests.test_package_update_snapshot_safety import (
+    _break_incarnation_continuity_at_the_same_locator,
     _canonical,
     _current_entry,
     _foreign_entry,
@@ -681,6 +683,16 @@ def test_v18_post_update_link_accepts_only_same_resource_running_once(
                 (terminal.scan_run_id, job.job_id),
             )
 
+    other_resource, _, _ = _add_approved_resource(system.store, system.authority)
+    wrong_resource = system.authority.issue_package_scan(other_resource.resource_id)
+    with pytest.raises(sqlite3.IntegrityError, match="link is invalid"):
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_post_scan_requests SET scan_run_id=? "
+                "WHERE job_id=?",
+                (wrong_resource.scan_run_id, job.job_id),
+            )
+
     running = system.authority.issue_package_scan(job.resource_id)
     with system.store._transaction() as connection:
         connection.execute(
@@ -701,6 +713,47 @@ def test_v18_post_update_link_accepts_only_same_resource_running_once(
                 "WHERE job_id=?",
                 (str(uuid.uuid4()), job.job_id),
             )
+
+
+def test_periodic_cycle_does_not_duplicate_post_update_resource(tmp_path: Path) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        system.authority,
+        system.store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    outcomes = scheduler.run_once()
+    assert [outcome.resource_id for outcome in outcomes] == [job.resource_id]
+    assert host.calls == 1
+
+
+def test_vmid_reuse_cannot_satisfy_an_old_resource_post_update_request(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    _break_incarnation_continuity_at_the_same_locator(system.store, system.authority)
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        system.authority,
+        system.store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    outcomes = scheduler.run_post_update_once()
+    assert len(outcomes) == 1
+    assert outcomes[0].status == "conflict"
+    assert host.calls == 0
+    assert system.authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
 
 
 def test_the_execution_gate_runs_before_the_mutation_stage(tmp_path: Path) -> None:
