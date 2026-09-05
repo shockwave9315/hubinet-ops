@@ -860,15 +860,47 @@ class InventoryAuthority:
         """
 
         with self._store._read_transaction() as connection:
-            rows = connection.execute(
-                "SELECT request.job_id, request.resource_id "
-                "FROM package_update_post_scan_requests request "
-                "LEFT JOIN package_scan_runs run "
-                "ON run.scan_run_id=request.scan_run_id "
-                "WHERE request.scan_run_id IS NULL OR run.lifecycle='running' "
-                "ORDER BY request.requested_at, request.job_id"
-            ).fetchall()
+            rows = self._pending_post_update_package_scan_request_rows(connection)
         return tuple((str(row["job_id"]), str(row["resource_id"])) for row in rows)
+
+    @staticmethod
+    def _pending_post_update_package_scan_request_rows(
+        connection: sqlite3.Connection, *, resource_id: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Select requests whose one owed refresh has not terminalized.
+
+        This is the single durable lifecycle definition shared by the scan
+        scheduler, publication, approval, and update-job authority. An
+        unclaimed request and its linked RUNNING scan are pending; the linked
+        scan's first real terminal 0/N/UNKNOWN result ends the fence without
+        deleting the immutable request history.
+        """
+
+        resource_filter = (
+            " AND request.resource_id=?" if resource_id is not None else ""
+        )
+        parameters = (resource_id,) if resource_id is not None else ()
+        return connection.execute(
+            "SELECT request.job_id, request.resource_id, request.requested_at, "
+            "request.scan_run_id FROM package_update_post_scan_requests request "
+            "LEFT JOIN package_scan_runs run "
+            "ON run.scan_run_id=request.scan_run_id "
+            "WHERE (request.scan_run_id IS NULL OR run.lifecycle='running')"
+            + resource_filter
+            + " ORDER BY request.requested_at, request.job_id",
+            parameters,
+        ).fetchall()
+
+    def _post_update_package_scan_is_pending(
+        self, connection: sqlite3.Connection, resource_id: str
+    ) -> bool:
+        """Whether retained scan data is observation-only for this resource."""
+
+        return bool(
+            self._pending_post_update_package_scan_request_rows(
+                connection, resource_id=resource_id
+            )
+        )
 
     def issue_post_update_package_scan(self, job_id: str) -> PackageScanRun:
         """Atomically claim one durable request into one normal scan run."""
@@ -1198,6 +1230,13 @@ class InventoryAuthority:
             )
             if str(run["resource_id"]) != canonical_resource_id:
                 raise AuthorityConflict("reviewed package scan belongs to another resource")
+            if self._post_update_package_scan_is_pending(
+                connection, canonical_resource_id
+            ):
+                raise AuthorityConflict(
+                    "package plan authority is unavailable while the required "
+                    "post-update package refresh is pending"
+                )
 
             latest_sequence = connection.execute(
                 "SELECT MAX(attempt_sequence) FROM package_scan_runs WHERE resource_id=?",
@@ -1654,6 +1693,14 @@ class InventoryAuthority:
                         "resource_unsupported",
                         "package update jobs support LXC resources only",
                     )
+                if self._post_update_package_scan_is_pending(
+                    connection, canonical_resource_id
+                ):
+                    raise PackageUpdateIssuanceRefused(
+                        "source_authority_unavailable",
+                        "package plan authority is unavailable while the required "
+                        "post-update package refresh is pending",
+                    )
 
                 approval = connection.execute(
                     "SELECT * FROM package_plan_approvals WHERE resource_id=?",
@@ -2093,6 +2140,17 @@ class InventoryAuthority:
             and self._package_scan_source_context_is_current(connection, job)
         ):
             return _PackageUpdateJobAuthorityState.STALE, None
+        if self._post_update_package_scan_is_pending(
+            connection, str(job["resource_id"])
+        ):
+            # This is unreachable for jobs issued by the repaired authority,
+            # but closes execution for a job issued by an older v18 runtime in
+            # the pre-refresh gap. Once the owed scan terminalizes, its new
+            # exact result decides whether the frozen job is still current.
+            return (
+                _PackageUpdateJobAuthorityState.TEMPORARILY_UNAVAILABLE,
+                "the required post-update package refresh is still pending",
+            )
 
         current = self._latest_package_scan_row(connection, str(job["resource_id"]))
         if current is None:

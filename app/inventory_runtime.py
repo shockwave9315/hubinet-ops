@@ -809,9 +809,11 @@ def create_read_only_app(
         except PackageUpdateIssuanceRefused as exc:
             # The authority already decided AND named the refusal; this
             # renders it. Two members of that set are genuinely retryable --
-            # a package scan that is still running, and a Hubinet product
-            # update holding the maintenance fence -- and both say "ask again
-            # shortly" rather than "your plan is wrong", so they get 503.
+            # package-scan authority that is temporarily unavailable (a
+            # running scan or an owed post-update refresh), and a Hubinet
+            # product update holding the maintenance fence -- and both say
+            # "ask again shortly" rather than "your plan is wrong", so they
+            # get 503.
             status = 503 if exc.reason in _RETRYABLE_ISSUANCE_REFUSALS else 409
             raise _package_update_error(status, exc.reason, str(exc)) from exc
         except AuthorityConflict as exc:

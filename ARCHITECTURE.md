@@ -107,8 +107,15 @@ deadline independent of post-update wakes. Reconfiguring the interval
 explicitly re-anchors that deadline from the reconfiguration instant; no other
 wake does. Publication retains the last real scan result and separately exposes
 `post_update_scan_pending` from durable request state until the linked fresh
-scan reaches any terminal 0/N/UNKNOWN result. `app/package_scan_host_control.py` sends one bounded JSON
-request over a dedicated pinned-key SSH connection to the bootstrap PVE node.
+scan reaches any terminal 0/N/UNKNOWN result. While that durable request is
+unclaimed or its linked scan is still RUNNING, the retained result is
+observation only: publication marks its approval stale/non-approvable and the
+authority refuses both approval and new update-job issuance. The same
+transaction that commits a job SUCCEEDED creates the request, and both that
+transaction and issuance take SQLite's one writer lock, so there is no
+post-success authority gap. `app/package_scan_host_control.py` sends one
+bounded JSON request over a dedicated pinned-key SSH connection to the
+bootstrap PVE node.
 The PVE forced helper accepts only `scan_packages`, rechecks live type/node/
 status before each fixed operation, and uses fixed `pct exec` shapes for OS
 inspection, `apt-get update -qq`, `apt-get -s upgrade`, and the

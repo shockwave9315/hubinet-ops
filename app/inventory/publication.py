@@ -107,13 +107,9 @@ class InventoryPublication:
             latest_by_resource = {str(row["resource_id"]): row for row in scan_rows}
             pending_post_update_resources = {
                 str(row["resource_id"])
-                for row in connection.execute(
-                    "SELECT request.resource_id "
-                    "FROM package_update_post_scan_requests request "
-                    "LEFT JOIN package_scan_runs run "
-                    "ON run.scan_run_id=request.scan_run_id "
-                    "WHERE request.scan_run_id IS NULL OR run.lifecycle='running'"
-                ).fetchall()
+                for row in self._authority._pending_post_update_package_scan_request_rows(
+                    connection
+                )
             }
             retained_by_resource: dict[str, Any] = {}
             if pending_post_update_resources:
@@ -336,7 +332,11 @@ class InventoryPublication:
                 post_update_scan_pending=post_update_scan_pending,
             ),
             "package_plan_approval": self._package_plan_approval(
-                connection, row, scan, approval
+                connection,
+                row,
+                scan,
+                approval,
+                post_update_scan_pending=post_update_scan_pending,
             ),
             "health_contract": InventoryPublication._health_contract(
                 row, health_contract
@@ -532,10 +532,16 @@ class InventoryPublication:
         return base
 
     def _package_plan_approval(
-        self, connection, resource, current_scan, approval
+        self,
+        connection,
+        resource,
+        current_scan,
+        approval,
+        *,
+        post_update_scan_pending: bool = False,
     ) -> dict[str, Any]:
         approvable = False
-        if current_scan is not None:
+        if current_scan is not None and not post_update_scan_pending:
             approvable = self._authority._package_scan_is_current_and_approvable(
                 connection, current_scan
             )

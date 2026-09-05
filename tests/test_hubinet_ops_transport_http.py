@@ -319,6 +319,7 @@ async def test_finding3_missing_package_scan_field_is_backward_compatible_not_sc
     assert scan.os is None
     assert scan.packages == ()
     assert scan.pending_count is None
+    assert scan.post_update_scan_pending is False
     assert scan.plan_fingerprint is None
     assert scan.reboot_required is None
     assert scan.error is None
@@ -352,6 +353,95 @@ async def test_finding3_present_valid_package_scan_field_still_parses(
     result = await transport.fetch_resource_snapshot()
 
     assert result.resources[0].package_scan == scan
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wire_value", "expected"),
+    [
+        (None, False),
+        (False, False),
+        (True, True),
+    ],
+    ids=("missing", "false", "true"),
+)
+async def test_post_update_scan_pending_supports_only_the_missing_field_default(
+    hass: HomeAssistant, aioclient_mock, wire_value, expected: bool
+) -> None:
+    scan = PackageScanSnapshot(
+        status=PackageScanStatus.FAILED,
+        scan_run_id="11111111-1111-1111-1111-111111111111",
+        started_at="2026-08-28T12:00:00+00:00",
+        completed_at="2026-08-28T12:05:00+00:00",
+        post_update_scan_pending=expected,
+        error=PackageScanError(
+            classification="metadata_refresh_failed",
+            message="APT metadata refresh failed",
+        ),
+    )
+    payload = _snapshot_json(
+        _fixture_snapshot(
+            resource(
+                RESOURCE_CT,
+                ResourceType.LXC,
+                101,
+                "Cloudflared",
+                package_scan=scan,
+            )
+        )
+    )
+    package_scan = _package_scan_json(scan)
+    if wire_value is None:
+        package_scan.pop("post_update_scan_pending")
+    else:
+        package_scan["post_update_scan_pending"] = wire_value
+    payload["resources"][0]["package_scan"] = package_scan
+    aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=payload)
+
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+    result = await transport.fetch_resource_snapshot()
+
+    assert result.resources[0].package_scan.post_update_scan_pending is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", (None, 1, "false"))
+async def test_present_malformed_post_update_scan_pending_still_fails(
+    hass: HomeAssistant, aioclient_mock, malformed
+) -> None:
+    scan = PackageScanSnapshot(
+        status=PackageScanStatus.FAILED,
+        scan_run_id="11111111-1111-1111-1111-111111111111",
+        started_at="2026-08-28T12:00:00+00:00",
+        completed_at="2026-08-28T12:05:00+00:00",
+        error=PackageScanError(
+            classification="metadata_refresh_failed",
+            message="APT metadata refresh failed",
+        ),
+    )
+    payload = _snapshot_json(
+        _fixture_snapshot(
+            resource(
+                RESOURCE_CT,
+                ResourceType.LXC,
+                101,
+                "Cloudflared",
+                package_scan=scan,
+            )
+        )
+    )
+    package_scan = _package_scan_json(scan)
+    package_scan["post_update_scan_pending"] = malformed
+    payload["resources"][0]["package_scan"] = package_scan
+    aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=payload)
+
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+    with pytest.raises(HubinetOpsInvalidResponse):
+        await transport.fetch_resource_snapshot()
 
 
 @pytest.mark.asyncio
