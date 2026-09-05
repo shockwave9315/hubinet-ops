@@ -57,9 +57,10 @@ PACKAGE_UPDATE_ISSUANCE_REFUSALS: frozenset[str] = frozenset(
         #: The supplied ``request_id`` was already used for a different
         #: resource or approval.
         "request_id_conflict",
-        #: Current plan authority is genuinely undecidable right now (a newer
-        #: package scan is still running), rather than proven stale.  The
-        #: operator may simply ask again once it finishes.
+        #: Current plan authority is genuinely undecidable right now: a newer
+        #: package scan is still running, or a required post-update refresh is
+        #: unclaimed/linked and not yet terminal. This is temporary rather
+        #: than proven stale; the operator may ask again once the scan ends.
         "source_authority_unavailable",
         #: A Hubinet PRODUCT update holds the exclusive maintenance fence.
         #: Starting a workload update now would let a product update replace

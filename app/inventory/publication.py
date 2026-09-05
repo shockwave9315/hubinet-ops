@@ -104,9 +104,46 @@ class InventoryPublication:
                 "WHERE latest.resource_id=p.resource_id) "
                 "ORDER BY p.resource_id"
             ).fetchall()
-            scan_by_resource = {
-                str(row["resource_id"]): row for row in scan_rows
+            latest_by_resource = {str(row["resource_id"]): row for row in scan_rows}
+            pending_post_update_resources = {
+                str(row["resource_id"])
+                for row in self._authority._pending_post_update_package_scan_request_rows(
+                    connection
+                )
             }
+            retained_by_resource: dict[str, Any] = {}
+            if pending_post_update_resources:
+                # The newest run that actually REACHED a terminal result.
+                retained_by_resource = {
+                    str(row["resource_id"]): row
+                    for row in connection.execute(
+                        "SELECT p.* FROM package_scan_runs p "
+                        "WHERE p.lifecycle='completed' AND p.attempt_sequence=("
+                        "SELECT MAX(done.attempt_sequence) FROM package_scan_runs done "
+                        "WHERE done.resource_id=p.resource_id "
+                        "AND done.lifecycle='completed') "
+                        "ORDER BY p.resource_id"
+                    ).fetchall()
+                }
+            # F2's post-success refresh contract: while any durable refresh
+            # request for this resource is pending, a newer RUNNING attempt
+            # must not erase the last real terminal 0/N/UNKNOWN result. This
+            # covers both an unclaimed request blocked behind an ordinary
+            # single-flight scan and the request's own linked running scan.
+            # The pending fact is exposed independently. Nothing is
+            # synthesized: without any terminal run, publication remains
+            # honestly `not_scanned`.
+            scan_by_resource: dict[str, Any] = {}
+            for resource_id, row in latest_by_resource.items():
+                if (
+                    resource_id in pending_post_update_resources
+                    and str(row["lifecycle"]) == "running"
+                ):
+                    retained = retained_by_resource.get(resource_id)
+                    if retained is not None:
+                        scan_by_resource[resource_id] = retained
+                    continue
+                scan_by_resource[resource_id] = row
             approval_rows = connection.execute(
                 "SELECT * FROM package_plan_approvals ORDER BY resource_id"
             ).fetchall()
@@ -151,12 +188,19 @@ class InventoryPublication:
                 # even regress across an ordinary clock correction. See
                 # PackageUpdateJob.issuance_sequence's own docstring.
                 job_by_resource[str(row["resource_id"])] = row
+            # Keyed by the run they belong to, and selected over TERMINAL runs
+            # only -- the same rule `scan_by_resource` publishes by, so the
+            # displayed header, pending count, fingerprint and package list
+            # always describe one single scan_run_id. Keying on the global
+            # newest attempt instead would silently yield no package rows the
+            # moment any newer run was still running.
             package_rows = connection.execute(
                 "SELECT package.* FROM package_scan_packages package "
                 "JOIN package_scan_runs run USING(scan_run_id) "
                 "WHERE run.outcome='success' AND run.attempt_sequence=("
                 "SELECT MAX(latest.attempt_sequence) FROM package_scan_runs latest "
-                "WHERE latest.resource_id=run.resource_id) "
+                "WHERE latest.resource_id=run.resource_id "
+                "AND latest.lifecycle='completed') "
                 "ORDER BY run.resource_id, package.package_index"
             ).fetchall()
             packages_by_run: dict[str, list[Any]] = {}
@@ -176,6 +220,7 @@ class InventoryPublication:
                     packages_by_run,
                     health_contract_by_resource.get(str(row["resource_id"])),
                     job_by_resource.get(str(row["resource_id"])),
+                    str(row["resource_id"]) in pending_post_update_resources,
                 )
                 for row in resource_rows
             )
@@ -253,6 +298,7 @@ class InventoryPublication:
         packages_by_run: Mapping[str, list[Any]],
         health_contract,
         package_update_job,
+        post_update_scan_pending: bool,
     ) -> dict[str, Any]:
         return {
             "resource_id": str(row["resource_id"]),
@@ -280,10 +326,17 @@ class InventoryPublication:
             "effective_capabilities": (),
             "state": json.loads(str(row["facts_json"])),
             "package_scan": InventoryPublication._package_scan(
-                row, scan, packages_by_run
+                row,
+                scan,
+                packages_by_run,
+                post_update_scan_pending=post_update_scan_pending,
             ),
             "package_plan_approval": self._package_plan_approval(
-                connection, row, scan, approval
+                connection,
+                row,
+                scan,
+                approval,
+                post_update_scan_pending=post_update_scan_pending,
             ),
             "health_contract": InventoryPublication._health_contract(
                 row, health_contract
@@ -297,7 +350,11 @@ class InventoryPublication:
 
     @staticmethod
     def _package_scan(
-        resource, scan, packages_by_run: Mapping[str, list[Any]]
+        resource,
+        scan,
+        packages_by_run: Mapping[str, list[Any]],
+        *,
+        post_update_scan_pending: bool = False,
     ) -> dict[str, Any]:
         base = {
             "status": "unsupported" if resource["resource_type"] == "qemu" else "not_scanned",
@@ -306,6 +363,7 @@ class InventoryPublication:
             "completed_at": None,
             "os": None,
             "pending_count": None,
+            "post_update_scan_pending": post_update_scan_pending,
             "plan_fingerprint": None,
             "reboot_required": None,
             "packages": (),
@@ -474,10 +532,16 @@ class InventoryPublication:
         return base
 
     def _package_plan_approval(
-        self, connection, resource, current_scan, approval
+        self,
+        connection,
+        resource,
+        current_scan,
+        approval,
+        *,
+        post_update_scan_pending: bool = False,
     ) -> dict[str, Any]:
         approvable = False
-        if current_scan is not None:
+        if current_scan is not None and not post_update_scan_pending:
             approvable = self._authority._package_scan_is_current_and_approvable(
                 connection, current_scan
             )

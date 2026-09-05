@@ -1,10 +1,13 @@
 """Dark bounded SSH transport for same-job PVE rollback operations.
 
-**Not production-reachable and not deployed.** No production configuration,
-key, or `authorized_keys` entry exists for this channel:
-`app/inventory_runtime.py` never constructs it, and neither bootstrap nor the
-product updater installs its helper or key. It is instantiated only by
-hermetic tests in this stage.
+**Production-reachable and deployed.** `app/inventory_runtime.py` constructs
+exactly one of these for the package-update worker, and both bootstrap and
+the product updater install its forced-command helper together with a key
+dedicated to this boundary alone
+(`deploy/lib/bootstrap-update-boundaries.sh`,
+`deploy/lib/update-boundaries.sh`). Deploying the channel broadens no PVE API
+privilege: the deployed identity stays `Sys.Audit` plus `VM.Audit`, and a
+rollback is still only ever started by an explicit operator request.
 
 It is a separate, purpose-specific client from the scan, snapshot, and
 mutation transports, and deliberately does not resurrect the removed generic
@@ -67,8 +70,8 @@ _OPERATIONS = (
 
 #: Outcomes the dark helper may report, mapped onto the orchestrator's typed
 #: vocabulary. ``absent`` maps to UNCERTAIN, never FAILED: a canonical absence
-#: is an observation, not proof that an already-submitted asynchronous PVE
-#: rollback terminated.
+#: is an observation, not proof that an already-submitted PVE rollback
+#: terminated; the detached host runner may still be active.
 _OUTCOMES = {
     "completed": RollbackOperationOutcome.COMPLETED,
     "failed": RollbackOperationOutcome.FAILED,
@@ -82,6 +85,14 @@ _OUTCOMES = {
 #: value stays uncertain, so an older helper that does not report submission
 #: proof can never accidentally release a fenced job.
 _HELPER_NOT_SUBMITTED = "not_submitted"
+
+#: The helper's exact classification for "the per-VMID lease is already
+#: held", which is precisely what this operation's own detached destructive
+#: runner does for the whole of its physical `pvesh`. Matched exactly against
+#: the typed classification and never against reason text, so an unknown or
+#: malformed value stays plain UNKNOWN. It proves nothing on its own -- see
+#: `HostRollbackResult.host_operation_in_progress`.
+_HELPER_OPERATION_IN_PROGRESS = "operation_in_progress"
 
 
 class SshPackageUpdateRollbackHostControl:
@@ -382,6 +393,9 @@ class SshPackageUpdateRollbackHostControl:
             return self._uncertain(
                 rollback_operation_id,
                 f"host-control reported a failure ({classification})",
+                host_operation_in_progress=(
+                    classification == _HELPER_OPERATION_IN_PROGRESS
+                ),
             )
         outcome = _OUTCOMES.get(str(payload.get("outcome")))
         if outcome is None:
@@ -507,9 +521,15 @@ class SshPackageUpdateRollbackHostControl:
         return False
 
     @staticmethod
-    def _uncertain(rollback_operation_id: str, reason: str) -> HostRollbackResult:
+    def _uncertain(
+        rollback_operation_id: str,
+        reason: str,
+        *,
+        host_operation_in_progress: bool = False,
+    ) -> HostRollbackResult:
         return HostRollbackResult(
             outcome=RollbackOperationOutcome.UNCERTAIN,
             rollback_operation_id=rollback_operation_id,
             reason=reason,
+            host_operation_in_progress=host_operation_in_progress,
         )

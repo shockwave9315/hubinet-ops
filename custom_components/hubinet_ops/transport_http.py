@@ -261,6 +261,11 @@ def _package_scan_snapshot(payload: Any) -> PackageScanSnapshot:
             else None
         ),
         pending_count=payload.get("pending_count"),
+        # Staggered 0.5 upgrades: a backend predating durable post-update
+        # refresh requests cannot owe one, so only a genuinely missing field
+        # defaults to false. A present malformed value still reaches the
+        # contract validator unchanged and fails closed.
+        post_update_scan_pending=payload.get("post_update_scan_pending", False),
         plan_fingerprint=payload.get("plan_fingerprint"),
         reboot_required=payload.get("reboot_required"),
         packages=tuple(

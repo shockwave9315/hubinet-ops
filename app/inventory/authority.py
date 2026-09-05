@@ -836,82 +836,203 @@ class InventoryAuthority:
 
         canonical_resource_id = _require_uuid(resource_id, "resource_id")
         scan_run_id = _new_uuid()
-        source_authority_rejected = False
         with self._store._transaction() as connection:
-            row = self._require_package_scan_target(connection, canonical_resource_id)
-            if str(row["resource_type"]) != "lxc":
-                raise AuthorityConflict("package scanning supports LXC resources only")
-            source_id = str(row["inventory_source_id"])
-            decision_time = self._authority_decision_time()
-            self._materialize_due_expiry_in_transaction(
-                connection, source_id, now=decision_time
+            source_authority_rejected = not self._insert_package_scan_run(
+                connection,
+                resource_id=canonical_resource_id,
+                scan_run_id=scan_run_id,
             )
-            if not self._source_has_current_authority_in_transaction(
-                connection, source_id
-            ):
-                source_authority_rejected = True
-            else:
-                source = self._require_source_row(connection, source_id)
-                endpoint = self._require_active_endpoint_row(connection, source_id)
-                health = connection.execute(
-                    "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
-                    (source_id,),
-                ).fetchone()
-                if health is None:
-                    raise AuthorityInvariantError(
-                        "inventory source must have exactly one runtime health record"
-                    )
-                previous = connection.execute(
-                    "SELECT MAX(attempt_sequence) FROM package_scan_runs WHERE resource_id=?",
-                    (canonical_resource_id,),
-                ).fetchone()[0]
-                attempt_sequence = (int(previous) if previous is not None else 0) + 1
-                try:
-                    connection.execute(
-                        "INSERT INTO package_scan_runs("
-                        "scan_run_id, resource_id, inventory_source_id, "
-                        "committed_source_config_revision, committed_endpoint_id, "
-                        "committed_canonical_transport_locator, "
-                        "committed_canonicalization_contract_version, "
-                        "committed_transport_trust_revision, provider_contract_version, "
-                        "attempt_sequence, "
-                        "expected_binding_id, expected_locator_generation, "
-                        "expected_resource_continuity_revision, expected_vmid, "
-                        "expected_node_id, expected_node_name, started_at, lifecycle) "
-                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
-                        (
-                            scan_run_id,
-                            canonical_resource_id,
-                            source_id,
-                            int(health["committed_source_config_revision"]),
-                            str(health["committed_endpoint_id"]),
-                            str(health["committed_canonical_transport_locator"]),
-                            int(health["committed_canonicalization_contract_version"]),
-                            int(health["committed_transport_trust_revision"]),
-                            int(source["provider_contract_version"]),
-                            attempt_sequence,
-                            str(row["binding_id"]),
-                            int(row["locator_generation"]),
-                            int(row["resource_continuity_revision"]),
-                            int(row["vmid"]),
-                            str(row["current_node_id"]),
-                            str(row["external_node_name"]),
-                            _timestamp(decision_time),
-                        ),
-                    )
-                except sqlite3.IntegrityError as exc:
-                    raise AuthorityConflict(
-                        "resource already has an active package scan"
-                    ) from exc
-                self._bump_global_revisions(
-                    connection, inventory_changed=False, published_changed=True
-                )
         # Preserve any expiry materialized above while refusing the scan row.
         if source_authority_rejected:
             raise AuthorityConflict(
                 "package scan requires fresh healthy inventory authority"
             )
         return self._store.package_scan_run(scan_run_id)
+
+    def pending_post_update_package_scans(self) -> tuple[tuple[str, str], ...]:
+        """Return durable successful-job scan requests needing execution.
+
+        A request survives a crash between SUCCEEDED and the scheduler wake.
+        A linked RUNNING scan also survives one because this operation is
+        read-only apart from allowed APT metadata refresh and is safe to
+        continue. Once that same run publishes 0, N, or UNKNOWN, it is no
+        longer returned. This makes one successful job own exactly one run.
+        """
+
+        with self._store._read_transaction() as connection:
+            rows = self._pending_post_update_package_scan_request_rows(connection)
+        return tuple((str(row["job_id"]), str(row["resource_id"])) for row in rows)
+
+    @staticmethod
+    def _pending_post_update_package_scan_request_rows(
+        connection: sqlite3.Connection, *, resource_id: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Select requests whose one owed refresh has not terminalized.
+
+        This is the single durable lifecycle definition shared by the scan
+        scheduler, publication, approval, and update-job authority. An
+        unclaimed request and its linked RUNNING scan are pending; the linked
+        scan's first real terminal 0/N/UNKNOWN result ends the fence without
+        deleting the immutable request history.
+        """
+
+        resource_filter = (
+            " AND request.resource_id=?" if resource_id is not None else ""
+        )
+        parameters = (resource_id,) if resource_id is not None else ()
+        return connection.execute(
+            "SELECT request.job_id, request.resource_id, request.requested_at, "
+            "request.scan_run_id FROM package_update_post_scan_requests request "
+            "LEFT JOIN package_scan_runs run "
+            "ON run.scan_run_id=request.scan_run_id "
+            "WHERE (request.scan_run_id IS NULL OR run.lifecycle='running')"
+            + resource_filter
+            + " ORDER BY request.requested_at, request.job_id",
+            parameters,
+        ).fetchall()
+
+    def _post_update_package_scan_is_pending(
+        self, connection: sqlite3.Connection, resource_id: str
+    ) -> bool:
+        """Whether retained scan data is observation-only for this resource."""
+
+        return bool(
+            self._pending_post_update_package_scan_request_rows(
+                connection, resource_id=resource_id
+            )
+        )
+
+    def issue_post_update_package_scan(self, job_id: str) -> PackageScanRun:
+        """Atomically claim one durable request into one normal scan run."""
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        scan_run_id = _new_uuid()
+        source_authority_rejected = False
+        linked_scan_run_id: str | None = None
+        with self._store._transaction() as connection:
+            request = connection.execute(
+                "SELECT * FROM package_update_post_scan_requests WHERE job_id=?",
+                (canonical_job_id,),
+            ).fetchone()
+            if request is None:
+                raise AuthorityNotFound("post-update package scan request does not exist")
+            if request["scan_run_id"] is not None:
+                linked_scan_run_id = str(request["scan_run_id"])
+            else:
+                job = self._require_package_update_job_row(connection, canonical_job_id)
+                if (
+                    str(job["status"]) != PackageUpdateJobStatus.SUCCEEDED.value
+                    or str(job["checkpoint"])
+                    != PackageUpdateCheckpoint.HEALTH_COMPLETED.value
+                    or str(job["health_outcome"]) != HealthOutcome.PASSED.value
+                    or str(job["resource_id"]) != str(request["resource_id"])
+                ):
+                    raise AuthorityInvariantError(
+                        "post-update package scan request is not owned by a succeeded job"
+                    )
+                source_authority_rejected = not self._insert_package_scan_run(
+                    connection,
+                    resource_id=str(request["resource_id"]),
+                    scan_run_id=scan_run_id,
+                )
+                if not source_authority_rejected:
+                    updated = connection.execute(
+                        "UPDATE package_update_post_scan_requests SET scan_run_id=? "
+                        "WHERE job_id=? AND scan_run_id IS NULL",
+                        (scan_run_id, canonical_job_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise AuthorityConflict(
+                            "post-update package scan request lost durable ownership"
+                        )
+                    linked_scan_run_id = scan_run_id
+        if source_authority_rejected:
+            raise AuthorityConflict(
+                "post-update package scan requires fresh healthy inventory authority"
+            )
+        if linked_scan_run_id is None:  # pragma: no cover - defensive
+            raise AuthorityInvariantError("post-update scan claim produced no scan run")
+        return self._store.package_scan_run(linked_scan_run_id)
+
+    def _insert_package_scan_run(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        resource_id: str,
+        scan_run_id: str,
+    ) -> bool:
+        """Insert one running scan inside the caller's transaction.
+
+        Returns ``False`` only when source authority is not currently fresh;
+        any expiry materialized while reaching that decision remains part of
+        the caller's transaction.
+        """
+
+        row = self._require_package_scan_target(connection, resource_id)
+        if str(row["resource_type"]) != "lxc":
+            raise AuthorityConflict("package scanning supports LXC resources only")
+        source_id = str(row["inventory_source_id"])
+        decision_time = self._authority_decision_time()
+        self._materialize_due_expiry_in_transaction(
+            connection, source_id, now=decision_time
+        )
+        if not self._source_has_current_authority_in_transaction(
+            connection, source_id
+        ):
+            return False
+        source = self._require_source_row(connection, source_id)
+        endpoint = self._require_active_endpoint_row(connection, source_id)
+        health = connection.execute(
+            "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
+            (source_id,),
+        ).fetchone()
+        if health is None:
+            raise AuthorityInvariantError(
+                "inventory source must have exactly one runtime health record"
+            )
+        previous = connection.execute(
+            "SELECT MAX(attempt_sequence) FROM package_scan_runs WHERE resource_id=?",
+            (resource_id,),
+        ).fetchone()[0]
+        attempt_sequence = (int(previous) if previous is not None else 0) + 1
+        try:
+            connection.execute(
+                "INSERT INTO package_scan_runs("
+                "scan_run_id, resource_id, inventory_source_id, "
+                "committed_source_config_revision, committed_endpoint_id, "
+                "committed_canonical_transport_locator, "
+                "committed_canonicalization_contract_version, "
+                "committed_transport_trust_revision, provider_contract_version, "
+                "attempt_sequence, expected_binding_id, expected_locator_generation, "
+                "expected_resource_continuity_revision, expected_vmid, "
+                "expected_node_id, expected_node_name, started_at, lifecycle) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
+                (
+                    scan_run_id,
+                    resource_id,
+                    source_id,
+                    int(health["committed_source_config_revision"]),
+                    str(health["committed_endpoint_id"]),
+                    str(health["committed_canonical_transport_locator"]),
+                    int(health["committed_canonicalization_contract_version"]),
+                    int(health["committed_transport_trust_revision"]),
+                    int(source["provider_contract_version"]),
+                    attempt_sequence,
+                    str(row["binding_id"]),
+                    int(row["locator_generation"]),
+                    int(row["resource_continuity_revision"]),
+                    int(row["vmid"]),
+                    str(row["current_node_id"]),
+                    str(row["external_node_name"]),
+                    _timestamp(decision_time),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise AuthorityConflict("resource already has an active package scan") from exc
+        self._bump_global_revisions(
+            connection, inventory_changed=False, published_changed=True
+        )
+        return True
 
     def package_scan_context_is_current(self, scan_run_id: str) -> bool:
         canonical_run_id = _require_uuid(scan_run_id, "scan_run_id")
@@ -1040,13 +1161,24 @@ class InventoryAuthority:
         return self._store.package_scan_run(canonical_run_id)
 
     def recover_interrupted_package_scans(self) -> tuple[str, ...]:
-        """Terminalize every pre-restart running attempt as unknown/interrupted."""
+        """Terminalize ordinary pre-restart attempts as unknown/interrupted.
+
+        A running scan linked to a successful update's durable request is the
+        sole exception: the independent scheduler resumes that SAME run after
+        startup. The scan boundary performs metadata refresh and simulation,
+        never package mutation, so repeating its host read is safe and keeps
+        the successful job's one requested fresh scan restart-live without
+        creating another attempt.
+        """
 
         completed_at = _timestamp(self._now())
         with self._store._transaction() as connection:
             rows = connection.execute(
                 "SELECT scan_run_id FROM package_scan_runs "
-                "WHERE lifecycle='running' ORDER BY resource_id, attempt_sequence"
+                "WHERE lifecycle='running' AND NOT EXISTS ("
+                "SELECT 1 FROM package_update_post_scan_requests request "
+                "WHERE request.scan_run_id=package_scan_runs.scan_run_id) "
+                "ORDER BY resource_id, attempt_sequence"
             ).fetchall()
             recovered = tuple(str(row["scan_run_id"]) for row in rows)
             for scan_run_id in recovered:
@@ -1098,6 +1230,13 @@ class InventoryAuthority:
             )
             if str(run["resource_id"]) != canonical_resource_id:
                 raise AuthorityConflict("reviewed package scan belongs to another resource")
+            if self._post_update_package_scan_is_pending(
+                connection, canonical_resource_id
+            ):
+                raise AuthorityConflict(
+                    "package plan authority is unavailable while the required "
+                    "post-update package refresh is pending"
+                )
 
             latest_sequence = connection.execute(
                 "SELECT MAX(attempt_sequence) FROM package_scan_runs WHERE resource_id=?",
@@ -1554,6 +1693,14 @@ class InventoryAuthority:
                         "resource_unsupported",
                         "package update jobs support LXC resources only",
                     )
+                if self._post_update_package_scan_is_pending(
+                    connection, canonical_resource_id
+                ):
+                    raise PackageUpdateIssuanceRefused(
+                        "source_authority_unavailable",
+                        "package plan authority is unavailable while the required "
+                        "post-update package refresh is pending",
+                    )
 
                 approval = connection.execute(
                     "SELECT * FROM package_plan_approvals WHERE resource_id=?",
@@ -1993,6 +2140,17 @@ class InventoryAuthority:
             and self._package_scan_source_context_is_current(connection, job)
         ):
             return _PackageUpdateJobAuthorityState.STALE, None
+        if self._post_update_package_scan_is_pending(
+            connection, str(job["resource_id"])
+        ):
+            # This is unreachable for jobs issued by the repaired authority,
+            # but closes execution for a job issued by an older v18 runtime in
+            # the pre-refresh gap. Once the owed scan terminalizes, its new
+            # exact result decides whether the frozen job is still current.
+            return (
+                _PackageUpdateJobAuthorityState.TEMPORARILY_UNAVAILABLE,
+                "the required post-update package refresh is still pending",
+            )
 
         current = self._latest_package_scan_row(connection, str(job["resource_id"]))
         if current is None:
@@ -2422,8 +2580,9 @@ class InventoryAuthority:
         IMMEDIATE below holds this store's one writer lock across it.
 
         ``submit`` MUST be the host's submission-only operation and nothing
-        else: no PVE task polling, no package mutation, no rollback, and no
-        recursive authority mutation. It is invoked at most once, only when
+        else: it durably starts one detached fixed runner, with no PVE task
+        polling, package mutation, rollback, or recursive authority mutation.
+        It is invoked at most once, only when
         current authority still holds, and only while this transaction still
         owns the writer lock. A stale authority context refuses BEFORE
         ``submit`` is ever called, so the host is never asked to submit
@@ -3238,7 +3397,7 @@ class InventoryAuthority:
         across the (potentially multi-minute) host round trip a caller must
         perform first, outside any transaction -- exactly like every other
         snapshot-safety transition holds the writer lock only across a
-        single bounded operation, never across PVE's own asynchronous work.
+        single bounded detached submission, never across physical PVE work.
 
         The job must currently be ACTIVE at exactly ``snapshot_confirmed``:
         this gate exists specifically for the window after the job's own
@@ -4452,6 +4611,29 @@ class InventoryAuthority:
                     "unknown_probe_indexes": unknown_indexes,
                 },
             )
+            if passed:
+                # The request and SUCCEEDED are one atomic authority fact.
+                # No host I/O happens here: the independent package-scan
+                # scheduler later claims this row into one ordinary scan run.
+                connection.execute(
+                    "INSERT INTO package_update_post_scan_requests("
+                    "job_id, resource_id, requested_at, scan_run_id) "
+                    "VALUES(?, ?, ?, NULL)",
+                    (canonical_job_id, str(job["resource_id"]), recorded_at),
+                )
+                self._append_package_update_job_event(
+                    connection,
+                    job_id=canonical_job_id,
+                    created_at=recorded_at,
+                    level=PackageUpdateEventLevel.INFO,
+                    stage=PackageUpdateCheckpoint.HEALTH_COMPLETED,
+                    event_type=PackageUpdateEventType.POST_UPDATE_SCAN_REQUESTED,
+                    message=(
+                        "successful update requested one fresh package scan "
+                        "from the independent scan scheduler"
+                    ),
+                    details={"resource_id": str(job["resource_id"])},
+                )
             self._bump_global_revisions(
                 connection, inventory_changed=False, published_changed=True
             )
@@ -4920,9 +5102,9 @@ class InventoryAuthority:
         already-run update must never gate its compensation.
 
         ``submit`` MUST be the host's submission-only rollback operation and
-        nothing else: it journals ``submitted`` durably, invokes `pvesh
-        create` once, journals whatever UPID PVE returns, and returns. It
-        never polls the asynchronous `vzrollback` task to completion. That
+        nothing else: it journals ``submitted`` durably, starts one detached
+        fixed `pvesh create`, and returns. Exact task identity is promoted
+        later from the completed durable capture. That
         bound is machine-enforced by ``app/inventory/contention_policy.py``
         and the rollback transport's own timeout ceiling.
 
@@ -4963,7 +5145,7 @@ class InventoryAuthority:
 
         Pure evidence preservation, and deliberately unconditional on the
         resource/locator context: a task identity is the only thing that lets
-        a restarted backend reattach to an asynchronous `vzrollback` instead
+        a restarted backend reattach to the exact attributed `vzrollback` instead
         of guessing, so a context that moved on must never discard it.
         Write-once at the SQL layer; a conflicting identity raises.
         """

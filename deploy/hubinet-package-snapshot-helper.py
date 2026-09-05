@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Forced-command PVE boundary for Hubinet's job-owned pre-update snapshots.
 
-**Not deployed.** Neither `deploy/bootstrap-proxmox-0.5.sh` nor
-`deploy/update-proxmox-0.5.sh` installs this file, its forced-command
-`authorized_keys` entry, or any key for it, and no additional PVE privilege is
-provisioned for it. It is a separate file and a separate logical privilege
-boundary from `deploy/hubinet-package-scan-helper.py`, which stays scan-only
-and is never extended into a mutation helper.
+**Deployed.** Both `deploy/bootstrap-proxmox-0.5.sh` and
+`deploy/update-proxmox-0.5.sh` install this file, its forced-command
+`authorized_keys` entry, and a key used by this boundary alone
+(`deploy/lib/bootstrap-update-boundaries.sh`,
+`deploy/lib/update-boundaries.sh`). No additional PVE API privilege is
+provisioned for it: the deployed identity stays `Sys.Audit` plus `VM.Audit`.
+It is a separate file and a separate logical privilege boundary from
+`deploy/hubinet-package-scan-helper.py`, which stays scan-only and is never
+extended into a mutation helper.
 
 Scope is deliberately minimal:
 
@@ -19,26 +22,30 @@ Scope is deliberately minimal:
   constants plus validated typed fields.
 - **No snapshot delete operation, and no rollback submission.**
 
-`ensure_pre_update_snapshot_submitted` is submission-only: it never polls a
-PVE task to completion. It journals the submission, invokes `pvesh create`
-at most once, records the task identity the instant PVE returns one, and
-returns immediately. The backend DOES hold a lock of its own across this
+`ensure_pre_update_snapshot_submitted` is submission-only. Local `pvesh` CLI
+waits for the physical snapshot worker and prints its final UPID only after
+that worker exits, so this helper never invokes it synchronously. It journals
+`submitted`, starts exactly one double-forked fixed runner holding the VMID
+lease, and returns while the runner durably captures bounded raw stdout and
+stderr. Later inspect promotes only an exact completed capture to
+`task_known`; incomplete or ambiguous capture stays UNKNOWN. The backend DOES hold a lock of its own across this
 call -- its own authority store's short SQLite writer transaction, so a
 concurrent Hubinet writer cannot invalidate this job's authority in the gap
 between proving it and submitting (see
 `InventoryAuthority.execute_snapshot_submission_if_current` in
 `app/inventory/authority.py`, and the sized wait policy in
 `app/inventory/contention_policy.py`). What the backend must never do is hold
-that lock, or any lock, across PVE's own asynchronous task completion: this
-call itself never blocks for that, and neither does any caller-side
+that lock, or any lock, across PVE's physical snapshot work: this call
+detaches before that work completes, and neither does any caller-side
 transaction wrapping it. `inspect_job_snapshot_state` reads the journaled
 task's status exactly once, synchronously, alongside a fresh canonical
 listing -- fast, bounded, and repeatable from the caller's own bounded retry
 loop -- so completion is observed by the caller polling this cheap read
 operation, never by the mutating one blocking internally.
 
-`inspect_job_snapshot_state` is read-only with respect to PVE and the
-journal -- no write, no `pvesh create` -- but it is serialized against the
+`inspect_job_snapshot_state` is read-only with respect to PVE -- no `pvesh
+create` -- but may promote a completed durable capture in the host journal.
+It is serialized against the
 SAME per-VMID mutation lease (`VmidMutationLock`) the mutating operation
 uses, acquired non-blocking and released before it returns. A backend that
 lost its own lock (crashed, restarted, or is simply a later attempt) cannot
@@ -107,12 +114,12 @@ Mutations are serialized per VMID with a kernel `flock`.
 
 ## Verified PVE semantics this file depends on
 
-- `POST /nodes/{node}/lxc/{vmid}/snapshot` returns a UPID immediately
-  (`fork_worker('vzsnapshot', ...)`); `pvesh create` prints that UPID rather
-  than waiting, so the task identity can be journaled before polling.
-- `pvesh` resolves the endpoint's own `proxyto => node` by running
-  `pvesh --noproxy` on the owning cluster member over PVE's existing root
-  SSH trust, so no per-node Hubinet credential is needed here.
+- The API handler uses `fork_worker('vzsnapshot', ...)`, but local `pvesh` runs
+  in CLI mode with synchronous worker semantics: worker output may precede the
+  final machine-readable UPID and the command waits for physical completion.
+- Current package-update mutation is single-node only. PVE's fixed
+  `/cluster/status` local-node fact must equal `expected_node` before
+  `submitted`, and the destructive argv includes `--noproxy`.
 - `GET /nodes/{node}/tasks/{upid}/status` gives `status` in
   `running`/`stopped` plus an optional `exitstatus`; PVE's own rule treats
   `OK` and `WARNINGS: <n>` as non-errors.
@@ -134,6 +141,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import selectors
 import subprocess
 import sys
@@ -145,6 +153,21 @@ from typing import Any
 MAX_REQUEST_BYTES = 8192
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 120.0
+#: The deadline the detached destructive capture child runs under: none.
+#: Read/preflight commands keep :data:`COMMAND_TIMEOUT_SECONDS`; only the
+#: already-detached physical `pvesh create ... /snapshot` uses this, so that
+#: its exact terminal UPID survives an operation slower than any local clock.
+DETACHED_CAPTURE_NO_DEADLINE: float | None = None
+MAX_CAPTURE_OUTPUT_BYTES = 512 * 1024
+#: Bounded wait for the detached executor's one READY byte.
+#:
+#: This is NOT a deadline on any physical PVE work, and it never becomes one:
+#: the executor cannot reach `pvesh` before it is released, and it is released
+#: only after `submitted` is durable. Giving up here is therefore still PROOF
+#: that no mutation was submitted for this attempt -- the release byte is
+#: never written on that path. It exists so that a wedged local handoff cannot
+#: hang the forced-command request forever.
+DETACHED_READY_TIMEOUT_SECONDS = 30.0
 
 JOURNAL_DIRECTORY = Path("/var/lib/hubinet-ops/snapshot-operations")
 
@@ -195,7 +218,7 @@ class CommandResult:
     output_exceeded: bool = False
 
 
-Runner = Callable[[tuple[str, ...], float, int], CommandResult]
+Runner = Callable[[tuple[str, ...], float | None, int], CommandResult]
 
 
 class RequestError(ValueError):
@@ -207,6 +230,12 @@ class RequestError(ValueError):
 #: backend terminalize a job that is already past its write-ahead uncertainty
 #: checkpoint, so it is derived from the durable journal, never from an error
 #: name, a canonical absence, a timeout, or a transport failure.
+#: The two bytes of the detached-runner handshake. READY is the executor
+#: proving it exists; GO is the ONLY thing that permits physical PVE work,
+#: and is written only after the durable `submitted` record.
+_DETACHED_READY = b"R"
+_DETACHED_GO = b"G"
+
 SUBMISSION_NOT_SUBMITTED = "not_submitted"
 SUBMISSION_UNKNOWN = "may_have_been_submitted"
 
@@ -233,8 +262,28 @@ class SnapshotError(RuntimeError):
 
 
 def _run_bounded(
-    argv: tuple[str, ...], timeout: float, max_output: int
+    argv: tuple[str, ...], timeout: float | None, max_output: int
 ) -> CommandResult:
+    """Run one fixed argv, optionally under a single wall-clock deadline.
+
+    ``timeout=None`` means NO local wall clock at all. It exists for exactly
+    one caller: the already-detached destructive `pvesh create ... /snapshot`
+    child (:func:`_run_capture_child`). A physical PVE snapshot legitimately
+    outlives any arbitrary local submission deadline, and killing that
+    `pvesh` mid-flight destroys the only channel through which its exact
+    terminal UPID can still be captured -- while the PVE worker itself keeps
+    running. Since the operation is already journaled ``submitted`` and can
+    NEVER be resubmitted, a local timeout buys nothing and costs task
+    attribution, so the detached child is allowed to reach its natural
+    terminal result instead.
+
+    Every ordinary read/preflight caller keeps its bounded deadline: they run
+    inline in the backend's request and must not be able to hang it.
+
+    The output bound is NOT a deadline and is enforced identically in both
+    modes: excessive output still kills the process and still fails closed.
+    """
+
     process = subprocess.Popen(  # noqa: S603 - every argv shape is fixed below
         argv,
         stdin=subprocess.DEVNULL,
@@ -253,12 +302,16 @@ def _run_bounded(
     exceeded = False
     try:
         while selector.get_map():
-            remaining = timeout - (time.monotonic() - started)
-            if remaining <= 0:
-                timed_out = True
-                process.kill()
-                break
-            for key, _ in selector.select(min(remaining, 0.2)):
+            if timeout is None:
+                wait_for = 0.2
+            else:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    timed_out = True
+                    process.kill()
+                    break
+                wait_for = min(remaining, 0.2)
+            for key, _ in selector.select(wait_for):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -272,7 +325,11 @@ def _run_bounded(
                 break
     finally:
         selector.close()
-        process.wait(timeout=5)
+        if timeout is None and not exceeded:
+            # No wall clock anywhere on this path: reap the natural exit.
+            process.wait()
+        else:
+            process.wait(timeout=5)
     return CommandResult(
         process.returncode,
         bytes(output["stdout"][: max_output + 1]),
@@ -540,6 +597,9 @@ class OperationJournal:
         # The id is a validated canonical UUID, so this never escapes.
         return self._directory / f"op-{snapshot_operation_id}.json"
 
+    def _capture_path(self, snapshot_operation_id: str, suffix: str) -> Path:
+        return self._directory / f"op-{snapshot_operation_id}.pvesh-{suffix}"
+
     def ensure_directory(self) -> None:
         self._directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -630,6 +690,117 @@ class OperationJournal:
         finally:
             os.close(directory_descriptor)
 
+    def write_completed_capture(
+        self, snapshot_operation_id: str, result: CommandResult
+    ) -> None:
+        """Durably publish bounded raw pvesh output, completion marker last."""
+
+        self.ensure_directory()
+        streams = {"stdout": result.stdout, "stderr": result.stderr}
+        metadata: dict[str, Any] = {
+            "capture_version": 1,
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "output_exceeded": result.output_exceeded,
+        }
+        for name, payload in streams.items():
+            path = self._capture_path(snapshot_operation_id, name)
+            temporary = path.with_name(path.name + ".tmp")
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            try:
+                offset = 0
+                while offset < len(payload):
+                    written = os.write(descriptor, payload[offset:])
+                    if written <= 0:
+                        raise OSError("capture write made no progress")
+                    offset += written
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, path)
+            metadata[f"{name}_size"] = len(payload)
+            metadata[f"{name}_sha256"] = hashlib.sha256(payload).hexdigest()
+        marker = self._capture_path(snapshot_operation_id, "complete.json")
+        temporary = marker.with_name(marker.name + ".tmp")
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        try:
+            payload = _canonical_json(metadata).encode("ascii")
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("capture marker write made no progress")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, marker)
+        directory_descriptor = os.open(self._directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+
+    def read_completed_capture(
+        self, snapshot_operation_id: str
+    ) -> CommandResult | None:
+        marker = self._capture_path(snapshot_operation_id, "complete.json")
+        try:
+            metadata = json.loads(marker.read_bytes().decode("ascii"))
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(metadata, dict) or metadata.get("capture_version") != 1:
+            return None
+        streams: dict[str, bytes] = {}
+        for name in ("stdout", "stderr"):
+            size = metadata.get(f"{name}_size")
+            digest = metadata.get(f"{name}_sha256")
+            if type(size) is not int or not 0 <= size <= MAX_CAPTURE_OUTPUT_BYTES + 1:
+                return None
+            if not isinstance(digest, str) or len(digest) != 64:
+                return None
+            try:
+                payload = self._capture_path(snapshot_operation_id, name).read_bytes()
+            except OSError:
+                return None
+            if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+                return None
+            streams[name] = payload
+        returncode = metadata.get("returncode")
+        timed_out = metadata.get("timed_out")
+        output_exceeded = metadata.get("output_exceeded")
+        if (
+            type(returncode) is not int
+            or type(timed_out) is not bool
+            or type(output_exceeded) is not bool
+        ):
+            return None
+        return CommandResult(
+            returncode,
+            streams["stdout"],
+            streams["stderr"],
+            timed_out,
+            output_exceeded,
+        )
+
+    def cleanup_capture(self, snapshot_operation_id: str) -> None:
+        for suffix in ("stdout", "stderr", "complete.json"):
+            try:
+                self._capture_path(snapshot_operation_id, suffix).unlink()
+            except FileNotFoundError:
+                pass
+        directory_descriptor = os.open(self._directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+
 
 class VmidMutationLock:
     """Kernel `flock` serializing snapshot mutation per VMID."""
@@ -659,6 +830,13 @@ class VmidMutationLock:
     def __exit__(self, *_exc: object) -> None:
         if self._descriptor is not None:
             fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    def detach(self) -> None:
+        """Hand the inherited lease to a detached child without unlocking it."""
+
+        if self._descriptor is not None:
             os.close(self._descriptor)
             self._descriptor = None
 
@@ -720,6 +898,33 @@ def revalidate_live_target(runner: Runner, vmid: int, expected_node: str) -> Non
         raise SnapshotError("stale_target", "guest node changed after job issuance")
     if row.get("status") not in ("running", "stopped"):
         raise SnapshotError("guest_unavailable", "guest status is not snapshot-ready")
+
+
+def read_local_node(runner: Runner) -> str:
+    """Return PVE's one typed local-node identity; never guess from hostname."""
+
+    rows = _json_command(
+        runner,
+        ("pvesh", "get", "/cluster/status", "--output-format", "json"),
+        "local PVE node identity",
+        max_output=1024 * 1024,
+    )
+    if not isinstance(rows, list):
+        raise SnapshotError("execution_failed", "local PVE node identity was malformed")
+    local_nodes = [
+        row.get("name")
+        for row in rows
+        if isinstance(row, Mapping)
+        and row.get("type") == "node"
+        and row.get("local") in (1, True)
+    ]
+    if (
+        len(local_nodes) != 1
+        or not isinstance(local_nodes[0], str)
+        or not NODE_RE.fullmatch(local_nodes[0])
+    ):
+        raise SnapshotError("execution_failed", "local PVE node identity was ambiguous")
+    return local_nodes[0]
 
 
 def read_container_lock(
@@ -962,6 +1167,11 @@ def _inspect(
                 submission_state="sealed_not_submitted",
             )
 
+        if record is not None and submission_state == "submitted":
+            recovered_upid = _promote_completed_capture(request, journal, record)
+            if recovered_upid is not None:
+                record = {**record, "phase": "task_known", "task_upid": recovered_upid}
+                submission_state = "task_known"
         task_upid = record.get("task_upid") if record else None
         task = None
         try:
@@ -1130,11 +1340,276 @@ def _finalize(
     )
 
 
+def _run_capture_child(
+    runner: Runner,
+    journal: OperationJournal,
+    operation_id: str,
+    argv: tuple[str, ...],
+) -> None:
+    """Run the already-detached destructive `pvesh` to its natural end.
+
+    Deliberately passes ``DETACHED_CAPTURE_NO_DEADLINE`` (``None``) instead of
+    :data:`COMMAND_TIMEOUT_SECONDS`. This child is not in the backend's
+    request path -- the writer transaction already returned after the
+    double-fork handoff -- so no caller is waiting on this wall clock, and a
+    physical snapshot that legitimately runs longer than any local submission
+    deadline must not have its `pvesh` killed: doing so throws away the exact
+    terminal UPID while the PVE worker carries on regardless, leaving a
+    permanently unattributable ``submitted`` operation that may never be
+    resubmitted.
+
+    The output bound still applies unchanged, and excessive output still
+    fails closed. A host crash or reboot still leaves durable ``submitted``
+    uncertainty; that case is deliberately NOT made retryable here. No PID
+    ever becomes authority, and at-most-once submission is untouched: this
+    function only observes an already-submitted operation.
+    """
+
+    try:
+        result = runner(
+            argv, DETACHED_CAPTURE_NO_DEADLINE, MAX_CAPTURE_OUTPUT_BYTES
+        )
+        journal.write_completed_capture(operation_id, result)
+    except Exception:
+        # No completion marker means UNKNOWN. The submitted journal is retained.
+        return
+
+
+class DetachedRunner:
+    """A prepared detached executor that cannot touch PVE until released.
+
+    Between :func:`_prepare_detached_runner` returning and :meth:`release`,
+    the executor process exists, has inherited this operation's VMID lease,
+    has proved both by sending its READY byte, and is blocked reading its
+    release pipe. It has run no `pvesh` and cannot run one.
+
+    :meth:`release` writes the single GO byte and is the ONLY thing that lets
+    physical PVE work begin, so it must be called strictly AFTER the durable
+    ``submitted`` write. :meth:`abandon` closes the pipe instead, which the
+    executor reads as EOF and answers by exiting having mutated nothing --
+    which is why every failure before the GO byte is provably a
+    non-submission rather than an ambiguity.
+    """
+
+    __slots__ = ("_release_write",)
+
+    def __init__(self, release_write: int) -> None:
+        self._release_write = release_write
+
+    def release(self) -> None:
+        """Permit the physical mutation. ONLY after `submitted` is durable."""
+
+        descriptor, self._release_write = self._release_write, -1
+        if descriptor < 0:
+            return
+        try:
+            os.write(descriptor, _DETACHED_GO)
+        except OSError:
+            # The executor died before consuming its release byte, so it ran
+            # nothing -- but `submitted` is already durable and this process
+            # cannot prove which side of the boundary the failure fell on.
+            # Deliberately NOT downgraded to a non-submission: the operation
+            # stays submitted, no capture appears, and the caller's bounded
+            # polling ends UNKNOWN and fenced. Never resubmitted.
+            pass
+        finally:
+            _close_quietly(descriptor)
+
+    def abandon(self) -> None:
+        """Refuse the executor permission to mutate, and let it exit."""
+
+        descriptor, self._release_write = self._release_write, -1
+        if descriptor >= 0:
+            _close_quietly(descriptor)
+
+
+def _close_quietly(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _await_ready(ready_read: int, timeout: float) -> bool:
+    """Wait, bounded, for the executor's one READY byte. EOF means it died."""
+
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            readable, _, _ = select.select([ready_read], [], [], remaining)
+        except OSError:
+            return False
+        if not readable:
+            return False
+        try:
+            chunk = os.read(ready_read, 1)
+        except OSError:
+            return False
+        if chunk == _DETACHED_READY:
+            return True
+        if not chunk:
+            return False
+
+
+def _detached_executor(
+    runner: Runner,
+    journal: OperationJournal,
+    operation_id: str,
+    argv: tuple[str, ...],
+    ready_write: int,
+    release_read: int,
+) -> None:
+    """The grandchild: prove existence, then WAIT to be allowed to mutate.
+
+    Every step that can fail on an ordinary loaded host -- opening
+    `/dev/null`, duplicating descriptors, writing READY -- happens before this
+    process is allowed anywhere near PVE, and a failure in any of them simply
+    means no READY is ever sent and the controlling helper never crosses its
+    durable submission boundary.
+    """
+
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for descriptor in (0, 1, 2):
+        os.dup2(devnull, descriptor)
+    if devnull > 2:
+        os.close(devnull)
+    # READY: this process exists, owns the inherited VMID lease, and holds
+    # everything it needs. It still may NOT touch PVE.
+    os.write(ready_write, _DETACHED_READY)
+    os.close(ready_write)
+    # GO, or EOF. EOF means the controlling helper never crossed its durable
+    # submission boundary, so this executor exits having submitted nothing.
+    if os.read(release_read, 1) != _DETACHED_GO:
+        return
+    _run_capture_child(runner, journal, operation_id, argv)
+
+
+def _prepare_detached_runner(
+    runner: Runner,
+    journal: OperationJournal,
+    operation_id: str,
+    argv: tuple[str, ...],
+    lease: VmidMutationLock,
+) -> DetachedRunner:
+    """Double-fork one fixed pvesh invocation, WITHOUT letting it start yet.
+
+    Returns only once the executor has proved it exists. Every ordinary local
+    handoff failure -- either fork hitting EAGAIN/ENOMEM, `setsid`, pipe or
+    descriptor exhaustion, the grandchild dying during setup -- raises here
+    instead, with `SUBMISSION_NOT_SUBMITTED`, because the executor is gated on
+    a release byte this path never writes. That is what stops a fork failure
+    from leaving an operation durably `submitted` that no runner can ever
+    complete and that may never be resubmitted.
+
+    Descriptor ownership is exact, so both directions get clean EOF:
+    the parent keeps only `ready_read`/`release_write`, and the grandchild
+    only `ready_write`/`release_read`.
+    """
+
+    try:
+        ready_read, ready_write = os.pipe()
+    except OSError as exc:
+        raise SnapshotError(
+            "execution_failed",
+            "host could not establish the detached snapshot runner",
+            submission=SUBMISSION_NOT_SUBMITTED,
+        ) from exc
+    try:
+        release_read, release_write = os.pipe()
+    except OSError as exc:
+        _close_quietly(ready_read)
+        _close_quietly(ready_write)
+        raise SnapshotError(
+            "execution_failed",
+            "host could not establish the detached snapshot runner",
+            submission=SUBMISSION_NOT_SUBMITTED,
+        ) from exc
+
+    try:
+        pid = os.fork()
+    except OSError as exc:
+        for descriptor in (ready_read, ready_write, release_read, release_write):
+            _close_quietly(descriptor)
+        raise SnapshotError(
+            "execution_failed",
+            "host could not establish the detached snapshot runner",
+            submission=SUBMISSION_NOT_SUBMITTED,
+        ) from exc
+
+    if pid == 0:
+        try:
+            os.close(ready_read)
+            os.close(release_write)
+            os.setsid()
+            if os.fork() > 0:
+                os._exit(0)
+            _detached_executor(
+                runner, journal, operation_id, argv, ready_write, release_read
+            )
+        finally:
+            # Any failure above exits WITHOUT sending READY, which is exactly
+            # how the controlling helper learns no executor exists.
+            os._exit(0)
+
+    _close_quietly(ready_write)
+    _close_quietly(release_read)
+    if not _await_ready(ready_read, DETACHED_READY_TIMEOUT_SECONDS):
+        _close_quietly(ready_read)
+        # Closing the release pipe is what guarantees the claim below: a
+        # grandchild that exists but was slow reads EOF and exits having run
+        # nothing, because the GO byte is never written on this path.
+        _close_quietly(release_write)
+        _reap(pid, block=False)
+        raise SnapshotError(
+            "execution_failed",
+            "detached snapshot runner did not confirm it was ready",
+            submission=SUBMISSION_NOT_SUBMITTED,
+        )
+    _close_quietly(ready_read)
+    _reap(pid, block=True)
+    # The executor exists and inherited the lease, so the caller hands its own
+    # descriptor over without unlocking. Only now is this irreversible.
+    lease.detach()
+    return DetachedRunner(release_write)
+
+
+def _reap(pid: int, *, block: bool) -> None:
+    """Collect the intermediate child. Never blocks on a failed handoff."""
+
+    try:
+        os.waitpid(pid, 0 if block else os.WNOHANG)
+    except OSError:
+        pass
+
+
+def _promote_completed_capture(
+    request: Mapping[str, Any], journal: OperationJournal, record: dict[str, Any]
+) -> str | None:
+    """Promote one complete, exact capture to task_known; never infer identity."""
+
+    result = journal.read_completed_capture(request["snapshot_operation_id"])
+    if result is None:
+        return None
+    upid = _extract_upid(result)
+    if upid is None:
+        return None
+    journal.write({**record, "phase": "task_known", "task_upid": upid})
+    journal.cleanup_capture(request["snapshot_operation_id"])
+    return upid
+
+
 def _ensure_submitted(
-    runner: Runner, request: Mapping[str, Any], journal: OperationJournal
+    runner: Runner,
+    request: Mapping[str, Any],
+    journal: OperationJournal,
+    *,
+    detach: bool,
 ) -> dict[str, Any]:
     fingerprint = request_fingerprint(request)
-    with VmidMutationLock(request["vmid"], journal.directory):
+    with VmidMutationLock(request["vmid"], journal.directory) as lease:
         record = journal.read(request["snapshot_operation_id"])
         if record is not None:
             if record["request_fingerprint"] != fingerprint:
@@ -1168,6 +1643,15 @@ def _ensure_submitted(
                 )
             if phase == "submitted":
                 # The genuinely uncertain window. NEVER resubmit here.
+                upid = _promote_completed_capture(request, journal, record)
+                if upid is not None:
+                    return _response(
+                        request,
+                        "uncertain",
+                        task_upid=upid,
+                        submission_state="task_known",
+                        reason="completed pvesh capture yielded the exact task identity",
+                    )
                 return _recover_submitted_without_task(
                     runner, request, journal, record
                 )
@@ -1225,6 +1709,12 @@ def _ensure_submitted(
         try:
             # Live target revalidation immediately before the mutation.
             revalidate_live_target(runner, request["vmid"], request["expected_node"])
+            local_node = read_local_node(runner)
+            if local_node != request["expected_node"]:
+                raise SnapshotError(
+                    "stale_target",
+                    "target guest is not owned by this local PVE node",
+                )
             lock = read_container_lock(
                 runner, request["vmid"], request["expected_node"]
             )
@@ -1286,29 +1776,68 @@ def _ensure_submitted(
                 submission_state="intent",
             )
 
-        record = {**record, "phase": "submitted"}
-        journal.write(record)
+        # Re-prove the live locator after the canonical reads, still before
+        # the uncertainty boundary and without any proxy routing.
+        revalidate_live_target(runner, request["vmid"], request["expected_node"])
 
         description = build_snapshot_description(request["ownership"])
-        result = _command(
-            runner,
-            (
-                "pvesh", "create",
-                f"/nodes/{request['expected_node']}/lxc/{request['vmid']}/snapshot",
-                "--snapname", request["snapshot_name"],
-                "--description", description,
-                "--output-format", "json",
-            ),
-            max_output=256 * 1024,
+        argv = (
+            "pvesh", "create",
+            f"/nodes/{request['expected_node']}/lxc/{request['vmid']}/snapshot",
+            "--snapname", request["snapshot_name"],
+            "--description", description,
+            "--noproxy",
+            "--output-format", "json",
         )
-        upid = _extract_upid(result)
+        # -------------------------------------------------------------------
+        # THE SUBMISSION BARRIER
+        #
+        #   prepare executor -> READY (exists, holds the lease, cannot mutate)
+        #     -> durable `submitted` write
+        #       -> GO (the only thing that permits physical `pvesh`)
+        #
+        # Both halves of the safety property hold at once. Physical PVE work
+        # cannot begin before the write-ahead record is durable, because the
+        # executor blocks until the GO byte. And the write-ahead record is not
+        # created merely because a runner was INTENDED: an ordinary local
+        # handoff failure raises above it, provably before any submission,
+        # rather than leaving an operation durably `submitted` that no runner
+        # can ever complete and that may never be resubmitted.
+        # -------------------------------------------------------------------
+        if detach:
+            executor = _prepare_detached_runner(
+                runner,
+                journal,
+                request["snapshot_operation_id"],
+                argv,
+                lease,
+            )
+            try:
+                record = {**record, "phase": "submitted"}
+                journal.write(record)
+            except Exception as exc:
+                # Still provably pre-submission: the executor is released by
+                # nothing but the byte below, and now never receives one.
+                executor.abandon()
+                raise SnapshotError(
+                    "execution_failed",
+                    "host could not durably journal this snapshot submission",
+                    submission=SUBMISSION_NOT_SUBMITTED,
+                ) from exc
+            executor.release()
+        else:
+            # Explicit injected-runner seam for hermetic tests only.
+            record = {**record, "phase": "submitted"}
+            journal.write(record)
+            _run_capture_child(runner, journal, request["snapshot_operation_id"], argv)
+        upid = _promote_completed_capture(request, journal, record)
         if upid is None:
             return _response(
                 request,
                 "uncertain",
                 reason=(
-                    "PVE snapshot submission returned no usable task identity; "
-                    "the operation may or may not have started"
+                    "snapshot submitted to detached host runner; exact task "
+                    "identity awaits durable capture recovery"
                 ),
                 submission_state="submitted",
             )
@@ -1329,21 +1858,37 @@ def _ensure_submitted(
 
 
 def _extract_upid(result: CommandResult) -> str | None:
-    if result.returncode != 0:
+    if result.returncode != 0 or result.timed_out or result.output_exceeded:
         return None
     try:
-        text = result.stdout.decode("utf-8").strip()
+        text = result.stdout.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    if not text:
+
+    stripped = text.strip()
+    if UPID_RE.fullmatch(stripped):
+        return stripped
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[int, str]] = []
+    for start, character in enumerate(text):
+        if character != '"':
+            continue
+        try:
+            decoded, end = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if (
+            isinstance(decoded, str)
+            and UPID_RE.fullmatch(decoded)
+            and not text[end:].strip()
+        ):
+            candidates.append((start, decoded))
+    if len(candidates) != 1:
         return None
-    try:
-        decoded = json.loads(text)
-    except ValueError:
-        decoded = text
-    if not isinstance(decoded, str) or not UPID_RE.fullmatch(decoded):
+    start, upid = candidates[0]
+    if "UPID:" in text[:start]:
         return None
-    return decoded
+    return upid
 
 
 def _recover_submitted_without_task(
@@ -1405,17 +1950,21 @@ def _recover_submitted_without_task(
 def handle_request(
     payload: Any,
     *,
-    runner: Runner = _run_bounded,
+    runner: Runner | None = None,
     journal: OperationJournal | None = None,
 ) -> dict[str, Any]:
     request = validate_request(payload)
     operation_journal = journal or OperationJournal()
+    detach = runner is None
+    effective_runner = _run_bounded if runner is None else runner
     try:
         if request["operation"] == "inspect_job_snapshot_state":
-            return _inspect(runner, request, operation_journal)
+            return _inspect(effective_runner, request, operation_journal)
         if request["operation"] == "seal_operation_never_submitted":
             return _seal_never_submitted(request, operation_journal)
-        return _ensure_submitted(runner, request, operation_journal)
+        return _ensure_submitted(
+            effective_runner, request, operation_journal, detach=detach
+        )
     except SnapshotError as exc:
         return {
             "response_version": 1,

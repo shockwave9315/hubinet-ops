@@ -34,6 +34,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+import sqlite3
 from threading import Barrier
 import uuid
 
@@ -47,14 +48,18 @@ from app.inventory import (
     HealthProbeOutcome,
     InventoryAuthority,
     InventoryAuthorityStore,
+    InventoryPublication,
     HostSubmissionState,
     ObservedSnapshot,
+    PackageScanFailure,
     PackageUpdateCheckpoint,
     PackageUpdateIssuanceRefused,
     PackageUpdateJobStatus,
     ProductUpdateFenceError,
     product_update_fence_path,
 )
+from app.package_scan import HostScanFailure, HostScanResult, expected_host_context
+from app.package_scan_scheduler import PackageScanScheduler
 from app.inventory_runtime import PackageUpdateRuntime, create_read_only_app
 from app.inventory_runtime_config import parse_r0_runtime_config
 from app.package_update_health import (
@@ -84,6 +89,7 @@ from tests.test_package_update_execution_gate import (
 )
 from tests.test_package_update_job_authority import (
     HEALTH_PROBES,
+    _add_approved_resource,
     _approved_system,
     _issue,
 )
@@ -96,7 +102,9 @@ from tests.test_package_update_rollback import (
     FakePve,
     HelperBackedHostControl as RollbackHostControl,
 )
+from tests.test_package_scan_authority import _reconcile
 from tests.test_package_update_snapshot_safety import (
+    _break_incarnation_continuity_at_the_same_locator,
     _canonical,
     _current_entry,
     _foreign_entry,
@@ -193,14 +201,18 @@ class ScriptedSnapshotHostControl:
 class ScriptedHealthHostControl:
     """A read-only health boundary with a scripted verdict per attempt."""
 
-    def __init__(self, *outcomes):
+    def __init__(self, *outcomes, before_evaluate=None):
         #: One entry per attempt: "passed", "failed", "unknown", or an
         #: exception instance to raise.
         self._outcomes = list(outcomes) or ["passed"]
+        self._before_evaluate = before_evaluate
         self.calls = 0
 
     def evaluate_health_contract(self, request):
         self.calls += 1
+        if self._before_evaluate is not None:
+            before_evaluate, self._before_evaluate = self._before_evaluate, None
+            before_evaluate()
         outcome = self._outcomes.pop(0) if self._outcomes else "passed"
         if isinstance(outcome, BaseException):
             raise outcome
@@ -463,6 +475,292 @@ def test_explicit_start_drives_the_whole_lifecycle_to_succeeded(
     assert "submit_same_job_rollback" not in system.rollback_host.calls
 
 
+class _PostUpdateScanHost:
+    def __init__(self, *, packages=(), failure: PackageScanFailure | None = None):
+        self.packages = tuple(packages)
+        self.failure = failure
+        self.calls = 0
+
+    def scan_packages(self, run):
+        self.calls += 1
+        if self.failure is not None:
+            raise HostScanFailure(self.failure, "fresh post-update scan failed")
+        return HostScanResult(
+            context=expected_host_context(run),
+            os_release='ID=debian\nVERSION_ID="12"\n',
+            native_architecture="amd64\n",
+            installed_inventory=_inventory_for(self.packages),
+            simulation_stdout=_simulation_for(self.packages),
+            reboot_required=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status", "expected_pending"),
+    [
+        ("zero", "success", 0),
+        ("nonzero", "success", 2),
+        ("unknown", "failed", None),
+    ],
+)
+def test_success_requests_one_real_scan_and_publishes_its_actual_result(
+    tmp_path: Path,
+    mode: str,
+    expected_status: str,
+    expected_pending: int | None,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    wakes: list[str] = []
+    system.worker.configure_post_update_scan_wake(lambda: wakes.append("wake"))
+
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    assert wakes == ["wake"]
+    assert system.authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+    assert "post_update_scan_requested" in system.events(job.job_id)
+    before_scan = next(
+        resource
+        for resource in InventoryPublication(
+            system.store, system.authority
+        ).read().resources
+        if resource["resource_id"] == job.resource_id
+    )["package_scan"]
+    assert before_scan["post_update_scan_pending"] is True
+
+    packages = system.scan.packages[:2] if mode == "nonzero" else ()
+    host = _PostUpdateScanHost(
+        packages=packages,
+        failure=(
+            PackageScanFailure.METADATA_REFRESH_FAILED
+            if mode == "unknown"
+            else None
+        ),
+    )
+    scheduler = PackageScanScheduler(
+        system.authority,
+        system.store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+
+    outcomes = scheduler.run_post_update_once()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].resource_id == job.resource_id
+    assert host.calls == 1
+    assert system.authority.pending_post_update_package_scans() == ()
+    latest = system.store.list_package_scan_runs(job.resource_id)[-1]
+    assert latest.outcome is not None and latest.outcome.value == expected_status
+    assert latest.pending_count == expected_pending
+    published = next(
+        resource
+        for resource in InventoryPublication(
+            system.store, system.authority
+        ).read().resources
+        if resource["resource_id"] == job.resource_id
+    )["package_scan"]
+    assert published["status"] == expected_status
+    assert published["pending_count"] == expected_pending
+    assert published["post_update_scan_pending"] is False
+    assert (
+        system.authority.package_update_job(job.job_id).status
+        is PackageUpdateJobStatus.SUCCEEDED
+    )
+
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.IDLE
+    InventoryPublication(system.store, system.authority).read()
+    assert scheduler.run_post_update_once() == ()
+    assert system.authority.pending_post_update_package_scans() == ()
+    assert wakes == ["wake"]
+    assert host.calls == 1
+
+
+def test_restart_before_post_update_scan_claim_preserves_one_request(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    path = system.store.path
+    system.store.close()
+    store = InventoryAuthorityStore(path, now=system.clock)
+    authority = InventoryAuthority(store, now=system.clock)
+    assert authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    outcomes = scheduler.run_post_update_once()
+    assert len(outcomes) == 1
+    assert host.calls == 1
+    assert authority.pending_post_update_package_scans() == ()
+    assert scheduler.run_post_update_once() == ()
+    store.close()
+
+
+def test_restart_after_post_update_scan_claim_resumes_same_run_once(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    claimed = system.authority.issue_post_update_package_scan(job.job_id)
+    assert claimed.lifecycle.value == "running"
+    pending = next(
+        resource
+        for resource in InventoryPublication(
+            system.store, system.authority
+        ).read().resources
+        if resource["resource_id"] == job.resource_id
+    )["package_scan"]
+    assert pending["post_update_scan_pending"] is True
+
+    path = system.store.path
+    system.store.close()
+    store = InventoryAuthorityStore(path, now=system.clock)
+    authority = InventoryAuthority(store, now=system.clock)
+    assert authority.recover_interrupted_package_scans() == ()
+    assert authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    outcomes = scheduler.run_post_update_once()
+    assert len(outcomes) == 1
+    assert outcomes[0].scan_run_id == claimed.scan_run_id
+    assert authority.pending_post_update_package_scans() == ()
+    assert scheduler.run_post_update_once() == ()
+    assert host.calls == 1
+    latest = store.list_package_scan_runs(job.resource_id)[-1]
+    assert latest.scan_run_id == claimed.scan_run_id
+    assert latest.outcome is not None and latest.outcome.value == "success"
+    assert latest.pending_count == 0
+    published = next(
+        resource
+        for resource in InventoryPublication(store, authority).read().resources
+        if resource["resource_id"] == job.resource_id
+    )["package_scan"]
+    assert published["status"] == "success"
+    assert published["pending_count"] == 0
+    assert published["post_update_scan_pending"] is False
+    store.close()
+
+
+def test_v18_post_update_link_accepts_only_same_resource_running_once(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    terminal = system.authority.issue_package_scan(job.resource_id)
+    system.authority.finalize_successful_package_scan(
+        terminal.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=(),
+        reboot_required=None,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="link is invalid"):
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_post_scan_requests SET scan_run_id=? "
+                "WHERE job_id=?",
+                (terminal.scan_run_id, job.job_id),
+            )
+
+    other_resource, _, _ = _add_approved_resource(system.store, system.authority)
+    wrong_resource = system.authority.issue_package_scan(other_resource.resource_id)
+    with pytest.raises(sqlite3.IntegrityError, match="link is invalid"):
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_post_scan_requests SET scan_run_id=? "
+                "WHERE job_id=?",
+                (wrong_resource.scan_run_id, job.job_id),
+            )
+
+    running = system.authority.issue_package_scan(job.resource_id)
+    with system.store._transaction() as connection:
+        connection.execute(
+            "UPDATE package_update_post_scan_requests SET scan_run_id=? WHERE job_id=?",
+            (running.scan_run_id, job.job_id),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="link is invalid"):
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_post_scan_requests SET scan_run_id=NULL "
+                "WHERE job_id=?",
+                (job.job_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="link is invalid"):
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_post_scan_requests SET scan_run_id=? "
+                "WHERE job_id=?",
+                (str(uuid.uuid4()), job.job_id),
+            )
+
+
+def test_periodic_cycle_does_not_duplicate_post_update_resource(tmp_path: Path) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        system.authority,
+        system.store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    outcomes = scheduler.run_once()
+    assert [outcome.resource_id for outcome in outcomes] == [job.resource_id]
+    assert host.calls == 1
+
+
+def test_vmid_reuse_cannot_satisfy_an_old_resource_post_update_request(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    _break_incarnation_continuity_at_the_same_locator(system.store, system.authority)
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        system.authority,
+        system.store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    outcomes = scheduler.run_post_update_once()
+    assert len(outcomes) == 1
+    assert outcomes[0].status == "conflict"
+    assert host.calls == 0
+    assert system.authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+
+
 def test_the_execution_gate_runs_before_the_mutation_stage(tmp_path: Path) -> None:
     """The gate is not skipped because mutation re-proves material itself.
 
@@ -658,12 +956,14 @@ def test_a_failed_health_verdict_leaves_the_job_rollback_capable_and_idle(
     assert final.rollback_may_have_started_at is None
     assert final.rollback_operation_id is None
     assert system.rollback_host.calls == []
+    assert system.authority.pending_post_update_package_scans() == ()
 
     # And a further wake changes nothing: it is not a retry loop.
     again = system.worker.run_once()
     assert again.stop_reason == "health_failed"
     assert system.health_host.calls == 1
     assert system.rollback_host.calls == []
+    assert system.authority.pending_post_update_package_scans() == ()
 
 
 def test_an_unknown_health_verdict_writes_no_verdict_and_never_retries(
@@ -690,6 +990,7 @@ def test_an_unknown_health_verdict_writes_no_verdict_and_never_retries(
     assert final.health_probe_results == ()
     assert system.health_host.calls == 1
     assert system.rollback_host.calls == []
+    assert system.authority.pending_post_update_package_scans() == ()
 
 
 def test_an_explicit_resume_re_evaluates_read_only_health_and_can_succeed(
@@ -1278,6 +1579,9 @@ class _DeferredWorker:
 
     def wake(self) -> None:
         self.wakes += 1
+
+    def configure_post_update_scan_wake(self, wake) -> None:
+        self.post_update_scan_wake = wake
 
     def start(self) -> None:  # pragma: no cover - the app may start it
         pass
@@ -1952,3 +2256,777 @@ def test_the_fence_route_refuses_while_a_workload_job_is_active(api) -> None:
     assert response.status_code == 409
     assert response.json()["detail"]["error"] == "product_update_fence_unavailable"
     assert api.get("/r0/v1/package-update/maintenance-fence").json()["held"] is False
+
+
+# ===========================================================================
+# F2 POST-SUCCESS REFRESH: A RUNNING REFRESH MUST NOT ERASE THE LAST REAL
+# TERMINAL RESULT.
+#
+# The refresh a successful update requests is published INDEPENDENTLY through
+# `post_update_scan_pending`. While it is still running, the resource keeps
+# showing the last real terminal 0/N/UNKNOWN observation it actually has --
+# publishing `scanning` there would blank `pending_count`, the plan
+# fingerprint and the whole package list, which is precisely the state an
+# operator has just been told the update changed.
+# ===========================================================================
+
+
+def _published_scan(store, authority, resource_id: str):
+    return _published_resource(store, authority, resource_id)["package_scan"]
+
+
+def _published_resource(store, authority, resource_id: str):
+    return next(
+        resource
+        for resource in InventoryPublication(store, authority).read().resources
+        if resource["resource_id"] == resource_id
+    )
+
+
+def _terminalize_a_fresh_scan(system, resource_id: str, *, packages=None, failure=None):
+    """Give the resource one more REAL terminal scan before the refresh."""
+
+    run = system.authority.issue_package_scan(resource_id)
+    if failure is not None:
+        return system.authority.finalize_failed_package_scan(
+            run.scan_run_id,
+            failure_class=failure,
+            error_message="scan failed for this test",
+        )
+    return system.authority.finalize_successful_package_scan(
+        run.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=tuple(packages or ()),
+        reboot_required=None,
+    )
+
+
+def _claim_post_update_refresh(system, job_id: str):
+    claimed = system.authority.issue_post_update_package_scan(job_id)
+    assert claimed.lifecycle.value == "running"
+    return claimed
+
+
+def test_unclaimed_post_update_refresh_retains_observation_but_fences_authority(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    published = _published_resource(system.store, system.authority, job.resource_id)
+    assert published["package_scan"]["scan_run_id"] == system.scan.scan_run_id
+    assert published["package_scan"]["pending_count"] == len(system.scan.packages)
+    assert published["package_scan"]["post_update_scan_pending"] is True
+    assert published["package_plan_approval"]["status"] == "stale"
+    assert published["package_plan_approval"]["approvable"] is False
+    assert (
+        published["package_plan_approval"]["approval_id"]
+        == system.approval.approval_id
+    )
+
+    before = system.store.package_plan_approval(job.resource_id)
+    revision = system.store.backend_instance().published_state_revision
+    with pytest.raises(AuthorityConflict, match="post-update package refresh"):
+        system.authority.approve_package_plan(
+            job.resource_id,
+            system.scan.scan_run_id,
+            system.scan.plan_fingerprint,
+        )
+    assert system.store.package_plan_approval(job.resource_id) == before
+    assert system.store.backend_instance().published_state_revision == revision
+
+    with pytest.raises(PackageUpdateIssuanceRefused) as refusal:
+        _issue(system.authority, system.resource, system.approval)
+    assert refusal.value.reason == "source_authority_unavailable"
+    assert system.store.active_package_update_job() is None
+    assert len(system.store.list_package_update_jobs()) == 1
+
+    # Idempotency is resolved before current authority: retrying the request
+    # that already owns this succeeded job returns it even though its refresh
+    # fence now exists. It never creates a second job.
+    repeated = system.authority.issue_package_update_job(
+        job.resource_id, job.approval_id, job.request_id
+    )
+    assert repeated.job_id == job.job_id
+    assert len(system.store.list_package_update_jobs()) == 1
+
+
+def test_linked_running_post_update_refresh_retains_observation_but_fences_authority(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    claimed = _claim_post_update_refresh(system, job.job_id)
+
+    published = _published_resource(system.store, system.authority, job.resource_id)
+    assert published["package_scan"]["scan_run_id"] == system.scan.scan_run_id
+    assert published["package_scan"]["scan_run_id"] != claimed.scan_run_id
+    assert published["package_scan"]["post_update_scan_pending"] is True
+    assert published["package_plan_approval"]["status"] == "stale"
+    assert published["package_plan_approval"]["approvable"] is False
+
+    before = system.store.package_plan_approval(job.resource_id)
+    with pytest.raises(AuthorityConflict, match="post-update package refresh"):
+        system.authority.approve_package_plan(
+            job.resource_id,
+            system.scan.scan_run_id,
+            system.scan.plan_fingerprint,
+        )
+    assert system.store.package_plan_approval(job.resource_id) == before
+
+    with pytest.raises(PackageUpdateIssuanceRefused) as refusal:
+        _issue(system.authority, system.resource, system.approval)
+    assert refusal.value.reason == "source_authority_unavailable"
+    assert system.store.active_package_update_job() is None
+    assert len(system.store.list_package_update_jobs()) == 1
+
+
+def test_operator_routes_render_pending_refresh_as_temporary_authority_unavailability(
+    tmp_path: Path,
+) -> None:
+    api = ApiSystem(tmp_path)
+    try:
+        started = api.start()
+        assert started.status_code == 202
+        api.bind(started.json()["job_id"])
+        assert api.run_worker().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+        approval = api.client.put(
+            f"/r0/v1/resources/{api.resource_id}/package-plan-approval",
+            headers={"Authorization": f"Bearer {BEARER}"},
+            json={
+                "scan_run_id": api.seed.scan.scan_run_id,
+                "plan_fingerprint": api.seed.scan.plan_fingerprint,
+            },
+        )
+        assert approval.status_code == 409
+        assert "post-update package refresh" in approval.json()["detail"]
+
+        second = api.start()
+        assert second.status_code == 503
+        assert second.json()["detail"]["error"] == "source_authority_unavailable"
+        assert len(api.store.list_package_update_jobs()) == 1
+    finally:
+        api.close()
+
+
+def test_successful_post_update_refresh_restores_authority_to_its_new_exact_plan(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    first_job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    claimed = _claim_post_update_refresh(system, first_job.job_id)
+    refreshed = system.authority.finalize_successful_package_scan(
+        claimed.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=system.scan.packages[:1],
+        reboot_required=None,
+    )
+
+    published = _published_resource(
+        system.store, system.authority, first_job.resource_id
+    )
+    assert published["package_scan"]["scan_run_id"] == refreshed.scan_run_id
+    assert published["package_scan"]["post_update_scan_pending"] is False
+    assert published["package_plan_approval"]["status"] == "stale"
+    assert published["package_plan_approval"]["approvable"] is True
+
+    with pytest.raises(PackageUpdateIssuanceRefused) as refusal:
+        _issue(system.authority, system.resource, system.approval)
+    assert refusal.value.reason == "plan_not_approved"
+
+    refreshed_approval = system.authority.approve_package_plan(
+        first_job.resource_id,
+        refreshed.scan_run_id,
+        refreshed.plan_fingerprint,
+    )
+    second = _issue(system.authority, system.resource, refreshed_approval)
+    assert second.current_plan_scan_run_id == refreshed.scan_run_id
+    assert second.approved_plan_fingerprint == refreshed.plan_fingerprint
+
+
+def test_failed_post_update_refresh_clears_fence_without_granting_authority(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    claimed = _claim_post_update_refresh(system, job.job_id)
+    failed = system.authority.finalize_failed_package_scan(
+        claimed.scan_run_id,
+        failure_class=PackageScanFailure.METADATA_REFRESH_FAILED,
+        error_message="fresh post-update scan failed",
+    )
+
+    published = _published_resource(system.store, system.authority, job.resource_id)
+    assert published["package_scan"]["scan_run_id"] == failed.scan_run_id
+    assert published["package_scan"]["status"] == "failed"
+    assert published["package_scan"]["post_update_scan_pending"] is False
+    assert published["package_plan_approval"]["status"] == "stale"
+    assert published["package_plan_approval"]["approvable"] is False
+
+    with pytest.raises(AuthorityConflict, match="latest attempt"):
+        system.authority.approve_package_plan(
+            job.resource_id,
+            system.scan.scan_run_id,
+            system.scan.plan_fingerprint,
+        )
+    with pytest.raises(PackageUpdateIssuanceRefused) as refusal:
+        _issue(system.authority, system.resource, system.approval)
+    assert refusal.value.reason == "plan_not_approved"
+
+
+def test_post_update_refresh_fence_is_scoped_to_the_immutable_resource_id(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    source_id = system.resource.inventory_source_id
+    _reconcile(system.authority, source_id, resource_type="qemu")
+    _reconcile(system.authority, source_id, resource_type="lxc")
+    successor = next(
+        resource
+        for resource in system.store.list_resources(source_id)
+        if resource.lifecycle == "active" and resource.resource_type == "lxc"
+    )
+    assert successor.resource_id != job.resource_id
+    successor_scan = system.authority.issue_package_scan(successor.resource_id)
+    successor_scan = system.authority.finalize_successful_package_scan(
+        successor_scan.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=system.scan.packages,
+        reboot_required=None,
+    )
+    successor_approval = system.authority.approve_package_plan(
+        successor.resource_id,
+        successor_scan.scan_run_id,
+        successor_scan.plan_fingerprint,
+    )
+    system.authority.replace_resource_health_contract(
+        successor.resource_id, HEALTH_PROBES
+    )
+
+    old = _published_resource(system.store, system.authority, job.resource_id)
+    current = _published_resource(
+        system.store, system.authority, successor.resource_id
+    )
+    assert old["package_scan"]["post_update_scan_pending"] is True
+    assert current["package_scan"]["post_update_scan_pending"] is False
+    assert current["package_plan_approval"]["status"] == "approved"
+    issued = _issue(system.authority, successor, successor_approval)
+    assert issued.resource_id == successor.resource_id
+
+
+def test_health_success_and_post_update_fence_commit_before_new_issuance_can_enter(
+    tmp_path: Path,
+) -> None:
+    barrier = Barrier(2)
+
+    class PausingHealthAuthority(InventoryAuthority):
+        def _append_package_update_job_event(self, connection, **kwargs):
+            InventoryAuthority._append_package_update_job_event(connection, **kwargs)
+            if kwargs["event_type"].value == "health_passed":
+                # The job row is already SUCCEEDED in this transaction, but
+                # the post-update request has not been inserted yet. A second
+                # writer released here must wait rather than observe a gap.
+                barrier.wait(timeout=5)
+
+    system = _system(tmp_path)
+    system.authority = PausingHealthAuthority(system.store, now=system.clock)
+    job = _start(system)
+    contender = InventoryAuthority(system.store, now=system.clock)
+
+    def issue_second():
+        barrier.wait(timeout=5)
+        try:
+            return _issue(contender, system.resource, system.approval)
+        except PackageUpdateIssuanceRefused as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        completion = pool.submit(system.worker.run_once)
+        issuance = pool.submit(issue_second)
+        cycle = completion.result(timeout=10)
+        refused = issuance.result(timeout=10)
+
+    assert cycle.status is PackageUpdateWorkerCycleStatus.TERMINAL
+    assert isinstance(refused, PackageUpdateIssuanceRefused)
+    assert refused.reason == "source_authority_unavailable"
+    assert system.authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+    assert len(system.store.list_package_update_jobs()) == 1
+
+
+def test_repaired_authority_stops_a_preexisting_v18_gap_job_before_snapshot(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    first = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    class LegacyGapAuthority(InventoryAuthority):
+        """Model the exact v18 authority behavior repaired by this change."""
+
+        def _post_update_package_scan_is_pending(self, connection, resource_id):
+            return False
+
+    legacy = LegacyGapAuthority(system.store, now=system.clock)
+    second = _issue(legacy, system.resource, system.approval)
+    assert second.status is PackageUpdateJobStatus.ACTIVE
+    assert second.checkpoint is PackageUpdateCheckpoint.ISSUED
+
+    with pytest.raises(AuthorityConflict, match="post-update package refresh"):
+        system.authority.record_package_update_preflight_passed(second.job_id)
+    stopped = system.authority.package_update_job(second.job_id)
+    assert stopped.checkpoint is PackageUpdateCheckpoint.ISSUED
+    assert stopped.snapshot_operation_id is None
+    assert system.authority.pending_post_update_package_scans() == (
+        (first.job_id, first.resource_id),
+    )
+
+
+def _succeed_while_an_ordinary_scan_is_running(
+    system,
+    job_id: str,
+    *,
+    previous: str = "approved",
+):
+    state = {}
+
+    def prepare_publication_race() -> None:
+        if previous == "zero":
+            state["terminal"] = _terminalize_a_fresh_scan(
+                system, system.resource.resource_id, packages=()
+            )
+        elif previous == "failed":
+            state["terminal"] = _terminalize_a_fresh_scan(
+                system,
+                system.resource.resource_id,
+                failure=PackageScanFailure.METADATA_REFRESH_FAILED,
+            )
+        else:
+            assert previous == "approved"
+            state["terminal"] = system.scan
+        state["running"] = system.authority.issue_package_scan(
+            system.resource.resource_id
+        )
+
+    system.health_host._before_evaluate = prepare_publication_race
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    with system.store._read_transaction() as connection:
+        request = connection.execute(
+            "SELECT scan_run_id FROM package_update_post_scan_requests WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+    assert request is not None
+    assert request["scan_run_id"] is None
+    return state["terminal"], state["running"]
+
+
+def test_an_unclaimed_refresh_retains_the_previous_success_with_packages(
+    tmp_path: Path,
+) -> None:
+    """An ordinary scan already RUNNING cannot erase the terminal result
+    when health PASS creates a still-unclaimed post-update refresh request."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id
+    )
+
+    published = _published_scan(system.store, system.authority, job.resource_id)
+    assert published["scan_run_id"] == previous.scan_run_id
+    assert published["scan_run_id"] != ordinary_running.scan_run_id
+    assert published["status"] == "success"
+    assert published["pending_count"] == len(previous.packages)
+    assert published["packages"] == tuple(
+        {
+            "name": package.package_name,
+            "architecture": package.architecture,
+            "installed_version": package.installed_version,
+            "candidate_version": package.candidate_version,
+            "origin": package.origin,
+            "description": package.description,
+            "security": package.security,
+        }
+        for package in previous.packages
+    )
+    assert published["plan_fingerprint"] == previous.plan_fingerprint
+    assert published["post_update_scan_pending"] is True
+
+
+def test_an_unclaimed_refresh_retains_the_previous_zero_success(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id, previous="zero"
+    )
+
+    published = _published_scan(system.store, system.authority, job.resource_id)
+    assert published["scan_run_id"] == previous.scan_run_id
+    assert published["scan_run_id"] != ordinary_running.scan_run_id
+    assert published["status"] == "success"
+    assert published["pending_count"] == 0
+    assert published["packages"] == ()
+    assert published["plan_fingerprint"] == previous.plan_fingerprint
+    assert published["post_update_scan_pending"] is True
+
+
+def test_an_unclaimed_refresh_retains_the_previous_unknown(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id, previous="failed"
+    )
+
+    published = _published_scan(system.store, system.authority, job.resource_id)
+    assert published["scan_run_id"] == previous.scan_run_id
+    assert published["scan_run_id"] != ordinary_running.scan_run_id
+    assert published["status"] == "failed"
+    assert published["pending_count"] is None
+    assert published["packages"] == ()
+    assert published["plan_fingerprint"] is None
+    assert published["error"]["classification"] == "metadata_refresh_failed"
+    assert published["post_update_scan_pending"] is True
+
+
+def test_pending_without_a_selected_terminal_scan_is_honestly_not_scanned() -> None:
+    """The renderer never fabricates a zero/success fallback.
+
+    Coherent authority cannot create this database state: a post-update
+    request requires a SUCCEEDED job, and job issuance requires an approved
+    completed scan for this same immutable resource. This direct renderer
+    control covers the honest fallback without manufacturing impossible SQL.
+    """
+
+    published = InventoryPublication._package_scan(
+        {"resource_type": "lxc"},
+        None,
+        {},
+        post_update_scan_pending=True,
+    )
+    assert published["status"] == "not_scanned"
+    assert published["scan_run_id"] is None
+    assert published["pending_count"] is None
+    assert published["packages"] == ()
+    assert published["plan_fingerprint"] is None
+    assert published["post_update_scan_pending"] is True
+
+
+def test_unclaimed_refresh_waits_for_ordinary_single_flight_then_gets_its_own_run(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    _previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id
+    )
+    host = _PostUpdateScanHost()
+    scheduler = PackageScanScheduler(
+        system.authority,
+        system.store,
+        host,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+
+    conflicted = scheduler.run_post_update_once()
+    assert len(conflicted) == 1
+    assert conflicted[0].status == "conflict"
+    assert conflicted[0].scan_run_id is None
+    assert host.calls == 0
+    assert system.authority.pending_post_update_package_scans() == (
+        (job.job_id, job.resource_id),
+    )
+
+    system.authority.finalize_failed_package_scan(
+        ordinary_running.scan_run_id,
+        failure_class=PackageScanFailure.METADATA_REFRESH_FAILED,
+        error_message="ordinary scan failed for this test",
+    )
+    completed = scheduler.run_post_update_once()
+    assert len(completed) == 1
+    assert completed[0].status == "success"
+    assert completed[0].scan_run_id not in {None, ordinary_running.scan_run_id}
+    assert host.calls == 1
+    assert system.authority.pending_post_update_package_scans() == ()
+    published = _published_scan(system.store, system.authority, job.resource_id)
+    assert published["scan_run_id"] == completed[0].scan_run_id
+    assert published["status"] == "success"
+    assert published["pending_count"] == 0
+    assert published["post_update_scan_pending"] is False
+
+
+def test_restart_terminalizes_unlinked_ordinary_scan_but_preserves_request(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path)
+    job = _start(system)
+    _previous, ordinary_running = _succeed_while_an_ordinary_scan_is_running(
+        system, job.job_id
+    )
+
+    path = system.store.path
+    system.store.close()
+    store = InventoryAuthorityStore(path, now=system.clock)
+    authority = InventoryAuthority(store, now=system.clock)
+    try:
+        assert authority.recover_interrupted_package_scans() == (
+            ordinary_running.scan_run_id,
+        )
+        assert authority.pending_post_update_package_scans() == (
+            (job.job_id, job.resource_id),
+        )
+        published = _published_scan(store, authority, job.resource_id)
+        assert published["scan_run_id"] == ordinary_running.scan_run_id
+        assert published["status"] == "interrupted"
+        assert published["pending_count"] is None
+        assert published["packages"] == ()
+        assert published["plan_fingerprint"] is None
+        assert published["post_update_scan_pending"] is True
+
+        host = _PostUpdateScanHost()
+        scheduler = PackageScanScheduler(
+            authority,
+            store,
+            host,
+            interval_seconds=21_600,
+            initial_delay_seconds=0,
+        )
+        completed = scheduler.run_post_update_once()
+        assert len(completed) == 1
+        assert completed[0].scan_run_id not in {
+            None,
+            ordinary_running.scan_run_id,
+        }
+        assert host.calls == 1
+        assert authority.pending_post_update_package_scans() == ()
+    finally:
+        store.close()
+
+
+def test_a_running_post_update_refresh_retains_the_previous_success_with_packages(
+    tmp_path: Path,
+) -> None:
+    """Case 1. Previous terminal SUCCESS with N>0 is retained whole."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+
+    before = _published_scan(system.store, system.authority, job.resource_id)
+    assert before["status"] == "success"
+    assert before["pending_count"] == 2
+    assert len(before["packages"]) == 2
+    assert before["post_update_scan_pending"] is True
+
+    claimed = _claim_post_update_refresh(system, job.job_id)
+
+    during = _published_scan(system.store, system.authority, job.resource_id)
+    assert during["status"] == "success"
+    assert during["pending_count"] == 2
+    assert during["packages"] == before["packages"]
+    assert during["plan_fingerprint"] == before["plan_fingerprint"]
+    assert during["post_update_scan_pending"] is True
+    # The retained result is the PREVIOUS run, never the running refresh, and
+    # header and packages describe one single scan_run_id.
+    assert during["scan_run_id"] == before["scan_run_id"]
+    assert during["scan_run_id"] != claimed.scan_run_id
+
+
+def test_a_running_post_update_refresh_retains_a_previous_zero_success(
+    tmp_path: Path,
+) -> None:
+    """Case 2. SUCCESS/0 is a real terminal observation, not an absence."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    zero = _terminalize_a_fresh_scan(system, job.resource_id, packages=())
+
+    _claim_post_update_refresh(system, job.job_id)
+
+    during = _published_scan(system.store, system.authority, job.resource_id)
+    assert during["status"] == "success"
+    assert during["pending_count"] == 0
+    assert during["packages"] == ()
+    assert during["scan_run_id"] == zero.scan_run_id
+    assert during["post_update_scan_pending"] is True
+
+
+def test_a_running_post_update_refresh_retains_a_previous_unknown(
+    tmp_path: Path,
+) -> None:
+    """Case 3. A real failed/UNKNOWN terminal result is retained as-is --
+    never softened into `scanning`, never synthesized into success."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    failed = _terminalize_a_fresh_scan(
+        system,
+        job.resource_id,
+        failure=PackageScanFailure.METADATA_REFRESH_FAILED,
+    )
+
+    _claim_post_update_refresh(system, job.job_id)
+
+    during = _published_scan(system.store, system.authority, job.resource_id)
+    assert during["status"] == "failed"
+    assert during["pending_count"] is None
+    assert during["packages"] == ()
+    assert during["error"]["classification"] == "metadata_refresh_failed"
+    assert during["scan_run_id"] == failed.scan_run_id
+    assert during["post_update_scan_pending"] is True
+
+
+def test_the_refreshed_result_replaces_the_retained_one_once_it_terminalizes(
+    tmp_path: Path,
+) -> None:
+    """Cases 4 and 5. The retention lasts exactly as long as the refresh is
+    running: whatever it really proves -- success or failure -- is published
+    the moment it terminalizes, and pending drops to False."""
+
+    for failure, expected_status, expected_pending in (
+        (None, "success", 0),
+        (PackageScanFailure.METADATA_REFRESH_FAILED, "failed", None),
+    ):
+        system = _system(tmp_path / f"case-{expected_status}")
+        job = _start(system)
+        assert (
+            system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+        )
+        claimed = _claim_post_update_refresh(system, job.job_id)
+        retained = _published_scan(system.store, system.authority, job.resource_id)
+        assert retained["pending_count"] == 2
+        assert retained["post_update_scan_pending"] is True
+
+        if failure is None:
+            system.authority.finalize_successful_package_scan(
+                claimed.scan_run_id,
+                os_id="debian",
+                os_version="12",
+                packages=(),
+                reboot_required=None,
+            )
+        else:
+            system.authority.finalize_failed_package_scan(
+                claimed.scan_run_id,
+                failure_class=failure,
+                error_message="fresh post-update scan failed",
+            )
+
+        published = _published_scan(system.store, system.authority, job.resource_id)
+        assert published["status"] == expected_status
+        assert published["pending_count"] == expected_pending
+        assert published["scan_run_id"] == claimed.scan_run_id
+        assert published["post_update_scan_pending"] is False
+        system.store.close()
+
+
+def test_restart_while_the_linked_refresh_runs_still_retains_the_result(
+    tmp_path: Path,
+) -> None:
+    """Case 6. The contract is durable state, not in-process memory."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    claimed = _claim_post_update_refresh(system, job.job_id)
+    before = _published_scan(system.store, system.authority, job.resource_id)
+
+    path = system.store.path
+    system.store.close()
+    store = InventoryAuthorityStore(path, now=system.clock)
+    authority = InventoryAuthority(store, now=system.clock)
+    try:
+        assert authority.recover_interrupted_package_scans() == ()
+        after = _published_scan(store, authority, job.resource_id)
+        assert after["status"] == "success"
+        assert after["pending_count"] == 2
+        assert after["packages"] == before["packages"]
+        assert after["scan_run_id"] == before["scan_run_id"]
+        assert after["scan_run_id"] != claimed.scan_run_id
+        assert after["post_update_scan_pending"] is True
+    finally:
+        store.close()
+
+
+def test_an_ordinary_periodic_running_scan_still_publishes_scanning(
+    tmp_path: Path,
+) -> None:
+    """Case 7. The retention is scoped to the post-update refresh contract.
+
+    With no post-update request occupying this run, an ordinary periodic scan
+    keeps its intended `scanning` semantics -- this fix must not silently turn
+    every running scan into "show the old numbers".
+    """
+
+    system = _system(tmp_path)
+    resource, _scan, _approval = _add_approved_resource(system.store, system.authority)
+
+    baseline = _published_scan(system.store, system.authority, resource.resource_id)
+    assert baseline["status"] == "success"
+    assert baseline["post_update_scan_pending"] is False
+
+    running = system.authority.issue_package_scan(resource.resource_id)
+
+    during = _published_scan(system.store, system.authority, resource.resource_id)
+    assert during["status"] == "scanning"
+    assert during["pending_count"] is None
+    assert during["packages"] == ()
+    assert during["plan_fingerprint"] is None
+    assert during["scan_run_id"] == running.scan_run_id
+    assert during["post_update_scan_pending"] is False
+
+
+def test_every_published_scan_header_and_package_list_share_one_run_id(
+    tmp_path: Path,
+) -> None:
+    """The 2B invariant, asserted directly against the store.
+
+    Whatever run the header names, the published package list must be exactly
+    that run's frozen rows -- never another run's, and never a truncated view
+    of one because a newer run happened to be in flight.
+    """
+
+    system = _system(tmp_path)
+    job = _start(system)
+    assert system.worker.run_once().status is PackageUpdateWorkerCycleStatus.TERMINAL
+    _claim_post_update_refresh(system, job.job_id)
+
+    for resource in InventoryPublication(
+        system.store, system.authority
+    ).read().resources:
+        scan = resource["package_scan"]
+        if scan["scan_run_id"] is None:
+            assert scan["packages"] == ()
+            continue
+        with system.store._transaction() as connection:
+            rows = connection.execute(
+                "SELECT package_name FROM package_scan_packages "
+                "WHERE scan_run_id=? ORDER BY package_index",
+                (scan["scan_run_id"],),
+            ).fetchall()
+        if scan["status"] != "success":
+            # Only a successful run publishes packages at all.
+            assert scan["packages"] == ()
+            continue
+        assert [entry["name"] for entry in scan["packages"]] == [
+            str(row["package_name"]) for row in rows
+        ]
+        assert scan["pending_count"] == len(rows)

@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v17):
+  SQLite authority database (schema v18):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -49,7 +49,9 @@
   a retried idempotent `request_id`; the latest-job readback and published
   summary order by `issuance_sequence`, not wall-clock `issued_at`, so an
   ordinary host clock correction between two issuances can never make an
-  older job outrank a genuinely later one.
+  older job outrank a genuinely later one. Schema v18 adds one durable,
+  job-keyed post-success package-scan request. Its scan link is write-once and
+  accepts only a RUNNING scan for the same resource.
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`;
   authority-metadata mutations
   (`PUT /r0/v1/resources/{resource_id}/package-plan-approval`,
@@ -77,7 +79,11 @@
   default interval, one worker, typed pinned-key SSH to a forced PVE helper,
   fixed `pct exec` operations, APT metadata refresh plus upgrade simulation,
   exact durable package rows/fingerprint, fencing, restart recovery, and
-  failure-is-unknown semantics. It never installs packages.
+  failure-is-unknown semantics. Successful package updates atomically enqueue
+  one real fresh scan; its wake cannot move the ordinary scan lane's absolute
+  monotonic deadline, and publication exposes durable
+  `post_update_scan_pending` without replacing or synthesizing the last real
+  0/N/UNKNOWN result. It never installs packages.
 - **Bootstrap and deployment** — `deploy/bootstrap-proxmox-0.5.sh` provisions a
   fresh unprivileged LXC, a least-privilege PVE identity, TLS trust, a dedicated
   forced-command scan boundary, five further dedicated forced-command
@@ -235,8 +241,8 @@ Human0-validated.
   identity; strict structured ownership metadata in the snapshot description as
   the authority proof (never the name); a `snapshot_may_have_started`
   write-ahead checkpoint committed before any mutation request can be sent;
-  observed PVE task identity; verified PVE async-task semantics with mandatory
-  fresh canonical snapshot re-read before confirmation; a durable per-operation
+  observed PVE task identity; verified synchronous local `pvesh` CLI semantics
+  with mandatory fresh canonical snapshot re-read before confirmation; a durable per-operation
   host journal under a per-VMID `flock` that reattaches instead of resubmitting;
   transient host `absent`/`intent` routing evidence plus a durable
   `sealed_not_submitted` no-future-submit fence, serialized against delayed
@@ -247,6 +253,17 @@ Human0-validated.
   fail-closed handling of every other ambiguity; startup recovery that fences
   an uncertain snapshot operation and keeps it owning the global slot; and the
   same-job rollback authorization contract.
+- **Short host submission boundary:** local `pvesh create` waits for the
+  physical snapshot and prints its final task id only afterwards. The helper
+  therefore journals `submitted`, starts exactly one detached fixed runner,
+  and returns while that runner durably captures bounded stdout/stderr. A
+  later inspect promotes only an unambiguous exact terminal UPID to
+  `task_known`; incomplete, malformed, truncated, or ambiguous capture stays
+  UNKNOWN and is never resubmitted.
+- **Single-node package mutation:** the privileged PVE host reached by the
+  snapshot, mutation, or rollback connection must currently own the LXC. Each
+  helper proves the local node through fixed read-only PVE state and refuses a
+  mismatch before `submitted`; snapshot and rollback also use `--noproxy`.
 - **Production reachable** through the explicit operator start control and the
   one worker, and through nothing else: no scheduler, scan, approval write, or
   Home Assistant poll can create a PVE snapshot. The snapshot helper is
@@ -507,14 +524,21 @@ Human0-validated.
   proof and the destructive call. Combining rollback into the snapshot helper
   was considered and rejected: keeping create and rollback in separate
   forced-command boundaries means one deployed key never carries both.
+- **Short host submission boundary:** local `pvesh create` waits for the
+  physical rollback and emits its final task id only afterwards. The helper
+  starts one detached fixed runner after `submitted` is durable, returns to
+  the backend, and durably captures bounded stdout/stderr for later exact-UPID
+  recovery. Missing, incomplete, truncated, malformed, or ambiguous capture
+  remains UNKNOWN and never permits a retry.
 - **Completion is proven, never assumed:** `rollback_completed` requires the
   coherent set -- a terminal non-error PVE task by PVE's own rule, the durable
   `rollback_task_upid` this job recorded, fresh canonical evidence of exactly
   one complete job-owned snapshot, and PVE's `current` pseudo-entry reporting
   `parent` equal to that snapshot. `parent` is corroboration inside that set,
   never standalone; the source snapshot surviving is treated as no evidence at
-  all, because upstream never deletes it. A `submitted` operation with no
-  captured UPID never recovers into success.
+  all, because upstream never deletes it. A `submitted` operation may advance
+  only when its completed durable capture yields one exact terminal UPID;
+  canonical state alone never proves rollback success.
 - **Failure never releases ownership:** a terminal failed task, a running task,
   a timeout, a lost response, an unreadable status, a corrupt journal, or
   evidence about a different operation all leave the job ACTIVE at
@@ -808,10 +832,12 @@ The operator-triggered update lifecycle is production reachable.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v17 is incompatible with v16 and every earlier version,
+- Pre-release: schema v18 is incompatible with v17 and every earlier version,
   and there is no in-place migration path. Schema v17 added the durable
   per-resource `issuance_sequence` package-update jobs now use for latest-job
-  ordering (see "Implemented" above), so an existing schema-v16 (or earlier)
+  ordering, and schema v18 adds the durable post-success package-scan request
+  and constrained scan link (see "Implemented" above), so an existing
+  schema-v17 (or earlier)
   installation is incompatible even though this activation itself changed no
   schema. An existing installation now uses `deploy/update-proxmox-0.5.sh` for
   this: it detects the incompatible authority schema, backs it up, and resets

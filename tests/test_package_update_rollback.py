@@ -25,11 +25,16 @@ transport parser.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
+import threading
+import time
 from types import ModuleType
 import uuid
 
@@ -89,6 +94,40 @@ def _load_helper() -> ModuleType:
 
 
 helper = _load_helper()
+REAL_PREPARE_DETACHED_RUNNER = helper._prepare_detached_runner
+
+
+class _SynchronousExecutor:
+    """An in-process stand-in that keeps the production RELEASE ordering.
+
+    Like the real executor it runs nothing when it is prepared: the capture
+    happens only when `release()` is called, which the helper does strictly
+    after the durable `submitted` write. `abandon()` runs nothing at all.
+    """
+
+    def __init__(self, run) -> None:
+        self._run = run
+        self.released = False
+        self.abandoned = False
+
+    def release(self) -> None:
+        self.released = True
+        self._run()
+
+    def abandon(self) -> None:
+        self.abandoned = True
+
+
+@pytest.fixture(autouse=True)
+def _synchronous_detached_runner(monkeypatch):
+    """Keep fake-runner state in-process; production spawn is tested separately."""
+
+    def prepare(runner, journal, operation_id, argv, _lease):
+        return _SynchronousExecutor(
+            lambda: helper._run_capture_child(runner, journal, operation_id, argv)
+        )
+
+    monkeypatch.setattr(helper, "_prepare_detached_runner", prepare)
 
 
 # ===========================================================================
@@ -108,6 +147,7 @@ class FakePve:
     def __init__(self, *, vmid: int, snapshot_name: str, ownership) -> None:
         self.vmid = vmid
         self.node = NODE
+        self.local_node = NODE
         self.snapshot_name = snapshot_name
         self.ownership = ownership
         self.present = True
@@ -134,6 +174,10 @@ class FakePve:
         self.snapshot_description: str | None = None
         #: Extra listing rows, for ambiguity cases.
         self.extra_rows: list[dict] = []
+        self.argvs: list[tuple[str, ...]] = []
+        #: Every (argv, timeout) pair, so a test can prove WHICH deadline
+        #: each command class was actually run under.
+        self.deadlines: list[tuple[tuple[str, ...], float | None]] = []
 
     # -- rendering -----------------------------------------------------
 
@@ -169,6 +213,8 @@ class FakePve:
 
     def runner(self, argv, timeout, max_output):
         argv = tuple(argv)
+        self.argvs.append(argv)
+        self.deadlines.append((argv, timeout))
         result = self._dispatch(argv)
         if result is None:
             raise AssertionError(f"fake PVE received an unexpected command: {argv}")
@@ -193,6 +239,10 @@ class FakePve:
         )
 
     def _dispatch(self, argv):
+        if argv[:3] == ("pvesh", "get", "/cluster/status"):
+            return self._ok(
+                [{"type": "node", "name": self.local_node, "local": 1}]
+            )
         if argv[:3] == ("pvesh", "get", "/cluster/resources"):
             if "resources" in self.fail_reads:
                 return self._fail()
@@ -967,6 +1017,223 @@ def test_a_submitted_operation_is_never_resubmitted(tmp_path: Path) -> None:
     assert len(pve.rollbacks) == 1
 
 
+def test_real_pvesh_framing_captures_rollback_task_and_completes_once(
+    tmp_path: Path,
+) -> None:
+    """A status line before pvesh's final JSON UPID must not lose identity."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, orchestrator = (
+        _mutating_job(tmp_path)
+    )
+    observed = _canonical_before_rollback(ownership, identity)
+    original = pve.runner
+
+    def prefixed(argv, timeout, max_output):
+        result = original(argv, timeout, max_output)
+        if tuple(argv)[:2] == ("pvesh", "create") and result.returncode == 0:
+            return helper.CommandResult(
+                returncode=0,
+                stdout=b"200 OK\n" + result.stdout + b"\n",
+                stderr=b"",
+                timed_out=False,
+                output_exceeded=False,
+            )
+        return result
+
+    pve.runner = prefixed
+    first = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    request = authority.package_update_rollback_request(job.job_id)
+    record = host.journal.read(request.rollback_operation_id)
+    assert first.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert first.job.rollback_task_upid == UPID
+    assert record["phase"] == "task_known"
+    assert record["task_upid"] == UPID
+
+    _complete_rollback(pve)
+    completed = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+    assert completed.outcome is RollbackOperationOutcome.COMPLETED
+    assert completed.job.status is PackageUpdateJobStatus.ROLLED_BACK
+    assert len(pve.rollbacks) == 1
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        UPID.encode(),
+        b'"' + UPID.encode() + b'"',
+        b"progress\nwarning\n\"" + UPID.encode() + b"\"\n",
+        b"progress without newline\"" + UPID.encode() + b"\"\n",
+    ],
+)
+def test_rollback_upid_accepts_only_an_exact_terminal_machine_result(
+    stdout: bytes,
+) -> None:
+    assert helper._extract_upid(stdout) == UPID
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"progress only\n",
+        b"prefix UPID:not-a-task\n\"" + UPID.encode() + b"\"\n",
+        UPID.encode() + b"\n\"" + UPID.encode() + b"\"\n",
+        b"prefix " + UPID.encode() + b" suffix\n",
+        b'{"upid":"' + UPID.encode() + b'"}\n',
+        b'["' + UPID.encode() + b'"]\n',
+        b'"' + UPID.encode() + b'" garbage',
+        b"\xff\"" + UPID.encode() + b'"',
+    ],
+)
+def test_rollback_upid_extraction_rejects_malformed_or_ambiguous_stdout(
+    stdout: bytes,
+) -> None:
+    assert helper._extract_upid(stdout) is None
+
+
+def test_remote_owner_refuses_before_submitted_and_rollback_is_noproxy(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.local_node = "pve-b"
+    refused = host.submit_same_job_rollback(request)
+    assert refused.outcome is RollbackOperationOutcome.NOT_SUBMITTED
+    assert pve.rollbacks == []
+    assert host.journal.read(request.rollback_operation_id) is None
+
+    pve.local_node = NODE
+    host.submit_same_job_rollback(request)
+    create = next(argv for argv in pve.argvs if argv[:2] == ("pvesh", "create"))
+    assert "--noproxy" in create
+
+
+def test_rollback_submitted_capture_promotes_later_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.returned_upid = None
+    host.submit_same_job_rollback(request)
+    host.journal.write_completed_capture(
+        request.rollback_operation_id,
+        helper.CommandResult(
+            0,
+            b"progress without newline\"" + UPID.encode() + b'"\n',
+            b"warning",
+            False,
+            False,
+        ),
+    )
+
+    recovered = host.inspect_rollback_state(request)
+    assert recovered.rollback_state is HostRollbackState.TASK_KNOWN
+    assert recovered.task_upid == UPID
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "task_known"
+    assert len(pve.rollbacks) == 1
+
+
+def test_rollback_incomplete_capture_stays_submitted_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.returned_upid = None
+    host.submit_same_job_rollback(request)
+    host.journal._capture_path(
+        request.rollback_operation_id, "complete.json"
+    ).unlink()
+
+    inspected = host.inspect_rollback_state(request)
+    assert inspected.rollback_state is HostRollbackState.SUBMITTED
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"
+    assert len(pve.rollbacks) == 1
+
+
+def test_rollback_ambiguous_capture_stays_submitted_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.returned_upid = None
+    host.submit_same_job_rollback(request)
+    host.journal.write_completed_capture(
+        request.rollback_operation_id,
+        helper.CommandResult(
+            0,
+            UPID.encode() + b'\n"' + OTHER_UPID.encode() + b'"\n',
+            b"",
+            False,
+            False,
+        ),
+    )
+    inspected = host.inspect_rollback_state(request)
+    assert inspected.rollback_state is HostRollbackState.SUBMITTED
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"
+    assert len(pve.rollbacks) == 1
+
+
+def test_real_detached_rollback_runner_returns_while_physical_task_is_alive(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "rollback-operations"
+    journal = helper.OperationJournal(directory, anchor=tmp_path)
+    operation_id = "11111111-1111-4111-8111-111111111111"
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+
+    def slow_runner(argv, timeout, max_output):
+        started.touch()
+        deadline = time.monotonic() + 3
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return helper.CommandResult(0, b'"' + UPID.encode() + b'"', b"", False, False)
+
+    began = time.monotonic()
+    with helper.VmidRollbackLease(110, directory, anchor=tmp_path) as lease:
+        executor = REAL_PREPARE_DETACHED_RUNNER(
+            slow_runner,
+            journal,
+            operation_id,
+            ("pvesh", "create", "/fixed", "--noproxy"),
+            lease,
+        )
+        executor.release()
+    assert time.monotonic() - began < 1
+    deadline = time.monotonic() + 2
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+    with pytest.raises(helper.RollbackError, match="holds this guest's lease"):
+        with helper.VmidRollbackLease(110, directory, anchor=tmp_path):
+            pass
+    release.touch()
+    deadline = time.monotonic() + 3
+    while journal.read_completed_capture(operation_id) is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert journal.read_completed_capture(operation_id).stdout == b'"' + UPID.encode() + b'"'
+
+
 def test_a_sealed_operation_can_never_be_submitted(tmp_path: Path) -> None:
     _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
         tmp_path
@@ -1433,6 +1700,38 @@ def test_an_interleaving_writer_cannot_race_the_submission_boundary(
     )
 
     assert seen == ["seam", "submit"]
+
+
+def test_rollback_writer_releases_while_detached_physical_work_remains_alive(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, _, job, ownership, identity, *_ = _mutating_job(tmp_path)
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    started = threading.Event()
+    release = threading.Event()
+    physical: list[threading.Thread] = []
+
+    def submit():
+        thread = threading.Thread(
+            target=lambda: (started.set(), release.wait(timeout=5)), daemon=True
+        )
+        physical.append(thread)
+        thread.start()
+        assert started.wait(timeout=1)
+        return "submitted"
+
+    assert authority.execute_rollback_submission_if_current(job.job_id, submit) == "submitted"
+    assert physical[0].is_alive()
+    other = sqlite3.connect(store.path, timeout=0.2, isolation_level=None)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute("ROLLBACK")
+    finally:
+        other.close()
+        release.set()
+        physical[0].join(timeout=1)
 
 
 # ===========================================================================
@@ -2137,11 +2436,11 @@ def test_the_known_task_is_durable_before_the_first_poll_call(
     observed_before_poll: list[str | None] = []
     original_poll = orchestrator._poll_until_resolved
 
-    def _seam(request, result):
+    def _seam(polled_job, request, result):
         observed_before_poll.append(
             authority.package_update_job(job.job_id).rollback_task_upid
         )
-        return original_poll(request, result)
+        return original_poll(polled_job, request, result)
 
     orchestrator._poll_until_resolved = _seam
 
@@ -2950,3 +3249,1079 @@ def test_the_legal_authority_completion_still_reaches_rolled_back(
     # status can never disagree even momentarily.
     assert result.job.terminalized_at is not None
     assert len(pve.rollbacks) == 1
+
+
+# ===========================================================================
+# P1-A. The detached destructive rollback `pvesh` must outlive the ordinary
+# bounded submission deadline.
+#
+# A rollback force-stops the container and replaces every volume; on a large
+# mountpoint that legitimately runs longer than COMMAND_TIMEOUT_SECONDS.
+# Killing the local `pvesh` there does NOT stop PVE's worker -- it only
+# destroys the channel the exact terminal UPID still arrives through, leaving
+# a `submitted` rollback that may never be resubmitted permanently
+# unattributable and the job permanently fenced.
+# ===========================================================================
+
+
+def test_rollback_reads_stay_bounded_but_the_destructive_capture_has_no_clock(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, orchestrator = (
+        _mutating_job(tmp_path)
+    )
+
+    first = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert first.job.rollback_task_upid == UPID
+    reads = [
+        (argv, deadline)
+        for argv, deadline in pve.deadlines
+        if argv[:2] != ("pvesh", "create")
+    ]
+    submissions = [
+        (argv, deadline)
+        for argv, deadline in pve.deadlines
+        if argv[:2] == ("pvesh", "create")
+    ]
+    # Every read/preflight command keeps its ordinary bounded deadline...
+    assert reads
+    assert all(
+        deadline == helper.COMMAND_TIMEOUT_SECONDS for _argv, deadline in reads
+    )
+    # ...and the one destructive rollback runs under no wall clock at all.
+    assert len(submissions) == 1
+    argv, deadline = submissions[0]
+    assert deadline is None
+    assert deadline is helper.DETACHED_CAPTURE_NO_DEADLINE
+    assert helper.COMMAND_TIMEOUT_SECONDS == 120.0
+    assert argv[2].endswith("/rollback")
+    assert "--noproxy" in argv
+    assert len(pve.rollbacks) == 1
+
+    # At-most-once is untouched: a replay resubmits nothing.
+    orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    assert len(pve.rollbacks) == 1
+
+
+def test_rollback_no_deadline_mode_lets_a_slow_child_finish() -> None:
+    """Structural proof in fractions of a second, not 121 of them."""
+
+    argv = (
+        sys.executable,
+        "-c",
+        f"import sys, time; time.sleep(0.4); sys.stdout.write({UPID!r}); "
+        "sys.stdout.flush()",
+    )
+
+    killed = helper._run_bounded(argv, 0.05, helper.MAX_CAPTURE_OUTPUT_BYTES)
+    assert killed.timed_out is True
+    assert helper._extract_upid(killed.stdout) is None
+
+    survived = helper._run_bounded(
+        argv, helper.DETACHED_CAPTURE_NO_DEADLINE, helper.MAX_CAPTURE_OUTPUT_BYTES
+    )
+    assert survived.timed_out is False
+    assert survived.returncode == 0
+    assert helper._extract_upid(survived.stdout) == UPID
+
+
+def test_rollback_output_bound_still_fails_closed_without_a_deadline() -> None:
+    argv = (
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.write('x' * 200000); sys.stdout.flush()",
+    )
+
+    result = helper._run_bounded(argv, helper.DETACHED_CAPTURE_NO_DEADLINE, 1024)
+
+    assert result.output_exceeded is True
+    assert result.timed_out is False
+    # Fail closed: an over-bound capture is never promoted to a task identity.
+    assert result.output_exceeded and helper._extract_upid(result.stdout) is None
+
+
+def test_the_rollback_capture_child_asks_for_no_deadline(tmp_path: Path) -> None:
+    seen: list[tuple[tuple[str, ...], float | None, int]] = []
+
+    def recording_runner(argv, timeout, max_output):
+        seen.append((tuple(argv), timeout, max_output))
+        return helper.CommandResult(
+            returncode=0,
+            stdout=json.dumps(UPID).encode("utf-8"),
+            stderr=b"",
+            timed_out=False,
+            output_exceeded=False,
+        )
+
+    journal = helper.OperationJournal(tmp_path / "journal", anchor=tmp_path)
+    operation_id = str(uuid.uuid4())
+    helper._run_capture_child(
+        recording_runner, journal, operation_id, ("pvesh", "create", "/x")
+    )
+
+    assert len(seen) == 1
+    _argv, timeout, max_output = seen[0]
+    assert timeout is None
+    assert max_output == helper.MAX_CAPTURE_OUTPUT_BYTES
+    recovered = journal.read_completed_capture(operation_id)
+    assert recovered is not None
+    assert helper._extract_upid(recovered.stdout) == UPID
+
+
+def test_an_over_bound_rollback_capture_is_never_promoted(tmp_path: Path) -> None:
+    """The output bound is not a deadline, and removing the deadline must not
+    weaken it: a capture that blew its size bound stays UNKNOWN, and nothing
+    is resubmitted."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    pve.returned_upid = None
+    host.submit_same_job_rollback(request)
+    host.journal.write_completed_capture(
+        request.rollback_operation_id,
+        helper.CommandResult(0, b'"' + UPID.encode() + b'"', b"", False, True),
+    )
+
+    inspected = host.inspect_rollback_state(request)
+
+    assert inspected.rollback_state is HostRollbackState.SUBMITTED
+    assert inspected.task_upid is None
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"
+    assert len(pve.rollbacks) == 1
+
+
+# ===========================================================================
+# P1-B. `submitted` WITHOUT a task identity is a POLLABLE in-flight state.
+#
+# Submission hands the physical rollback `pvesh` to a detached host child and
+# returns immediately, so the first response routinely reports `submitted`
+# with no UPID. Polling used to start only at `task_known`, so the cycle ended
+# `rollback_uncertain` and an operator RESUME was needed purely to notice a
+# capture that landed moments later. The poll is read-only, never resubmits,
+# and rollback still refuses to infer success from canonical state alone.
+# ===========================================================================
+
+
+def test_submitted_rollback_is_polled_until_the_detached_capture_appears(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    observed = _canonical_before_rollback(ownership, identity)
+
+    # Model the real detached child: submission returns BEFORE the physical
+    # `pvesh` has run at all, so no durable capture exists yet.
+    detached: list = []
+    real_capture = helper._run_capture_child
+
+    def defer_capture(runner, journal, operation_id, argv):
+        detached.append(
+            lambda: real_capture(runner, journal, operation_id, argv)
+        )
+
+    monkeypatch.setattr(helper, "_run_capture_child", defer_capture)
+
+    clock = [0.0]
+    sleep_calls: list[float] = []
+    phases_when_polling: list[tuple[str, object]] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 1.0
+        request = authority.package_update_rollback_request(job.job_id)
+        record = host.journal.read(request.rollback_operation_id)
+        phases_when_polling.append((record["phase"], record.get("task_upid")))
+        if detached:
+            # The detached physical rollback finishes now, writes its
+            # crash-safe completion marker, and exits -- after the backend
+            # already saw `submitted`.
+            detached.pop()()
+            _complete_rollback(pve)
+
+    orchestrator = PackageUpdateRollbackOrchestrator(
+        authority,
+        host,
+        sleep=sleep,
+        monotonic=lambda: clock[0],
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    # The FIRST poll ran while the rollback was `submitted` with no identity
+    # at all -- the exact state that used to stop polling dead.
+    assert phases_when_polling == [("submitted", None)]
+    assert sleep_calls == [2.0]
+    # One ordinary cycle reached exact-task terminal success evidence without
+    # an operator RESUME.
+    assert result.outcome is RollbackOperationOutcome.COMPLETED
+    assert result.job.status is PackageUpdateJobStatus.ROLLED_BACK
+    assert result.job.rollback_task_upid == UPID
+    request = authority.package_update_rollback_request(job.job_id)
+    assert host.journal.read(request.rollback_operation_id)["task_upid"] == UPID
+    # Exactly one destructive rollback submission ever happened.
+    assert len(pve.rollbacks) == 1
+
+
+def test_a_submitted_rollback_without_a_capture_never_infers_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The heart of the rollback contract: canonical state is NOT a witness.
+
+    Even with the guest showing exactly the post-rollback canonical state, a
+    rollback with no exact task attribution stays UNCERTAIN and fenced. The
+    poll is bounded, read-only, and resubmits nothing.
+    """
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    observed = _canonical_before_rollback(ownership, identity)
+
+    # The detached child ran the physical `pvesh` and then died before it
+    # could write its crash-safe completion marker.
+    def lose_the_capture(runner, journal, operation_id, argv):
+        runner(
+            argv,
+            helper.DETACHED_CAPTURE_NO_DEADLINE,
+            helper.MAX_CAPTURE_OUTPUT_BYTES,
+        )
+
+    monkeypatch.setattr(helper, "_run_capture_child", lose_the_capture)
+    # Canonical state that a canonical-only inference would misread as proof.
+    _complete_rollback(pve)
+    pve.current_parent = identity.snapshot_name
+
+    clock = [0.0]
+    sleep_calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 400.0
+
+    orchestrator = PackageUpdateRollbackOrchestrator(
+        authority,
+        host,
+        sleep=sleep,
+        monotonic=lambda: clock[0],
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    # Bounded: it gave up on its own deadline rather than looping forever.
+    assert sleep_calls == [2.0, 2.0]
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert result.job.status is not PackageUpdateJobStatus.ROLLED_BACK
+    assert authority.package_update_job(job.job_id).rollback_task_upid is None
+    request = authority.package_update_rollback_request(job.job_id)
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"
+    assert len(pve.rollbacks) == 1
+
+
+# ===========================================================================
+# P1. THE REAL PRODUCTION TEMPORAL ORDER.
+#
+# `handle` picks `detach = runner is None`, so the injected-runner seam every
+# other dark-chain test uses runs the capture synchronously and releases the
+# per-VMID lease before submission returns -- the opposite of production. In
+# production the detached grandchild INHERITS that lease and holds it for the
+# whole physical rollback `pvesh`, releasing it only after the durable
+# completion capture is written, so every inspect in between is refused with
+# the typed `operation_in_progress` classification and carries NO journal
+# phase at all.
+#
+# This reproduces that ordering against the real lease file, the real helper
+# refusal, and the real host-control classification mapping -- no fork, no
+# sleeping, no network.
+# ===========================================================================
+
+
+class _HeldVmidLease:
+    """Hold the REAL per-VMID lease file the way the detached child does."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._descriptor: int | None = None
+
+    @property
+    def held(self) -> bool:
+        return self._descriptor is not None
+
+    def acquire(self) -> None:
+        assert self._descriptor is None
+        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(self._path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(descriptor)
+            raise
+        self._descriptor = descriptor
+
+    def release(self) -> None:
+        if self._descriptor is not None:
+            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+
+class _StagedExecutor:
+    """A prepared executor that mirrors the production release contract.
+
+    `release()` does NOT run the physical work: it only records that the
+    helper crossed its durable submission boundary and handed over
+    permission. The test then runs the deferred work itself, so the window
+    between "submitted, executor released" and "capture durable, lease free"
+    is under the test's control exactly as the real detached child's is.
+    """
+
+    def __init__(self, physical_work) -> None:
+        self._physical_work = physical_work
+        self.released = False
+        self.abandoned = False
+
+    def release(self) -> None:
+        self.released = True
+
+    def abandon(self) -> None:
+        self.abandoned = True
+
+    def run_physical_work(self) -> None:
+        assert self.released, "physical pvesh ran before the submission boundary"
+        self._physical_work()
+
+
+class _DetachedHelperBackedHostControl(HelperBackedHostControl):
+    """`HelperBackedHostControl` whose helper takes its REAL detach path.
+
+    Patching the module-level `_run_bounded` -- rather than injecting a
+    runner -- keeps the fake `pvesh` while leaving `detach` True, so
+    `submit_same_job_rollback` really takes the detached branch and really
+    calls `lease.detach()`, which drops the caller's descriptor WITHOUT
+    unlocking it.
+    """
+
+    def __init__(self, pve, journal_directory: Path, monkeypatch) -> None:
+        super().__init__(pve, journal_directory)
+        self.lease = _HeldVmidLease(
+            self.journal.directory / f"vmid-{pve.vmid}.lock"
+        )
+        #: Prepared executors, in preparation order. Each stays un-run until
+        #: the helper releases it, and the test drives its physical work.
+        self.executors: list = []
+        real_capture = helper._run_capture_child
+
+        def prepare_like_production(runner, journal, operation_id, argv, lease):
+            # READY: the executor exists and has taken over the lease, but is
+            # blocked and has run nothing. `_ensure_submitted` may now write
+            # its durable record; only `release()` lets pvesh start.
+            lease.detach()
+            self.lease.acquire()
+
+            def finish_physical_work() -> None:
+                # The capture is durable BEFORE the lease is released,
+                # exactly as the grandchild's `os._exit` orders it.
+                real_capture(runner, journal, operation_id, argv)
+                self.lease.release()
+
+            executor = _StagedExecutor(finish_physical_work)
+            self.executors.append(executor)
+            return executor
+
+        monkeypatch.setattr(helper, "_run_bounded", pve.runner)
+        monkeypatch.setattr(helper, "_prepare_detached_runner", prepare_like_production)
+
+    def _run(self, operation: str, request):
+        self.calls.append(operation)
+        payload = _request_payload(operation, request)
+        try:
+            response = helper.handle(payload, journal=self.journal)
+        except helper.RollbackError as exc:
+            # Exactly what the helper's own `main()` emits for a raised
+            # error, including the typed classification the transport keys
+            # `host_operation_in_progress` off.
+            response = {
+                "response_version": 1,
+                "ok": False,
+                "rollback_operation_id": request.rollback_operation_id,
+                "error": {
+                    "classification": exc.classification,
+                    "message": str(exc),
+                    "submission": exc.submission,
+                },
+            }
+        return self._parser(response, request.rollback_operation_id)
+
+
+def test_a_detached_rollback_survives_the_whole_lease_busy_window(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """T0 submitted -> busy -> busy -> capture -> task_known -> terminal.
+
+    One invocation, no operator RESUME, exactly one destructive rollback, and
+    still no canonical-only success inference anywhere on the path.
+    """
+
+    clock_, store, authority, _, job, ownership, identity, pve, _, _ = _mutating_job(
+        tmp_path
+    )
+    host = _DetachedHelperBackedHostControl(pve, tmp_path / "detached", monkeypatch)
+    observed = _canonical_before_rollback(ownership, identity)
+
+    clock = [0.0]
+    sleep_calls: list[float] = []
+    seen: list[tuple[object, bool]] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 1.0
+        if len(sleep_calls) == 3:
+            # The physical rollback's pvesh returns here: the capture is
+            # written and the lease is freed, but PVE's own task is still
+            # running, so the exact task must still be polled afterwards.
+            assert host.lease.held
+            host.executors[0].run_physical_work()
+            assert not host.lease.held
+        if len(sleep_calls) == 4:
+            _complete_rollback(pve)
+
+    orchestrator = PackageUpdateRollbackOrchestrator(
+        authority,
+        host,
+        sleep=sleep,
+        monotonic=lambda: clock[0],
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+    real_inspect = orchestrator._read_inspection
+
+    def recording_inspect(request):
+        answer = real_inspect(request)
+        seen.append((answer.rollback_state, answer.host_operation_in_progress))
+        return answer
+
+    orchestrator._read_inspection = recording_inspect
+
+    result = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    assert seen[0] == (HostRollbackState.ABSENT, False)
+    assert seen[1:4] == [(None, True)] * 3
+    # The capture is promoted to an EXACT task identity, and only then is
+    # that exact task polled to its own terminal evidence.
+    assert seen[4] == (HostRollbackState.TASK_KNOWN, False)
+    assert seen[5][0] is HostRollbackState.TERMINAL
+    assert sleep_calls == [2.0, 2.0, 2.0, 2.0]
+
+    # Exact task attribution reached legitimate terminal success evidence.
+    assert result.outcome is RollbackOperationOutcome.COMPLETED
+    assert result.job.status is PackageUpdateJobStatus.ROLLED_BACK
+    assert result.job.rollback_task_upid == UPID
+    request = authority.package_update_rollback_request(job.job_id)
+    assert host.journal.read(request.rollback_operation_id)["task_upid"] == UPID
+    assert len(pve.rollbacks) == 1
+    # Exactly one executor was ever prepared, and it was released -- never
+    # abandoned -- because the durable submission write succeeded.
+    assert len(host.executors) == 1
+    assert host.executors[0].released is True
+    assert host.executors[0].abandoned is False
+
+
+# ===========================================================================
+# The negative half. `host_operation_in_progress` is control flow, never
+# authority: it may only EXTEND polling that durable submission proof already
+# justified, and it is keyed off the exact typed classification.
+# ===========================================================================
+
+
+def _rollback_busy(request: PackageUpdateRollbackRequest) -> HostRollbackResult:
+    """Exactly what a lease-busy helper answer parses to: no journal phase."""
+
+    return HostRollbackResult(
+        outcome=RollbackOperationOutcome.UNCERTAIN,
+        rollback_operation_id=request.rollback_operation_id,
+        reason="host-control reported a failure (operation_in_progress)",
+        host_operation_in_progress=True,
+    )
+
+
+def _rollback_submitted(request: PackageUpdateRollbackRequest) -> HostRollbackResult:
+    return HostRollbackResult(
+        outcome=RollbackOperationOutcome.UNCERTAIN,
+        rollback_operation_id=request.rollback_operation_id,
+        rollback_state=HostRollbackState.SUBMITTED,
+    )
+
+
+def _bounded_scripted_orchestrator(authority, host, *, timeout=800.0):
+    clock = [0.0]
+    sleep_calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 400.0
+
+    return (
+        PackageUpdateRollbackOrchestrator(
+            authority,
+            host,
+            sleep=sleep,
+            monotonic=lambda: clock[0],
+            task_poll_timeout_seconds=timeout,
+            task_poll_interval_seconds=2.0,
+        ),
+        sleep_calls,
+    )
+
+
+def test_rollback_lease_busy_before_submission_proof_is_plain_unknown(
+    tmp_path: Path,
+) -> None:
+    """A. No prior SUBMITTED/TASK_KNOWN, so busy proves nothing at all."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    host = _ScriptedRollbackHostControl([_rollback_busy])
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 1
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+    assert sleep_calls == []
+    fenced = authority.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+    assert fenced.rollback_task_upid is None
+    assert fenced.rollback_completed_at is None
+
+
+def test_rollback_lease_busy_after_submitted_stays_fenced_at_the_deadline(
+    tmp_path: Path,
+) -> None:
+    """B. Bounded, read-only, no resubmission, and never a fabricated
+    outcome. Rollback in particular must not become COMPLETED here: it has no
+    exact task identity, and canonical state is not a witness."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    host = _ScriptedRollbackHostControl(
+        [
+            _rollback_submitted,
+            _rollback_busy,
+            _rollback_busy,
+            _rollback_busy,
+        ]
+    )
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 4
+    assert sleep_calls == [2.0, 2.0]
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+    fenced = authority.package_update_job(job.job_id)
+    assert fenced.status is not PackageUpdateJobStatus.ROLLED_BACK
+    assert fenced.rollback_task_upid is None
+
+
+def test_rollback_unknown_failure_after_submitted_is_not_lease_busy(
+    tmp_path: Path,
+) -> None:
+    """C. Only the EXACT typed classification extends polling."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+
+    def _generic_failure(request: PackageUpdateRollbackRequest) -> HostRollbackResult:
+        return HostRollbackResult(
+            outcome=RollbackOperationOutcome.UNCERTAIN,
+            rollback_operation_id=request.rollback_operation_id,
+            reason="host-control reported a failure (journal_corrupt)",
+        )
+
+    host = _ScriptedRollbackHostControl([_rollback_submitted, _generic_failure])
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 2
+    assert sleep_calls == []
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+
+
+def test_rollback_lease_busy_never_discards_a_known_task_identity(
+    tmp_path: Path,
+) -> None:
+    """D. TASK_KNOWN plus transient busy keeps polling AND keeps the exact
+    UPID authority already recorded."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    host = _ScriptedRollbackHostControl(
+        [_task_known, _rollback_busy, _rollback_busy, _rollback_busy]
+    )
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 4
+    assert sleep_calls == [2.0, 2.0]
+    assert authority.package_update_job(job.job_id).rollback_task_upid == UPID
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+
+
+def test_a_busy_rollback_answer_for_another_operation_inherits_nothing(
+    tmp_path: Path,
+) -> None:
+    """E. Operation identity is checked first, so a foreign answer can never
+    inherit this operation's SUBMITTED state."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    foreign = str(uuid.uuid4())
+
+    class _ForeignRequest:
+        rollback_operation_id = foreign
+
+    host = _ScriptedRollbackHostControl(
+        [
+            _rollback_submitted,
+            lambda _request: _rollback_busy(_ForeignRequest()),
+            _rollback_busy,
+        ]
+    )
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 2
+    assert sleep_calls == []
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+    assert authority.package_update_job(job.job_id).rollback_task_upid is None
+
+
+def test_the_rollback_transport_sets_lease_busy_only_for_the_exact_token() -> None:
+    """The typed field comes from the helper's classification, never text."""
+
+    transport = _transport()
+    operation_id = str(uuid.uuid4())
+
+    def _parse(error: object) -> HostRollbackResult:
+        return transport._parse_payload(
+            {
+                "response_version": 1,
+                "ok": False,
+                "rollback_operation_id": operation_id,
+                "error": error,
+            },
+            operation_id,
+        )
+
+    exact = _parse({"classification": "operation_in_progress"})
+    assert exact.host_operation_in_progress is True
+    assert exact.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert exact.rollback_state is None
+
+    for near_miss in (
+        {"classification": "Operation_In_Progress"},
+        {"classification": "operation_in_progress "},
+        {"classification": "another operation_in_progress holds the lease"},
+        {"classification": "already_submitted"},
+        {"message": "another rollback operation holds this guest's lease"},
+        {},
+        "operation_in_progress",
+        None,
+    ):
+        assert _parse(near_miss).host_operation_in_progress is False, near_miss
+
+    ok = transport._parse_payload(
+        {
+            "response_version": 1,
+            "ok": True,
+            "rollback_operation_id": operation_id,
+            "outcome": "uncertain",
+            "rollback_state": "submitted",
+        },
+        operation_id,
+    )
+    assert ok.host_operation_in_progress is False
+    assert ok.rollback_state is HostRollbackState.SUBMITTED
+
+
+# ===========================================================================
+# THE SUBMISSION BARRIER.
+#
+# `submitted` is the durable record that says "a physical rollback may now
+# exist, and must never be blindly repeated". Creating it merely because a
+# detached runner was INTENDED is how an ordinary `fork` EAGAIN on a loaded
+# host used to strand an operation forever: journal submitted, no executor,
+# no capture, no possible completion, and no permission to resubmit. For a
+# rollback that also means a job fenced with no exact task attribution it
+# could ever obtain.
+#
+# The repair is a two-phase handoff: the executor is established FIRST and
+# proves it exists (READY) while blocked from `pvesh`, and only the durable
+# `submitted` write releases it (GO).
+#
+# These exercise the REAL forks, the REAL pipes, and the REAL lease.
+# ===========================================================================
+
+
+ROLLBACK_VMID = 110
+
+
+def _wait_until(predicate, seconds: float = 3.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def _rollback_lease_is_free(directory: Path, anchor: Path, vmid: int) -> bool:
+    try:
+        with helper.VmidRollbackLease(vmid, directory, anchor=anchor):
+            return True
+    except helper.RollbackError:
+        return False
+
+
+def _rollback_marker_runner(marker: Path):
+    """A fake `pvesh` whose invocations are counted ON DISK.
+
+    The real executor is a forked grandchild, so nothing it does to an
+    in-memory fake is visible here. A file is the only honest way to count
+    physical invocations across that boundary -- and counting them is exactly
+    what "exactly one destructive submission" means.
+    """
+
+    def runner(argv, timeout, max_output):
+        with marker.open("a", encoding="ascii") as handle:
+            handle.write(f"{timeout!r}|{ascii(tuple(argv))}\n")
+        return helper.CommandResult(
+            returncode=0,
+            stdout=b'"' + UPID.encode() + b'"',
+            stderr=b"",
+            timed_out=False,
+            output_exceeded=False,
+        )
+
+    return runner
+
+
+def _physical_invocations(marker: Path) -> list[str]:
+    if not marker.exists():
+        return []
+    return [
+        line for line in marker.read_text(encoding="ascii").splitlines() if line
+    ]
+
+
+def test_a_prepared_rollback_executor_holds_the_lease_and_has_run_nothing(
+    tmp_path: Path,
+) -> None:
+    """Cases 4 and 5. READY proves existence, never permission."""
+
+    directory = tmp_path / "rollback-operations"
+    journal = helper.OperationJournal(directory, anchor=tmp_path)
+    operation_id = str(uuid.uuid4())
+    ran = tmp_path / "ran"
+
+    with helper.VmidRollbackLease(
+        ROLLBACK_VMID, directory, anchor=tmp_path
+    ) as lease:
+        executor = REAL_PREPARE_DETACHED_RUNNER(
+            _rollback_marker_runner(ran),
+            journal,
+            operation_id,
+            ("pvesh", "create", "/fixed", "--noproxy"),
+            lease,
+        )
+        assert not _rollback_lease_is_free(directory, tmp_path, ROLLBACK_VMID)
+        assert not ran.exists()
+        assert journal.read_completed_capture(operation_id) is None
+
+        executor.release()
+        assert _wait_until(ran.exists)
+        assert _wait_until(
+            lambda: journal.read_completed_capture(operation_id) is not None
+        )
+    assert _wait_until(
+        lambda: _rollback_lease_is_free(directory, tmp_path, ROLLBACK_VMID)
+    )
+
+
+def test_an_abandoned_rollback_executor_exits_having_rolled_nothing_back(
+    tmp_path: Path,
+) -> None:
+    """Case 7. Deterministic: the lease is only freed once the executor has
+    exited, so a missing marker after that proves `pvesh` never ran."""
+
+    directory = tmp_path / "rollback-operations"
+    journal = helper.OperationJournal(directory, anchor=tmp_path)
+    operation_id = str(uuid.uuid4())
+    ran = tmp_path / "ran"
+
+    with helper.VmidRollbackLease(
+        ROLLBACK_VMID, directory, anchor=tmp_path
+    ) as lease:
+        executor = REAL_PREPARE_DETACHED_RUNNER(
+            _rollback_marker_runner(ran),
+            journal,
+            operation_id,
+            ("pvesh", "create", "/fixed", "--noproxy"),
+            lease,
+        )
+        executor.abandon()
+
+    assert _wait_until(
+        lambda: _rollback_lease_is_free(directory, tmp_path, ROLLBACK_VMID)
+    )
+    assert not ran.exists()
+    assert journal.read_completed_capture(operation_id) is None
+
+
+def _detached_rollback_request(authority, job_id, pve, journal, monkeypatch):
+    """Drive the helper's REAL detached path with a fake `pvesh`."""
+
+    monkeypatch.setattr(
+        helper, "_prepare_detached_runner", REAL_PREPARE_DETACHED_RUNNER
+    )
+    monkeypatch.setattr(helper, "_run_bounded", pve.runner)
+    monkeypatch.setattr(helper, "DETACHED_READY_TIMEOUT_SECONDS", 2.0)
+    payload = _helper_request(authority, job_id)
+    try:
+        return helper.handle(payload, journal=journal)
+    except helper.RollbackError as exc:
+        return {
+            "response_version": 1,
+            "ok": False,
+            "error": {
+                "classification": exc.classification,
+                "message": str(exc),
+                "submission": exc.submission,
+            },
+        }
+
+
+def _failing_fork(monkeypatch, *, after: int):
+    """Make `os.fork` raise EAGAIN on the (after+1)-th call in this process."""
+
+    calls = [0]
+    real_fork = os.fork
+
+    def fork():
+        calls[0] += 1
+        if calls[0] > after:
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+        return real_fork()
+
+    monkeypatch.setattr(os, "fork", fork)
+
+
+def _armed_rollback(tmp_path: Path):
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    request = authority.package_update_rollback_request(job.job_id)
+    return authority, job, pve, host, request
+
+
+@pytest.mark.parametrize("after", [0, 1])
+def test_a_rollback_fork_failure_never_creates_a_submitted_operation(
+    tmp_path: Path, monkeypatch, after: int
+) -> None:
+    """Cases 1 and 2. Either fork failing is provably pre-submission.
+
+    ``after=1`` is the exact case whose `finally: os._exit(0)` used to look to
+    the controlling helper exactly like a successful handoff.
+    """
+
+    authority, job, pve, host, request = _armed_rollback(tmp_path)
+    _failing_fork(monkeypatch, after=after)
+
+    response = _detached_rollback_request(
+        authority, job.job_id, pve, host.journal, monkeypatch
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "execution_failed"
+    assert response["error"]["submission"] == "not_submitted"
+    record = host.journal.read(request.rollback_operation_id)
+    assert record["phase"] == "intent"
+    assert len(pve.rollbacks) == 0
+    assert host.journal.read_completed_capture(request.rollback_operation_id) is None
+
+
+def test_a_rollback_executor_dying_before_ready_creates_no_submission(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Case 3."""
+
+    authority, job, pve, host, request = _armed_rollback(tmp_path)
+
+    def die_before_ready(*_args, **_kwargs):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(helper, "_detached_executor", die_before_ready)
+
+    response = _detached_rollback_request(
+        authority, job.job_id, pve, host.journal, monkeypatch
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["submission"] == "not_submitted"
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "intent"
+    assert len(pve.rollbacks) == 0
+
+
+def test_a_rollback_journal_failure_after_ready_still_submits_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """READY was proved, the durable write failed, so the executor is
+    abandoned rather than released."""
+
+    authority, job, pve, host, request = _armed_rollback(tmp_path)
+    real_write = helper.OperationJournal.write
+
+    def refuse_submitted(self, record):
+        if record.get("phase") == "submitted":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(self, record)
+
+    monkeypatch.setattr(helper.OperationJournal, "write", refuse_submitted)
+
+    response = _detached_rollback_request(
+        authority, job.job_id, pve, host.journal, monkeypatch
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["submission"] == "not_submitted"
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "intent"
+    assert len(pve.rollbacks) == 0
+    assert host.journal.read_completed_capture(request.rollback_operation_id) is None
+
+
+def test_the_real_two_phase_rollback_handoff_submits_exactly_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Case 6 plus cases 9, 10, 11 and 12. One destructive pvesh through the
+    real handoff, the exact UPID recovered from its durable capture, repeated
+    resume submitting nothing more, and no wall clock on the physical work."""
+
+    authority, job, pve, host, request = _armed_rollback(tmp_path)
+    marker = tmp_path / "physical.log"
+    fake = pve.runner
+
+    def counting_runner(argv, timeout, max_output):
+        # Ordinary reads keep the faithful fake; only the DESTRUCTIVE call is
+        # counted on disk, because the executor that makes it is a forked
+        # grandchild whose in-memory effects never come back here.
+        if tuple(argv)[:2] == ("pvesh", "create"):
+            with marker.open("a", encoding="ascii") as handle:
+                # `ascii()` so no argument's own newlines can masquerade as
+                # extra invocations.
+                handle.write(f"{timeout!r}|{ascii(tuple(argv))}\n")
+        return fake(argv, timeout, max_output)
+
+    monkeypatch.setattr(
+        helper, "_prepare_detached_runner", REAL_PREPARE_DETACHED_RUNNER
+    )
+    monkeypatch.setattr(helper, "_run_bounded", counting_runner)
+    monkeypatch.setattr(helper, "DETACHED_READY_TIMEOUT_SECONDS", 2.0)
+
+    response = helper.handle(
+        _helper_request(authority, job.job_id), journal=host.journal
+    )
+
+    assert response["ok"] is True
+    assert _wait_until(
+        lambda: host.journal.read(request.rollback_operation_id)["phase"]
+        == "task_known"
+        or host.journal.read_completed_capture(request.rollback_operation_id)
+        is not None
+    )
+    inspected = host.inspect_rollback_state(request)
+    # Case 10: exact task attribution, recovered from the real capture.
+    assert inspected.task_upid == UPID
+    assert host.journal.read(request.rollback_operation_id)["task_upid"] == UPID
+
+    # Exactly ONE physical invocation actually happened, counted on disk
+    # across the fork boundary.
+    invocations = _physical_invocations(marker)
+    assert len(invocations) == 1
+    deadline_text, argv_text = invocations[0].split("|", 1)
+    # Cases 11 and 12: no wall-clock deadline, still `--noproxy`.
+    assert deadline_text == "None"
+    assert "'--noproxy'" in argv_text
+    assert "/rollback" in argv_text
+
+    # Case 9: repeated resume/inspection never submits a second rollback.
+    for _ in range(3):
+        helper.handle(_helper_request(authority, job.job_id), journal=host.journal)
+        host.inspect_rollback_state(request)
+    assert _physical_invocations(marker) == invocations
+
+
+def test_a_submitted_rollback_with_no_executor_stays_unknown_and_fenced(
+    tmp_path: Path,
+) -> None:
+    """Case 8. The irreducible window stays UNKNOWN: never resubmitted, never
+    released, and never inferred from canonical state."""
+
+    authority, job, pve, host, request = _armed_rollback(tmp_path)
+    host.journal.write(
+        helper._journal_record(
+            helper.parse_request(
+                _request_payload("submit_same_job_rollback", request)
+            ),
+            "submitted",
+        )
+    )
+    # Canonical state that a canonical-only inference would misread as proof.
+    _complete_rollback(pve)
+    pve.current_parent = request.snapshot_name
+
+    for _ in range(3):
+        inspected = host.inspect_rollback_state(request)
+        assert inspected.rollback_state is HostRollbackState.SUBMITTED
+        assert inspected.task_upid is None
+        assert inspected.outcome is RollbackOperationOutcome.UNCERTAIN
+        resumed = host.submit_same_job_rollback(request)
+        assert resumed.outcome is RollbackOperationOutcome.UNCERTAIN
+
+    assert len(pve.rollbacks) == 0
+    assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"

@@ -1,9 +1,12 @@
 """Dark bounded SSH transport for job-owned pre-update snapshot operations.
 
-**Not production-reachable and not deployed.** No production configuration,
-key, or `authorized_keys` entry exists for this channel: `app/inventory_runtime.py`
-never constructs it, and neither bootstrap nor the product updater installs
-its helper or key. It is instantiated only by hermetic tests in this stage.
+**Production-reachable and deployed.** `app/inventory_runtime.py` constructs
+exactly one of these for the package-update worker, and both bootstrap and
+the product updater install its forced-command helper together with a key
+dedicated to this boundary alone
+(`deploy/lib/bootstrap-update-boundaries.sh`,
+`deploy/lib/update-boundaries.sh`). Deploying the channel broadens no PVE API
+privilege: the deployed identity stays `Sys.Audit` plus `VM.Audit`.
 
 It is a separate, purpose-specific client from `app/package_scan_host_control.py`
 and deliberately does not resurrect the removed generic `app/host_control.py`:
@@ -52,8 +55,8 @@ _MAX_REQUEST_BYTES = 8192
 #:
 #: ``absent`` is only produced by the read-only ``inspect_job_snapshot_state``
 #: operation, and it maps to UNCERTAIN, never FAILED. A canonical absence is
-#: an *observation*, not proof that an already-submitted asynchronous PVE
-#: snapshot operation terminated: the task may still be queued or running and
+#: an *observation*, not proof that an already-submitted PVE snapshot
+#: operation terminated: the detached host runner may still be running and
 #: about to create the snapshot. Only a terminal failed PVE task (which the
 #: helper reports as ``failed``, with its own canonical evidence attached) may
 #: reach the FAILED branch, and only the explicit durable ``not_submitted``
@@ -71,6 +74,14 @@ _OUTCOMES = {
 #: value stays uncertain, so an older helper that does not report submission
 #: proof can never accidentally release a fenced job.
 _HELPER_NOT_SUBMITTED = "not_submitted"
+
+#: The helper's exact classification for "the per-VMID lease is already
+#: held", which is precisely what this operation's own detached destructive
+#: runner does for the whole of its physical `pvesh`. Matched exactly against
+#: the typed classification and never against reason text, so an unknown or
+#: malformed value stays plain UNKNOWN. It proves nothing on its own -- see
+#: `HostSnapshotResult.host_operation_in_progress`.
+_HELPER_OPERATION_IN_PROGRESS = "operation_in_progress"
 
 
 class SshPackageUpdateSnapshotHostControl:
@@ -347,6 +358,9 @@ class SshPackageUpdateSnapshotHostControl:
             return self._uncertain(
                 snapshot_operation_id,
                 f"host-control reported a failure ({classification})",
+                host_operation_in_progress=(
+                    classification == _HELPER_OPERATION_IN_PROGRESS
+                ),
             )
         outcome = _OUTCOMES.get(str(payload.get("outcome")))
         if outcome is None:
@@ -468,9 +482,15 @@ class SshPackageUpdateSnapshotHostControl:
         return False
 
     @staticmethod
-    def _uncertain(snapshot_operation_id: str, reason: str) -> HostSnapshotResult:
+    def _uncertain(
+        snapshot_operation_id: str,
+        reason: str,
+        *,
+        host_operation_in_progress: bool = False,
+    ) -> HostSnapshotResult:
         return HostSnapshotResult(
             outcome=SnapshotOperationOutcome.UNCERTAIN,
             snapshot_operation_id=snapshot_operation_id,
             reason=reason,
+            host_operation_in_progress=host_operation_in_progress,
         )

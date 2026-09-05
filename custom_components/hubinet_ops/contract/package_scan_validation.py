@@ -29,6 +29,8 @@ def validate_package_scan_snapshot(scan: "PackageScanSnapshot") -> None:
         type(scan.pending_count) is not int or scan.pending_count < 0
     ):
         raise ValueError("package_scan.pending_count must be non-negative or unknown")
+    if not isinstance(scan.post_update_scan_pending, bool):
+        raise ValueError("package_scan.post_update_scan_pending must be a boolean")
 
     empty_evidence = (
         scan.pending_count is None

@@ -101,9 +101,9 @@ class HostRollbackState(StrEnum):
 
     Deliberately the same SHAPE as :class:`HostSubmissionState`, and
     deliberately a DIFFERENT type. The shape matches because the verified
-    upstream semantics match: like snapshot create, an LXC rollback is
-    submitted through an asynchronous PVE endpoint that returns a UPID
-    immediately (`fork_worker('vzrollback', ...)`), so there is a real
+    task-attribution semantics match: like snapshot create, an LXC rollback
+    uses a detached local `pvesh` runner whose durable completed capture is
+    promoted to the exact UPID, so there is a real
     ``task_known`` phase between "submission crossed PVE's door" and "the
     operation reached a terminal result".
 
@@ -235,6 +235,7 @@ class PackageUpdateEventType(StrEnum):
     MUTATION_BLOCKED_BEFORE_SUBMISSION = "mutation_blocked_before_submission"
     HEALTH_STARTED = "health_started"
     HEALTH_PASSED = "health_passed"
+    POST_UPDATE_SCAN_REQUESTED = "post_update_scan_requested"
     HEALTH_FAILED = "health_failed"
     HEALTH_OUTCOME_UNKNOWN = "health_outcome_unknown"
     ROLLBACK_MAY_HAVE_STARTED = "rollback_may_have_started"
@@ -909,7 +910,7 @@ class PackageUpdateJob:
     rollback_may_have_started_at: str | None
     #: The PVE task identity observed for this exact rollback, recorded the
     #: instant the host durably knows one. Write-once; it is what lets a
-    #: restarted backend reattach to an asynchronous `vzrollback` task
+    #: restarted backend reattach to the exact attributed `vzrollback` task
     #: instead of guessing.
     rollback_task_upid: str | None
     rollback_completed_at: str | None

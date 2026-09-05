@@ -579,6 +579,10 @@ def create_read_only_app(
         else _build_package_update_runtime(authority, store, config)
     )
     package_update_worker = None if package_update is None else package_update.worker
+    if package_update_worker is not None:
+        package_update_worker.configure_post_update_scan_wake(
+            package_scan_scheduler.wake_for_post_update_scan
+        )
     if package_update_worker is not None and start_scheduler:
         # The worker's first cycle is a RECOVERY cycle. `authority.
         # recover_interrupted_package_update_jobs()` above has already
@@ -805,9 +809,11 @@ def create_read_only_app(
         except PackageUpdateIssuanceRefused as exc:
             # The authority already decided AND named the refusal; this
             # renders it. Two members of that set are genuinely retryable --
-            # a package scan that is still running, and a Hubinet product
-            # update holding the maintenance fence -- and both say "ask again
-            # shortly" rather than "your plan is wrong", so they get 503.
+            # package-scan authority that is temporarily unavailable (a
+            # running scan or an owed post-update refresh), and a Hubinet
+            # product update holding the maintenance fence -- and both say
+            # "ask again shortly" rather than "your plan is wrong", so they
+            # get 503.
             status = 503 if exc.reason in _RETRYABLE_ISSUANCE_REFUSALS else 409
             raise _package_update_error(status, exc.reason, str(exc)) from exc
         except AuthorityConflict as exc:

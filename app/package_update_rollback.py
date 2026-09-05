@@ -1,11 +1,13 @@
 """Dark same-job rollback execution for package update jobs.
 
-**Not production-reachable.** Nothing in `app/inventory_runtime.py`, the HTTP
-API, the Home Assistant integration, the discovery scheduler, or the package
-scan scheduler constructs or calls anything in this module. It exists so the
-compensation half of the update lifecycle can be built and adversarially
-tested before it is ever activated, and `tests/test_r0_architecture_regression.py`
-proves it stays unreachable.
+**Production-reachable.** `app/inventory_runtime.py` builds this orchestrator
+and its dedicated SSH host control as part of the package-update worker, and
+both bootstrap and the product updater install the matching forced-command
+helper and its own key (`deploy/lib/bootstrap-update-boundaries.sh`,
+`deploy/lib/update-boundaries.sh`). Reachability is NOT policy: NOTHING calls
+a rollback automatically. The worker may never arm one, no scheduler, startup
+path, or health verdict triggers one, and
+`tests/test_r0_architecture_regression.py` enforces that.
 
 It contains no snapshot deletion, no retention, and no automatic rollback
 policy: a caller must ask for one exact job to be rolled back. Health
@@ -65,12 +67,13 @@ operation.
 Established from current Proxmox VE sources, not inherited from snapshot
 create and not from Hubinet 0.4:
 
-- `POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback` is
-  `protected => 1`, `proxyto => 'node'`, takes an optional `start` boolean
-  (default 0), and requires `VM.Snapshot` or `VM.Snapshot.Rollback` on
-  `/vms/{vmid}`.
-- It is asynchronous: the worker is `fork_worker('vzrollback', ...)` and the
-  endpoint returns the task id, so a returned POST proves nothing.
+- `POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback` is protected,
+  takes an optional `start` boolean (default 0), and requires `VM.Snapshot` or
+  `VM.Snapshot.Rollback` on `/vms/{vmid}`.
+- The endpoint uses `fork_worker('vzrollback', ...)`, but local `pvesh` CLI
+  runs it synchronously and emits the final task id only after worker output.
+  The host helper detaches that CLI call and recovers the exact UPID from its
+  durable bounded capture, so a returned submission response proves nothing.
 - `snapshot_rollback` refuses, with these exact upstream conditions: a
   template; a snapshot that does not exist; a snapshot still carrying
   `snapstate` ("unable to rollback to incomplete snapshot"); a config already
@@ -151,10 +154,25 @@ class HostRollbackResult:
     #: Bounded classification/reason text. Never raw PVE logs or command text.
     reason: str | None = None
     #: The host's own durable journal phase for this operation, read directly
-    #: off it. ``None`` only for an older host predating this field, which the
-    #: caller must treat exactly like ``SUBMITTED`` -- never a licence to
-    #: submit.
+    #: off it. ``None`` whenever the host could not report one at all -- an
+    #: older host predating this field, a transport failure, or any host-side
+    #: error including :attr:`host_operation_in_progress`. The caller must
+    #: treat ``None`` exactly like ``SUBMITTED`` -- never a licence to submit.
     rollback_state: HostRollbackState | None = None
+    #: The host refused this read because the per-VMID lease was already
+    #: held, which is what the detached destructive runner does for the whole
+    #: of its physical `pvesh`. INTERNAL CONTROL FLOW ONLY.
+    #:
+    #: Set from the helper's exact typed error classification, never from
+    #: reason text; an absent/unknown/malformed classification leaves it
+    #: ``False`` so an older or misbehaving host fails closed.
+    #:
+    #: It is NOT authority: not success, not failure, not absence, not
+    #: submission proof, and it never reaches publication or HA. It may
+    #: extend bounded read-only polling ONLY when the orchestrator already
+    #: holds durable ``submitted``/``task_known`` evidence for this exact
+    #: operation; before that proof exists it is plain UNKNOWN.
+    host_operation_in_progress: bool = False
 
 
 class PackageUpdateRollbackHostControl(Protocol):
@@ -170,10 +188,10 @@ class PackageUpdateRollbackHostControl(Protocol):
     ) -> HostRollbackResult:
         """Submit, or reattach to, this exact job's rollback operation.
 
-        Submission-only: it journals `submitted`, invokes `pvesh create`
-        once, journals whatever UPID PVE returns, and returns. It never polls
-        the asynchronous `vzrollback` task to completion, so it is safe to
-        call while the backend holds its authority writer lock across it.
+        Submission-only: it journals `submitted`, starts one detached fixed
+        local `pvesh create`, and returns. Inspect later promotes only an exact
+        completed capture to `task_known`, so it is safe to call while the
+        backend holds its authority writer lock across it.
         """
 
     def inspect_rollback_state(
@@ -196,8 +214,10 @@ class RollbackStageResult:
     reason: str | None = None
 
 
-#: Bounded polling of one journaled PVE rollback task. A task still running
-#: when this elapses stays UNCERTAIN -- never failed, never resubmitted. The
+#: Bounded polling of one in-flight rollback: a journaled PVE task, or a
+#: `submitted` rollback whose detached host capture has not yet yielded the
+#: exact UPID. Either still in flight when this elapses stays UNCERTAIN --
+#: never failed, never resubmitted. The
 #: default is generous because a rollback force-stops the container and then
 #: rolls back every volume, which on a large mountpoint is not quick.
 DEFAULT_TASK_POLL_TIMEOUT_SECONDS = 1800.0
@@ -382,7 +402,7 @@ class PackageUpdateRollbackOrchestrator:
         # Task polling and canonical recovery happen entirely outside the
         # authority critical section: every iteration is a bounded, read-only
         # host inspection, never a resubmission and never a held writer lock.
-        result = self._poll_until_resolved(request, result)
+        result = self._poll_until_resolved(job, request, result)
         return self._apply_host_result(
             job,
             request,
@@ -513,37 +533,126 @@ class PackageUpdateRollbackOrchestrator:
 
     def _poll_until_resolved(
         self,
+        job: PackageUpdateJob,
         request: PackageUpdateRollbackRequest,
         result: HostRollbackResult,
     ) -> HostRollbackResult:
-        """Bounded-poll a known PVE task purely through read-only inspection.
+        """Bounded-poll one in-flight rollback purely through read-only inspection.
 
-        Never opens a database transaction and never resubmits. Once a read
-        observes the task ITSELF has reached a terminal PVE state, further
-        polling cannot make that same task more terminal, so it stops: the
-        durable journal phase alone is not a fresh signal, since it stays
-        ``task_known`` forever once a task identity is captured.
+        Never opens a database transaction and never resubmits.
+
+        THE PROBLEM THIS SOLVES. Submission hands the physical `pvesh` to a
+        DETACHED host grandchild which keeps this operation's per-VMID lease
+        for the whole of the physical rollback, and releases it only AFTER
+        the durable completion capture is written. So the ordinary production
+        sequence is:
+
+        ```text
+        submit           -> submitted, no UPID (capture does not exist yet)
+        inspect          -> lease still held -> host_operation_in_progress
+        inspect          -> lease still held -> host_operation_in_progress
+        (pvesh ends, capture written, lease released)
+        inspect          -> capture promoted -> task_known + exact UPID
+        inspect          -> exact task terminal evidence -> done
+        ```
+
+        Neither middle read carries a journal phase -- the helper could not
+        read the journal at all -- so a predicate looking only at
+        ``rollback_state`` would end the cycle as ``rollback_uncertain`` and
+        demand an operator RESUME purely to notice a capture that landed
+        moments later.
+
+        THE STATE MACHINE. This loop carries the last DURABLY PROVEN
+        in-flight phase for this exact operation across transient unreadable
+        windows: ``submitted``/``task_known`` sets the proof
+        (``task_known`` never degrades back), a bare
+        :attr:`~HostRollbackResult.host_operation_in_progress` KEEPS it and
+        keeps polling but proves nothing itself, and anything else clears it
+        so a transport failure, an unknown classification, or a malformed
+        answer after ``submitted`` fails closed rather than being mistaken
+        for the expected lease-busy window.
+
+        None of this weakens rollback's attribution rule. Promotion still
+        requires a COMPLETE, exact capture, and rollback NEVER infers success
+        from canonical state: a rollback that never yields an exact UPID
+        stays uncertain and fenced however long this loop looks.
+
+        ``task_known`` whose task is not yet terminal stays pollable exactly
+        as before. Once a read observes the task ITSELF has reached a
+        terminal PVE state, further polling cannot make that same task more
+        terminal, so it stops: the durable journal phase alone is not a fresh
+        signal, since it stays ``task_known`` forever once a task identity is
+        captured.
         """
 
-        def _pending(candidate: HostRollbackResult) -> bool:
-            if candidate.rollback_state is not HostRollbackState.TASK_KNOWN:
-                return False
-            if candidate.outcome is not RollbackOperationOutcome.UNCERTAIN:
-                return False
-            if candidate.task is not None and candidate.task.terminal:
-                return False
-            return True
-
-        if not _pending(result):
+        proven = self._proven_in_flight(result, self._durable_proof(job))
+        if not self._pending(result, proven):
             return result
         deadline = self._monotonic() + self._task_poll_timeout_seconds
         while True:
             result = self._read_inspection(request)
-            if not _pending(result):
+            proven = self._proven_in_flight(result, proven)
+            if not self._pending(result, proven):
                 return result
             if self._monotonic() >= deadline:
                 return result
             self._sleep(self._task_poll_interval_seconds)
+
+    @staticmethod
+    def _durable_proof(job: PackageUpdateJob) -> HostRollbackState | None:
+        """Seed the in-flight proof from authority's own durable record.
+
+        A recorded rollback task UPID is write-once durable evidence that
+        THIS job's rollback reached ``task_known``, so a worker that
+        restarted mid-flight may keep polling through the lease-busy window
+        instead of needing an operator RESUME to re-learn what authority
+        already knows. Nothing weaker seeds anything: the write-ahead
+        ``rollback_may_have_started`` checkpoint is committed BEFORE
+        submission and so proves no submission at all.
+        """
+
+        return (
+            HostRollbackState.TASK_KNOWN
+            if job.rollback_task_upid is not None
+            else None
+        )
+
+    @staticmethod
+    def _proven_in_flight(
+        candidate: HostRollbackResult, previous: HostRollbackState | None
+    ) -> HostRollbackState | None:
+        """Carry the last durably proven in-flight phase across busy reads."""
+
+        state = candidate.rollback_state
+        if state is HostRollbackState.TASK_KNOWN:
+            return state
+        if state is HostRollbackState.SUBMITTED:
+            # Never let a re-read downgrade proof the cycle already has.
+            return previous if previous is HostRollbackState.TASK_KNOWN else state
+        if candidate.host_operation_in_progress:
+            # The host could not read its journal; it did not contradict it.
+            return previous
+        return None
+
+    @staticmethod
+    def _pending(
+        candidate: HostRollbackResult, proven: HostRollbackState | None
+    ) -> bool:
+        if candidate.outcome is not RollbackOperationOutcome.UNCERTAIN:
+            return False
+        if candidate.host_operation_in_progress:
+            # Transient read-unavailable. Pollable ONLY on top of durable
+            # submission proof this cycle already holds; never on its own.
+            return proven is not None
+        if candidate.rollback_state is HostRollbackState.SUBMITTED:
+            # The detached capture may still land and yield the exact UPID.
+            # Looking again is a read; it never resubmits.
+            return True
+        if candidate.rollback_state is not HostRollbackState.TASK_KNOWN:
+            return False
+        if candidate.task is not None and candidate.task.terminal:
+            return False
+        return True
 
     def _apply_host_result(
         self,
