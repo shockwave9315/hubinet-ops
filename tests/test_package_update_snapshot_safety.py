@@ -12,6 +12,8 @@ mutation. There is no APT execution anywhere in this stage.
 from __future__ import annotations
 
 from dataclasses import replace
+import fcntl
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -4834,3 +4836,468 @@ def test_a_submitted_operation_whose_capture_never_lands_stays_uncertain(
     assert store.package_update_job(job.job_id).snapshot_task_upid is None
     assert journal.read(identity.snapshot_operation_id)["phase"] == "submitted"
     assert pve.submissions == 1
+
+
+# ---------------------------------------------------------------------------
+# P1. THE REAL PRODUCTION TEMPORAL ORDER.
+#
+# The injected-runner seam every other dark-chain test uses sets
+# `detach = runner is None` to False, which runs the capture synchronously and
+# releases the per-VMID lease before submission returns -- the exact opposite
+# of production. In production the detached grandchild INHERITS that lease and
+# holds it for the whole physical `pvesh`, releasing it only after the durable
+# completion capture is written, so every inspect in between is refused with
+# the typed `operation_in_progress` classification and carries NO journal
+# phase at all.
+#
+# These tests reproduce that ordering: the real lease file, the real helper
+# refusal, the real host-control classification mapping, and the real
+# orchestrator state machine -- with no fork and no sleeping.
+# ---------------------------------------------------------------------------
+
+
+class _HeldVmidLease:
+    """Hold the REAL per-VMID lease file the way the detached child does.
+
+    `flock` treats two open file descriptions of one file independently even
+    inside a single process, so this genuinely blocks the helper's own
+    non-blocking acquisition exactly as another process would.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._descriptor: int | None = None
+
+    @property
+    def held(self) -> bool:
+        return self._descriptor is not None
+
+    def acquire(self) -> None:
+        assert self._descriptor is None
+        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(self._path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(descriptor)
+            raise
+        self._descriptor = descriptor
+
+    def release(self) -> None:
+        if self._descriptor is not None:
+            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+
+def _detached_dark_channel(fake_pve, journal, monkeypatch, lease_holder, detached):
+    """A dark channel whose helper takes its REAL detached submission path.
+
+    `handle_request` picks `detach = runner is None`, so patching the module
+    level `_run_bounded` -- rather than injecting a runner -- keeps the fake
+    `pvesh` while leaving `detach` True. `_ensure_submitted` then really takes
+    the detached branch and really calls `lease.detach()`, which drops the
+    caller's descriptor WITHOUT unlocking; `lease_holder` immediately stands
+    in for the grandchild that inherited it.
+    """
+
+    import json as _json
+
+    from app.package_scan_host_control import BoundedProcessResult
+    from app.package_update_snapshot_host_control import (
+        SshPackageUpdateSnapshotHostControl,
+    )
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    real_capture = snapshot_helper._run_capture_child
+
+    def spawn_like_production(runner, host_journal, operation_id, argv, lease):
+        lease.detach()
+        lease_holder.acquire()
+
+        def finish_physical_work() -> None:
+            # Ordering is load-bearing: the capture is durable BEFORE the
+            # lease is released, exactly as the grandchild's `os._exit` does.
+            real_capture(runner, host_journal, operation_id, argv)
+            lease_holder.release()
+
+        detached.append(finish_physical_work)
+
+    monkeypatch.setattr(snapshot_helper, "_run_bounded", fake_pve)
+    monkeypatch.setattr(
+        snapshot_helper, "_spawn_detached_runner", spawn_like_production
+    )
+
+    def runner(argv, input_bytes, timeout, max_output):
+        assert argv[0] == "ssh"
+        assert not any(item.startswith("pvesh") for item in argv)
+        response = snapshot_helper.handle_request(
+            _json.loads(input_bytes.decode("utf-8")), journal=journal
+        )
+        payload = _json.dumps(response, ensure_ascii=True, separators=(",", ":"))
+        return BoundedProcessResult(
+            0 if response.get("ok") else 1, payload.encode("utf-8"), b""
+        )
+
+    return SshPackageUpdateSnapshotHostControl(
+        host="pve.example.internal",
+        port=22,
+        user="hubinet-snapshot",
+        private_key_path=Path("/etc/hubinet-ops/snapshot-key"),
+        known_hosts_path=Path("/etc/hubinet-ops/known_hosts"),
+        timeout_seconds=60,
+        max_result_bytes=1024 * 1024,
+        runner=runner,
+    )
+
+
+def test_a_detached_snapshot_survives_the_whole_lease_busy_window(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """T0 submitted -> busy -> busy -> capture -> task_known -> completed.
+
+    One worker cycle, no operator RESUME, exactly one destructive submission.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    pve.on_submit = lambda p: p.snapshots.append(
+        _owned_listing_entry(identity, ownership)
+    )
+    lease_holder = _HeldVmidLease(journal.directory / f"vmid-{job.expected_vmid}.lock")
+    detached: list = []
+    channel = _detached_dark_channel(pve, journal, monkeypatch, lease_holder, detached)
+
+    clock = [0.0]
+    sleep_calls: list[float] = []
+    seen: list[tuple[object, bool]] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 1.0
+        if len(sleep_calls) == 3:
+            # The physical pvesh ends here: capture written, lease released.
+            assert lease_holder.held
+            detached.pop()()
+            assert not lease_holder.held
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority,
+        channel,
+        sleep=sleep,
+        monotonic=lambda: clock[0],
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+    real_inspect = orchestrator._read_inspection
+
+    def recording_inspect(*args, **kwargs):
+        answer = real_inspect(*args, **kwargs)
+        seen.append((answer.submission_state, answer.host_operation_in_progress))
+        return answer
+
+    orchestrator._read_inspection = recording_inspect
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    # The first read is the pre-submission one; then three genuinely
+    # lease-busy reads carrying NO journal phase, which the old predicate
+    # would have treated as the end of the cycle.
+    assert seen[0] == (HostSubmissionState.ABSENT, False)
+    assert seen[1:4] == [(None, True)] * 3
+    assert seen[4][0] is HostSubmissionState.TASK_KNOWN
+    assert sleep_calls == [2.0, 2.0, 2.0]
+
+    # One ordinary worker cycle reached a confirmed snapshot.
+    assert result.outcome is SnapshotOperationOutcome.COMPLETED
+    assert result.job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert result.job.snapshot_task_upid == upid
+    assert store.package_update_job(job.job_id).snapshot_task_upid == upid
+    assert journal.read(identity.snapshot_operation_id)["phase"] == "task_known"
+    # Exactly one destructive submission, and the helper really detached.
+    assert pve.submissions == 1
+    assert detached == []
+
+
+# ---------------------------------------------------------------------------
+# The negative half. `host_operation_in_progress` is control flow, never
+# authority: it may only EXTEND polling that durable submission proof already
+# justified, and it is keyed off the exact typed classification.
+# ---------------------------------------------------------------------------
+
+
+def _busy(snapshot_operation_id: str) -> HostSnapshotResult:
+    """Exactly what a lease-busy helper answer parses to: no journal phase."""
+
+    return HostSnapshotResult(
+        outcome=SnapshotOperationOutcome.UNCERTAIN,
+        snapshot_operation_id=snapshot_operation_id,
+        reason="host-control reported a failure (operation_in_progress)",
+        host_operation_in_progress=True,
+    )
+
+
+class _ScriptedSnapshotHostControl:
+    """An ordered answer queue for `inspect`, with submission/seal tripwires."""
+
+    def __init__(self, inspect_results, *, submit_result=None) -> None:
+        self._inspect_results = list(inspect_results)
+        self._submit_result = submit_result
+        self.inspect_calls = 0
+        self.submit_calls = 0
+        self.seal_calls = 0
+
+    def inspect_job_snapshot_state(self, *, snapshot_operation_id, **_kwargs):
+        self.inspect_calls += 1
+        if not self._inspect_results:
+            # A scenario that runs off the end of its script would silently
+            # stop proving what it claims to prove.
+            raise AssertionError("inspect_job_snapshot_state called past its script")
+        item = self._inspect_results.pop(0)
+        return item(snapshot_operation_id) if callable(item) else item
+
+    def ensure_pre_update_snapshot_submitted(
+        self, *, snapshot_operation_id, **_kwargs
+    ):
+        self.submit_calls += 1
+        if self._submit_result is None:
+            raise AssertionError("this scenario must never submit a snapshot")
+        return self._submit_result(snapshot_operation_id)
+
+    def seal_operation_never_submitted(self, *, snapshot_operation_id, **_kwargs):
+        self.seal_calls += 1
+        raise AssertionError("this scenario must never seal")
+
+
+def _submitted(snapshot_operation_id: str) -> HostSnapshotResult:
+    return HostSnapshotResult(
+        outcome=SnapshotOperationOutcome.UNCERTAIN,
+        snapshot_operation_id=snapshot_operation_id,
+        submission_state=HostSubmissionState.SUBMITTED,
+    )
+
+
+def _prepared_for_scripted_host(tmp_path: Path):
+    _, store, authority, _resource, job, identity, _ownership = _prepared(tmp_path)
+    return store, authority, job, identity
+
+
+def _scripted_orchestrator(authority, host, *, timeout=800.0):
+    clock = [0.0]
+    sleep_calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 400.0
+
+    return (
+        PackageUpdateSnapshotOrchestrator(
+            authority,
+            host,
+            sleep=sleep,
+            monotonic=lambda: clock[0],
+            task_poll_timeout_seconds=timeout,
+            task_poll_interval_seconds=2.0,
+        ),
+        sleep_calls,
+    )
+
+
+def test_lease_busy_before_any_submission_proof_is_plain_unknown(
+    tmp_path: Path,
+) -> None:
+    """A. No prior SUBMITTED/TASK_KNOWN for this operation, so a busy read
+    proves nothing: it may not submit, may not seal, may not release, and may
+    not start a poll loop on its own."""
+
+    store, authority, job, identity = _prepared_for_scripted_host(tmp_path)
+    host = _ScriptedSnapshotHostControl([_busy])
+    orchestrator, sleep_calls = _scripted_orchestrator(authority, host)
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 1
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+    assert sleep_calls == []
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert fenced.snapshot_confirmed_at is None
+    assert fenced.snapshot_task_upid is None
+
+
+def test_lease_busy_after_submitted_stays_fenced_at_the_poll_deadline(
+    tmp_path: Path,
+) -> None:
+    """B. Bounded: repeated busy reads never resubmit and never fabricate an
+    outcome, and the cycle ends UNCERTAIN and fenced."""
+
+    store, authority, job, identity = _prepared_for_scripted_host(tmp_path)
+    host = _ScriptedSnapshotHostControl(
+        [_submitted, _busy, _busy, _busy], submit_result=None
+    )
+    orchestrator, sleep_calls = _scripted_orchestrator(authority, host)
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+    # Bounded by the configured deadline, not by the script running out.
+    assert sleep_calls == [2.0, 2.0]
+    assert host.inspect_calls == 4
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.snapshot_task_upid is None
+
+
+def test_an_unknown_failure_after_submitted_is_not_treated_as_lease_busy(
+    tmp_path: Path,
+) -> None:
+    """C. Only the EXACT typed classification extends polling. A generic
+    transport/host failure after SUBMITTED fails closed immediately."""
+
+    store, authority, job, identity = _prepared_for_scripted_host(tmp_path)
+
+    def _generic_failure(snapshot_operation_id: str) -> HostSnapshotResult:
+        return HostSnapshotResult(
+            outcome=SnapshotOperationOutcome.UNCERTAIN,
+            snapshot_operation_id=snapshot_operation_id,
+            reason="host-control reported a failure (journal_corrupt)",
+        )
+
+    host = _ScriptedSnapshotHostControl([_submitted, _generic_failure])
+    orchestrator, sleep_calls = _scripted_orchestrator(authority, host)
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    # It looked exactly once more and stopped dead: no busy-window credit was
+    # extended, so it never even reached its first poll interval.
+    assert host.inspect_calls == 2
+    assert sleep_calls == []
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+
+
+def test_lease_busy_never_discards_an_already_known_task_identity(
+    tmp_path: Path,
+) -> None:
+    """D. TASK_KNOWN plus transient busy keeps polling AND keeps the exact
+    UPID authority already recorded."""
+
+    store, authority, job, identity = _prepared_for_scripted_host(tmp_path)
+
+    def _task_known(snapshot_operation_id: str) -> HostSnapshotResult:
+        return HostSnapshotResult(
+            outcome=SnapshotOperationOutcome.UNCERTAIN,
+            snapshot_operation_id=snapshot_operation_id,
+            task_upid=UPID,
+            submission_state=HostSubmissionState.TASK_KNOWN,
+        )
+
+    host = _ScriptedSnapshotHostControl([_task_known, _busy, _busy, _busy])
+    orchestrator, sleep_calls = _scripted_orchestrator(authority, host)
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 4
+    assert sleep_calls == [2.0, 2.0]
+    # The identity survives every busy read, in authority's own record.
+    assert store.package_update_job(job.job_id).snapshot_task_upid == UPID
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+
+
+def test_a_busy_answer_for_a_different_operation_inherits_nothing(
+    tmp_path: Path,
+) -> None:
+    """E. Operation identity is checked before anything else, so a foreign
+    answer can never inherit this operation's SUBMITTED state."""
+
+    store, authority, job, identity = _prepared_for_scripted_host(tmp_path)
+    foreign = str(uuid.uuid4())
+
+    host = _ScriptedSnapshotHostControl(
+        [_submitted, lambda _own: _busy(foreign), _busy]
+    )
+    orchestrator, sleep_calls = _scripted_orchestrator(authority, host)
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    # The mismatched answer is rejected as "answered a different operation"
+    # -- not busy, not proof -- so polling stops there.
+    assert host.inspect_calls == 2
+    assert sleep_calls == []
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+    assert store.package_update_job(job.job_id).snapshot_task_upid is None
+
+
+def test_the_transport_sets_lease_busy_only_for_the_exact_classification(
+    tmp_path: Path,
+) -> None:
+    """The typed field comes from the helper's classification, never text."""
+
+    from app.package_update_snapshot_host_control import (
+        SshPackageUpdateSnapshotHostControl,
+    )
+
+    transport = SshPackageUpdateSnapshotHostControl(
+        host="pve.example.internal",
+        port=22,
+        user="hubinet-snapshot",
+        private_key_path=Path("/k"),
+        known_hosts_path=Path("/h"),
+        timeout_seconds=60,
+        max_result_bytes=1024,
+        runner=lambda *_a, **_k: None,
+    )
+    operation_id = str(uuid.uuid4())
+
+    def _parse(error: object) -> HostSnapshotResult:
+        return transport._parse_payload(
+            {
+                "response_version": 1,
+                "ok": False,
+                "snapshot_operation_id": operation_id,
+                "error": error,
+            },
+            operation_id,
+        )
+
+    exact = _parse({"classification": "operation_in_progress"})
+    assert exact.host_operation_in_progress is True
+    assert exact.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert exact.submission_state is None
+
+    for near_miss in (
+        {"classification": "Operation_In_Progress"},
+        {"classification": "operation_in_progress "},
+        {"classification": "another operation_in_progress holds the lease"},
+        {"classification": "journal_corrupt"},
+        {"message": "another snapshot operation holds this guest's lease"},
+        {},
+        "operation_in_progress",
+        None,
+    ):
+        assert _parse(near_miss).host_operation_in_progress is False, near_miss
+
+    # A successful response never carries the flag either.
+    ok = transport._parse_payload(
+        {
+            "response_version": 1,
+            "ok": True,
+            "snapshot_operation_id": operation_id,
+            "outcome": "uncertain",
+            "submission_state": "submitted",
+        },
+        operation_id,
+    )
+    assert ok.host_operation_in_progress is False
+    assert ok.submission_state is HostSubmissionState.SUBMITTED

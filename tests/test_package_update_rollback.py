@@ -25,8 +25,10 @@ transport parser.
 
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -2409,11 +2411,11 @@ def test_the_known_task_is_durable_before_the_first_poll_call(
     observed_before_poll: list[str | None] = []
     original_poll = orchestrator._poll_until_resolved
 
-    def _seam(request, result):
+    def _seam(polled_job, request, result):
         observed_before_poll.append(
             authority.package_update_job(job.job_id).rollback_task_upid
         )
-        return original_poll(request, result)
+        return original_poll(polled_job, request, result)
 
     orchestrator._poll_until_resolved = _seam
 
@@ -3503,3 +3505,411 @@ def test_a_submitted_rollback_without_a_capture_never_infers_success(
     request = authority.package_update_rollback_request(job.job_id)
     assert host.journal.read(request.rollback_operation_id)["phase"] == "submitted"
     assert len(pve.rollbacks) == 1
+
+
+# ===========================================================================
+# P1. THE REAL PRODUCTION TEMPORAL ORDER.
+#
+# `handle` picks `detach = runner is None`, so the injected-runner seam every
+# other dark-chain test uses runs the capture synchronously and releases the
+# per-VMID lease before submission returns -- the opposite of production. In
+# production the detached grandchild INHERITS that lease and holds it for the
+# whole physical rollback `pvesh`, releasing it only after the durable
+# completion capture is written, so every inspect in between is refused with
+# the typed `operation_in_progress` classification and carries NO journal
+# phase at all.
+#
+# This reproduces that ordering against the real lease file, the real helper
+# refusal, and the real host-control classification mapping -- no fork, no
+# sleeping, no network.
+# ===========================================================================
+
+
+class _HeldVmidLease:
+    """Hold the REAL per-VMID lease file the way the detached child does."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._descriptor: int | None = None
+
+    @property
+    def held(self) -> bool:
+        return self._descriptor is not None
+
+    def acquire(self) -> None:
+        assert self._descriptor is None
+        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(self._path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(descriptor)
+            raise
+        self._descriptor = descriptor
+
+    def release(self) -> None:
+        if self._descriptor is not None:
+            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+
+class _DetachedHelperBackedHostControl(HelperBackedHostControl):
+    """`HelperBackedHostControl` whose helper takes its REAL detach path.
+
+    Patching the module-level `_run_bounded` -- rather than injecting a
+    runner -- keeps the fake `pvesh` while leaving `detach` True, so
+    `submit_same_job_rollback` really takes the detached branch and really
+    calls `lease.detach()`, which drops the caller's descriptor WITHOUT
+    unlocking it.
+    """
+
+    def __init__(self, pve, journal_directory: Path, monkeypatch) -> None:
+        super().__init__(pve, journal_directory)
+        self.lease = _HeldVmidLease(
+            self.journal.directory / f"vmid-{pve.vmid}.lock"
+        )
+        self.detached: list = []
+        real_capture = helper._run_capture_child
+
+        def spawn_like_production(runner, journal, operation_id, argv, lease):
+            lease.detach()
+            self.lease.acquire()
+
+            def finish_physical_work() -> None:
+                # The capture is durable BEFORE the lease is released,
+                # exactly as the grandchild's `os._exit` orders it.
+                real_capture(runner, journal, operation_id, argv)
+                self.lease.release()
+
+            self.detached.append(finish_physical_work)
+
+        monkeypatch.setattr(helper, "_run_bounded", pve.runner)
+        monkeypatch.setattr(helper, "_spawn_detached_runner", spawn_like_production)
+
+    def _run(self, operation: str, request):
+        self.calls.append(operation)
+        payload = _request_payload(operation, request)
+        try:
+            response = helper.handle(payload, journal=self.journal)
+        except helper.RollbackError as exc:
+            # Exactly what the helper's own `main()` emits for a raised
+            # error, including the typed classification the transport keys
+            # `host_operation_in_progress` off.
+            response = {
+                "response_version": 1,
+                "ok": False,
+                "rollback_operation_id": request.rollback_operation_id,
+                "error": {
+                    "classification": exc.classification,
+                    "message": str(exc),
+                    "submission": exc.submission,
+                },
+            }
+        return self._parser(response, request.rollback_operation_id)
+
+
+def test_a_detached_rollback_survives_the_whole_lease_busy_window(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """T0 submitted -> busy -> busy -> capture -> task_known -> terminal.
+
+    One invocation, no operator RESUME, exactly one destructive rollback, and
+    still no canonical-only success inference anywhere on the path.
+    """
+
+    clock_, store, authority, _, job, ownership, identity, pve, _, _ = _mutating_job(
+        tmp_path
+    )
+    host = _DetachedHelperBackedHostControl(pve, tmp_path / "detached", monkeypatch)
+    observed = _canonical_before_rollback(ownership, identity)
+
+    clock = [0.0]
+    sleep_calls: list[float] = []
+    seen: list[tuple[object, bool]] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 1.0
+        if len(sleep_calls) == 3:
+            # The physical rollback's pvesh returns here: the capture is
+            # written and the lease is freed, but PVE's own task is still
+            # running, so the exact task must still be polled afterwards.
+            assert host.lease.held
+            host.detached.pop()()
+            assert not host.lease.held
+        if len(sleep_calls) == 4:
+            _complete_rollback(pve)
+
+    orchestrator = PackageUpdateRollbackOrchestrator(
+        authority,
+        host,
+        sleep=sleep,
+        monotonic=lambda: clock[0],
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+    real_inspect = orchestrator._read_inspection
+
+    def recording_inspect(request):
+        answer = real_inspect(request)
+        seen.append((answer.rollback_state, answer.host_operation_in_progress))
+        return answer
+
+    orchestrator._read_inspection = recording_inspect
+
+    result = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    assert seen[0] == (HostRollbackState.ABSENT, False)
+    assert seen[1:4] == [(None, True)] * 3
+    # The capture is promoted to an EXACT task identity, and only then is
+    # that exact task polled to its own terminal evidence.
+    assert seen[4] == (HostRollbackState.TASK_KNOWN, False)
+    assert seen[5][0] is HostRollbackState.TERMINAL
+    assert sleep_calls == [2.0, 2.0, 2.0, 2.0]
+
+    # Exact task attribution reached legitimate terminal success evidence.
+    assert result.outcome is RollbackOperationOutcome.COMPLETED
+    assert result.job.status is PackageUpdateJobStatus.ROLLED_BACK
+    assert result.job.rollback_task_upid == UPID
+    request = authority.package_update_rollback_request(job.job_id)
+    assert host.journal.read(request.rollback_operation_id)["task_upid"] == UPID
+    assert len(pve.rollbacks) == 1
+    assert host.detached == []
+
+
+# ===========================================================================
+# The negative half. `host_operation_in_progress` is control flow, never
+# authority: it may only EXTEND polling that durable submission proof already
+# justified, and it is keyed off the exact typed classification.
+# ===========================================================================
+
+
+def _rollback_busy(request: PackageUpdateRollbackRequest) -> HostRollbackResult:
+    """Exactly what a lease-busy helper answer parses to: no journal phase."""
+
+    return HostRollbackResult(
+        outcome=RollbackOperationOutcome.UNCERTAIN,
+        rollback_operation_id=request.rollback_operation_id,
+        reason="host-control reported a failure (operation_in_progress)",
+        host_operation_in_progress=True,
+    )
+
+
+def _rollback_submitted(request: PackageUpdateRollbackRequest) -> HostRollbackResult:
+    return HostRollbackResult(
+        outcome=RollbackOperationOutcome.UNCERTAIN,
+        rollback_operation_id=request.rollback_operation_id,
+        rollback_state=HostRollbackState.SUBMITTED,
+    )
+
+
+def _bounded_scripted_orchestrator(authority, host, *, timeout=800.0):
+    clock = [0.0]
+    sleep_calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += 400.0
+
+    return (
+        PackageUpdateRollbackOrchestrator(
+            authority,
+            host,
+            sleep=sleep,
+            monotonic=lambda: clock[0],
+            task_poll_timeout_seconds=timeout,
+            task_poll_interval_seconds=2.0,
+        ),
+        sleep_calls,
+    )
+
+
+def test_rollback_lease_busy_before_submission_proof_is_plain_unknown(
+    tmp_path: Path,
+) -> None:
+    """A. No prior SUBMITTED/TASK_KNOWN, so busy proves nothing at all."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    host = _ScriptedRollbackHostControl([_rollback_busy])
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 1
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+    assert sleep_calls == []
+    fenced = authority.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+    assert fenced.rollback_task_upid is None
+    assert fenced.rollback_completed_at is None
+
+
+def test_rollback_lease_busy_after_submitted_stays_fenced_at_the_deadline(
+    tmp_path: Path,
+) -> None:
+    """B. Bounded, read-only, no resubmission, and never a fabricated
+    outcome. Rollback in particular must not become COMPLETED here: it has no
+    exact task identity, and canonical state is not a witness."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    host = _ScriptedRollbackHostControl(
+        [
+            _rollback_submitted,
+            _rollback_busy,
+            _rollback_busy,
+            _rollback_busy,
+        ]
+    )
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 4
+    assert sleep_calls == [2.0, 2.0]
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+    fenced = authority.package_update_job(job.job_id)
+    assert fenced.status is not PackageUpdateJobStatus.ROLLED_BACK
+    assert fenced.rollback_task_upid is None
+
+
+def test_rollback_unknown_failure_after_submitted_is_not_lease_busy(
+    tmp_path: Path,
+) -> None:
+    """C. Only the EXACT typed classification extends polling."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+
+    def _generic_failure(request: PackageUpdateRollbackRequest) -> HostRollbackResult:
+        return HostRollbackResult(
+            outcome=RollbackOperationOutcome.UNCERTAIN,
+            rollback_operation_id=request.rollback_operation_id,
+            reason="host-control reported a failure (journal_corrupt)",
+        )
+
+    host = _ScriptedRollbackHostControl([_rollback_submitted, _generic_failure])
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 2
+    assert sleep_calls == []
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+
+
+def test_rollback_lease_busy_never_discards_a_known_task_identity(
+    tmp_path: Path,
+) -> None:
+    """D. TASK_KNOWN plus transient busy keeps polling AND keeps the exact
+    UPID authority already recorded."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    host = _ScriptedRollbackHostControl(
+        [_task_known, _rollback_busy, _rollback_busy, _rollback_busy]
+    )
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 4
+    assert sleep_calls == [2.0, 2.0]
+    assert authority.package_update_job(job.job_id).rollback_task_upid == UPID
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+
+
+def test_a_busy_rollback_answer_for_another_operation_inherits_nothing(
+    tmp_path: Path,
+) -> None:
+    """E. Operation identity is checked first, so a foreign answer can never
+    inherit this operation's SUBMITTED state."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    foreign = str(uuid.uuid4())
+
+    class _ForeignRequest:
+        rollback_operation_id = foreign
+
+    host = _ScriptedRollbackHostControl(
+        [
+            _rollback_submitted,
+            lambda _request: _rollback_busy(_ForeignRequest()),
+            _rollback_busy,
+        ]
+    )
+    orchestrator, sleep_calls = _bounded_scripted_orchestrator(authority, host)
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert host.inspect_calls == 2
+    assert sleep_calls == []
+    assert host.submit_calls == 0
+    assert host.seal_calls == 0
+    assert authority.package_update_job(job.job_id).rollback_task_upid is None
+
+
+def test_the_rollback_transport_sets_lease_busy_only_for_the_exact_token() -> None:
+    """The typed field comes from the helper's classification, never text."""
+
+    transport = _transport()
+    operation_id = str(uuid.uuid4())
+
+    def _parse(error: object) -> HostRollbackResult:
+        return transport._parse_payload(
+            {
+                "response_version": 1,
+                "ok": False,
+                "rollback_operation_id": operation_id,
+                "error": error,
+            },
+            operation_id,
+        )
+
+    exact = _parse({"classification": "operation_in_progress"})
+    assert exact.host_operation_in_progress is True
+    assert exact.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert exact.rollback_state is None
+
+    for near_miss in (
+        {"classification": "Operation_In_Progress"},
+        {"classification": "operation_in_progress "},
+        {"classification": "another operation_in_progress holds the lease"},
+        {"classification": "already_submitted"},
+        {"message": "another rollback operation holds this guest's lease"},
+        {},
+        "operation_in_progress",
+        None,
+    ):
+        assert _parse(near_miss).host_operation_in_progress is False, near_miss
+
+    ok = transport._parse_payload(
+        {
+            "response_version": 1,
+            "ok": True,
+            "rollback_operation_id": operation_id,
+            "outcome": "uncertain",
+            "rollback_state": "submitted",
+        },
+        operation_id,
+    )
+    assert ok.host_operation_in_progress is False
+    assert ok.rollback_state is HostRollbackState.SUBMITTED

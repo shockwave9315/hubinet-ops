@@ -1,11 +1,13 @@
 """Dark job-owned pre-update snapshot safety for package update jobs.
 
-**Not production-reachable.** Nothing in `app/inventory_runtime.py`, the HTTP
-API, the Home Assistant integration, the discovery scheduler, or the package
-scan scheduler constructs or calls anything in this module. It exists so the
-snapshot half of the update lifecycle can be built and adversarially tested
-before it is ever activated, and `tests/test_r0_architecture_regression.py`
-proves it stays unreachable.
+**Production-reachable.** `app/inventory_runtime.py` builds this orchestrator
+and its dedicated SSH host control as part of the package-update worker, and
+both bootstrap and the product updater install the matching forced-command
+helper and its own key (`deploy/lib/bootstrap-update-boundaries.sh`,
+`deploy/lib/update-boundaries.sh`). Reachability is NOT permission: nothing
+here starts on a schedule, at startup, or from recovery -- an update still
+requires an exact operator approval and revalidation, and
+`tests/test_r0_architecture_regression.py` enforces which edges may exist.
 
 It contains no APT/package mutation of any kind, and no snapshot deletion.
 
@@ -203,10 +205,27 @@ class HostSnapshotResult:
     #: Bounded classification/reason text. Never raw PVE logs or command text.
     reason: str | None = None
     #: The host's own durable journal phase for this operation, read
-    #: directly off it. ``None`` only for an older host that predates this
-    #: field, which the caller must treat exactly like ``SUBMITTED`` --
-    #: never a licence to submit, and never something to poll.
+    #: directly off it. ``None`` whenever the host could not report one at
+    #: all -- an older host that predates the field, a transport failure, or
+    #: any host-side error including :attr:`host_operation_in_progress`. The
+    #: caller must treat ``None`` exactly like ``SUBMITTED``: never a licence
+    #: to submit, and never by itself proof of anything.
     submission_state: HostSubmissionState | None = None
+    #: The host refused this read because the per-VMID lease was already
+    #: held, which is what the detached destructive runner does for the whole
+    #: of its physical `pvesh`. INTERNAL CONTROL FLOW ONLY.
+    #:
+    #: It is set from the helper's exact typed error classification, never
+    #: from reason text, and an absent/unknown/malformed classification
+    #: leaves it ``False`` so an older or misbehaving host fails closed.
+    #:
+    #: It is NOT authority: not success, not failure, not absence, not
+    #: submission proof, and it never reaches publication or HA. On its own
+    #: it means only "this read could not see durable state right now". It
+    #: may extend bounded read-only polling ONLY when the orchestrator
+    #: already holds durable ``submitted``/``task_known`` evidence for this
+    #: exact operation; before that proof exists it is plain UNKNOWN.
+    host_operation_in_progress: bool = False
 
 
 class PackageUpdateSnapshotHostControl(Protocol):
@@ -560,7 +579,16 @@ class PackageUpdateSnapshotOrchestrator:
         *,
         allow_pre_submission_seal: bool = True,
     ) -> SnapshotStageResult:
-        # F. Task polling and canonical recovery happen entirely outside the
+        # F1. The instant a result carries a known PVE task identity, persist
+        # it durably -- BEFORE any polling/sleep loop, in a short transaction
+        # that ends immediately. From that point on a lost SSH answer, a
+        # lease-busy inspect, a timeout, or a backend crash can never cost
+        # authority a task identity it already durably observed: the host's
+        # journal stops being the only place that identity survives.
+        early = self._persist_known_task(job.job_id, result)
+        if early is not None:
+            return early
+        # F2. Task polling and canonical recovery happen entirely outside the
         # authority critical section: every iteration here is a bounded,
         # read-only host inspection, never a resubmission and never a held
         # database writer lock.
@@ -572,6 +600,29 @@ class PackageUpdateSnapshotOrchestrator:
             result,
             allow_pre_submission_seal=allow_pre_submission_seal,
         )
+
+    def _persist_known_task(
+        self, job_id: str, result: HostSnapshotResult
+    ) -> SnapshotStageResult | None:
+        """Durably record a known PVE task identity before polling begins.
+
+        Returns ``None`` to let the caller proceed (there was nothing to
+        persist, or it persisted cleanly -- including idempotently, if this
+        exact identity was already durable). A conflicting identity is
+        uncertainty, never an overwrite.
+        """
+
+        if result.task_upid is None:
+            return None
+        try:
+            self._authority.record_package_update_snapshot_task(
+                job_id, result.task_upid
+            )
+        except Exception:  # noqa: BLE001 - a conflicting task is uncertainty
+            return self._uncertain(
+                job_id, "observed PVE snapshot task conflicts with the durable one"
+            )
+        return None
 
     def _resolve_pre_submission_block(
         self,
@@ -710,58 +761,124 @@ class PackageUpdateSnapshotOrchestrator:
         submission boundary already crossed for reaches a terminal outcome or
         this bound elapses.
 
-        TWO states are in-flight and therefore pollable, both strictly
-        read-only:
+        THE PROBLEM THIS SOLVES. Submission hands the physical `pvesh` to a
+        DETACHED host grandchild which keeps the operation's per-VMID lease
+        for the whole of that physical work, and releases it only AFTER the
+        durable completion capture is written. So the ordinary production
+        sequence is:
 
-        ``submitted`` without a task identity is one of them. It used to be
-        skipped, on the reasoning that repeating an identical read could not
-        change it -- that reasoning is now false. Submission hands the
-        physical `pvesh` to a DETACHED host child and returns immediately, so
-        the very first response routinely reports ``submitted`` before the
-        durable capture exists at all. That child later writes a crash-safe
-        completion marker, and a subsequent inspect promotes it to
-        ``task_known`` with the exact UPID. Refusing to look again would end
-        the worker cycle as ``snapshot_uncertain`` and demand an operator
-        RESUME purely to notice a capture that had already landed.
+        ```text
+        submit           -> submitted, no UPID (capture does not exist yet)
+        inspect          -> lease still held  -> host_operation_in_progress
+        inspect          -> lease still held  -> host_operation_in_progress
+        (pvesh ends, capture written, lease released)
+        inspect          -> capture promoted  -> task_known + exact UPID
+        inspect          -> exact task terminal evidence -> done
+        ```
 
-        ``task_known`` whose task is not yet terminal is the other, exactly as
-        before. The durable journal phase alone is not a fresh signal there:
-        it stays ``task_known`` forever once a task identity is captured,
-        whatever the live PVE task later does. So once a read observes the
-        task ITSELF has reached a terminal PVE state (``running`` vs
-        ``stopped``, never inferred from anything else), further polling
-        cannot make that same task "more terminal" and the loop stops.
+        Neither of the two middle reads carries a journal phase -- the helper
+        could not read the journal at all -- so a poll predicate that looked
+        only at ``submission_state`` would end the worker cycle as
+        ``snapshot_uncertain`` and demand an operator RESUME purely to notice
+        a capture that landed moments later.
 
-        Everything else -- a terminal, sealed, malformed, or otherwise
-        non-uncertain result -- stops immediately and is decided by the
-        existing strict rules, unchanged: the current canonical evidence
-        decides completed/failed/uncertain, a canonical absence is never
-        turned into failure, and nothing here ever resubmits.
+        THE STATE MACHINE. This loop therefore carries the last DURABLY
+        PROVEN in-flight phase for this exact operation across transient
+        unreadable windows:
+
+        * a read that reports ``submitted``/``task_known`` sets the proof
+          (``task_known`` never degrades back to ``submitted``);
+        * a read that only reports :attr:`~HostSnapshotResult.
+          host_operation_in_progress` KEEPS the existing proof and keeps
+          polling -- but proves nothing itself, so with no prior proof it is
+          plain UNKNOWN and the loop never starts;
+        * anything else clears the proof, so a transport failure, an unknown
+          classification, or a malformed answer after ``submitted`` fails
+          closed instead of being mistaken for the expected lease-busy
+          window.
+
+        ``task_known`` whose task is not yet terminal stays pollable exactly
+        as before: the durable journal phase alone is not a fresh signal, so
+        once a read observes the task ITSELF has reached a terminal PVE state
+        (``running`` vs ``stopped``, never inferred from anything else),
+        further polling cannot make that same task "more terminal" and the
+        loop stops.
+
+        Everything else -- a terminal, sealed, or otherwise non-uncertain
+        result -- stops immediately and is decided by the existing strict
+        rules, unchanged: the current canonical evidence decides
+        completed/failed/uncertain, a canonical absence is never turned into
+        failure, and nothing here ever resubmits.
         """
 
-        def _pending(candidate: HostSnapshotResult) -> bool:
-            if candidate.outcome is not SnapshotOperationOutcome.UNCERTAIN:
-                return False
-            if candidate.submission_state is HostSubmissionState.SUBMITTED:
-                # The detached capture may still land and yield the exact
-                # UPID. Looking again is a read; it never resubmits.
-                return True
-            if candidate.submission_state is not HostSubmissionState.TASK_KNOWN:
-                return False
-            if candidate.task is not None and candidate.task.terminal:
-                return False
-            return True
-
-        if not _pending(result):
+        proven = self._proven_in_flight(result, self._durable_proof(job))
+        if not self._pending(result, proven):
             return result
         deadline = self._monotonic() + self._task_poll_timeout_seconds
         while True:
             result = self._read_inspection(job, identity, ownership)
-            if not _pending(result):
+            proven = self._proven_in_flight(result, proven)
+            if not self._pending(result, proven):
                 return result
             if self._monotonic() >= deadline:
                 return result
             self._sleep(self._task_poll_interval_seconds)
+
+    @staticmethod
+    def _durable_proof(job: PackageUpdateJob) -> HostSubmissionState | None:
+        """Seed the in-flight proof from authority's own durable record.
+
+        A recorded snapshot task UPID is write-once durable evidence that
+        THIS job's operation reached ``task_known``, so a worker that
+        restarted mid-flight may keep polling through the lease-busy window
+        instead of needing an operator RESUME to re-learn what authority
+        already knows. Nothing weaker seeds anything: the write-ahead
+        ``snapshot_may_have_started`` checkpoint is committed BEFORE
+        submission and so proves no submission at all.
+        """
+
+        return (
+            HostSubmissionState.TASK_KNOWN
+            if job.snapshot_task_upid is not None
+            else None
+        )
+
+    @staticmethod
+    def _proven_in_flight(
+        candidate: HostSnapshotResult, previous: HostSubmissionState | None
+    ) -> HostSubmissionState | None:
+        """Carry the last durably proven in-flight phase across busy reads."""
+
+        state = candidate.submission_state
+        if state is HostSubmissionState.TASK_KNOWN:
+            return state
+        if state is HostSubmissionState.SUBMITTED:
+            # Never let a re-read downgrade proof the cycle already has.
+            return previous if previous is HostSubmissionState.TASK_KNOWN else state
+        if candidate.host_operation_in_progress:
+            # The host could not read its journal; it did not contradict it.
+            return previous
+        return None
+
+    @staticmethod
+    def _pending(
+        candidate: HostSnapshotResult, proven: HostSubmissionState | None
+    ) -> bool:
+        if candidate.outcome is not SnapshotOperationOutcome.UNCERTAIN:
+            return False
+        if candidate.host_operation_in_progress:
+            # Transient read-unavailable. Pollable ONLY on top of durable
+            # submission proof this cycle already holds; never on its own.
+            return proven is not None
+        if candidate.submission_state is HostSubmissionState.SUBMITTED:
+            # The detached capture may still land and yield the exact UPID.
+            # Looking again is a read; it never resubmits.
+            return True
+        if candidate.submission_state is not HostSubmissionState.TASK_KNOWN:
+            return False
+        if candidate.task is not None and candidate.task.terminal:
+            return False
+        return True
 
     def _apply_host_result(
         self,
@@ -781,18 +898,15 @@ class PackageUpdateSnapshotOrchestrator:
                 job_id, "snapshot host operation answered a different operation"
             )
 
-        # Persist the task identity as soon as it is known, whatever the
-        # outcome: it is the only thing that lets a later attempt reattach
-        # instead of guessing.
-        if result.task_upid is not None:
-            try:
-                self._authority.record_package_update_snapshot_task(
-                    job_id, result.task_upid
-                )
-            except Exception:  # noqa: BLE001 - a conflicting task is uncertainty
-                return self._uncertain(
-                    job_id, "observed PVE snapshot task conflicts with the durable one"
-                )
+        # Idempotent safeguard, not the primary persistence point: `_finish`
+        # already durably recorded a known task identity BEFORE polling ran,
+        # via `_persist_known_task`. This repeats the same write-once record
+        # for whatever the FINAL (post-poll) result carries, which is
+        # harmless when it is the same UPID already durable, and still fails
+        # closed on a conflicting one.
+        conflict = self._persist_known_task(job_id, result)
+        if conflict is not None:
+            return conflict
 
         if result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED:
             if allow_pre_submission_seal:

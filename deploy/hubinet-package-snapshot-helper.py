@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Forced-command PVE boundary for Hubinet's job-owned pre-update snapshots.
 
-**Not deployed.** Neither `deploy/bootstrap-proxmox-0.5.sh` nor
-`deploy/update-proxmox-0.5.sh` installs this file, its forced-command
-`authorized_keys` entry, or any key for it, and no additional PVE privilege is
-provisioned for it. It is a separate file and a separate logical privilege
-boundary from `deploy/hubinet-package-scan-helper.py`, which stays scan-only
-and is never extended into a mutation helper.
+**Deployed.** Both `deploy/bootstrap-proxmox-0.5.sh` and
+`deploy/update-proxmox-0.5.sh` install this file, its forced-command
+`authorized_keys` entry, and a key used by this boundary alone
+(`deploy/lib/bootstrap-update-boundaries.sh`,
+`deploy/lib/update-boundaries.sh`). No additional PVE API privilege is
+provisioned for it: the deployed identity stays `Sys.Audit` plus `VM.Audit`.
+It is a separate file and a separate logical privilege boundary from
+`deploy/hubinet-package-scan-helper.py`, which stays scan-only and is never
+extended into a mutation helper.
 
 Scope is deliberately minimal:
 

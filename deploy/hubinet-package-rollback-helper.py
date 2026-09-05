@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Forced-command PVE boundary for Hubinet's same-job snapshot rollback.
 
-**Not deployed.** Neither `deploy/bootstrap-proxmox-0.5.sh` nor
-`deploy/update-proxmox-0.5.sh` installs this file, its forced-command
-`authorized_keys` entry, or any key for it, and neither of the two PVE
+**Deployed, but never automatic.** Both `deploy/bootstrap-proxmox-0.5.sh`
+and `deploy/update-proxmox-0.5.sh` install this file, its forced-command
+`authorized_keys` entry, and a key used by this boundary alone
+(`deploy/lib/bootstrap-update-boundaries.sh`,
+`deploy/lib/update-boundaries.sh`). Installing the boundary is not policy:
+NOTHING rolls back automatically -- no scheduler, no startup recovery, no
+worker stage, and no health verdict -- and only an explicit operator request
+reaches it.
+
+Deploying it broadens no PVE API privilege either: neither of the two PVE
 snapshot privileges upstream accepts for the rollback endpoint is provisioned
 anywhere. Production provisions exactly the audit-only pair (`Sys.Audit` plus
 the VM audit privilege) and nothing else; the exact privilege tokens are
