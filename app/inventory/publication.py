@@ -230,7 +230,17 @@ class InventoryPublication:
                 "j.health_started_at, j.health_completed_at, "
                 "j.snapshot_confirmed_at, j.mutation_completed_at, "
                 "j.rollback_completed_at, "
-                "j.terminalized_at, j.terminal_reason FROM package_update_jobs j "
+                "j.terminalized_at, j.terminal_reason, "
+                # The exact post-mutation target columns
+                # `_post_mutation_job_context_is_current` proves against --
+                # carried here so the SAME authority predicate arming
+                # rollback uses can also gate `can_rollback_update`,
+                # without a second, subtly-different copy of these rules.
+                "j.inventory_source_id, j.expected_binding_id, "
+                "j.expected_locator_generation, "
+                "j.expected_resource_continuity_revision, j.expected_vmid, "
+                "j.expected_node_id, j.expected_node_name "
+                "FROM package_update_jobs j "
                 "WHERE j.issuance_sequence=("
                 "SELECT MAX(latest.issuance_sequence) FROM package_update_jobs latest "
                 "WHERE latest.resource_id=j.resource_id) "
@@ -422,6 +432,7 @@ class InventoryPublication:
             package_plan_approval,
             health_contract_summary,
             package_update_job_summary,
+            package_update_job,
             any_active_job=any_active_job,
             product_update_fenced=product_update_fenced,
         )
@@ -667,6 +678,7 @@ class InventoryPublication:
         approval: Mapping[str, Any],
         health_contract: Mapping[str, Any],
         job: Mapping[str, Any],
+        raw_job,
         *,
         any_active_job: bool,
         product_update_fenced: bool,
@@ -677,6 +689,18 @@ class InventoryPublication:
         true value means the already-published authority facts satisfy the
         action's current prerequisites; the endpoint repeats every proof in
         its own transaction and refuses if state raced after publication.
+
+        ``raw_job`` is the durable job ROW (not the ``job`` summary dict
+        above): only it carries the exact expected VMID/binding/locator/
+        continuity/node columns :meth:`InventoryAuthority.
+        _post_mutation_job_context_is_current` proves against. GitHub review
+        P2 #2: without that proof, ``can_rollback_update`` could stay true
+        even though the same-job rollback endpoint's own arming path would
+        immediately refuse it (a replaced binding, a moved/unavailable node,
+        or a resource no longer present/active). This reuses the exact
+        authority predicate the arming path itself uses -- deliberately not
+        a second, differently-shaped copy of the same rules -- so a
+        presentation hint can never promise more than the endpoint accepts.
         """
 
         false = {
@@ -704,6 +728,17 @@ class InventoryPublication:
         has_job = job["state"] not in {"unsupported", "not_started"}
         active_job = job["state"] == "active"
         rollback_available = bool(job["rollback_available"])
+        # The durable checkpoint fact above says a rollback COULD apply to
+        # this job in principle; it says nothing about whether the exact
+        # workload it names is still the one currently at that identity.
+        # Never require this when there is no checkpoint-eligible rollback
+        # to begin with -- `raw_job` is only actually queried in that case.
+        rollback_target_current = rollback_available and (
+            raw_job is not None
+            and self._authority._post_mutation_job_context_is_current(
+                connection, raw_job
+            )
+        )
 
         contract_executable = False
         if current_target and health_contract["status"] == "configured":
@@ -730,7 +765,7 @@ class InventoryPublication:
             "can_view_update_job": has_job,
             "can_resume_update": self._package_update_activated and active_job,
             "can_rollback_update": (
-                self._package_update_activated and rollback_available
+                self._package_update_activated and rollback_target_current
             ),
             "can_view_health_contract": current_target,
             "can_configure_health_contract": current_target,

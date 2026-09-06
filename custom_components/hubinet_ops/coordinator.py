@@ -82,23 +82,31 @@ def _all_false_operator_availability(
     )
 
 
-def _availability_revision_race(
+def _availability_race_candidate(
     availability: OperatorAvailabilityView, incoming: HubinetOpsSnapshot
 ) -> bool:
-    """Return whether a mismatch is ONLY an ordinary revision race.
+    """Return whether a mismatch could be one ordinary intervening write.
 
-    Bound to the exact shape of HUMAN1-AVAIL-RACE-01: the two reads named the
-    same backend and the same resource set, and disagree only on the
-    revision number an intervening, legitimate backend write could explain.
-    A backend identity mismatch or a resource-set mismatch is a structural
-    inconsistency, never a race, and this deliberately returns ``False`` for
-    those so the caller fails closed on the first attempt instead of
-    retrying them.
+    HUMAN1-AVAIL-RACE-01, broadened per GitHub review P2 #1: the property
+    that actually distinguishes an ordinary cross-request race from a
+    structural inconsistency is NOT "same resource set" -- it is "does the
+    revision disagree at all". A legitimate intervening discovery/scan/
+    product-update commit can add or remove a resource in the very same
+    commit that advances the revision, so two individually-correct reads
+    straddling that commit may legitimately disagree on resource membership
+    *and* revision together. Requiring the resource set to already match
+    would wrongly refuse to retry exactly that legal case.
+
+    Backend identity is never healed by retry: a foreign backend answering
+    is always structural. And a revision that already MATCHES is never a
+    race candidate even if resource membership disagrees -- the backend is
+    then claiming both reads describe the exact same published state, so a
+    membership disagreement at identical revision is a structural
+    inconsistency (a bug, not a race) and gets no retry.
     """
 
     return (
         availability.backend_instance_id == incoming.backend.backend_instance_id
-        and set(availability.resources_by_id) == set(incoming.resources_by_id)
         and availability.authority_published_state_revision
         != incoming.published_state_revision
     )
@@ -385,18 +393,21 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
         """Fetch one mutually coherent snapshot/availability pair.
 
         HUMAN1-AVAIL-RACE-01: an ordinary backend write can land between the
-        two independently correct HTTP reads below and make them disagree
-        only on revision. That gets exactly one bounded self-heal: refetch
-        the COMPLETE pair once. A backend-identity or resource-set mismatch
-        is never treated as this race and fails closed immediately, and a
-        revision mismatch still present after the retry fails closed too.
+        two independently correct HTTP reads below and make them disagree on
+        revision -- and, per GitHub review P2 #1, possibly on resource
+        membership too, when the same intervening commit both changed
+        membership and advanced the revision. That gets exactly one bounded
+        self-heal: refetch the COMPLETE pair once. A backend-identity
+        mismatch, or a resource-set mismatch at an IDENTICAL revision, is
+        never treated as this race and fails closed immediately; a mismatch
+        still present after the retry fails closed too.
         """
 
         for attempt in range(1, self._MAX_COHERENCE_ATTEMPTS + 1):
             incoming = await self._fetch_snapshot(previous)
             availability = await self._fetch_availability(incoming)
 
-            if _availability_revision_race(availability, incoming):
+            if _availability_race_candidate(availability, incoming):
                 if attempt < self._MAX_COHERENCE_ATTEMPTS:
                     continue
                 raise UpdateFailed(

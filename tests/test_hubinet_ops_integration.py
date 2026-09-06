@@ -2579,6 +2579,106 @@ async def test_operator_availability_persistent_revision_mismatch_fails_closed(
     assert transport.operator_availability_calls == 3
 
 
+# ---------------------------------------------------------------------------
+# GitHub review P2 #1 -- resource-set agreement is NOT what distinguishes an
+# ordinary cross-request race from a structural inconsistency; revision
+# agreement is. A legal discovery/scan/product-update commit can add or
+# remove a resource in the same commit that advances the revision, so the
+# bounded retry must also self-heal when membership disagrees, as long as
+# the revision disagrees too. A membership mismatch at an IDENTICAL revision
+# remains structural and still gets no retry (already covered by
+# test_availability_resource_membership_mismatch_fails_closed_without_retry
+# above, which is unaffected by this broadening).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_membership_addition_race_self_heals_once(
+    hass: HomeAssistant,
+) -> None:
+    """Required witness A: an intervening discovery commit adds a resource
+    and advances the revision in the same legal step."""
+
+    before = snapshot((INITIAL_RESOURCES[1],), published_state_revision=100)
+    after = snapshot(
+        (INITIAL_RESOURCES[1], INITIAL_RESOURCES[2]), published_state_revision=101
+    )
+    transport = FakeTransport(
+        [before, after],
+        operator_availability_views=(
+            # Paired with `before` on attempt 1 but already names the newly
+            # committed resource and the newer revision.
+            operator_availability(after),
+            operator_availability(after),
+        ),
+    )
+    entry = await setup_entry(hass, transport)
+
+    assert entry.runtime_data.last_update_success is True
+    assert entry.runtime_data.data == after
+    assert transport.snapshot_calls == 2
+    assert transport.operator_availability_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_membership_removal_race_self_heals_once(
+    hass: HomeAssistant,
+) -> None:
+    """Required witness B: the symmetric removal case self-heals too."""
+
+    before = snapshot(
+        (INITIAL_RESOURCES[1], INITIAL_RESOURCES[2]), published_state_revision=100
+    )
+    after = snapshot((INITIAL_RESOURCES[1],), published_state_revision=101)
+    transport = FakeTransport(
+        [before, after],
+        operator_availability_views=(
+            operator_availability(after),
+            operator_availability(after),
+        ),
+    )
+    entry = await setup_entry(hass, transport)
+
+    assert entry.runtime_data.last_update_success is True
+    assert entry.runtime_data.data == after
+    assert transport.snapshot_calls == 2
+    assert transport.operator_availability_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_membership_and_revision_persistent_mismatch_fails_closed(
+    hass: HomeAssistant,
+) -> None:
+    """Required witness E, broadened: a combined membership-and-revision
+    mismatch still present after the one bounded retry fails closed exactly
+    like an ordinary revision-only persistent mismatch does -- broadening
+    what MAY self-heal never turns into an unbounded or unconditional
+    retry."""
+
+    good = snapshot((INITIAL_RESOURCES[1],), published_state_revision=100)
+    transport = FakeTransport(
+        [good, good],
+        operator_availability_views=(
+            operator_availability(good),
+            operator_availability(
+                snapshot(
+                    (INITIAL_RESOURCES[1], INITIAL_RESOURCES[2]),
+                    published_state_revision=101,
+                )
+            ),
+        ),
+    )
+    entry = await setup_entry(hass, transport)
+    assert entry.runtime_data.last_update_success is True
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.last_update_success is False
+    assert transport.snapshot_calls == 3
+    assert transport.operator_availability_calls == 3
+
+
 @pytest.mark.asyncio
 async def test_operator_availability_unsupported_route_falls_back_to_all_false(
     hass: HomeAssistant,

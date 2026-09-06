@@ -74,6 +74,14 @@ from custom_components.hubinet_ops.contract.models import (
 )
 from custom_components.hubinet_ops.contract.enums import PackageScanStatus
 
+# Reuses the established fixture that drives a job to `mutation_completed`
+# through the real authority API (issuance, preflight, snapshot intent/
+# confirm) and only the mutation execution itself through direct SQL --
+# exactly the same reuse pattern `test_package_update_health.py` itself uses
+# for `tests.test_package_update_job_authority`. Avoids a second, subtly
+# different way of standing up a rollback-eligible job.
+from tests.test_package_update_health import _mutated_job
+
 
 START = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 
@@ -346,6 +354,102 @@ def test_operator_capabilities_are_backend_derived_and_activation_gated(
     assert after["can_view_update_job"]
     assert after["can_resume_update"]
     assert not after["can_rollback_update"]
+
+
+# ---------------------------------------------------------------------------
+# GitHub review P2 #2 -- `can_rollback_update` must reuse the same current-
+# target proof `arm_package_update_rollback` itself requires
+# (`_post_mutation_job_context_is_current`), not just the durable
+# checkpoint/status fact. That proof is deliberately narrower than plan/
+# health currency: it must survive a stopped guest, a stale package plan,
+# and a changed live health contract, and must withdraw the moment the
+# exact resource/locator/node identity it names is no longer current.
+# ---------------------------------------------------------------------------
+
+
+def _node_id_for(store, resource_id: str) -> str:
+    return next(
+        item.current_node_id
+        for item in store.list_resources()
+        if item.resource_id == resource_id
+    )
+
+
+def test_rollback_capability_requires_current_post_mutation_target(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource, _, _, job = _mutated_job(tmp_path)
+    publication = InventoryPublication(store, authority, package_update_activated=True)
+
+    # Witness B: exact job target still current, node available.
+    assert publication.read_operator_availability().resources[0]["can_rollback_update"]
+
+    # Witness A: the node the job's exact target names becomes unavailable.
+    node_id = _node_id_for(store, resource.resource_id)
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE inventory_nodes SET available=0 WHERE node_id=?", (node_id,)
+        )
+    assert not publication.read_operator_availability().resources[
+        0
+    ]["can_rollback_update"]
+
+
+def test_rollback_capability_survives_a_stopped_guest(tmp_path: Path) -> None:
+    """Witness C: a failed mutation can legitimately leave the guest
+    stopped. Requiring `running` would fence exactly the guests that most
+    need recovery, so `status` must never gate this capability."""
+
+    _, store, authority, resource, _, _, job = _mutated_job(tmp_path)
+    publication = InventoryPublication(store, authority, package_update_activated=True)
+
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE resource_incarnations SET status='stopped' WHERE resource_id=?",
+            (resource.resource_id,),
+        )
+    assert publication.read_operator_availability().resources[0]["can_rollback_update"]
+
+
+def test_rollback_capability_requires_exact_continuity_revision(
+    tmp_path: Path,
+) -> None:
+    """Witness D: any drifted exact-identity column -- here, the resource
+    continuity revision the job names -- withdraws the capability."""
+
+    _, store, authority, resource, _, _, job = _mutated_job(tmp_path)
+    publication = InventoryPublication(store, authority, package_update_activated=True)
+
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE resource_incarnations SET resource_continuity_revision="
+            "resource_continuity_revision + 1 WHERE resource_id=?",
+            (resource.resource_id,),
+        )
+    assert not publication.read_operator_availability().resources[
+        0
+    ]["can_rollback_update"]
+
+
+def test_rollback_capability_ignores_package_plan_and_health_contract_drift(
+    tmp_path: Path,
+) -> None:
+    """Witnesses G and H: rollback is compensation for a workload that may
+    already have been mutated. A newer package scan (stale plan/approval)
+    and a changed or cleared LIVE health contract are both ordinary and
+    expected after an update ran, and must never by themselves erase
+    recovery -- the job owns its own frozen contract generation, and never
+    required current package-plan authority to begin with."""
+
+    _, store, authority, resource, _, _, job = _mutated_job(tmp_path)
+    publication = InventoryPublication(store, authority, package_update_activated=True)
+    assert publication.read_operator_availability().resources[0]["can_rollback_update"]
+
+    successful_package_scan(authority, resource.resource_id)
+    assert publication.read_operator_availability().resources[0]["can_rollback_update"]
+
+    authority.clear_resource_health_contract(resource.resource_id)
+    assert publication.read_operator_availability().resources[0]["can_rollback_update"]
 
 
 def test_product_update_fence_changes_only_volatile_operator_availability(
