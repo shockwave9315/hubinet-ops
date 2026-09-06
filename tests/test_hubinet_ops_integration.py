@@ -32,7 +32,7 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers import service as service_helper
 from homeassistant.helpers.translation import async_get_translations
 from homeassistant.helpers.update_coordinator import UpdateFailed
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -48,6 +48,8 @@ from custom_components.hubinet_ops.api import (
     HubinetOpsConflict,
     HubinetOpsHealthContractUnconfigured,
     HubinetOpsInvalidAuth,
+    HubinetOpsInvalidResponse,
+    HubinetOpsOperatorAvailabilityUnsupported,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     LifecycleState,
@@ -475,7 +477,9 @@ class FakeTransport:
         package_update_jobs: dict[str, PackageUpdateJobView] | None = None,
         package_update_error: Exception | None = None,
         operator_capabilities: dict[str, OperatorCapabilities] | None = None,
-        operator_availability_views: Iterable[OperatorAvailabilityView] = (),
+        operator_availability_views: Iterable[
+            OperatorAvailabilityView | Exception
+        ] = (),
     ) -> None:
         self._snapshots = list(snapshots)
         self._index = 0
@@ -544,6 +548,8 @@ class FakeTransport:
                 )
             ]
             self._operator_availability_index += 1
+            if isinstance(selected, Exception):
+                raise selected
             return selected
         if self._last_snapshot is None:
             raise HubinetOpsCannotConnect("operator availability requested first")
@@ -2006,6 +2012,97 @@ def test_update_plan_action_metadata_and_polish_translations_are_structural() ->
     )
 
 
+#: The exception constructors this collector scopes to. Entity/service
+#: descriptions also carry a ``translation_key=`` kwarg (resolved against
+#: ``strings.json["entity"]``/``["services"]`` instead), so an unscoped walk
+#: would wrongly demand every entity's translation key exist under
+#: ``exceptions`` too.
+_TRANSLATABLE_EXCEPTION_CONSTRUCTORS = frozenset(
+    {"HomeAssistantError", "ConfigEntryAuthFailed", "UpdateFailed"}
+)
+
+
+def _translation_keys_raised_in_source() -> set[str]:
+    """Return every exception ``translation_key=`` literal raised anywhere in
+    the integration, by walking the AST rather than grepping -- a renamed
+    keyword or a non-literal value is deliberately invisible to this
+    collector, exactly like it would be to Home Assistant's own runtime
+    lookup, so this only ever asserts about the keys that actually resolve.
+    """
+
+    keys: set[str] = set()
+    for path in Path("custom_components/hubinet_ops").glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else None
+            )
+            if name not in _TRANSLATABLE_EXCEPTION_CONSTRUCTORS:
+                continue
+            for kw in node.keywords:
+                if (
+                    kw.arg == "translation_key"
+                    and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)
+                ):
+                    keys.add(kw.value.value)
+    return keys
+
+
+def test_operator_error_translations_are_structural() -> None:
+    """HUMAN1-ERROR-I18N-01: every raised ``translation_key`` must resolve in
+    both English and Polish, and neither language may silently drop a key
+    the other still declares.
+    """
+
+    integration_root = (
+        Path(__file__).parents[1] / "custom_components" / "hubinet_ops"
+    )
+    strings = json.loads((integration_root / "strings.json").read_text())
+    english = json.loads((integration_root / "translations" / "en.json").read_text())
+    polish = json.loads((integration_root / "translations" / "pl.json").read_text())
+
+    assert strings["exceptions"] == english["exceptions"]
+    assert set(strings["exceptions"]) == set(polish["exceptions"])
+    for key, entry in polish["exceptions"].items():
+        message = entry["message"]
+        assert isinstance(message, str) and message
+
+    raised_keys = _translation_keys_raised_in_source()
+    # Every translation_key actually raised must resolve in the shipped
+    # catalog -- a renamed or newly added key with no matching entry would
+    # otherwise fall back to Home Assistant's generic untranslated message
+    # silently.
+    assert raised_keys <= set(strings["exceptions"])
+    # The exact family this corrective pass closed: the routine operator
+    # failure paths that were previously hard-coded English only.
+    assert {
+        "review_failed",
+        "backend_changed_during_review",
+        "resource_absent_during_review",
+        "approve_without_review",
+        "approve_revalidation_failed",
+        "plan_changed",
+        "approve_refused",
+        "start_refused",
+        "view_job_failed",
+        "resume_refused",
+        "rollback_refused",
+        "control_unavailable",
+        "health_contract_read_failed",
+        "health_contract_set_refused",
+        "health_contract_clear_refused",
+        "device_not_found",
+        "device_not_unique_resource",
+    } <= raised_keys
+
+
 @pytest.mark.asyncio
 async def test_pinned_ha_loads_device_selector_and_polish_action_translations(
     hass: HomeAssistant,
@@ -2393,6 +2490,232 @@ async def test_availability_must_align_with_backend_and_authority_revision(
 
     assert entry.runtime_data.last_update_success is False
     assert entry.runtime_data.data == selected
+
+
+@pytest.mark.asyncio
+async def test_availability_resource_membership_mismatch_fails_closed_without_retry(
+    hass: HomeAssistant,
+) -> None:
+    """HUMAN1-AVAIL-RACE-01: a resource-set mismatch is never an ordinary
+    revision race, even when backend identity and revision both match."""
+
+    selected = snapshot((INITIAL_RESOURCES[1],))
+    foreign_membership = operator_availability(snapshot((INITIAL_RESOURCES[0],)))
+    transport = FakeTransport(
+        [selected, selected],
+        operator_availability_views=(operator_availability(selected), foreign_membership),
+    )
+    # The first refresh (inside setup) is coherent and must succeed, so the
+    # second refresh's failure below is provably NOT a first-refresh-only
+    # artifact.
+    entry = await setup_entry(hass, transport)
+    assert entry.runtime_data.last_update_success is True
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.last_update_success is False
+    # One setup fetch plus exactly one more -- no retry for a structural
+    # mismatch, even though a revision race would have retried here.
+    assert transport.snapshot_calls == 2
+    assert transport.operator_availability_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_revision_race_self_heals_once(
+    hass: HomeAssistant,
+) -> None:
+    """HUMAN1-AVAIL-RACE-01: a legitimate write between the two reads is a
+    bounded, self-healing race, not a failure -- the coordinator refetches
+    the COMPLETE pair once and succeeds when the second pair agrees."""
+
+    resource_at_20 = snapshot((INITIAL_RESOURCES[1],), published_state_revision=20)
+    resource_at_21 = snapshot((INITIAL_RESOURCES[1],), published_state_revision=21)
+    transport = FakeTransport(
+        [resource_at_20, resource_at_21],
+        operator_availability_views=(
+            # Paired with resource_at_20 on the first attempt but already
+            # describing revision 21 -- exactly the intervening-write shape.
+            operator_availability(resource_at_21),
+            operator_availability(resource_at_21),
+        ),
+    )
+    entry = await setup_entry(hass, transport)
+
+    assert entry.runtime_data.last_update_success is True
+    assert entry.runtime_data.data == resource_at_21
+    assert transport.snapshot_calls == 2
+    assert transport.operator_availability_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_persistent_revision_mismatch_fails_closed(
+    hass: HomeAssistant,
+) -> None:
+    """HUMAN1-AVAIL-RACE-01: the retry is bounded to exactly one -- a
+    mismatch still present on the second complete pair fails closed."""
+
+    resource_at_20 = snapshot((INITIAL_RESOURCES[1],), published_state_revision=20)
+    transport = FakeTransport(
+        [resource_at_20, resource_at_20],
+        operator_availability_views=(
+            operator_availability(resource_at_20),
+            operator_availability(resource_at_20, authority_published_state_revision=21),
+        ),
+    )
+    # The first refresh (inside setup) is coherent and must succeed, so the
+    # persistent mismatch below is provably a SECOND-refresh failure, not an
+    # artifact of the entry never having come up.
+    entry = await setup_entry(hass, transport)
+    assert entry.runtime_data.last_update_success is True
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.last_update_success is False
+    # One setup fetch, plus exactly the bounded retry (two more attempts)
+    # for the second refresh -- never an unbounded loop.
+    assert transport.snapshot_calls == 3
+    assert transport.operator_availability_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_unsupported_route_falls_back_to_all_false(
+    hass: HomeAssistant,
+) -> None:
+    """HUMAN1-AVAIL-COMPAT-01, required test A: a new HA against a backend
+    that predates operator-availability publication keeps inventory/sensors
+    working, with every Human1 control forced unavailable and no authority
+    invented."""
+
+    ready = exact_plan_resource(approved=True)
+    current = snapshot((ready,))
+    transport = FakeTransport(
+        [current],
+        operator_availability_views=(
+            HubinetOpsOperatorAvailabilityUnsupported("no such route"),
+        ),
+    )
+    entry = await setup_entry(hass, transport)
+
+    assert entry.runtime_data.last_update_success is True
+    assert entry.runtime_data.data == current
+    states = resource_entity_states(hass, entry, RESOURCE_CT)
+    assert states["package_plan_approval"] == "approved"
+    for key in (
+        "review_update_plan",
+        "approve_reviewed_plan",
+        "start_update",
+        "view_update_job",
+        "resume_update",
+        "rollback_update",
+        "view_health_contract",
+    ):
+        entity_id = resource_entity_id(hass, entry, RESOURCE_CT, key)
+        assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        HubinetOpsInvalidAuth("bearer token rejected"),
+    ],
+)
+async def test_operator_availability_auth_failure_does_not_fall_back(
+    hass: HomeAssistant, error: Exception
+) -> None:
+    """HUMAN1-AVAIL-COMPAT-01, required test B: 401/403 never falls back."""
+
+    selected = snapshot((INITIAL_RESOURCES[1],))
+    transport = FakeTransport(
+        [selected, selected],
+        operator_availability_views=(operator_availability(selected), error),
+    )
+    entry = await setup_entry(hass, transport)
+    assert entry.runtime_data.last_update_success is True
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.last_update_success is False
+    assert isinstance(entry.runtime_data.last_exception, ConfigEntryAuthFailed)
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_connection_failure_does_not_fall_back(
+    hass: HomeAssistant,
+) -> None:
+    """HUMAN1-AVAIL-COMPAT-01, required test C: 5xx/connection/timeout never
+    falls back -- it remains an ordinary fail-closed coordinator failure."""
+
+    selected = snapshot((INITIAL_RESOURCES[1],))
+    transport = FakeTransport(
+        [selected, selected],
+        operator_availability_views=(
+            operator_availability(selected),
+            HubinetOpsCannotConnect("backend returned HTTP 500"),
+        ),
+    )
+    entry = await setup_entry(hass, transport)
+    assert entry.runtime_data.last_update_success is True
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.last_update_success is False
+    assert isinstance(entry.runtime_data.last_exception, UpdateFailed)
+    assert entry.runtime_data.last_exception.translation_key == "cannot_connect"
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_malformed_response_does_not_fall_back(
+    hass: HomeAssistant,
+) -> None:
+    """HUMAN1-AVAIL-COMPAT-01, required test D: a malformed body is never
+    treated as the one definite compatibility case."""
+
+    selected = snapshot((INITIAL_RESOURCES[1],))
+    transport = FakeTransport(
+        [selected, selected],
+        operator_availability_views=(
+            operator_availability(selected),
+            HubinetOpsInvalidResponse("malformed operator availability"),
+        ),
+    )
+    entry = await setup_entry(hass, transport)
+    assert entry.runtime_data.last_update_success is True
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.last_update_success is False
+    assert isinstance(entry.runtime_data.last_exception, UpdateFailed)
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_new_backend_path_is_unaffected(
+    hass: HomeAssistant,
+) -> None:
+    """HUMAN1-AVAIL-COMPAT-01, required test E: the ordinary new-backend
+    path is unchanged by either the compatibility fallback or the bounded
+    race handling."""
+
+    ready = exact_plan_resource(approved=True)
+    current = snapshot((ready,))
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [current],
+            operator_capabilities={
+                RESOURCE_CT: OperatorCapabilities(can_review_update_plan=True)
+            },
+        ),
+    )
+
+    assert entry.runtime_data.last_update_success is True
+    review_id = resource_entity_id(hass, entry, RESOURCE_CT, "review_update_plan")
+    assert hass.states.get(review_id).state != STATE_UNAVAILABLE
 
 
 @pytest.mark.asyncio

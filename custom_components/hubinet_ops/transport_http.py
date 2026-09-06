@@ -37,6 +37,7 @@ from .api import (
     HubinetOpsHealthContractUnconfigured,
     HubinetOpsInvalidAuth,
     HubinetOpsInvalidResponse,
+    HubinetOpsOperatorAvailabilityUnsupported,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     LifecycleState,
@@ -762,8 +763,54 @@ class HttpHubinetOpsTransport:
         except (KeyError, TypeError, ValueError) as exc:
             raise HubinetOpsInvalidResponse(f"malformed Hubinet Ops snapshot: {exc}") from exc
 
+    async def _get_operator_availability(self) -> Any:
+        """Fetch the volatile availability route with one typed exception.
+
+        This deliberately does NOT reuse the generic ``_get`` helper: an
+        HTTP 404 here means one specific, definite thing -- the route does
+        not exist on this backend at all (HUMAN1-AVAIL-COMPAT-01) -- and that
+        must never be confused with any other failure. Every other status,
+        including a 404-shaped body that is not this route (which cannot
+        happen; this route takes no path parameters), still fails closed
+        exactly like ``_get``.
+        """
+
+        url = f"{self._base_url}{_OPERATOR_AVAILABILITY_ROUTE}"
+        headers = {"Authorization": f"Bearer {self._api_token}"}
+        try:
+            async with self._session.get(
+                url, headers=headers, timeout=_REQUEST_TIMEOUT
+            ) as response:
+                if response.status in (401, 403):
+                    raise HubinetOpsInvalidAuth(
+                        "Hubinet Ops backend rejected the bearer token"
+                    )
+                if response.status == 404:
+                    raise HubinetOpsOperatorAvailabilityUnsupported(
+                        "Hubinet Ops backend does not expose operator "
+                        "availability (predates Human1 publication)"
+                    )
+                if response.status != 200:
+                    raise HubinetOpsCannotConnect(
+                        f"Hubinet Ops backend returned HTTP {response.status}"
+                    )
+                try:
+                    return await response.json()
+                except (aiohttp.ContentTypeError, ValueError) as exc:
+                    raise HubinetOpsInvalidResponse(
+                        "Hubinet Ops backend returned a non-JSON body"
+                    ) from exc
+        except TimeoutError as exc:
+            raise HubinetOpsCannotConnect("Hubinet Ops backend request timed out") from exc
+        except aiohttp.ClientConnectorError as exc:
+            raise HubinetOpsCannotConnect(
+                "cannot connect to Hubinet Ops backend"
+            ) from exc
+        except aiohttp.ClientError as exc:
+            raise HubinetOpsCannotConnect("Hubinet Ops backend request failed") from exc
+
     async def fetch_operator_availability(self) -> OperatorAvailabilityView:
-        payload = await self._get(_OPERATOR_AVAILABILITY_ROUTE)
+        payload = await self._get_operator_availability()
         try:
             return _operator_availability_view(payload)
         except (KeyError, TypeError, ValueError) as exc:

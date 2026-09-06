@@ -297,7 +297,9 @@ class HubinetOpsResourceButton(HubinetOpsResourceEntity, ButtonEntity):
     async def async_press(self) -> None:
         if not self.available:
             raise HomeAssistantError(
-                "the Hubinet Ops backend does not currently allow this operation"
+                "the Hubinet Ops backend does not currently allow this operation",
+                translation_domain=DOMAIN,
+                translation_key="control_unavailable",
             )
 
         key = self.entity_description.key

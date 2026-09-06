@@ -104,7 +104,16 @@ database. Home Assistant re-enrollment is required after that reset because
 
 ## Installation
 
-The two halves deploy independently.
+The two halves deploy independently. A Home Assistant integration newer than
+its backend keeps working: if the backend gives a definite "this route does
+not exist" answer for `GET /operator-availability` (a backend that predates
+Human1 operator-availability publication), Home Assistant falls back to a
+conservative all-unavailable presentation for the already-validated snapshot
+— inventory and sensors stay live, and every Human1 operator control is
+unavailable rather than invented. Any other failure on that route (auth,
+network, a malformed or inconsistent body) is never treated as that one case
+and fails the refresh closed exactly as before. See ARCHITECTURE.md,
+"Operator-availability compatibility and coherence".
 
 **Backend (on the Proxmox host).** `deploy/bootstrap-proxmox-0.5.sh` creates a
 fresh unprivileged Debian LXC at the next free VMID, provisions a

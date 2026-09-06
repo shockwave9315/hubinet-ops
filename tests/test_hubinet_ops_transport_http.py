@@ -41,6 +41,7 @@ from custom_components.hubinet_ops.api import (
     HubinetOpsConflict,
     HubinetOpsInvalidAuth,
     HubinetOpsInvalidResponse,
+    HubinetOpsOperatorAvailabilityUnsupported,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     LifecycleState,
@@ -367,6 +368,105 @@ async def test_malformed_operator_availability_fails_closed(
             "authority_published_state_revision": 20,
             "resources": [{"resource_id": RESOURCE_CT, "can_start_update": "yes"}],
         },
+    )
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        await transport.fetch_operator_availability()
+
+
+# ---------------------------------------------------------------------------
+# Corrective pass, HUMAN1-AVAIL-COMPAT-01 -- a definite 404 on this exact
+# no-path-parameter route is the ONE typed compatibility signal a backend
+# predating Human1 operator-availability publication can give. Every other
+# failure shape on the same route must remain an ordinary, distinct,
+# fail-closed error -- never silently reinterpreted as that one case.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_404_is_the_typed_unsupported_signal(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    aioclient_mock.get(f"{BASE_URL}/r0/v1/operator-availability", status=404)
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    with pytest.raises(HubinetOpsOperatorAvailabilityUnsupported):
+        await transport.fetch_operator_availability()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", (401, 403))
+async def test_operator_availability_auth_failure_is_not_unsupported(
+    hass: HomeAssistant, aioclient_mock, status: int
+) -> None:
+    aioclient_mock.get(f"{BASE_URL}/r0/v1/operator-availability", status=status)
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    with pytest.raises(HubinetOpsInvalidAuth):
+        await transport.fetch_operator_availability()
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_server_error_is_not_unsupported(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    aioclient_mock.get(f"{BASE_URL}/r0/v1/operator-availability", status=500)
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    with pytest.raises(HubinetOpsCannotConnect):
+        await transport.fetch_operator_availability()
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_connection_error_is_not_unsupported(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability",
+        exc=aiohttp.ClientConnectorError(
+            connection_key=None, os_error=OSError("refused")
+        ),
+    )
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    with pytest.raises(HubinetOpsCannotConnect):
+        await transport.fetch_operator_availability()
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_timeout_is_not_unsupported(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability", exc=TimeoutError()
+    )
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    with pytest.raises(HubinetOpsCannotConnect):
+        await transport.fetch_operator_availability()
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_non_json_body_is_not_unsupported(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability",
+        text="not json",
+        headers={"Content-Type": "text/plain"},
     )
     transport = HttpHubinetOpsTransport(
         hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True

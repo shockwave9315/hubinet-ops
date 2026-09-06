@@ -292,6 +292,57 @@
     },
     "wrong_instance": {
       "message": "The connection points to a different Hubinet Ops backend instance."
+    },
+    "device_not_found": {
+      "message": "The selected Hubinet Ops resource device does not exist."
+    },
+    "device_not_unique_resource": {
+      "message": "The selected device must identify exactly one loaded Hubinet Ops resource."
+    },
+    "review_failed": {
+      "message": "Could not read the current Hubinet Ops update plan."
+    },
+    "backend_changed_during_review": {
+      "message": "The backend identity changed during plan review."
+    },
+    "resource_absent_during_review": {
+      "message": "The resource is absent from the fresh backend snapshot."
+    },
+    "health_contract_read_failed": {
+      "message": "Could not read the Hubinet Ops health contract."
+    },
+    "health_contract_set_refused": {
+      "message": "Hubinet Ops refused the declared health contract."
+    },
+    "health_contract_clear_refused": {
+      "message": "Hubinet Ops refused to clear the health contract."
+    },
+    "approve_without_review": {
+      "message": "Review the current update plan before approving it."
+    },
+    "approve_revalidation_failed": {
+      "message": "Could not revalidate the reviewed Hubinet Ops plan."
+    },
+    "plan_changed": {
+      "message": "The exact reviewed plan changed; review the update plan again."
+    },
+    "approve_refused": {
+      "message": "Hubinet Ops refused the reviewed update plan."
+    },
+    "start_refused": {
+      "message": "Hubinet Ops refused to start the package update."
+    },
+    "view_job_failed": {
+      "message": "Could not read the Hubinet Ops package update job."
+    },
+    "resume_refused": {
+      "message": "Hubinet Ops refused to resume the package update job."
+    },
+    "rollback_refused": {
+      "message": "Hubinet Ops refused the same-job rollback request."
+    },
+    "control_unavailable": {
+      "message": "The Hubinet Ops backend does not currently allow this operation."
     }
   }
 }

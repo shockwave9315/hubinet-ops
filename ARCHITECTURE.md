@@ -827,6 +827,37 @@ repeats its complete authority proof, so a raced capability can only lead to a
 refusal. Polling remains mutation-free and never interprets a capability as
 retry permission.
 
+**Operator-availability compatibility and coherence.** `/snapshot` and
+`/operator-availability` are two separate HTTP reads, so two ordinary things
+can happen between them that are not authority defects: the backend HA is
+talking to may predate Human1 operator-availability publication entirely
+(the two halves deploy independently), or a legitimate write may land between
+the reads and advance the revision. The coordinator's own
+`_fetch_coherent_pair` handles exactly these two cases and nothing more:
+
+- *Compatibility.* A definite HTTP 404 on `/operator-availability` (the route
+  takes no path parameters, so 404 there is unambiguous) is the ONE typed
+  signal treated as "this backend predates Human1" — the transport raises a
+  dedicated `HubinetOpsOperatorAvailabilityUnsupported`, and the coordinator
+  substitutes a conservative view with every capability `False` for every
+  resource in the snapshot it just fetched. Inventory and sensors stay live;
+  no Human1 control becomes reachable and no authority is invented. Every
+  other failure on that route — 401/403, TLS/connection errors, timeouts,
+  5xx, a malformed or structurally inconsistent body — remains an ordinary
+  fail-closed coordinator failure and is never folded into this case.
+- *Bounded revision race.* A backend identity match, an identical resource
+  set, and a revision that merely disagrees (an intervening scan/discovery/
+  product-update commit landed between the two reads) gets exactly one
+  retry of the COMPLETE pair — both `/snapshot` and `/operator-availability`
+  refetched together, never mixed across attempts. A backend-identity or
+  resource-membership mismatch is never treated as this race and fails
+  closed on the first attempt; a revision mismatch still present after the
+  retry fails closed too. The bound is exactly one retry, never a loop.
+
+Neither behavior weakens `validate_operator_availability`: it still runs
+against whichever pair the coordinator ultimately accepts, and a structural
+inconsistency it rejects still fails the refresh closed.
+
 Start/view/resume/rollback buttons share the response-capable action handlers.
 One start press generates one request ID once and makes one logical call; it is
 never blindly replayed after uncertainty. Job status, checkpoint, package

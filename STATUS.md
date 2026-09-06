@@ -86,6 +86,16 @@
   when explicitly requested.
   `start_update`, `resume_update`, and `rollback_update` are explicit operator
   actions and are unreachable from coordinator polling. Distributed via HACS.
+  A backend that predates Human1 operator-availability publication (a
+  definite 404 on `GET /operator-availability`) keeps inventory/sensors
+  working with every Human1 control conservatively unavailable, never with
+  invented authority; every other failure on that route still fails the
+  refresh closed. An ordinary revision race between the `/snapshot` and
+  `/operator-availability` reads gets one bounded retry of the complete pair
+  before failing closed. Routine operator failure paths (review/approval/
+  start/resume/rollback refusals, a changed reviewed plan, a health-contract
+  read failure, a raced control) are localized in English and Polish, not
+  only the setup/reauth/coordinator messages.
 - **Automatic Debian/Ubuntu LXC package scanning** — configurable six-hour
   default interval, one worker, typed pinned-key SSH to a forced PVE helper,
   fixed `pct exec` operations, APT metadata refresh plus upgrade simulation,

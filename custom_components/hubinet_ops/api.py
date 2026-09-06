@@ -82,6 +82,26 @@ class HubinetOpsHealthContractUnconfigured(HubinetOpsApiError):
     """
 
 
+class HubinetOpsOperatorAvailabilityUnsupported(HubinetOpsApiError):
+    """The backend gives a definite "this route does not exist" answer.
+
+    Raised ONLY for the one bounded 0.5 compatibility seam (HUMAN1-AVAIL-
+    COMPAT-01): a backend that predates publishing
+    ``GET /r0/v1/operator-availability`` at all. The route takes no path
+    parameters, so an HTTP 404 on it is unambiguous -- unlike the
+    health-contract route, there is no per-resource "not found" it could
+    otherwise mean.
+
+    This is deliberately a distinct exception rather than a generic
+    connection failure: a caller must never be able to confuse "this old
+    backend has no opinion yet" with an authentication problem, a network
+    failure, a server error, or a malformed response, all of which remain
+    ordinary fail-closed ``HubinetOpsApiError`` failures. Only the
+    coordinator's own compatibility fallback catches this one exception; it
+    is never treated as permission to invent authority.
+    """
+
+
 class HubinetOpsTransport(Protocol):
     """Typed backend transport with one exact-plan approval mutation."""
 
@@ -95,7 +115,13 @@ class HubinetOpsTransport(Protocol):
         """Fetch one logical inventory/state/policy snapshot."""
 
     async def fetch_operator_availability(self) -> OperatorAvailabilityView:
-        """Fetch point-in-time backend-owned operator availability."""
+        """Fetch point-in-time backend-owned operator availability.
+
+        May raise ``HubinetOpsOperatorAvailabilityUnsupported`` for the one
+        definite "this backend predates the route" case; every other failure
+        (auth, connection, timeout, 5xx, malformed body) remains an ordinary
+        ``HubinetOpsApiError`` and must never be treated as that case.
+        """
 
     async def approve_package_plan(
         self, resource_id: str, scan_run_id: str, plan_fingerprint: str
