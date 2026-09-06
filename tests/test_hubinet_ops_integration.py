@@ -42,6 +42,12 @@ from custom_components.hubinet_ops.api import (
     DetailStatus,
     HealthContractStatus,
     HealthContractSummary,
+    HealthDiscoveryAdapter,
+    HealthDiscoveryCandidate,
+    HealthDiscoveryRecommendationBasis,
+    HealthDiscoveryResult,
+    HealthDiscoveryRoleHint,
+    HealthDiscoveryStatus,
     HealthProbe,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -477,6 +483,8 @@ class FakeTransport:
         approval_error: Exception | None = None,
         health_contracts: dict[str, ResourceHealthContract] | None = None,
         health_contract_error: Exception | None = None,
+        health_discovery_results: dict[str, HealthDiscoveryResult] | None = None,
+        health_discovery_error: Exception | None = None,
         package_update_jobs: dict[str, PackageUpdateJobView] | None = None,
         package_update_error: Exception | None = None,
         operator_capabilities: dict[str, OperatorCapabilities] | None = None,
@@ -508,6 +516,15 @@ class FakeTransport:
         self.health_contract_reads: list[str] = []
         self.health_contract_writes: list[tuple[str, tuple, int | None]] = []
         self.health_contract_clears: list[tuple[str, int | None]] = []
+        # Ephemeral discovery (v20): a resource absent from this mapping has
+        # no fake answer configured at all, which raises rather than
+        # inventing a plausible-looking result -- exactly like an
+        # unconfigured health contract above.
+        self.health_discovery_results: dict[str, HealthDiscoveryResult] = dict(
+            health_discovery_results or {}
+        )
+        self.health_discovery_error = health_discovery_error
+        self.health_discovery_reads: list[str] = []
         # Stands in for the backend's durable job authority. Every operator
         # update control records what it was asked and returns the job it
         # acted on, so a test can assert exactly what crossed the boundary --
@@ -577,6 +594,15 @@ class FakeTransport:
                 "resource has no configured health contract"
             )
         return contract
+
+    async def fetch_health_candidates(self, resource_id: str) -> HealthDiscoveryResult:
+        self.health_discovery_reads.append(resource_id)
+        if self.health_discovery_error is not None:
+            raise self.health_discovery_error
+        result = self.health_discovery_results.get(resource_id)
+        if result is None:
+            raise HubinetOpsCannotConnect("no fake discovery result configured")
+        return result
 
     async def replace_health_contract(
         self,
@@ -5135,15 +5161,19 @@ async def test_approved_but_unconfigured_resource_raises_a_repair_issue(
     assert planned.package_plan_approval.status is PackagePlanApprovalStatus.APPROVED
     assert planned.health_contract.status is HealthContractStatus.UNCONFIGURED
 
-    await setup_entry(hass, FakeTransport([snapshot((planned,))]))
+    entry = await setup_entry(hass, FakeTransport([snapshot((planned,))]))
 
     issues = _health_contract_repair_ids(hass)
     assert len(issues) == 1
     issue = ir.async_get(hass).issues[(DOMAIN, next(iter(issues)))]
-    assert issue.is_fixable is False
+    # Stage 4 (v20): fixable through the discover -> render -> confirm ->
+    # declare flow, but the manual `set_health_contract` action described in
+    # the issue text remains a supported alternative path.
+    assert issue.is_fixable is True
     assert issue.severity == ir.IssueSeverity.WARNING
     assert issue.translation_key == "health_contract_unconfigured"
     assert issue.translation_placeholders == {"name": "CT101 Cloudflared"}
+    assert issue.data == {"entry_id": entry.entry_id, "resource_id": RESOURCE_CT}
 
 
 @pytest.mark.asyncio

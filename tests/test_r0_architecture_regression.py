@@ -984,6 +984,7 @@ def test_r0_ha_transport_defines_an_exact_operator_method_allowlist() -> None:
         "fetch_operator_availability",
         "approve_package_plan",
         "fetch_health_contract",
+        "fetch_health_candidates",
         "replace_health_contract",
         "clear_health_contract",
         "start_package_update",
@@ -2057,3 +2058,38 @@ def test_no_detached_boundary_keeps_the_old_unchecked_spawn(source_name: str) ->
 
     source = (REPO_ROOT / "deploy" / source_name).read_text(encoding="utf-8")
     assert "_spawn_detached_runner" not in source
+
+
+def test_ha_integration_contains_no_docker_or_systemd_inspection_logic() -> None:
+    """Stage 4 (v20): health-candidate discovery -- Docker HEALTHCHECK
+    detection, systemd unit-file/failed-unit enumeration, and origin/
+    role_hint classification -- lives entirely on the backend
+    (`deploy/hubinet-package-health-helper.py`). Home Assistant only ever
+    renders an already-classified, already-bounded `HealthDiscoveryResult`
+    it fetched over one typed HTTP route; it must never itself run, parse,
+    or reimplement any part of that classification.
+
+    Asserted as the absence of the exact literals the backend's own
+    discovery engine owns (Docker/systemd CLI invocations and output-field
+    names no HA-side parser has any legitimate reason to mention), across
+    every Python file the integration ships.
+    """
+
+    forbidden_substrings = (
+        "docker inspect",
+        "docker ps",
+        "systemctl show",
+        "systemctl list-unit-files",
+        "systemctl list-units",
+        "Healthcheck",
+        "FragmentPath",
+        "subprocess",
+        "paramiko",
+    )
+    integration_root = REPO_ROOT / "custom_components" / "hubinet_ops"
+    python_files = sorted(integration_root.glob("**/*.py"))
+    assert len(python_files) > 10  # sanity: the glob actually found the package
+    for path in python_files:
+        text = path.read_text(encoding="utf-8")
+        for forbidden in forbidden_substrings:
+            assert forbidden not in text, (path.relative_to(REPO_ROOT), forbidden)

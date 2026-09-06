@@ -294,7 +294,28 @@
   "issues": {
     "health_contract_unconfigured": {
       "title": "{name}: aktualizacja pakietów zablokowana brakiem kontraktu kondycji",
-      "description": "Przejrzany plan pakietów dla **{name}** jest zatwierdzony, ale nie zadeklarowano kontraktu kondycji, więc przycisk **Rozpocznij zatwierdzoną aktualizację** pozostaje wyłączony. To celowe: Hubinet Ops nigdy nie wymyśla, co oznacza „zdrowy” dla Twojego obciążenia — Ty to deklarujesz.\n\nZadeklaruj kontrakt za pomocą akcji `hubinet_ops.set_health_contract` dla tego urządzenia, dostępnej z zakładki **Akcje** tego urządzenia lub z Narzędzi deweloperskich → Akcje. Podaj każdy wymagany rodzaj sondy (`systemd_unit_active`, `docker_container_running` lub `docker_container_healthy`) i jej cel. To zgłoszenie zniknie automatycznie, gdy tylko kontrakt dla tego zasobu zostanie utworzony."
+      "description": "Przejrzany plan pakietów dla **{name}** jest zatwierdzony, ale nie zadeklarowano kontraktu kondycji, więc przycisk **Rozpocznij zatwierdzoną aktualizację** pozostaje wyłączony. To celowe: Hubinet Ops nigdy nie wymyśla, co oznacza „zdrowy” dla Twojego obciążenia — Ty to deklarujesz.\n\nWybierz **Napraw** poniżej, aby wykryć kandydatów dla tego zasobu i zadeklarować kontrakt na ich podstawie, albo użyj akcji `hubinet_ops.set_health_contract` dla tego urządzenia (dostępnej z zakładki **Akcje** tego urządzenia lub z Narzędzi deweloperskich → Akcje), aby wpisać go ręcznie. To zgłoszenie zniknie automatycznie, gdy tylko kontrakt dla tego zasobu zostanie utworzony.",
+      "fix_flow": {
+        "abort": {
+          "entry_not_loaded": "Ten wpis Hubinet Ops nie jest obecnie załadowany.",
+          "resource_not_found": "Ten zasób nie jest już załadowany przez Hubinet Ops.",
+          "discovery_failed": "Nie udało się połączyć z backendem Hubinet Ops w celu wykrycia kandydatów. Użyj zamiast tego akcji `hubinet_ops.set_health_contract` albo spróbuj ponownie, gdy backend będzie dostępny.",
+          "guest_unavailable": "Backend nie mógł połączyć się z gościem, aby wykryć kandydatów. Użyj zamiast tego akcji `hubinet_ops.set_health_contract` albo spróbuj ponownie, gdy gość będzie dostępny.",
+          "undecidable": "Backend nie mógł ustalić, czy na tym gościu jest obecny Docker czy systemd. Użyj zamiast tego akcji `hubinet_ops.set_health_contract`.",
+          "too_many_candidates": "Wykrywanie znalazło więcej kandydatów, niż można bezpiecznie wyświetlić. Użyj akcji `hubinet_ops.set_health_contract`, aby zadeklarować dokładne sondy.",
+          "no_candidates_discovered": "Wykrywanie nie znalazło niczego do zarekomendowania dla tego zasobu. Użyj akcji `hubinet_ops.set_health_contract`, aby zadeklarować dokładne sondy."
+        },
+        "error": {
+          "no_candidates_selected": "Wybierz co najmniej jedną sondę albo anuluj i użyj zamiast tego akcji `hubinet_ops.set_health_contract`.",
+          "declare_failed": "Hubinet Ops odrzucił zadeklarowany kontrakt kondycji. Nic nie zostało zmienione."
+        },
+        "step": {
+          "confirm": {
+            "title": "Zadeklaruj kontrakt kondycji dla {name}",
+            "description": "Hubinet Ops wykrył następujące elementy na {name}. Nic nie zostanie zapisane, dopóki nie wybierzesz **Zatwierdź** — zalecani kandydaci są wstępnie zaznaczeni; dostosuj wybór do tego, co „zdrowy” oznacza dla tego obciążenia, a następnie zatwierdź, aby go zadeklarować.\n\n{candidates}"
+          }
+        }
+      }
     }
   },
   "exceptions": {
