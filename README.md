@@ -91,12 +91,17 @@ a deterministic health failure, did not auto-rollback, and reached
 snapshot. See `STATUS.md` for the completed evidence and current product stage.
 
 Pre-release authority schema versions are not migrated in place: the current
-schema is v19. Schema v17 added the per-resource durable `issuance_sequence`
+schema is v20. Schema v17 added the per-resource durable `issuance_sequence`
 that orders "latest job" readback by issuance rather than wall-clock
 `issued_at`. Schema v18 adds the durable job-keyed post-success package-scan
 request and its write-once same-resource RUNNING scan link. Schema v19 makes a
 successful job the durable consumption fact for its exact approval and permits
-at most one successful job per approval. An existing schema-v18 (or earlier)
+at most one successful job per approval. Schema v20 adds `guest_operational`,
+a fallback health-probe kind with no target, for a guest on which backend
+discovery positively completes for both the Docker and systemd families and
+finds no workload candidate in either; its `target` column is nullable only
+for this kind (`CHECK`-enforced), and a partial unique index still permits at
+most one such probe per contract. An existing schema-v19 (or earlier)
 pre-release deployment is therefore incompatible in
 place. `deploy/update-proxmox-0.5.sh` reports
 `reset_required`, makes and validates a coherent authority backup, and resets

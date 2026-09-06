@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v19):
+  SQLite authority database (schema v20):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -882,7 +882,7 @@ The operator-triggered update lifecycle is production reachable.
   execution queue and the recovery authority; a worker wakeup is an in-memory
   hint and needed no second durable queue. Making the lifecycle reachable
   caused no authority migration and no reset on its own. The current authority
-  schema is v19; see "Implemented" and "Known limitations" below.
+  schema is v20; see "Implemented" and "Known limitations" below.
 - **Human0: COMPLETE / PASS.** See "Human0 production lifecycle" above.
 
 ## Product stages
@@ -946,23 +946,61 @@ The operator-triggered update lifecycle is production reachable.
   authority state was needed for either stage. See `ARCHITECTURE.md`,
   "Job-bound healthcheck execution".
 
+- **Post-Human1 PR #80 review remediation, schema v20, backend discovery,
+  and native onboarding.** A code review of Stage 1+2 found five concrete
+  gaps in the bounded-settling stage, each closed structurally: an explicit
+  typed `evaluation_status` (`decisive`/`unresolved`) now travels on the wire
+  and is checked *before* aggregation, never re-inferred from probe outcomes;
+  the 180s settling window is now one real absolute monotonic deadline
+  enforced before every round/sleep/command, with every per-command timeout
+  clamped to the remaining budget; a structural target problem (a bad
+  target, an ambiguous pattern) now returns immediately, never waiting out
+  the window; Home Assistant independently proves kind/outcome/reason and
+  verdict/probe-set coherence with exact JSON-type checks (closing a
+  `bool("false") is True` coercion trap), not just bounded-set membership;
+  and the backend now states its own timing policy
+  (`settling_policy: {deadline_seconds, observation_interval_seconds}`) on
+  the wire, with the helper validating and clamping against its own hard
+  ceilings rather than trusting Home Assistant to supply correct values —
+  Home Assistant never states or overrides this policy.
+
+  **The authority schema is now v20** (bumped from v19, a normal pre-release
+  reset per `AGENTS.md`): a fourth probe kind, `guest_operational`, is a
+  fallback with no target at all (`CHECK`-enforced nullable `target`, a
+  partial unique index permitting at most one per contract) for a guest on
+  which backend discovery positively completed for both the Docker and
+  systemd families and found no workload candidate in either — it proves
+  guest liveness (`/bin/true`, fixed, no operator input), never application
+  health, and structurally can only ever PASS or UNKNOWN, never FAIL.
+
+  **Backend discovery** (`GET /r0/v1/resources/{resource_id}/health-candidates`,
+  a second ephemeral read-only operation sharing the existing forced-command
+  boundary, persisting nothing) inspects Docker (`docker ps` + batched
+  `docker inspect`, HEALTHCHECK detection) and systemd (unit-file/failed-unit
+  union, batched `systemctl show`, origin/role_hint classification by exact
+  small deny-lists) and recommends by one fixed backend-owned priority order
+  — Docker HEALTHCHECK, then Docker running, then a single unambiguous
+  systemd candidate, then (only once both families positively completed with
+  nothing found) `guest_operational`. Discovery uncertainty in either family
+  is never read as "nothing found" and can never fall through to recommending
+  the fallback.
+
+  **The `health_contract_unconfigured` Repair is now fixable**: its flow
+  calls discovery for the exact blocked resource, renders every candidate as
+  a checkbox (recommended ones pre-selected), and writes nothing until the
+  operator explicitly submits — through the same `async_replace_health_contract`
+  mutation `set_health_contract` already used. An undecided discovery status,
+  a transport failure, or zero candidates leaves the issue open; the manual
+  action remains a fully supported alternative. See `ARCHITECTURE.md`, "PR
+  #80 review remediation", "The guest_operational fallback and backend
+  discovery", and "Native HA onboarding".
+
 ### Next — Human1 follow-ons deliberately deferred
 
-- **Backend health-candidate discovery and a `guest_operational` fallback
-  probe kind, plus native HA onboarding/options flows for declaring a health
-  contract from discovered candidates, were scoped as later stages of the
-  same frozen architecture review and are NOT implemented in this slice.**
-  The normal path to declare a health contract remains the existing
-  `set_health_contract` action (native Repair-guided, since the entry above),
-  not a discovery-driven wizard. `guest_operational` would require resolving
-  a schema question first: `resource_health_contract_probes.kind` is a SQL
-  `CHECK` generated from the `HealthProbeKind` Python enum
-  (`app/inventory/store.py`), so adding a member changes the DDL text new
-  databases are created with; an already-created v19 database's existing
-  `CHECK` would not retroactively include it. That is a normal pre-release
-  schema-affecting change (this repository resets, never migrates, pre-release
-  authority databases -- `AGENTS.md`), not a blocker, but it was not
-  undertaken alongside this slice.
+- An edit/re-discover/clear maintenance flow for a resource that **already**
+  has a declared contract was not built alongside the initial-declaration fix
+  flow above; `set_health_contract`/`clear_health_contract` remain the
+  supported path for editing an existing contract.
 - Typed CT start/stop/restart and manual-snapshot operations were not added in
   this slice. They require new dedicated backend operations and privileged
   forced-command boundaries; combining that deployment/host-control work with
@@ -1010,14 +1048,15 @@ not attestation or defense against an omnipotent PVE root.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v19 is incompatible with v18 and every earlier version,
+- Pre-release: schema v20 is incompatible with v19 and every earlier version,
   and there is no in-place migration path. Schema v17 added the durable
   per-resource `issuance_sequence` package-update jobs now use for latest-job
   ordering, and schema v18 adds the durable post-success package-scan request
   and constrained scan link. Schema v19 adds durable one-shot-on-success
-  approval consumption and the unique successful-job-per-approval fence (see
-  "Implemented" above), so an existing schema-v18 (or earlier) installation is
-  incompatible. An existing installation now uses
+  approval consumption and the unique successful-job-per-approval fence, and
+  schema v20 adds the nullable-target `guest_operational` probe kind and its
+  partial unique index (see "Implemented" above), so an existing schema-v19
+  (or earlier) installation is incompatible. An existing installation now uses
   `deploy/update-proxmox-0.5.sh` for
   this: it detects the incompatible authority schema, backs it up, and resets
   only the authority database (see "In-place product updates" below) while

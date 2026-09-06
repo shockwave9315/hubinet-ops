@@ -23,7 +23,7 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v19). Schema v10 added
+database (marker `hubinet_ops_0_5_authority`, schema v20). Schema v10 added
 the job-owned snapshot operation identity, its write-ahead uncertainty
 checkpoint, the observed PVE task identity, and SQL-level state-machine
 invariants over all of them. Schema v11 added the explicit, material
@@ -58,8 +58,13 @@ replaced. Schema v19 makes a successful job the durable consumption fact for
 the exact approval copied into that job and adds a partial unique index
 permitting at most one `succeeded` job per `approval_id`. Because consumption
 is derived from the same terminal job row, success and consumption cannot be
-split by a crash or restart. There is no migration from v9 through v18;
-pre-release installs use the
+split by a crash or restart. Schema v20 adds `guest_operational`, a fourth
+health-probe kind whose `target` column is `NULL` (`CHECK`-enforced: exactly
+this kind may be `NULL`, and every other kind still requires a bounded
+target) with its own partial unique index permitting at most one such probe
+per resource contract or per frozen job copy (see "The guest_operational
+fallback and backend discovery" below). There is no migration from v9
+through v19; pre-release installs use the
 product updater's explicit backed-up authority reset and require Home
 Assistant re-enrollment.
 
@@ -2728,6 +2733,147 @@ same `/resume` liveness entrypoint. No retry policy, timer, or grace period
 exists ABOVE this bounded window: one worker wake performs one bounded
 settling attempt, and reaching its deadline still ends the attempt, exactly
 as reaching any other UNKNOWN classification always did.
+
+### PR #80 review remediation: typed decisiveness, a real deadline, and independent HA proof
+
+A code review of the bounded-settling stage above found five concrete gaps,
+each closed structurally rather than by patching a symptom:
+
+**A non-decisive round must never become durable PASS/FAIL.** The helper now
+carries an explicit typed `evaluation_status` (`decisive` | `unresolved`) on
+the wire alongside the probe results, computed once inside the helper from
+the same round bookkeeping that already decided whether to keep settling
+(`MIN_DECISIVE_ROUND`, `MAX_ROUND_SPAN_SECONDS`, no transient probe left). The
+backend (`app/package_update_health.py`) checks this field **before**
+calling `aggregate_health_outcome` — never re-inferring decisiveness from the
+probe outcomes it receives — and routes anything not `decisive` to UNKNOWN
+outright. `validate_host_health_result` additionally refuses a
+self-contradictory payload (`decisive` alongside any `UNKNOWN` probe): the
+helper's own claim of decisiveness is checked, not trusted.
+
+**180s is a real absolute deadline, not an accumulated budget.** The helper
+computes one `absolute_deadline = start + settling_deadline_seconds` at the
+very beginning of `evaluate_health_contract_settling` and re-checks
+`monotonic() >= absolute_deadline` before every subsequent round and sleep;
+every per-command timeout is clamped to whatever budget remains
+(`_clamped_command_timeout`), never the nominal per-command constant, so a
+slow round cannot let the wall-clock total run past the deadline by
+accumulating full-length command timeouts.
+
+**A structural target problem (a bad target, an ambiguous pattern) returns
+immediately.** It costs zero guest commands and was already computed
+statically, so it must never wait out any part of the 180s: a request whose
+probes are entirely structural returns at zero rounds, and a request mixing
+structural and live probes still runs the live probes for one full round
+before returning rather than looping until the deadline for probes that can
+never become live.
+
+**Home Assistant proves coherence independently, not just bounded-set
+membership.** `contract/package_update_validation.py` now checks, per probe,
+that `kind`/`outcome`/`reason` agree with the shared
+`HEALTH_PROBE_REASONS_BY_OUTCOME` / `HEALTH_PROBE_REASON_KINDS` tables
+(mirrored byte-for-byte from `app/inventory/health_observation.py`), and
+separately that the aggregate verdict and the accompanying probe set agree
+(`PASSED` requires every probe `PASSED`; `FAILED` requires at least one
+`FAILED`) — a verdict that merely uses tokens from the right closed sets but
+contradicts its own evidence is refused, not rendered. Every JSON value is
+checked against its **exact** Python type (`_strict_bool`/`_strict_str`/
+`_strict_int`) rather than coerced: a malformed `"false"` string for a
+boolean field is refused rather than silently becoming `True`
+(`bool("false") is True` in Python).
+
+**Timing policy ownership is unambiguous.** The backend states
+`settling_policy: {deadline_seconds, observation_interval_seconds}` on every
+request, sourced from its own product defaults
+(`PACKAGE_UPDATE_HEALTH_SETTLING_DEADLINE_SECONDS` /
+`_OBSERVATION_INTERVAL_SECONDS` in `app/inventory_runtime_config.py`) — Home
+Assistant never supplies or overrides these. The helper independently
+validates and clamps whatever it receives against its own hard ceilings
+(`MIN`/`MAX_SETTLING_DEADLINE_SECONDS`, `MIN`/`MAX_OBSERVATION_INTERVAL_SECONDS`)
+before using them, so a malformed or out-of-range request cannot make the
+helper run longer, or poll faster, than its own compiled bounds allow.
+
+### The guest_operational fallback and backend discovery (Stage 3, schema v20)
+
+Some guests genuinely run nothing a health contract can currently name: no
+Docker container, no non-platform systemd unit — a bare guest, or one running
+only the base OS. Before schema v20 such a guest could not be given a health
+contract that means anything, which meant it could not be given a package
+update job at all ("no contract means unconfigured" above). `guest_operational`
+closes that gap **without inventing application-health proof**: it names no
+container or unit, carries no target (`target IS NULL`, `CHECK`-enforced,
+mirrored by `HealthProbe.target: str | None` on both sides), and its command is
+fixed — `/bin/true` on the guest, an absolute path, no operator input, no
+shell — so its only claim is "the guest executed a command", never "a
+workload is up". `_guest_operational_round` can only ever produce PASS
+(`guest_operational_confirmed`) or UNKNOWN (`command_timed_out` /
+`malformed_output` / `command_failed`); it never FAILs, because a guest that
+cannot currently run a trivial command is a liveness question, not proof this
+specific fallback contract was violated. A partial unique index
+(`... WHERE kind = 'guest_operational'`) permits at most one such probe per
+contract — a plain column-level `UNIQUE` cannot express this, because SQL
+treats every `NULL` as distinct from every other `NULL`.
+
+**Discovery is a second, ephemeral, read-only operation, never a durable
+one.** `discover_health_candidates` (helper) /
+`resource_health_discovery_request` + `HealthDiscoveryResult` (backend) /
+`GET /r0/v1/resources/{resource_id}/health-candidates` (API) share the same
+forced-command SSH boundary and pinned key `evaluate_health_contract`
+already uses, dispatched by an explicit `operation` field — but discovery
+persists nothing, carries no `job_id`, and mutates no authority row. It looks
+at a resource **positively**, never by absence of a health result: current
+unhealthiness must never suppress a candidate from being discoverable.
+
+- **Docker**: one `docker ps --all` (the complete name universe and the daemon
+  oracle in one call, exactly the settling engine's own absence-safety
+  pattern) followed by batched `docker inspect`, mapped back by returned
+  `.Name`, reading `.Config.Healthcheck` to distinguish a
+  `docker_container_healthy` candidate from a merely-`docker_container_running`
+  one.
+- **systemd**: the union of `systemctl list-unit-files --type=service`
+  (`enabled`/`enabled-runtime`/`disabled` states only) and
+  `systemctl list-units --all --type=service --state=failed`, batched
+  `systemctl show`, each unit classified into an `origin`
+  (`local_unit`/`package_unit`/`generated`/`alias`/`unknown_origin`) and a
+  `role_hint` (`workload_candidate`/`runtime`/`platform`/`ambiguous`) via
+  small, exact deny-lists (`docker.service`, `ssh.service`,
+  `systemd-*`/`getty@*` prefixes, and similarly) — a unit's packaging origin
+  never implies its platform role; the two are classified independently.
+
+**Recommendation is backend-owned, one fixed priority order, computed once:**
+Docker `HEALTHCHECK` candidates outrank a merely-running Docker candidate,
+which outranks a single unambiguous systemd `workload_candidate`, which
+outranks the `guest_operational` fallback. Multiple systemd workload
+candidates with none dominant return `ambiguous_candidates` with nothing
+recommended — an operator choice, never a guess. **The one rule that may
+never be violated**: discovery uncertainty in *either* family (a daemon that
+would not answer, an ambiguous local-node identity) returns that uncertain
+status immediately, with zero candidates and no recommendation — it can
+never fall through to recommending `guest_operational`, because "discovery
+could not tell" and "discovery positively found nothing" are different
+facts, and only the second may ever produce that recommendation.
+
+### Native HA onboarding (Stage 4)
+
+The `health_contract_unconfigured` Repair (see "Human1 defect A" in
+`STATUS.md`) is now `is_fixable=True`: its `RepairsFlow` calls the discovery
+route above for the exact blocked resource, renders every returned candidate
+as a checkbox (backend-recommended ones pre-selected, everything else
+unchecked), and writes nothing until the operator submits that form — the
+same `async_replace_health_contract` mutation the `set_health_contract`
+action already used. Discovery only narrows what is *shown*; the operator's
+explicit confirmation is still the only thing that ever creates authority,
+exactly as `PRODUCT.md`, "What healthy means", requires. Any undecided
+discovery status, a transport failure, or zero returned candidates aborts the
+flow with the issue left open rather than rendering an empty or misleading
+form; the manual `set_health_contract` action remains a fully supported
+alternative path, named in the issue text either way. Classification itself
+— everything above about Docker/systemd inspection — has no HA-side
+counterpart at all: Home Assistant only ever renders an already-classified,
+already-bounded `HealthDiscoveryResult` it fetched over that one typed route
+(`tests/test_r0_architecture_regression.py`,
+`test_ha_integration_contains_no_docker_or_systemd_inspection_logic`, proves
+the absence).
 
 ### Restart, retry, and rollback
 

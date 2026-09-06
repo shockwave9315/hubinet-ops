@@ -95,18 +95,40 @@ incarnation and inherits nothing; the same resource keeps its contract when it
 is renamed or moves node.
 
 **A contract is one or more typed probes, and all of them are required.**
-There are exactly three probe kinds:
+There are exactly four probe kinds:
 
 - `systemd_unit_active` — the named systemd unit must be active;
 - `docker_container_running` — the named Docker container must be running;
 - `docker_container_healthy` — the named Docker container must be running and
-  report Docker `HEALTHCHECK` status healthy.
+  report Docker `HEALTHCHECK` status healthy;
+- `guest_operational` (schema v20) — the guest itself must be reachable. It
+  carries no target at all, never even a faked one (a literal `"guest"`, a
+  VMID string) — it is the one probe kind this product will recommend when
+  backend discovery positively completes for both the Docker and systemd
+  families on a guest and finds no workload candidate in either. It is a
+  fallback proof of guest liveness, never a substitute for application-health
+  proof: an operator who later adds a real workload to that guest is expected
+  to replace it with a probe naming that workload.
 
 Every declared probe must hold. There is no OR, no scoring, no percentage, and
 no boolean expression — a contract that needs those is a contract nobody can
 read at 3am. A probe names a target; it never carries a command, a script, or
 a shell fragment, and no caller-supplied text ever becomes command text (see
 "Arbitrary remote shell" under "Not the product").
+
+**Health is operator-declared even when the backend suggests candidates.**
+Home Assistant can ask the backend to look at a resource and report what it
+found — running Docker containers, containers with a `HEALTHCHECK`, systemd
+units it can enumerate — through one ephemeral, read-only discovery read that
+persists nothing and grants no authority. The backend's own priority order
+(a Docker `HEALTHCHECK` outranks a merely-running container, which outranks a
+single unambiguous systemd candidate, which outranks the `guest_operational`
+fallback, which is only ever recommended once discovery positively completed
+in both families with nothing to recommend) only ever narrows what is
+*shown* to an operator; nothing becomes a declared contract until the operator
+explicitly confirms it through the same contract mutation this section
+already describes. Discovery uncertainty in either family is never read as
+"nothing found" and never falls through to a recommendation.
 
 **Configuration and execution eligibility are separate.** The configuration
 layer keeps probe targets as bounded opaque data; it does not guess, append a

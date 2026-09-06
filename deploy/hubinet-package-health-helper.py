@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Forced-command PVE boundary for Hubinet's sole health-evaluation operation.
+"""Forced-command PVE boundary for Hubinet's health-evaluation operations.
 
 **Deployed.** `deploy/lib/bootstrap-update-boundaries.sh` and
 `deploy/update-proxmox-0.5.sh` install this file as one of the five
@@ -9,10 +9,14 @@ root-owned forced command. It requires no PVE API privilege beyond the
 audit-only pair the product already has: it uses host-local `pct exec`, not a
 PVE mutation endpoint.
 
-It exposes exactly ONE typed operation, `evaluate_health_contract`, and that
-operation is READ-ONLY. It cannot create, delete, start, stop, snapshot, roll
-back, upgrade, install, or remove anything, and there is no path through it
-that accepts remote command text.
+It exposes exactly TWO typed operations sharing this one boundary and key,
+dispatched by an explicit `operation` field: `evaluate_health_contract`
+(the durable job-bound verdict path) and `discover_health_candidates` (Stage
+3B, an ephemeral read-only candidate-discovery answer that persists nothing
+on either side of this boundary -- see below). Both are READ-ONLY. Neither
+can create, delete, start, stop, snapshot, roll back, upgrade, install, or
+remove anything, and there is no path through either that accepts remote
+command text.
 
 ## Bounded health settling, inside this one call
 
