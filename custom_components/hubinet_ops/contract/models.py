@@ -32,7 +32,7 @@ from .health_contract_validation import (
     validate_health_probe,
     validate_resource_health_contract,
 )
-from .primitives import _immutable_mapping, _require_uuid_identity
+from .primitives import _immutable_mapping, _require_positive, _require_uuid_identity
 from .package_scan_validation import validate_package_scan_snapshot
 from .approval_validation import validate_package_plan_approval_snapshot
 from .package_update_validation import (
@@ -306,15 +306,31 @@ class PackageUpdateJobSummary:
     A concise state, not a replica of the event log. Everything detailed --
     the frozen package rows, the per-probe results, the append-only events --
     is response data from an explicitly invoked action.
+
+    ``rollback_available`` here is durable CHECKPOINT ELIGIBILITY only --
+    exactly what the immutable, revisioned snapshot may ever carry: whether
+    this job's status/checkpoint could in principle accept a same-job
+    rollback. It says nothing about whether the exact workload identity the
+    job names is still current (that is a volatile fact and belongs outside
+    snapshot revisioning -- see ``OperatorCapabilities.can_rollback_update``
+    on ``OperatorAvailabilityView``, and ``PackageUpdateJobView.
+    rollback_available`` for the explicit-action readback, both of which
+    additionally require current-target validity). Never read this field to
+    answer "is rollback currently available" -- present it, if at all, as
+    history, not as an availability claim.
     """
 
     state: PackageUpdateJobState = PackageUpdateJobState.NOT_STARTED
     job_id: str | None = None
     checkpoint: str | None = None
     issued_at: str | None = None
+    package_count: int | None = None
     health_outcome: PackageUpdateHealthOutcome | None = None
+    health_started_at: str | None = None
+    health_completed_at: str | None = None
     snapshot_confirmed_at: str | None = None
     mutation_completed_at: str | None = None
+    rollback_available: bool = False
     rollback_completed_at: str | None = None
     terminalized_at: str | None = None
     terminal_reason: str | None = None
@@ -331,6 +347,74 @@ class PackageUpdateJobSummary:
     @property
     def rollback_completed(self) -> bool:
         return self.state is PackageUpdateJobState.ROLLED_BACK
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorCapabilities:
+    """One resource's point-in-time backend presentation availability.
+
+    This object deliberately lives in ``OperatorAvailabilityView``, not in the
+    revisioned inventory snapshot. Every mutation endpoint independently
+    revalidates the complete rule when an operator presses a control.
+    """
+
+    can_review_update_plan: bool = False
+    can_approve_update_plan: bool = False
+    can_start_update: bool = False
+    can_view_update_job: bool = False
+    can_resume_update: bool = False
+    can_rollback_update: bool = False
+    can_view_health_contract: bool = False
+    can_configure_health_contract: bool = False
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"operator capability {name} must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceOperatorAvailability:
+    """Current backend-owned presentation facts for one opaque resource."""
+
+    resource_id: str
+    capabilities: OperatorCapabilities
+
+    def __post_init__(self) -> None:
+        _require_uuid_identity(self.resource_id, "resource_id")
+        if not isinstance(self.capabilities, OperatorCapabilities):
+            raise ValueError("capabilities must be an OperatorCapabilities")
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorAvailabilityView:
+    """Volatile availability aligned to, but not versioned by, authority state."""
+
+    backend_instance_id: str
+    authority_published_state_revision: int
+    resources: tuple[ResourceOperatorAvailability, ...]
+
+    def __post_init__(self) -> None:
+        _require_uuid_identity(self.backend_instance_id, "backend_instance_id")
+        _require_positive(
+            self.authority_published_state_revision,
+            "authority_published_state_revision",
+        )
+        object.__setattr__(self, "resources", tuple(self.resources))
+        resource_ids = {resource.resource_id for resource in self.resources}
+        if len(resource_ids) != len(self.resources):
+            raise ValueError("operator availability contains duplicate resources")
+
+    @property
+    def resources_by_id(self) -> Mapping[str, OperatorCapabilities]:
+        """Return current availability keyed by backend resource identity."""
+
+        return MappingProxyType(
+            {
+                resource.resource_id: resource.capabilities
+                for resource in self.resources
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,9 +442,18 @@ class PackageUpdateJobView:
 
     Response data from an action an operator invoked, never entity state.
     Flat by design: Home Assistant renders these as a response mapping, and a
-    nested shape would only invite a template to reach into it. Everything
-    here is a durable authority fact -- no helper output, no PVE task log, no
-    command text, no package rows, and no per-probe results.
+    nested shape would only invite a template to reach into it. Every field
+    but one is a durable authority fact -- no helper output, no PVE task log,
+    no command text, no package rows, and no per-probe results.
+
+    ``rollback_available`` is the one exception, and deliberately so (GitHub
+    review P2 #3, Option A): it is the backend's own fresh, current-target-
+    checked verdict -- the same proof
+    ``InventoryAuthority.arm_package_update_rollback`` requires -- not merely
+    a durable checkpoint fact. This is the one meaning every operator-visible
+    "rollback available" in this integration converges on; contrast
+    ``PackageUpdateJobSummary.rollback_available``, which is durable
+    checkpoint eligibility only.
     """
 
     job_id: str

@@ -63,11 +63,16 @@ def validate_package_update_job_summary(summary: "PackageUpdateJobSummary") -> N
     _require_enum_instance(
         summary.state, PackageUpdateJobState, "package_update_job.state"
     )
+    if type(summary.rollback_available) is not bool:
+        raise ValueError("package_update_job.rollback_available must be a boolean")
     material = (
         summary.job_id,
         summary.checkpoint,
         summary.issued_at,
+        summary.package_count,
         summary.health_outcome,
+        summary.health_started_at,
+        summary.health_completed_at,
         summary.snapshot_confirmed_at,
         summary.mutation_completed_at,
         summary.rollback_completed_at,
@@ -75,7 +80,7 @@ def validate_package_update_job_summary(summary: "PackageUpdateJobSummary") -> N
         summary.terminal_reason,
     )
     if summary.state in _JOBLESS_STATES:
-        if any(value is not None for value in material):
+        if any(value is not None for value in material) or summary.rollback_available:
             raise ValueError(
                 "package_update_job carries material without a job"
             )
@@ -85,6 +90,10 @@ def validate_package_update_job_summary(summary: "PackageUpdateJobSummary") -> N
     if summary.checkpoint not in PACKAGE_UPDATE_CHECKPOINTS:
         raise ValueError("package_update_job.checkpoint is not a known checkpoint")
     _require_text(summary.issued_at, "package_update_job.issued_at")
+    if summary.package_count is not None and (
+        type(summary.package_count) is not int or summary.package_count < 1
+    ):
+        raise ValueError("package_update_job.package_count must be positive")
     if summary.health_outcome is not None:
         _require_enum_instance(
             summary.health_outcome,
@@ -94,6 +103,8 @@ def validate_package_update_job_summary(summary: "PackageUpdateJobSummary") -> N
     for value, name in (
         (summary.snapshot_confirmed_at, "snapshot_confirmed_at"),
         (summary.mutation_completed_at, "mutation_completed_at"),
+        (summary.health_started_at, "health_started_at"),
+        (summary.health_completed_at, "health_completed_at"),
         (summary.rollback_completed_at, "rollback_completed_at"),
         (summary.terminalized_at, "terminalized_at"),
         (summary.terminal_reason, "terminal_reason"),
@@ -113,6 +124,9 @@ def validate_package_update_job_summary(summary: "PackageUpdateJobSummary") -> N
                 "verdict"
             )
         return
+
+    if summary.rollback_available:
+        raise ValueError("only an active package update job can allow rollback")
 
     if summary.terminalized_at is None:
         raise ValueError("a terminal package update job must be terminalized")

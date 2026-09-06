@@ -14,18 +14,16 @@ update can therefore never begin as a side effect of Home Assistant
 refreshing.
 
 The device selector is the existing dynamic resource-device model, unchanged.
-There is no second resource-selection system here, and no action carries a
-VMID, a node, a package, a version, a snapshot name or id, a probe, a
-contract revision, a command, an argv, or a helper operation -- ``start_update``
-sends one generated ``request_id`` and ``rollback_update`` sends nothing at
-all, because the operator selects a RESOURCE and the backend resolves the
+There is no second resource-selection system here. Update-execution actions
+carry no VMID, node, package, version, snapshot, probe, command, argv, or
+helper operation: ``start_update`` sends one generated ``request_id`` and
+``rollback_update`` sends nothing at all, because the backend resolves the
 rest from durable authority.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-import re
 from typing import Any
 import uuid
 
@@ -59,6 +57,7 @@ from .const import (
 )
 from .coordinator import (
     HubinetOpsCoordinator,
+    ReviewedUpdatePlanReference,
     resource_device_name,
     resource_registry_key,
 )
@@ -79,21 +78,10 @@ ATTR_EVENTS = "events"
 MAX_HEALTH_PROBES = 32
 MAX_HEALTH_PROBE_TARGET_LENGTH = 200
 
-_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
-_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
-
 _VIEW_SCHEMA = vol.Schema(
     {vol.Required(ATTR_DEVICE_ID): str}
 )
-_APPROVE_SCHEMA = vol.Schema(
-    {
-        vol.Required(ATTR_RESOURCE_ID): vol.Match(_UUID_RE),
-        vol.Required(ATTR_SCAN_RUN_ID): vol.Match(_UUID_RE),
-        vol.Required(ATTR_PLAN_FINGERPRINT): vol.Match(_FINGERPRINT_RE),
-    }
-)
+_APPROVE_SCHEMA = vol.Schema({vol.Required(ATTR_DEVICE_ID): str})
 
 
 def _probe_target(value: Any) -> str:
@@ -155,24 +143,6 @@ _RESUME_UPDATE_SCHEMA = vol.Schema({vol.Required(ATTR_DEVICE_ID): str})
 _ROLLBACK_UPDATE_SCHEMA = vol.Schema({vol.Required(ATTR_DEVICE_ID): str})
 
 
-def _coordinator_for_resource(
-    hass: HomeAssistant, resource_id: str
-) -> HubinetOpsCoordinator:
-    coordinators: Mapping[str, HubinetOpsCoordinator] = hass.data.get(DOMAIN, {}).get(
-        DATA_COORDINATORS, {}
-    )
-    matches = [
-        coordinator
-        for coordinator in coordinators.values()
-        if resource_id in coordinator.data.resources_by_id
-    ]
-    if len(matches) != 1:
-        raise HomeAssistantError(
-            "resource must belong to exactly one loaded Hubinet Ops backend"
-        )
-    return matches[0]
-
-
 def _coordinator_and_resource_for_device(
     hass: HomeAssistant, device_id: str
 ) -> tuple[HubinetOpsCoordinator, str]:
@@ -180,7 +150,11 @@ def _coordinator_and_resource_for_device(
 
     device = dr.async_get(hass).async_get(device_id)
     if device is None:
-        raise HomeAssistantError("selected Hubinet Ops resource device does not exist")
+        raise HomeAssistantError(
+            "selected Hubinet Ops resource device does not exist",
+            translation_domain=DOMAIN,
+            translation_key="device_not_found",
+        )
 
     coordinators: Mapping[str, HubinetOpsCoordinator] = hass.data.get(DOMAIN, {}).get(
         DATA_COORDINATORS, {}
@@ -199,7 +173,9 @@ def _coordinator_and_resource_for_device(
 
     if len(matches) != 1:
         raise HomeAssistantError(
-            "selected device must identify exactly one loaded Hubinet Ops resource"
+            "selected device must identify exactly one loaded Hubinet Ops resource",
+            translation_domain=DOMAIN,
+            translation_key="device_not_unique_resource",
         )
     return matches[0]
 
@@ -215,27 +191,40 @@ def _approval_response(approval: Any) -> dict[str, Any]:
     }
 
 
-async def _view_update_plan(
-    hass: HomeAssistant, call: ServiceCall
+async def async_review_update_plan(
+    coordinator: HubinetOpsCoordinator, resource_id: str
 ) -> ServiceResponse:
-    coordinator, resource_id = _coordinator_and_resource_for_device(
-        hass, call.data[ATTR_DEVICE_ID]
-    )
+    """Fresh-read and remember exactly the plan the operator reviewed."""
+
     try:
         snapshot = await coordinator.api.async_fetch_resource_snapshot()
     except HubinetOpsApiError as exc:
-        raise HomeAssistantError("could not read the current Hubinet Ops plan") from exc
+        raise HomeAssistantError(
+            "could not read the current Hubinet Ops plan",
+            translation_domain=DOMAIN,
+            translation_key="review_failed",
+        ) from exc
     if snapshot.backend.backend_instance_id != coordinator.config_entry.unique_id:
-        raise HomeAssistantError("backend identity changed during plan review")
+        raise HomeAssistantError(
+            "backend identity changed during plan review",
+            translation_domain=DOMAIN,
+            translation_key="backend_changed_during_review",
+        )
     resource = snapshot.resources_by_id.get(resource_id)
     if resource is None:
-        raise HomeAssistantError("resource is absent from the fresh backend snapshot")
+        raise HomeAssistantError(
+            "resource is absent from the fresh backend snapshot",
+            translation_domain=DOMAIN,
+            translation_key="resource_absent_during_review",
+        )
 
     scan = resource.package_scan
     approval = resource.package_plan_approval
     approvable = bool(
         approval.approvable
         and scan.status is PackageScanStatus.SUCCESS
+        and scan.pending_count is not None
+        and scan.pending_count > 0
         and scan.scan_run_id is not None
         and scan.plan_fingerprint is not None
     )
@@ -248,6 +237,17 @@ async def _view_update_plan(
         if approvable
         else None
     )
+    if reference is None:
+        coordinator.forget_reviewed_update_plan(resource_id)
+    else:
+        coordinator.remember_reviewed_update_plan(
+            ReviewedUpdatePlanReference(
+                backend_instance_id=snapshot.backend.backend_instance_id,
+                resource_id=resource.resource_id,
+                scan_run_id=scan.scan_run_id,
+                plan_fingerprint=scan.plan_fingerprint,
+            )
+        )
     return {
         "resource_id": resource.resource_id,
         "resource_name": resource_device_name(resource),
@@ -272,6 +272,15 @@ async def _view_update_plan(
         "approval": _approval_response(approval),
         "approval_reference": reference,
     }
+
+
+async def _view_update_plan(
+    hass: HomeAssistant, call: ServiceCall
+) -> ServiceResponse:
+    coordinator, resource_id = _coordinator_and_resource_for_device(
+        hass, call.data[ATTR_DEVICE_ID]
+    )
+    return await async_review_update_plan(coordinator, resource_id)
 
 
 def _health_contract_response(
@@ -311,12 +320,9 @@ def _health_contract_response(
     }
 
 
-async def _view_health_contract(
-    hass: HomeAssistant, call: ServiceCall
+async def async_view_health_contract(
+    coordinator: HubinetOpsCoordinator, resource_id: str
 ) -> ServiceResponse:
-    coordinator, resource_id = _coordinator_and_resource_for_device(
-        hass, call.data[ATTR_DEVICE_ID]
-    )
     name = _resource_display_name(coordinator, resource_id)
     try:
         contract = await coordinator.api.async_fetch_health_contract(resource_id)
@@ -327,9 +333,20 @@ async def _view_health_contract(
         return _health_contract_response(resource_id, name, None)
     except HubinetOpsApiError as exc:
         raise HomeAssistantError(
-            "could not read the Hubinet Ops health contract"
+            "could not read the Hubinet Ops health contract",
+            translation_domain=DOMAIN,
+            translation_key="health_contract_read_failed",
         ) from exc
     return _health_contract_response(resource_id, name, contract)
+
+
+async def _view_health_contract(
+    hass: HomeAssistant, call: ServiceCall
+) -> ServiceResponse:
+    coordinator, resource_id = _coordinator_and_resource_for_device(
+        hass, call.data[ATTR_DEVICE_ID]
+    )
+    return await async_view_health_contract(coordinator, resource_id)
 
 
 async def _set_health_contract(
@@ -349,7 +366,9 @@ async def _set_health_contract(
         )
     except HubinetOpsApiError as exc:
         raise HomeAssistantError(
-            "Hubinet Ops refused the declared health contract"
+            "Hubinet Ops refused the declared health contract",
+            translation_domain=DOMAIN,
+            translation_key="health_contract_set_refused",
         ) from exc
     await coordinator.async_request_refresh()
     return _health_contract_response(resource_id, name, contract)
@@ -368,7 +387,9 @@ async def _clear_health_contract(
         )
     except HubinetOpsApiError as exc:
         raise HomeAssistantError(
-            "Hubinet Ops refused to clear the health contract"
+            "Hubinet Ops refused to clear the health contract",
+            translation_domain=DOMAIN,
+            translation_key="health_contract_clear_refused",
         ) from exc
     await coordinator.async_request_refresh()
     return _health_contract_response(resource_id, name, None)
@@ -381,18 +402,70 @@ def _resource_display_name(
     return resource_device_name(resource) if resource is not None else resource_id
 
 
-async def _approve_update_plan(hass: HomeAssistant, call: ServiceCall) -> None:
-    resource_id = call.data[ATTR_RESOURCE_ID]
-    scan_run_id = call.data[ATTR_SCAN_RUN_ID]
-    plan_fingerprint = call.data[ATTR_PLAN_FINGERPRINT]
-    coordinator = _coordinator_for_resource(hass, resource_id)
+async def async_approve_reviewed_update_plan(
+    coordinator: HubinetOpsCoordinator, resource_id: str
+) -> None:
+    """Approve only the exact fresh plan remembered by a prior review."""
+
+    reference = coordinator.reviewed_update_plan(resource_id)
+    if reference is None:
+        raise HomeAssistantError(
+            "review the current update plan before approving it",
+            translation_domain=DOMAIN,
+            translation_key="approve_without_review",
+        )
+
+    try:
+        fresh = await coordinator.api.async_fetch_resource_snapshot()
+    except HubinetOpsApiError as exc:
+        coordinator.forget_reviewed_update_plan(resource_id)
+        raise HomeAssistantError(
+            "could not revalidate the reviewed Hubinet Ops plan",
+            translation_domain=DOMAIN,
+            translation_key="approve_revalidation_failed",
+        ) from exc
+    resource = fresh.resources_by_id.get(resource_id)
+    scan = None if resource is None else resource.package_scan
+    if (
+        fresh.backend.backend_instance_id != reference.backend_instance_id
+        or fresh.backend.backend_instance_id != coordinator.config_entry.unique_id
+        or resource is None
+        or not resource.package_plan_approval.approvable
+        or scan.status is not PackageScanStatus.SUCCESS
+        or scan.pending_count is None
+        or scan.pending_count < 1
+        or scan.scan_run_id != reference.scan_run_id
+        or scan.plan_fingerprint != reference.plan_fingerprint
+    ):
+        coordinator.forget_reviewed_update_plan(resource_id)
+        raise HomeAssistantError(
+            "the exact reviewed plan changed; review the update plan again",
+            translation_domain=DOMAIN,
+            translation_key="plan_changed",
+        )
+
+    # Consume the UI reference before the potentially uncertain network
+    # mutation. A timeout must never turn a second press into an automatic
+    # replay of an approval whose result HA could not observe.
+    coordinator.forget_reviewed_update_plan(resource_id)
     try:
         await coordinator.api.async_approve_package_plan(
-            resource_id, scan_run_id, plan_fingerprint
+            resource_id, reference.scan_run_id, reference.plan_fingerprint
         )
     except HubinetOpsApiError as exc:
-        raise HomeAssistantError("Hubinet Ops refused the reviewed update plan") from exc
+        raise HomeAssistantError(
+            "Hubinet Ops refused the reviewed update plan",
+            translation_domain=DOMAIN,
+            translation_key="approve_refused",
+        ) from exc
     await coordinator.async_request_refresh()
+
+
+async def _approve_update_plan(hass: HomeAssistant, call: ServiceCall) -> None:
+    coordinator, resource_id = _coordinator_and_resource_for_device(
+        hass, call.data[ATTR_DEVICE_ID]
+    )
+    await async_approve_reviewed_update_plan(coordinator, resource_id)
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +523,9 @@ def _job_response(
     }
 
 
-async def _start_update(hass: HomeAssistant, call: ServiceCall) -> ServiceResponse:
+async def async_start_update(
+    coordinator: HubinetOpsCoordinator, resource_id: str
+) -> ServiceResponse:
     """Explicitly start the currently approved update for one resource.
 
     The ``request_id`` is generated HERE, once per invocation, and is the only
@@ -460,9 +535,6 @@ async def _start_update(hass: HomeAssistant, call: ServiceCall) -> ServiceRespon
     is refused there rather than negotiated here.
     """
 
-    coordinator, resource_id = _coordinator_and_resource_for_device(
-        hass, call.data[ATTR_DEVICE_ID]
-    )
     name = _resource_display_name(coordinator, resource_id)
     try:
         job = await coordinator.api.async_start_package_update(
@@ -470,9 +542,37 @@ async def _start_update(hass: HomeAssistant, call: ServiceCall) -> ServiceRespon
         )
     except HubinetOpsApiError as exc:
         raise HomeAssistantError(
-            "Hubinet Ops refused to start the package update"
+            "Hubinet Ops refused to start the package update",
+            translation_domain=DOMAIN,
+            translation_key="start_refused",
         ) from exc
     await coordinator.async_request_refresh()
+    return _job_response(resource_id, name, job)
+
+
+async def _start_update(hass: HomeAssistant, call: ServiceCall) -> ServiceResponse:
+    coordinator, resource_id = _coordinator_and_resource_for_device(
+        hass, call.data[ATTR_DEVICE_ID]
+    )
+    return await async_start_update(coordinator, resource_id)
+
+
+async def async_view_update_job(
+    coordinator: HubinetOpsCoordinator,
+    resource_id: str,
+    events: int = DEFAULT_PACKAGE_UPDATE_EVENTS,
+) -> ServiceResponse:
+    name = _resource_display_name(coordinator, resource_id)
+    try:
+        job = await coordinator.api.async_fetch_package_update(
+            resource_id, events
+        )
+    except HubinetOpsApiError as exc:
+        raise HomeAssistantError(
+            "could not read the Hubinet Ops package update job",
+            translation_domain=DOMAIN,
+            translation_key="view_job_failed",
+        ) from exc
     return _job_response(resource_id, name, job)
 
 
@@ -480,40 +580,45 @@ async def _view_update_job(hass: HomeAssistant, call: ServiceCall) -> ServiceRes
     coordinator, resource_id = _coordinator_and_resource_for_device(
         hass, call.data[ATTR_DEVICE_ID]
     )
-    name = _resource_display_name(coordinator, resource_id)
-    try:
-        job = await coordinator.api.async_fetch_package_update(
-            resource_id, call.data.get(ATTR_EVENTS, DEFAULT_PACKAGE_UPDATE_EVENTS)
-        )
-    except HubinetOpsApiError as exc:
-        raise HomeAssistantError(
-            "could not read the Hubinet Ops package update job"
-        ) from exc
-    return _job_response(resource_id, name, job)
+    return await async_view_update_job(
+        coordinator,
+        resource_id,
+        call.data.get(ATTR_EVENTS, DEFAULT_PACKAGE_UPDATE_EVENTS),
+    )
 
 
-async def _resume_update(hass: HomeAssistant, call: ServiceCall) -> ServiceResponse:
+async def async_resume_update(
+    coordinator: HubinetOpsCoordinator, resource_id: str
+) -> ServiceResponse:
     """Ask the backend to re-enter an existing recoverable job.
 
     Never "run the update again": the backend re-reads the durable checkpoint
     and invokes only the existing safe continuation semantics for it.
     """
 
-    coordinator, resource_id = _coordinator_and_resource_for_device(
-        hass, call.data[ATTR_DEVICE_ID]
-    )
     name = _resource_display_name(coordinator, resource_id)
     try:
         job = await coordinator.api.async_resume_package_update(resource_id)
     except HubinetOpsApiError as exc:
         raise HomeAssistantError(
-            "Hubinet Ops refused to resume the package update job"
+            "Hubinet Ops refused to resume the package update job",
+            translation_domain=DOMAIN,
+            translation_key="resume_refused",
         ) from exc
     await coordinator.async_request_refresh()
     return _job_response(resource_id, name, job)
 
 
-async def _rollback_update(hass: HomeAssistant, call: ServiceCall) -> ServiceResponse:
+async def _resume_update(hass: HomeAssistant, call: ServiceCall) -> ServiceResponse:
+    coordinator, resource_id = _coordinator_and_resource_for_device(
+        hass, call.data[ATTR_DEVICE_ID]
+    )
+    return await async_resume_update(coordinator, resource_id)
+
+
+async def async_rollback_update(
+    coordinator: HubinetOpsCoordinator, resource_id: str
+) -> ServiceResponse:
     """Explicitly roll one resource back to its own job's snapshot.
 
     The operator selects a resource. No snapshot is named here, and none can
@@ -523,18 +628,24 @@ async def _rollback_update(hass: HomeAssistant, call: ServiceCall) -> ServiceRes
     one snapshot owned by that job.
     """
 
-    coordinator, resource_id = _coordinator_and_resource_for_device(
-        hass, call.data[ATTR_DEVICE_ID]
-    )
     name = _resource_display_name(coordinator, resource_id)
     try:
         job = await coordinator.api.async_rollback_package_update(resource_id)
     except HubinetOpsApiError as exc:
         raise HomeAssistantError(
-            "Hubinet Ops refused the same-job rollback request"
+            "Hubinet Ops refused the same-job rollback request",
+            translation_domain=DOMAIN,
+            translation_key="rollback_refused",
         ) from exc
     await coordinator.async_request_refresh()
     return _job_response(resource_id, name, job)
+
+
+async def _rollback_update(hass: HomeAssistant, call: ServiceCall) -> ServiceResponse:
+    coordinator, resource_id = _coordinator_and_resource_for_device(
+        hass, call.data[ATTR_DEVICE_ID]
+    )
+    return await async_rollback_update(coordinator, resource_id)
 
 
 def async_setup_services(hass: HomeAssistant) -> None:

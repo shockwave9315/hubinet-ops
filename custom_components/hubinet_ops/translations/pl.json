@@ -100,7 +100,29 @@
           "interrupted": "Przerwane",
           "manual_intervention": "Wymaga interwencji"
         }
+      },
+      "resource_package_update_checkpoint": {"name": "Punkt kontrolny aktualizacji"},
+      "resource_package_update_package_count": {"name": "Liczba pakietów aktualizacji"},
+      "resource_package_update_health_outcome": {
+        "name": "Ostatni wynik kontroli zdrowia po aktualizacji",
+        "state": {
+          "not_recorded": "Brak ostatecznego wyniku",
+          "passed": "Powodzenie",
+          "failed": "Niepowodzenie"
+        }
       }
+    },
+    "binary_sensor": {
+      "rollback_available": {"name": "Wycofanie dostępne"}
+    },
+    "button": {
+      "review_update_plan": {"name": "Przejrzyj plan aktualizacji"},
+      "approve_reviewed_plan": {"name": "Zatwierdź przejrzany plan"},
+      "start_update": {"name": "Rozpocznij zatwierdzoną aktualizację"},
+      "view_update_job": {"name": "Wyświetl zadanie aktualizacji"},
+      "resume_update": {"name": "Wznów zadanie aktualizacji"},
+      "rollback_update": {"name": "Wycofaj tę aktualizację"},
+      "view_health_contract": {"name": "Wyświetl kontrakt zdrowia"}
     }
   },
   "services": {
@@ -116,19 +138,11 @@
     },
     "approve_update_plan": {
       "name": "Zatwierdź plan aktualizacji",
-      "description": "Zatwierdza dokładne skanowanie i odcisk zwrócone przez akcję Wyświetl plan aktualizacji.",
+      "description": "Zatwierdza tylko dokładny plan ostatnio zwrócony przez akcję Wyświetl plan aktualizacji w bieżącym uruchomieniu Home Assistant.",
       "fields": {
-        "resource_id": {
-          "name": "Identyfikator zasobu",
-          "description": "Dokładna tożsamość zasobu zwrócona przez akcję Wyświetl plan aktualizacji."
-        },
-        "scan_run_id": {
-          "name": "Identyfikator skanowania",
-          "description": "Dokładna tożsamość skanowania zwrócona przez akcję Wyświetl plan aktualizacji."
-        },
-        "plan_fingerprint": {
-          "name": "Odcisk planu",
-          "description": "Dokładny odcisk materialnego planu zwrócony przez akcję Wyświetl plan aktualizacji."
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz ten sam zasób, którego dokładny plan został właśnie przejrzany."
         }
       }
     },
@@ -219,6 +233,53 @@
       }
     }
   },
+  "notifications": {
+    "common": {
+      "unknown": "Nieznane",
+      "yes": "Tak",
+      "no": "Nie",
+      "none": "Brak"
+    },
+    "plan": {
+      "title": "Plan aktualizacji Hubinet Ops — {name}",
+      "package_count": "Liczba aktualizacji pakietów: {count}",
+      "columns": {
+        "package": "Pakiet",
+        "architecture": "Architektura",
+        "installed": "Zainstalowana",
+        "candidate": "Dostępna",
+        "origin": "Źródło",
+        "security": "Bezpieczeństwo",
+        "description": "Opis"
+      },
+      "approval_instruction": "Sprawdź każdy wiersz, a następnie naciśnij **Zatwierdź przejrzany plan** dla tego zasobu. Zatwierdzenie zostanie odrzucone, jeśli zmieni się backend, zasób, skan lub odcisk materiału. Home Assistant zapomni ten przegląd po ponownym wczytaniu."
+    },
+    "approval": {
+      "title": "Plan Hubinet Ops zatwierdzony — {name}",
+      "message": "Dokładny przejrzany plan pakietów został zatwierdzony. Rozpoczęcie aktualizacji nadal wymaga osobnego, jawnego naciśnięcia."
+    },
+    "job": {
+      "title": "Aktualizacja pakietów Hubinet Ops — {name}",
+      "no_definitive_result": "Brak rozstrzygającego wyniku",
+      "recent_events": "Ostatnie trwałe zdarzenia",
+      "labels": {
+        "status": "Stan",
+        "checkpoint": "Punkt kontrolny",
+        "packages": "Pakiety",
+        "snapshot_confirmed": "Snapshot potwierdzony",
+        "mutation_completed": "Zmiana pakietów ukończona",
+        "health_result": "Wynik kontroli kondycji",
+        "rollback_available": "Wycofanie dostępne",
+        "terminal_reason": "Powód zakończenia"
+      }
+    },
+    "health": {
+      "title": "Kontrakt kondycji Hubinet Ops — {name}",
+      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany.",
+      "revision": "Rewizja",
+      "all_required": "Wszystkie poniższe sondy są wymagane:"
+    }
+  },
   "exceptions": {
     "cannot_connect": {
       "message": "Nie można połączyć się z backendem Hubinet Ops."
@@ -231,6 +292,57 @@
     },
     "wrong_instance": {
       "message": "Połączenie wskazuje inną instancję backendu Hubinet Ops."
+    },
+    "device_not_found": {
+      "message": "Wybrane urządzenie zasobu Hubinet Ops nie istnieje."
+    },
+    "device_not_unique_resource": {
+      "message": "Wybrane urządzenie musi wskazywać dokładnie jeden załadowany zasób Hubinet Ops."
+    },
+    "review_failed": {
+      "message": "Nie można odczytać bieżącego planu aktualizacji Hubinet Ops."
+    },
+    "backend_changed_during_review": {
+      "message": "Tożsamość backendu zmieniła się podczas przeglądu planu."
+    },
+    "resource_absent_during_review": {
+      "message": "Zasób nie występuje w świeżym snapshocie backendu."
+    },
+    "health_contract_read_failed": {
+      "message": "Nie można odczytać kontraktu zdrowia Hubinet Ops."
+    },
+    "health_contract_set_refused": {
+      "message": "Hubinet Ops odrzucił zadeklarowany kontrakt zdrowia."
+    },
+    "health_contract_clear_refused": {
+      "message": "Hubinet Ops odmówił wyczyszczenia kontraktu zdrowia."
+    },
+    "approve_without_review": {
+      "message": "Przejrzyj bieżący plan aktualizacji przed jego zatwierdzeniem."
+    },
+    "approve_revalidation_failed": {
+      "message": "Nie można ponownie zweryfikować przejrzanego planu Hubinet Ops."
+    },
+    "plan_changed": {
+      "message": "Dokładnie przejrzany plan uległ zmianie; przejrzyj plan aktualizacji ponownie."
+    },
+    "approve_refused": {
+      "message": "Hubinet Ops odrzucił przejrzany plan aktualizacji."
+    },
+    "start_refused": {
+      "message": "Hubinet Ops odmówił rozpoczęcia aktualizacji pakietów."
+    },
+    "view_job_failed": {
+      "message": "Nie można odczytać zadania aktualizacji pakietów Hubinet Ops."
+    },
+    "resume_refused": {
+      "message": "Hubinet Ops odmówił wznowienia zadania aktualizacji pakietów."
+    },
+    "rollback_refused": {
+      "message": "Hubinet Ops odrzucił żądanie wycofania w ramach tego samego zadania."
+    },
+    "control_unavailable": {
+      "message": "Backend Hubinet Ops obecnie nie zezwala na tę operację."
     }
   }
 }

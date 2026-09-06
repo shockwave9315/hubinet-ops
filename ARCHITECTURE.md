@@ -73,8 +73,12 @@ Assistant re-enrollment.
   `configuration_error`, or `invalid`.
 - `reconciliation.py` — applies one complete normalized snapshot inside the
   caller's transaction.
-- `publication.py` — assembles the published snapshot (backend, sources, nodes,
-  resources, revisions) in one consistent read transaction.
+- `publication.py` — assembles the revisioned snapshot (backend, sources,
+  nodes, resources, revisions) in one consistent read transaction and exposes
+  a separate point-in-time operator-availability view. The latter contains
+  conservative backend-derived presentation facts, including runtime
+  activation and the product-update maintenance fence; it never authorizes or
+  advances a mutation.
 
 `app/inventory_runtime.py` is the production composition root, served via its
 `create_app_from_env` factory
@@ -82,6 +86,7 @@ Assistant re-enrollment.
 publication, PVE transport, the scheduler, and -- when `package_update.enabled`
 is configured true -- the five production update host controls and the one
 `PackageUpdateWorker`. It serves `GET /r0/v1/health`, `/backend`, `/snapshot`,
+`/operator-availability`,
 two families of authority-metadata mutation
 (`PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
 `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`), and the
@@ -776,25 +781,97 @@ anything on them.
 
 `custom_components/hubinet_ops/` — one `DataUpdateCoordinator`, one snapshot
 fetch per refresh, structural validation of the payload in `contract/`, then
-devices and entities. The response-capable `view_update_plan` action accepts a
-native Hubinet resource-device selection, resolves its backend-owned
-`resource_id`, performs a separate fresh snapshot read, and returns exact
-package rows plus the exact approval reference. `approve_update_plan` forwards
-that caller-supplied reference unchanged to the backend and refreshes the
-coordinator after success. One concise resource sensor displays the
-backend-published `none | approved | stale | consumed` approval state. A
-successful job consumes its exact approval; `consumed` never collapses into
-`stale`, and a new explicit approval creates a new approval identity even when
-the current plan fingerprint is unchanged. Package rows do not become entity
-attributes or package-per-entity state.
+devices and entities. Existing dynamic LXC devices receive sensor,
+binary-sensor, and button entities; no second resource/VMID identity exists.
+
+The **Review update plan** button performs a separate fresh snapshot read and
+renders every exact package row in a persistent notification. The coordinator
+remembers only `(backend_instance_id, resource_id, scan_run_id,
+plan_fingerprint)` in memory. **Approve reviewed plan** fresh-reads again,
+requires that exact tuple, consumes the UX reference before making the
+potentially uncertain approval request, and then sends it unchanged to the
+backend, whose authority transaction independently revalidates it. A reload
+forgets the reference. A new scan run is a new reference even if its material
+fingerprint is identical. The response-capable actions share these handlers;
+they do not implement a parallel policy path.
+
+One concise resource sensor displays the backend-published
+`none | approved | stale | consumed` approval state. A successful job consumes
+its exact approval; `consumed` never collapses into `stale`, and a new explicit
+approval creates a new approval identity even when the current plan fingerprint
+is unchanged. Package rows do not become entity attributes or
+package-per-entity state.
 
 `view_health_contract`, `set_health_contract`, and `clear_health_contract` use
 that same resource-device selector rather than a second selection model. All
 three return response data; contract material — the probe list — is response
-data only, never entity attributes. A second concise resource sensor displays
-the backend-published `unsupported | unconfigured | configured` contract state,
-which is a statement about configuration and never a health result: no health
-result exists to publish.
+data only, never entity attributes. A native viewer button renders it on
+demand. Editing remains a typed action because a variable-length all-required
+probe set is not truthfully representable by a scalar Text, Select, or Number
+entity. A second concise resource sensor displays the backend-published
+`unsupported | unconfigured | configured` contract state, which is a statement
+about configuration and never a health result.
+
+The backend also publishes review, approve, start, view-job, resume, rollback,
+and health-contract view/configuration availability through authenticated
+`GET /r0/v1/operator-availability`. This point-in-time view is deliberately
+separate from the immutable `/snapshot`: its
+`authority_published_state_revision` aligns the database-derived portion to
+the snapshot fetched in the same coordinator refresh, but is not a generation
+for volatile runtime activation or the filesystem maintenance fence. Thus one
+`published_state_revision` still names exactly one immutable snapshot even
+when either volatile fact changes. HA validates backend identity, authority
+revision, resource membership, and structural consistency, then uses the
+backend-supplied booleans only for button availability. Every mutation endpoint
+repeats its complete authority proof, so a raced capability can only lead to a
+refusal. Polling remains mutation-free and never interprets a capability as
+retry permission.
+
+**Operator-availability compatibility and coherence.** `/snapshot` and
+`/operator-availability` are two separate HTTP reads, so two ordinary things
+can happen between them that are not authority defects: the backend HA is
+talking to may predate Human1 operator-availability publication entirely
+(the two halves deploy independently), or a legitimate write may land between
+the reads and advance the revision. The coordinator's own
+`_fetch_coherent_pair` handles exactly these two cases and nothing more:
+
+- *Compatibility.* A definite HTTP 404 on `/operator-availability` (the route
+  takes no path parameters, so 404 there is unambiguous) is the ONE typed
+  signal treated as "this backend predates Human1" — the transport raises a
+  dedicated `HubinetOpsOperatorAvailabilityUnsupported`, and the coordinator
+  substitutes a conservative view with every capability `False` for every
+  resource in the snapshot it just fetched. Inventory and sensors stay live;
+  no Human1 control becomes reachable and no authority is invented. Every
+  other failure on that route — 401/403, TLS/connection errors, timeouts,
+  5xx, a malformed or structurally inconsistent body — remains an ordinary
+  fail-closed coordinator failure and is never folded into this case.
+- *Bounded revision race.* A backend identity match plus a revision that
+  merely disagrees (an intervening scan/discovery/product-update commit
+  landed between the two reads) gets exactly one retry of the COMPLETE pair
+  — both `/snapshot` and `/operator-availability` refetched together, never
+  mixed across attempts — regardless of whether resource membership also
+  disagrees: that same intervening commit can legitimately add or remove a
+  resource in the very step that advances the revision, so requiring
+  membership to already match before retrying would refuse to heal exactly
+  that legal case (GitHub review P2 #1). A backend-identity mismatch is
+  never treated as this race. Nor is a resource-membership mismatch at an
+  IDENTICAL revision: the backend is then claiming both reads describe the
+  exact same published state, so disagreeing membership there is structural,
+  not a race. Either way it fails closed on the first attempt. A mismatch
+  still present after the one retry fails closed too. The bound is exactly
+  one retry, never a loop.
+
+Neither behavior weakens `validate_operator_availability`: it still runs
+against whichever pair the coordinator ultimately accepts, and a structural
+inconsistency it rejects still fails the refresh closed.
+
+Start/view/resume/rollback buttons share the response-capable action handlers.
+One start press generates one request ID once and makes one logical call; it is
+never blindly replayed after uncertainty. Job status, checkpoint, package
+count, definitive health outcome, and rollback availability are bounded
+entities. Exact job details and recent durable events are fetched and rendered
+only when the operator presses **View update job** (or an operation returns its
+job), without raw helper output or arbitrary command material.
 
 Diagnostic labels preserve those distinctions rather than inventing answers:
 an unavailable reboot-required sensor is explicitly labelled as unknown, the

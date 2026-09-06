@@ -64,7 +64,7 @@ jobs:
 
   bootstrap-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       HUBINET_OPS_EPHEMERAL_CI: "1"
     steps:

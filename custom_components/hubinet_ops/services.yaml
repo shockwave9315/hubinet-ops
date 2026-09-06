@@ -8,18 +8,11 @@ view_update_plan:
 
 approve_update_plan:
   fields:
-    resource_id:
+    device_id:
       required: true
       selector:
-        text:
-    scan_run_id:
-      required: true
-      selector:
-        text:
-    plan_fingerprint:
-      required: true
-      selector:
-        text:
+        device:
+          integration: hubinet_ops
 
 view_health_contract:
   fields:

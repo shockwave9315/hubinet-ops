@@ -9,7 +9,64 @@ from types import MappingProxyType
 from typing import Any
 
 from .authority import InventoryAuthority
-from .store import InventoryAuthorityStore
+from .health_execution import (
+    HealthContractExecutionError,
+    require_health_contract_execution_eligible,
+)
+from .models import AuthorityConflict, AuthorityNotFound
+from .product_update_fence import (
+    ProductUpdateFenceError,
+    read_product_update_fence,
+)
+from .store import InventoryAuthorityStore, _resource_health_contract
+
+
+_ROLLBACK_AVAILABLE_CHECKPOINTS = frozenset(
+    {
+        "mutation_may_have_started",
+        "mutation_completed",
+        "health_started",
+        "health_completed",
+    }
+)
+
+#: GitHub review P2 (HUMAN1-RESUME-CHECKPOINT-01): every durable checkpoint
+#: an ACTIVE job can be at, EXCEPT the one from which
+#: ``app.package_update_worker.PackageUpdateWorker._step`` has no
+#: continuation at all.
+#:
+#: This deliberately mirrors ``_step``'s own dispatch as a second, explicit,
+#: closed set rather than importing it -- `app/inventory/` is an
+#: independently instantiable subsystem (see ``ARCHITECTURE.md``) and the
+#: worker module pulls in the execution/mutation/health/rollback host-control
+#: stages, which this read-only publication boundary must not depend on.
+#: Exactly the same deliberate-duplication shape this file already uses for
+#: `_ROLLBACK_AVAILABLE_CHECKPOINTS` above (which independently mirrors
+#: ``InventoryAuthority.arm_package_update_rollback``'s own accepted-entry
+#: checkpoints). A dedicated regression test drives the REAL worker through
+#: every one of these checkpoints and cross-checks this set against what it
+#: actually does, so the two can't silently drift apart.
+#:
+#: ``health_completed`` is excluded: reachable while ACTIVE only with a
+#: DEFINITIVE FAILED verdict (a PASSED one is inseparable from `succeeded`),
+#: and ``_step`` stops there with ``health_failed`` and no state change --
+#: PRODUCT.md has made no automatic compensation decision, and an explicit
+#: Resume press can never make that job progress. ``rollback_completed`` is
+#: never reachable while ACTIVE at all (the job is ``rolled_back`` by then);
+#: it is excluded here purely for closure/defense-in-depth, matching
+#: ``_step``'s own unreachable fallback for it.
+_RESUME_CAPABLE_CHECKPOINTS = frozenset(
+    {
+        "issued",
+        "preflight_passed",
+        "snapshot_may_have_started",
+        "snapshot_confirmed",
+        "mutation_may_have_started",
+        "mutation_completed",
+        "health_started",
+        "rollback_may_have_started",
+    }
+)
 
 
 def _freeze(value: Any) -> Any:
@@ -41,6 +98,25 @@ class PublishedInventoryView:
         object.__setattr__(self, "resources", tuple(_freeze(item) for item in self.resources))
 
 
+@dataclass(frozen=True, slots=True)
+class PublishedOperatorAvailabilityView:
+    """One point-in-time operator-availability view outside snapshot revisioning.
+
+    ``authority_published_state_revision`` binds the database-derived portion
+    to the inventory snapshot HA fetched in the same coordinator refresh. It
+    does NOT identify this whole view: activation and the maintenance fence
+    are deliberately volatile runtime facts and may change while the authority
+    revision stays fixed.
+    """
+
+    backend_instance_id: str
+    authority_published_state_revision: int
+    resources: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "resources", tuple(_freeze(item) for item in self.resources))
+
+
 class InventoryPublication:
     def __init__(
         self,
@@ -50,15 +126,31 @@ class InventoryPublication:
         backend_name: str = "Hubinet Ops",
         backend_version: str = "0.5",
         api_version: str = "0.5",
+        package_update_activated: bool = False,
     ) -> None:
         self._store = store
         self._authority = authority
         self._backend_name = backend_name
         self._backend_version = backend_version
         self._api_version = api_version
+        self._package_update_activated = package_update_activated
 
     def read(self) -> PublishedInventoryView:
-        """Materialize expiry and assemble one view in the same transaction."""
+        """Read only the revisioned, immutable inventory projection."""
+
+        inventory, _ = self._read_views()
+        return inventory
+
+    def read_operator_availability(self) -> PublishedOperatorAvailabilityView:
+        """Read current backend-owned presentation availability."""
+
+        _, availability = self._read_views()
+        return availability
+
+    def _read_views(
+        self,
+    ) -> tuple[PublishedInventoryView, PublishedOperatorAvailabilityView]:
+        """Assemble aligned inventory and availability views transactionally."""
 
         with self._store._transaction() as connection:
             decision_time = self._authority._authority_decision_time()
@@ -172,9 +264,21 @@ class InventoryPublication:
             # carries into entity state.
             job_rows = connection.execute(
                 "SELECT j.job_id, j.resource_id, j.status, j.checkpoint, "
-                "j.issued_at, j.health_outcome, j.snapshot_confirmed_at, "
-                "j.mutation_completed_at, j.rollback_completed_at, "
-                "j.terminalized_at, j.terminal_reason FROM package_update_jobs j "
+                "j.issued_at, j.package_count, j.health_outcome, "
+                "j.health_started_at, j.health_completed_at, "
+                "j.snapshot_confirmed_at, j.mutation_completed_at, "
+                "j.rollback_completed_at, "
+                "j.terminalized_at, j.terminal_reason, "
+                # The exact post-mutation target columns
+                # `_post_mutation_job_context_is_current` proves against --
+                # carried here so the SAME authority predicate arming
+                # rollback uses can also gate `can_rollback_update`,
+                # without a second, subtly-different copy of these rules.
+                "j.inventory_source_id, j.expected_binding_id, "
+                "j.expected_locator_generation, "
+                "j.expected_resource_continuity_revision, j.expected_vmid, "
+                "j.expected_node_id, j.expected_node_name "
+                "FROM package_update_jobs j "
                 "WHERE j.issuance_sequence=("
                 "SELECT MAX(latest.issuance_sequence) FROM package_update_jobs latest "
                 "WHERE latest.resource_id=j.resource_id) "
@@ -188,6 +292,18 @@ class InventoryPublication:
                 # even regress across an ordinary clock correction. See
                 # PackageUpdateJob.issuance_sequence's own docstring.
                 job_by_resource[str(row["resource_id"])] = row
+            any_active_job = any(
+                str(row["status"]) == "active" for row in job_rows
+            )
+            try:
+                product_update_fenced = (
+                    read_product_update_fence(self._store.path) is not None
+                )
+            except ProductUpdateFenceError:
+                # An unreadable or malformed fence is held, never absent.
+                # Publication remains available but start capability fails
+                # closed; the mutation endpoint applies the same rule.
+                product_update_fenced = True
             # Keyed by the run they belong to, and selected over TERMINAL runs
             # only -- the same rule `scan_by_resource` publishes by, so the
             # displayed header, pending count, fingerprint and package list
@@ -211,7 +327,7 @@ class InventoryPublication:
 
             sources = tuple(self._source(row) for row in source_rows)
             nodes = tuple(self._node(row) for row in node_rows)
-            resources = tuple(
+            resource_payloads = tuple(
                 self._resource(
                     connection,
                     row,
@@ -221,22 +337,49 @@ class InventoryPublication:
                     health_contract_by_resource.get(str(row["resource_id"])),
                     job_by_resource.get(str(row["resource_id"])),
                     str(row["resource_id"]) in pending_post_update_resources,
+                    any_active_job,
+                    product_update_fenced,
                 )
                 for row in resource_rows
             )
-            return PublishedInventoryView(
-                backend={
-                    "backend_instance_id": str(backend["backend_instance_id"]),
-                    "name": self._backend_name,
-                    "version": self._backend_version,
-                    "api_version": self._api_version,
-                },
-                sources=sources,
-                nodes=nodes,
-                resources=resources,
-                inventory_revision=int(backend["inventory_revision"]),
-                published_state_revision=int(backend["published_state_revision"]),
-                published_at=str(backend["published_at"]),
+            backend_payload = {
+                "backend_instance_id": str(backend["backend_instance_id"]),
+                "name": self._backend_name,
+                "version": self._backend_version,
+                "api_version": self._api_version,
+            }
+            revisioned_resources = tuple(
+                {
+                    key: value
+                    for key, value in resource.items()
+                    if key != "operator_capabilities"
+                }
+                for resource in resource_payloads
+            )
+            availability_resources = tuple(
+                {
+                    "resource_id": resource["resource_id"],
+                    **resource["operator_capabilities"],
+                }
+                for resource in resource_payloads
+            )
+            return (
+                PublishedInventoryView(
+                    backend=backend_payload,
+                    sources=sources,
+                    nodes=nodes,
+                    resources=revisioned_resources,
+                    inventory_revision=int(backend["inventory_revision"]),
+                    published_state_revision=int(backend["published_state_revision"]),
+                    published_at=str(backend["published_at"]),
+                ),
+                PublishedOperatorAvailabilityView(
+                    backend_instance_id=str(backend["backend_instance_id"]),
+                    authority_published_state_revision=int(
+                        backend["published_state_revision"]
+                    ),
+                    resources=availability_resources,
+                ),
             )
 
     @staticmethod
@@ -299,7 +442,38 @@ class InventoryPublication:
         health_contract,
         package_update_job,
         post_update_scan_pending: bool,
+        any_active_job: bool,
+        product_update_fenced: bool,
     ) -> dict[str, Any]:
+        package_scan = InventoryPublication._package_scan(
+            row,
+            scan,
+            packages_by_run,
+            post_update_scan_pending=post_update_scan_pending,
+        )
+        package_plan_approval = self._package_plan_approval(
+            connection,
+            row,
+            scan,
+            approval,
+            post_update_scan_pending=post_update_scan_pending,
+        )
+        health_contract_summary = InventoryPublication._health_contract(
+            row, health_contract
+        )
+        package_update_job_summary = InventoryPublication._package_update_job(
+            row, package_update_job
+        )
+        operator_capabilities = self._operator_capabilities(
+            connection,
+            row,
+            package_plan_approval,
+            health_contract_summary,
+            package_update_job_summary,
+            package_update_job,
+            any_active_job=any_active_job,
+            product_update_fenced=product_update_fenced,
+        )
         return {
             "resource_id": str(row["resource_id"]),
             "inventory_source_id": str(row["inventory_source_id"]),
@@ -325,25 +499,11 @@ class InventoryPublication:
             "suspended_reason": None,
             "effective_capabilities": (),
             "state": json.loads(str(row["facts_json"])),
-            "package_scan": InventoryPublication._package_scan(
-                row,
-                scan,
-                packages_by_run,
-                post_update_scan_pending=post_update_scan_pending,
-            ),
-            "package_plan_approval": self._package_plan_approval(
-                connection,
-                row,
-                scan,
-                approval,
-                post_update_scan_pending=post_update_scan_pending,
-            ),
-            "health_contract": InventoryPublication._health_contract(
-                row, health_contract
-            ),
-            "package_update_job": InventoryPublication._package_update_job(
-                row, package_update_job
-            ),
+            "package_scan": package_scan,
+            "package_plan_approval": package_plan_approval,
+            "health_contract": health_contract_summary,
+            "package_update_job": package_update_job_summary,
+            "operator_capabilities": operator_capabilities,
             "termination_reason": row["termination_reason"],
             "successor_resource_id": row["successor_resource_id"],
         }
@@ -453,8 +613,9 @@ class InventoryPublication:
         Three states and no fourth: `unsupported` for a resource type whose
         workload packages this product does not update, `unconfigured` when no
         contract exists, and `configured` when one does. `unconfigured` is
-        never a passing state, and none of these is a health RESULT -- no
-        health execution exists, so no result exists to publish.
+        never a passing state, and none of these is a health RESULT.
+        Definitive execution outcomes belong to the latest package-update job
+        summary, not to this configuration summary.
         """
 
         base = {
@@ -512,9 +673,13 @@ class InventoryPublication:
             "job_id": None,
             "checkpoint": None,
             "issued_at": None,
+            "package_count": None,
             "health_outcome": None,
+            "health_started_at": None,
+            "health_completed_at": None,
             "snapshot_confirmed_at": None,
             "mutation_completed_at": None,
+            "rollback_available": False,
             "rollback_completed_at": None,
             "terminalized_at": None,
             "terminal_reason": None,
@@ -527,15 +692,133 @@ class InventoryPublication:
                 "job_id": str(job["job_id"]),
                 "checkpoint": str(job["checkpoint"]),
                 "issued_at": str(job["issued_at"]),
+                "package_count": int(job["package_count"]),
                 "health_outcome": job["health_outcome"],
+                "health_started_at": job["health_started_at"],
+                "health_completed_at": job["health_completed_at"],
                 "snapshot_confirmed_at": job["snapshot_confirmed_at"],
                 "mutation_completed_at": job["mutation_completed_at"],
+                "rollback_available": (
+                    str(job["status"]) == "active"
+                    and str(job["checkpoint"]) in _ROLLBACK_AVAILABLE_CHECKPOINTS
+                ),
                 "rollback_completed_at": job["rollback_completed_at"],
                 "terminalized_at": job["terminalized_at"],
                 "terminal_reason": job["terminal_reason"],
             }
         )
         return base
+
+    def _operator_capabilities(
+        self,
+        connection,
+        resource,
+        approval: Mapping[str, Any],
+        health_contract: Mapping[str, Any],
+        job: Mapping[str, Any],
+        raw_job,
+        *,
+        any_active_job: bool,
+        product_update_fenced: bool,
+    ) -> dict[str, bool]:
+        """Publish conservative read-only action availability hints.
+
+        This deliberately performs no mutation and grants no authority. A
+        true value means the already-published authority facts satisfy the
+        action's current prerequisites; the endpoint repeats every proof in
+        its own transaction and refuses if state raced after publication.
+
+        ``raw_job`` is the durable job ROW (not the ``job`` summary dict
+        above): only it carries the exact expected VMID/binding/locator/
+        continuity/node columns :meth:`InventoryAuthority.
+        _post_mutation_job_context_is_current` proves against. GitHub review
+        P2 #2: without that proof, ``can_rollback_update`` could stay true
+        even though the same-job rollback endpoint's own arming path would
+        immediately refuse it (a replaced binding, a moved/unavailable node,
+        or a resource no longer present/active). This reuses the exact
+        authority predicate the arming path itself uses -- deliberately not
+        a second, differently-shaped copy of the same rules -- so a
+        presentation hint can never promise more than the endpoint accepts.
+        """
+
+        false = {
+            "can_review_update_plan": False,
+            "can_approve_update_plan": False,
+            "can_start_update": False,
+            "can_view_update_job": False,
+            "can_resume_update": False,
+            "can_rollback_update": False,
+            "can_view_health_contract": False,
+            "can_configure_health_contract": False,
+        }
+        if str(resource["resource_type"]) != "lxc":
+            return false
+
+        resource_id = str(resource["resource_id"])
+        try:
+            self._authority._require_package_scan_target(connection, resource_id)
+        except (AuthorityConflict, AuthorityNotFound):
+            current_target = False
+        else:
+            current_target = True
+
+        can_review = bool(approval["approvable"])
+        has_job = job["state"] not in {"unsupported", "not_started"}
+        active_job = job["state"] == "active"
+        # ACTIVE means the job still owns the global destructive slot; it
+        # does NOT mean an explicit Resume press has a meaningful
+        # continuation from the job's CURRENT durable checkpoint (GitHub
+        # review P2, HUMAN1-RESUME-CHECKPOINT-01). `health_completed` is the
+        # one ACTIVE checkpoint the worker deterministically cannot advance
+        # from -- see `_RESUME_CAPABLE_CHECKPOINTS`.
+        resumable_checkpoint = active_job and job["checkpoint"] in (
+            _RESUME_CAPABLE_CHECKPOINTS
+        )
+        rollback_available = bool(job["rollback_available"])
+        # The durable checkpoint fact above says a rollback COULD apply to
+        # this job in principle; it says nothing about whether the exact
+        # workload it names is still the one currently at that identity.
+        # Never require this when there is no checkpoint-eligible rollback
+        # to begin with -- `raw_job` is only actually queried in that case.
+        rollback_target_current = rollback_available and (
+            raw_job is not None
+            and self._authority._post_mutation_job_context_is_current(
+                connection, raw_job
+            )
+        )
+
+        contract_executable = False
+        if current_target and health_contract["status"] == "configured":
+            try:
+                contract = _resource_health_contract(connection, resource_id)
+                if contract is not None:
+                    require_health_contract_execution_eligible(contract.probes)
+                    contract_executable = True
+            except (HealthContractExecutionError, RuntimeError, ValueError):
+                contract_executable = False
+
+        can_start = bool(
+            self._package_update_activated
+            and current_target
+            and approval["status"] == "approved"
+            and contract_executable
+            and not any_active_job
+            and not product_update_fenced
+        )
+        return {
+            "can_review_update_plan": can_review,
+            "can_approve_update_plan": can_review,
+            "can_start_update": can_start,
+            "can_view_update_job": has_job,
+            "can_resume_update": (
+                self._package_update_activated and resumable_checkpoint
+            ),
+            "can_rollback_update": (
+                self._package_update_activated and rollback_target_current
+            ),
+            "can_view_health_contract": current_target,
+            "can_configure_health_contract": current_target,
+        }
 
     def _package_plan_approval(
         self,

@@ -55,7 +55,8 @@
   successful job row the atomic durable consumption fact for its exact
   approval and adds a unique fence permitting at most one successful job per
   approval.
-- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`;
+- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`,
+  `/operator-availability`;
   authority-metadata mutations
   (`PUT /r0/v1/resources/{resource_id}/package-plan-approval`,
   `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`); and the
@@ -67,18 +68,34 @@
   `/r0/v1/health` liveness probe, which exposes no inventory or credential
   data.
 - **Home Assistant integration** — config flow, coordinator, structural
-  contract validation, dynamic devices and entities, package-scan summary and
+  contract validation, dynamic devices, sensors, a binary sensor, and buttons;
+  package-scan summary and
   concise `none | approved | stale | consumed` approval-status sensors,
   diagnostics with recursive secret redaction,
-  a concise per-resource package-update job status sensor, and native
+  concise per-resource package-update job status/checkpoint/package-count and
+  health-outcome sensors, authoritative rollback availability, and native
   `view_update_plan` / `approve_update_plan` / `view_health_contract` /
   `set_health_contract` / `clear_health_contract` / `start_update` /
   `view_update_job` / `resume_update` / `rollback_update` actions. Every
   response-capable action uses the native Hubinet resource-device selector and
   returns exact material — package rows, contract probes, job events — as
-  response data, never as entity attributes. `start_update`, `resume_update`,
-  and `rollback_update` are explicit operator actions and are unreachable from
-  coordinator polling. Distributed via HACS.
+  response data, never as entity attributes. Per-resource buttons review and
+  approve an exact plan, start/view/resume/roll back an update, and view the
+  health contract. Exact plans, bounded job details/events, and contract probes
+  are rendered in localized, Markdown-hardened persistent notifications only
+  when explicitly requested.
+  `start_update`, `resume_update`, and `rollback_update` are explicit operator
+  actions and are unreachable from coordinator polling. Distributed via HACS.
+  A backend that predates Human1 operator-availability publication (a
+  definite 404 on `GET /operator-availability`) keeps inventory/sensors
+  working with every Human1 control conservatively unavailable, never with
+  invented authority; every other failure on that route still fails the
+  refresh closed. An ordinary revision race between the `/snapshot` and
+  `/operator-availability` reads gets one bounded retry of the complete pair
+  before failing closed. Routine operator failure paths (review/approval/
+  start/resume/rollback refusals, a changed reviewed plan, a health-contract
+  read failure, a raced control) are localized in English and Polish, not
+  only the setup/reauth/coordinator messages.
 - **Automatic Debian/Ubuntu LXC package scanning** — configurable six-hour
   default interval, one worker, typed pinned-key SSH to a forced PVE helper,
   fixed `pct exec` operations, APT metadata refresh plus upgrade simulation,
@@ -817,33 +834,48 @@ The operator-triggered update lifecycle is production reachable.
 
 ## Product stages
 
-### Current — post-Human0 remediation
+### Current — Human1 Home Assistant operator controls
 
-- One-shot-on-success approval consumption, with `consumed` distinct from
-  actual staleness and a new explicit approval required for an identical plan.
-- Periodic scans skip a known-stopped LXC; the execution-time `stale_target`
-  guard remains the fail-closed race boundary if a running candidate stops.
-- A successful zero-package scan is truthful current state but not approvable.
-- Home Assistant diagnostic wording distinguishes an unverified legacy
-  continuity observation from update failure, keeps reboot UNKNOWN explicit,
-  and labels terminal update jobs as the last historical job.
+- Existing dynamic LXC devices now carry seven explicit buttons: review the
+  exact plan, approve the reviewed plan, start an approved update, view the
+  latest job, resume an active job, request same-job rollback, and view the
+  health contract.
+- Exact package rows, contract probes, and bounded job facts/events are shown
+  in on-demand persistent notifications rather than stored as large entity
+  attributes. Sensors expose concise state, scan, pending-count, approval,
+  job, checkpoint, package-count, and health-result facts; one binary sensor
+  exposes rollback availability.
+- The backend publishes conservative read-only operator availability through a
+  separate authenticated endpoint. HA aligns it to the immutable revisioned
+  snapshot by backend identity, authority revision, and exact resource set.
+  Runtime activation and the filesystem product-update fence can therefore
+  change button availability without producing two different snapshots with
+  the same `published_state_revision`. These presentation facts grant no
+  authority: every mutation endpoint independently revalidates its full rule.
+- Plan review memory is deliberately ephemeral HA UX state. Approval performs
+  a fresh read and requires the exact backend identity, resource ID, scan run,
+  and material fingerprint previously reviewed. A changed plan, a new scan run
+  with identical material, a zero plan, or an HA reload requires review again.
+- The existing actions remain as response-capable diagnostic/configuration
+  interfaces. `approve_update_plan` now also requires the current-runtime
+  reviewed reference, closing the former blind caller-supplied approval path.
+- The authority schema remains v19. Operator availability is transient
+  presentation data and richer job summaries are revisioned publication facts;
+  no new durable authority state was needed.
 
-### Next — Human1 operator lifecycle UX
+### Next — Human1 follow-ons deliberately deferred
 
-Human1 replaces Developer Tools/raw-ID dependence with a normal per-resource
-Home Assistant experience. It must present current CT state, pending package
-count, the exact plan, approval state, last package-update job, health result,
-and rollback availability, with ordinary controls to show and approve a plan,
-start and inspect an update, request explicit rollback, start/stop/restart a
-guest, and create a manual snapshot.
-
-The backend remains the authority. Human1 must publish explicit action
-capability/availability facts (conceptually `can_approve`, `can_start_update`,
-`rollback_available`, and lifecycle/manual-snapshot equivalents); Home
-Assistant must not reconstruct policy from skipped snapshots or guessed state.
-Human1 also includes a deliberate, operator-facing bearer-token handoff or
-retrieval path after bootstrap/enrollment. The token must not enter ordinary
-logs, diagnostics, or the published snapshot.
+- Typed CT start/stop/restart and manual-snapshot operations were not added in
+  this slice. They require new dedicated backend operations and privileged
+  forced-command boundaries; combining that deployment/host-control work with
+  the package operator surface would make the boundary harder to review.
+  Manual snapshots must remain distinct from job-owned rollback authority.
+- Health-contract inspection is native, but editing the variable-length typed
+  probe list remains in `set_health_contract` / `clear_health_contract` actions.
+  A scalar Text/Select entity would be a misleading editor for this contract.
+- A dedicated operator-facing bearer-token handoff/retrieval path remains to
+  be designed. The token must not enter ordinary logs, diagnostics, or the
+  published snapshot.
 
 ### Later — snapshot retention
 

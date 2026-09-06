@@ -981,6 +981,7 @@ def test_r0_ha_transport_defines_an_exact_operator_method_allowlist() -> None:
         "validate_connection",
         "fetch_backend_information",
         "fetch_resource_snapshot",
+        "fetch_operator_availability",
         "approve_package_plan",
         "fetch_health_contract",
         "replace_health_contract",
@@ -992,6 +993,7 @@ def test_r0_ha_transport_defines_an_exact_operator_method_allowlist() -> None:
     }
     exact_private_methods = {
         "_get",
+        "_get_operator_availability",
         "_put",
         "_decode",
         "_health_contract_request",

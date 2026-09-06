@@ -8,6 +8,7 @@ licensed under Apache-2.0; see ``NOTICE.md`` and the vendored license.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -20,11 +21,16 @@ from .api import (
     HubinetOpsApi,
     HubinetOpsApiError,
     HubinetOpsInvalidAuth,
+    HubinetOpsOperatorAvailabilityUnsupported,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     NodeSnapshot,
+    OperatorAvailabilityView,
+    OperatorCapabilities,
+    ResourceOperatorAvailability,
     ResourceSnapshot,
     ResourceType,
+    validate_operator_availability,
 )
 from .const import (
     DEFAULT_UPDATE_INTERVAL,
@@ -39,6 +45,71 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 type HubinetOpsConfigEntry = ConfigEntry[HubinetOpsCoordinator]
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedUpdatePlanReference:
+    """Ephemeral UI memory of one exact plan the operator reviewed."""
+
+    backend_instance_id: str
+    resource_id: str
+    scan_run_id: str
+    plan_fingerprint: str
+
+
+def _all_false_operator_availability(
+    incoming: HubinetOpsSnapshot,
+) -> OperatorAvailabilityView:
+    """Build the conservative fallback view for HUMAN1-AVAIL-COMPAT-01.
+
+    Used ONLY when the transport raises the typed, definite
+    ``HubinetOpsOperatorAvailabilityUnsupported`` -- never for an ordinary
+    failure. Every capability is false for every resource in the just-fetched
+    snapshot: no authority is invented, and because this view is derived from
+    ``incoming`` itself, its ``authority_published_state_revision`` is
+    trivially aligned and can never trigger the revision-race handling below.
+    """
+
+    return OperatorAvailabilityView(
+        backend_instance_id=incoming.backend.backend_instance_id,
+        authority_published_state_revision=incoming.published_state_revision,
+        resources=tuple(
+            ResourceOperatorAvailability(
+                resource_id=resource_id, capabilities=OperatorCapabilities()
+            )
+            for resource_id in incoming.resources_by_id
+        ),
+    )
+
+
+def _availability_race_candidate(
+    availability: OperatorAvailabilityView, incoming: HubinetOpsSnapshot
+) -> bool:
+    """Return whether a mismatch could be one ordinary intervening write.
+
+    HUMAN1-AVAIL-RACE-01, broadened per GitHub review P2 #1: the property
+    that actually distinguishes an ordinary cross-request race from a
+    structural inconsistency is NOT "same resource set" -- it is "does the
+    revision disagree at all". A legitimate intervening discovery/scan/
+    product-update commit can add or remove a resource in the very same
+    commit that advances the revision, so two individually-correct reads
+    straddling that commit may legitimately disagree on resource membership
+    *and* revision together. Requiring the resource set to already match
+    would wrongly refuse to retry exactly that legal case.
+
+    Backend identity is never healed by retry: a foreign backend answering
+    is always structural. And a revision that already MATCHES is never a
+    race candidate even if resource membership disagrees -- the backend is
+    then claiming both reads describe the exact same published state, so a
+    membership disagreement at identical revision is a structural
+    inconsistency (a bug, not a race) and gets no retry.
+    """
+
+    return (
+        availability.backend_instance_id == incoming.backend.backend_instance_id
+        and availability.authority_published_state_revision
+        != incoming.published_state_revision
+    )
 
 
 def source_registry_key(backend_instance_id: str, inventory_source_id: str) -> str:
@@ -201,9 +272,62 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
         self.new_resources_callbacks: list[
             Callable[[list[ResourceSnapshot]], None]
         ] = []
+        # UX state only. It is never persisted and grants no backend
+        # authority. Reloading Home Assistant intentionally empties it.
+        self.reviewed_update_plans: dict[str, ReviewedUpdatePlanReference] = {}
+        self.operator_availability: OperatorAvailabilityView
 
-    async def _async_update_data(self) -> HubinetOpsSnapshot:
-        """Fetch one authoritative immutable Hubinet Ops snapshot."""
+    def operator_capabilities(self, resource_id: str) -> OperatorCapabilities:
+        """Return backend-owned point-in-time availability for one resource."""
+
+        return self.operator_availability.resources_by_id[resource_id]
+
+    def remember_reviewed_update_plan(
+        self, reference: ReviewedUpdatePlanReference
+    ) -> None:
+        self.reviewed_update_plans[reference.resource_id] = reference
+        self.async_update_listeners()
+
+    def forget_reviewed_update_plan(self, resource_id: str) -> None:
+        if self.reviewed_update_plans.pop(resource_id, None) is not None:
+            self.async_update_listeners()
+
+    def reviewed_update_plan(
+        self, resource_id: str
+    ) -> ReviewedUpdatePlanReference | None:
+        return self.reviewed_update_plans.get(resource_id)
+
+    def _invalidate_stale_plan_reviews(self, incoming: HubinetOpsSnapshot) -> None:
+        """Discard UX references contradicted by a newer backend view."""
+
+        stale: list[str] = []
+        for resource_id, reference in self.reviewed_update_plans.items():
+            resource = incoming.resources_by_id.get(resource_id)
+            if (
+                incoming.backend.backend_instance_id
+                != reference.backend_instance_id
+                or resource is None
+                or not self.operator_capabilities(
+                    resource_id
+                ).can_approve_update_plan
+                or resource.package_scan.scan_run_id != reference.scan_run_id
+                or resource.package_scan.plan_fingerprint
+                != reference.plan_fingerprint
+            ):
+                stale.append(resource_id)
+        for resource_id in stale:
+            self.reviewed_update_plans.pop(resource_id, None)
+
+    #: HUMAN1-AVAIL-RACE-01's exact bound: the first read plus exactly one
+    #: retry of the COMPLETE snapshot+availability pair. Never unbounded,
+    #: never a loop -- a persistent mismatch on the second attempt fails
+    #: closed exactly like it always did.
+    _MAX_COHERENCE_ATTEMPTS = 2
+
+    async def _fetch_snapshot(
+        self, previous: HubinetOpsSnapshot | None
+    ) -> HubinetOpsSnapshot:
+        """Fetch and validate one fresh snapshot against the prior one."""
 
         try:
             incoming = await self.api.async_fetch_resource_snapshot()
@@ -226,7 +350,6 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
                 translation_key="wrong_instance",
             )
 
-        previous = getattr(self, "data", None)
         if previous is not None:
             try:
                 incoming.validate_revision_successor(previous)
@@ -235,7 +358,85 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
                     translation_domain=DOMAIN,
                     translation_key="invalid_snapshot",
                 ) from err
+        return incoming
 
+    async def _fetch_availability(
+        self, incoming: HubinetOpsSnapshot
+    ) -> OperatorAvailabilityView:
+        """Fetch volatile availability, applying only the one typed fallback.
+
+        HUMAN1-AVAIL-COMPAT-01: a definite "this route does not exist"
+        result from a backend that predates Human1 publication falls back to
+        an all-false view aligned to ``incoming``. Every other failure --
+        auth, connection, timeout, 5xx, malformed body -- remains fail-closed
+        and is never treated as that one compatibility case.
+        """
+
+        try:
+            return await self.api.async_fetch_operator_availability()
+        except HubinetOpsOperatorAvailabilityUnsupported:
+            return _all_false_operator_availability(incoming)
+        except HubinetOpsInvalidAuth as err:
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_auth",
+            ) from err
+        except HubinetOpsApiError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+            ) from err
+
+    async def _fetch_coherent_pair(
+        self, previous: HubinetOpsSnapshot | None
+    ) -> tuple[HubinetOpsSnapshot, OperatorAvailabilityView]:
+        """Fetch one mutually coherent snapshot/availability pair.
+
+        HUMAN1-AVAIL-RACE-01: an ordinary backend write can land between the
+        two independently correct HTTP reads below and make them disagree on
+        revision -- and, per GitHub review P2 #1, possibly on resource
+        membership too, when the same intervening commit both changed
+        membership and advanced the revision. That gets exactly one bounded
+        self-heal: refetch the COMPLETE pair once. A backend-identity
+        mismatch, or a resource-set mismatch at an IDENTICAL revision, is
+        never treated as this race and fails closed immediately; a mismatch
+        still present after the retry fails closed too.
+        """
+
+        for attempt in range(1, self._MAX_COHERENCE_ATTEMPTS + 1):
+            incoming = await self._fetch_snapshot(previous)
+            availability = await self._fetch_availability(incoming)
+
+            if _availability_race_candidate(availability, incoming):
+                if attempt < self._MAX_COHERENCE_ATTEMPTS:
+                    continue
+                raise UpdateFailed(
+                    translation_domain=DOMAIN,
+                    translation_key="invalid_snapshot",
+                )
+
+            try:
+                validate_operator_availability(availability, incoming)
+            except ValueError as err:
+                raise UpdateFailed(
+                    translation_domain=DOMAIN,
+                    translation_key="invalid_snapshot",
+                ) from err
+
+            return incoming, availability
+
+        raise AssertionError(  # pragma: no cover - loop always returns or raises
+            "coherence attempt bound exhausted without a terminal outcome"
+        )
+
+    async def _async_update_data(self) -> HubinetOpsSnapshot:
+        """Fetch one authoritative immutable Hubinet Ops snapshot."""
+
+        previous = getattr(self, "data", None)
+        incoming, availability = await self._fetch_coherent_pair(previous)
+
+        self.operator_availability = availability
+        self._invalidate_stale_plan_reviews(incoming)
         self._async_publish_inventory(incoming)
         return incoming
 

@@ -37,12 +37,15 @@ from .api import (
     HubinetOpsHealthContractUnconfigured,
     HubinetOpsInvalidAuth,
     HubinetOpsInvalidResponse,
+    HubinetOpsOperatorAvailabilityUnsupported,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     LifecycleState,
     NodeAvailability,
     NodeSnapshot,
     ObservationalContinuity,
+    OperatorCapabilities,
+    OperatorAvailabilityView,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,
@@ -57,6 +60,7 @@ from .api import (
     PackageUpdateJobView,
     PresenceState,
     ResourceHealthContract,
+    ResourceOperatorAvailability,
     ResourceSnapshot,
     ResourceStateLevel,
     ResourceType,
@@ -171,6 +175,7 @@ _START_REQUEST_TIMEOUT = aiohttp.ClientTimeout(
 
 _BACKEND_ROUTE = "/r0/v1/backend"
 _SNAPSHOT_ROUTE = "/r0/v1/snapshot"
+_OPERATOR_AVAILABILITY_ROUTE = "/r0/v1/operator-availability"
 _PACKAGE_PLAN_APPROVAL_ROUTE = (
     "/r0/v1/resources/{resource_id}/package-plan-approval"
 )
@@ -368,11 +373,15 @@ def _package_update_job_summary(payload: Any) -> PackageUpdateJobSummary:
         job_id=payload.get("job_id"),
         checkpoint=payload.get("checkpoint"),
         issued_at=payload.get("issued_at"),
+        package_count=payload.get("package_count"),
         health_outcome=(
             None if outcome is None else PackageUpdateHealthOutcome(outcome)
         ),
+        health_started_at=payload.get("health_started_at"),
+        health_completed_at=payload.get("health_completed_at"),
         snapshot_confirmed_at=payload.get("snapshot_confirmed_at"),
         mutation_completed_at=payload.get("mutation_completed_at"),
+        rollback_available=payload.get("rollback_available", False),
         rollback_completed_at=payload.get("rollback_completed_at"),
         terminalized_at=payload.get("terminalized_at"),
         terminal_reason=payload.get("terminal_reason"),
@@ -531,6 +540,42 @@ def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
         ),
         termination_reason=payload.get("termination_reason"),
         successor_resource_id=payload.get("successor_resource_id"),
+    )
+
+
+def _operator_capabilities(payload: Any) -> OperatorCapabilities:
+    if not isinstance(payload, Mapping):
+        raise TypeError("operator_capabilities must be an object when present")
+    return OperatorCapabilities(
+        can_review_update_plan=payload["can_review_update_plan"],
+        can_approve_update_plan=payload["can_approve_update_plan"],
+        can_start_update=payload["can_start_update"],
+        can_view_update_job=payload["can_view_update_job"],
+        can_resume_update=payload["can_resume_update"],
+        can_rollback_update=payload["can_rollback_update"],
+        can_view_health_contract=payload["can_view_health_contract"],
+        can_configure_health_contract=payload["can_configure_health_contract"],
+    )
+
+
+def _operator_availability_view(payload: Any) -> OperatorAvailabilityView:
+    if not isinstance(payload, Mapping):
+        raise TypeError("operator availability must be an object")
+    resources = payload["resources"]
+    if not isinstance(resources, list):
+        raise TypeError("operator availability resources must be a list")
+    return OperatorAvailabilityView(
+        backend_instance_id=str(payload["backend_instance_id"]),
+        authority_published_state_revision=int(
+            payload["authority_published_state_revision"]
+        ),
+        resources=tuple(
+            ResourceOperatorAvailability(
+                resource_id=str(resource["resource_id"]),
+                capabilities=_operator_capabilities(resource),
+            )
+            for resource in resources
+        ),
     )
 
 
@@ -717,6 +762,61 @@ class HttpHubinetOpsTransport:
             return _snapshot_from_payload(payload)
         except (KeyError, TypeError, ValueError) as exc:
             raise HubinetOpsInvalidResponse(f"malformed Hubinet Ops snapshot: {exc}") from exc
+
+    async def _get_operator_availability(self) -> Any:
+        """Fetch the volatile availability route with one typed exception.
+
+        This deliberately does NOT reuse the generic ``_get`` helper: an
+        HTTP 404 here means one specific, definite thing -- the route does
+        not exist on this backend at all (HUMAN1-AVAIL-COMPAT-01) -- and that
+        must never be confused with any other failure. Every other status,
+        including a 404-shaped body that is not this route (which cannot
+        happen; this route takes no path parameters), still fails closed
+        exactly like ``_get``.
+        """
+
+        url = f"{self._base_url}{_OPERATOR_AVAILABILITY_ROUTE}"
+        headers = {"Authorization": f"Bearer {self._api_token}"}
+        try:
+            async with self._session.get(
+                url, headers=headers, timeout=_REQUEST_TIMEOUT
+            ) as response:
+                if response.status in (401, 403):
+                    raise HubinetOpsInvalidAuth(
+                        "Hubinet Ops backend rejected the bearer token"
+                    )
+                if response.status == 404:
+                    raise HubinetOpsOperatorAvailabilityUnsupported(
+                        "Hubinet Ops backend does not expose operator "
+                        "availability (predates Human1 publication)"
+                    )
+                if response.status != 200:
+                    raise HubinetOpsCannotConnect(
+                        f"Hubinet Ops backend returned HTTP {response.status}"
+                    )
+                try:
+                    return await response.json()
+                except (aiohttp.ContentTypeError, ValueError) as exc:
+                    raise HubinetOpsInvalidResponse(
+                        "Hubinet Ops backend returned a non-JSON body"
+                    ) from exc
+        except TimeoutError as exc:
+            raise HubinetOpsCannotConnect("Hubinet Ops backend request timed out") from exc
+        except aiohttp.ClientConnectorError as exc:
+            raise HubinetOpsCannotConnect(
+                "cannot connect to Hubinet Ops backend"
+            ) from exc
+        except aiohttp.ClientError as exc:
+            raise HubinetOpsCannotConnect("Hubinet Ops backend request failed") from exc
+
+    async def fetch_operator_availability(self) -> OperatorAvailabilityView:
+        payload = await self._get_operator_availability()
+        try:
+            return _operator_availability_view(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HubinetOpsInvalidResponse(
+                f"malformed Hubinet Ops operator availability: {exc}"
+            ) from exc
 
     async def approve_package_plan(
         self, resource_id: str, scan_run_id: str, plan_fingerprint: str

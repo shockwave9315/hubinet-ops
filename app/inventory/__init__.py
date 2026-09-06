@@ -130,7 +130,11 @@ from .provider import (
     evaluate_permission_coverage,
     validate_supported_pve_release,
 )
-from .publication import InventoryPublication, PublishedInventoryView
+from .publication import (
+    InventoryPublication,
+    PublishedInventoryView,
+    PublishedOperatorAvailabilityView,
+)
 from .snapshot_identity import (
     PVE_RESERVED_SNAPSHOT_NAMES,
     PVE_SNAPSHOT_NAME_MAX_LENGTH,
@@ -246,6 +250,7 @@ __all__ = [
     "ProviderFailureKind",
     "ProxmoxProviderV1",
     "PublishedInventoryView",
+    "PublishedOperatorAvailabilityView",
     "ReadOnlyProviderTransport",
     "ReconciliationSummary",
     "RollbackIdentityError",

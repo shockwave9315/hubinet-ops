@@ -109,6 +109,12 @@ from tests.test_package_update_snapshot_safety import (
     _current_entry,
     _foreign_entry,
 )
+# The same mutation-completed forcing this file's own snapshot/mutation
+# stages exercise, reused rather than re-implemented -- reaching
+# `mutation_completed` as a STABLE resting checkpoint (before health starts)
+# is not otherwise observable through the real worker, which advances
+# straight into the health stage in the same drive cycle.
+from tests.test_package_update_health import _force_mutation_completed
 
 
 UPID = "UPID:pve-a:0000A1B2:00C3D4E5:66000000:vzsnapshot:110:root@pam:"
@@ -1829,6 +1835,349 @@ def test_readback_reports_bounded_typed_facts_and_no_raw_output(api) -> None:
     # No package rows and no per-probe results in the readback.
     assert "packages" not in body
     assert "health_probe_results" not in body
+
+
+def test_readback_rollback_available_requires_current_job_target(
+    tmp_path: Path,
+) -> None:
+    """GitHub review P2 #3, Option A: the detailed job readback's
+    ``rollback.available`` must share the exact same current-target truth as
+    the backend's own rollback-arming proof
+    (``_post_mutation_job_context_is_current``) and the published
+    ``can_rollback_update`` capability -- never a checkpoint-only
+    approximation that can disagree with what the endpoint will actually
+    accept.
+    """
+
+    system = ApiSystem(tmp_path, health=["failed"])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "active"
+        assert body["checkpoint"] == "health_completed"
+
+        # Exact current target, node available: rollback-eligible checkpoint
+        # and current target agree -- TRUE.
+        assert body["rollback"]["available"] is True
+
+        resource = system.store.list_resources()[0]
+
+        # The exact node the job's target names becomes unavailable: the
+        # arming proof would refuse, so the readback must say so too.
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE inventory_nodes SET available=0 WHERE node_id=?",
+                (resource.current_node_id,),
+            )
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        assert response.json()["rollback"]["available"] is False
+
+        # Restore the node, then stop the guest: a failed mutation can
+        # legitimately leave it down, and recovery must not require
+        # `running` -- this must stay TRUE.
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE inventory_nodes SET available=1 WHERE node_id=?",
+                (resource.current_node_id,),
+            )
+            connection.execute(
+                "UPDATE resource_incarnations SET status='stopped' "
+                "WHERE resource_id=?",
+                (resource.resource_id,),
+            )
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        assert response.json()["rollback"]["available"] is True
+    finally:
+        system.close()
+
+
+def test_readback_rollback_available_requires_activation(tmp_path: Path) -> None:
+    """HUMAN1-ROLLBACK-ACTIVATION-01.
+
+    A durable rollback-eligible job with an otherwise-current exact target
+    must not read back as "available" when the package-update runtime
+    itself was never activated -- the destructive route refuses with
+    `package_update_not_activated` before it would ever reach its own
+    current-target proof, so the readback must say so too. The job's other
+    facts, and its very existence, must still be reported in full: a
+    disabled runtime is never reported as an absent job.
+    """
+
+    seed = ProductionSystem(tmp_path, health=["failed"])
+    job = _start(seed)
+    seed.worker.run_once()
+    final = seed.job(job.job_id)
+    assert final.status is PackageUpdateJobStatus.ACTIVE
+    assert final.checkpoint is PackageUpdateCheckpoint.HEALTH_COMPLETED
+    resource_id = seed.resource.resource_id
+    db_path = seed.store.path
+    seed.store.close()
+
+    # No package_update_runtime_factory override needed to prove the
+    # deactivated shape -- `_api_config` declares no `package_update`
+    # section, so the ordinary composition root builds none, exactly the
+    # real "not configured" installation this finding is about.
+    app = create_read_only_app(
+        _api_config(db_path), start_scheduler=False, now=seed.clock
+    )
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {BEARER}"}
+    try:
+        response = client.get(
+            f"/r0/v1/resources/{resource_id}/package-update", headers=headers
+        )
+        assert response.status_code == 200
+        body = response.json()
+        # Witness B: the job is fully reported, never erased or hidden.
+        assert body["job_id"] == job.job_id
+        assert body["status"] == "active"
+        assert body["checkpoint"] == "health_completed"
+        # Witness A: activation gates availability even though checkpoint
+        # and current target are both otherwise eligible.
+        assert body["rollback"]["available"] is False
+
+        # Witness F: /package-update/active shares the exact same semantics
+        # (it renders the same job body).
+        active_body = client.get(
+            "/r0/v1/package-update/active", headers=headers
+        ).json()
+        assert active_body["active"] is True
+        assert active_body["job"]["job_id"] == job.job_id
+        assert active_body["job"]["rollback"]["available"] is False
+
+        # The explicit destructive route is unchanged: it still refuses
+        # before ever reaching the current-target proof.
+        rollback_response = client.post(
+            f"/r0/v1/resources/{resource_id}/package-update/rollback",
+            headers=headers,
+            json={},
+        )
+        assert rollback_response.status_code == 503
+        assert (
+            rollback_response.json()["detail"]["error"]
+            == "package_update_not_activated"
+        )
+    finally:
+        client.close()
+        app.state.package_scan_scheduler.stop()
+        app.state.scheduler.stop()
+        app.state.store.close()
+
+
+# ===========================================================================
+# GitHub review P2, HUMAN1-RESUME-CHECKPOINT-01 -- `can_resume_update` must
+# match whether the REAL worker has a meaningful continuation from the job's
+# CURRENT durable checkpoint, not merely whether the job is ACTIVE. Each
+# builder below drives one job, through the real authority and (where
+# observable) the real worker, to rest at one exact checkpoint; the
+# parametrized test then cross-checks `InventoryPublication`'s
+# `can_resume_update` against `_RESUME_CAPABLE_CHECKPOINTS` for every one of
+# them, so the publication-side classification and the worker's actual
+# dispatch (`PackageUpdateWorker._step`) cannot silently drift apart.
+# ===========================================================================
+
+
+def _checkpoint_issued(tmp_path: Path):
+    system = _system(tmp_path)
+    job = _start(system)
+    return system, job
+
+
+def _checkpoint_preflight_passed(tmp_path: Path):
+    system, job = _checkpoint_issued(tmp_path)
+    job = system.authority.record_package_update_preflight_passed(job.job_id)
+    return system, job
+
+
+def _checkpoint_snapshot_may_have_started(tmp_path: Path):
+    """An unproven snapshot: the worker stops, never reaches the mutation
+    stage, and the checkpoint rests here durably (test_snapshot_uncertainty_
+    stays_fenced_and_never_reaches_mutation exercises the same shape)."""
+
+    system = _system(tmp_path)
+    job = _issue(system.authority, system.resource, system.approval)
+    system.bind_hosts(job.job_id, outcome=SnapshotOperationOutcome.UNCERTAIN)
+    system.build_worker()
+    system.worker.run_once()
+    return system, system.job(job.job_id)
+
+
+def _checkpoint_snapshot_confirmed(tmp_path: Path):
+    system, job = _checkpoint_preflight_passed(tmp_path)
+    job = system.authority.record_package_update_snapshot_intent(job.job_id)
+    identity = system.authority.package_update_snapshot_identity(job.job_id)
+    ownership = system.authority.package_update_snapshot_ownership(job.job_id)
+    job = system.authority.confirm_package_update_snapshot(
+        job.job_id, _canonical(ownership, identity)
+    )
+    return system, job
+
+
+def _checkpoint_mutation_may_have_started(tmp_path: Path):
+    """A package command that failed stays here durably (test_a_failed_
+    mutation_keeps_ownership_and_never_rolls_back exercises the same
+    shape) -- exactly the job most in need of the recovery path Resume
+    provides."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    system.guest.mutation_exit_code = 100
+    system.worker.run_once()
+    return system, system.job(job.job_id)
+
+
+def _checkpoint_mutation_completed(tmp_path: Path):
+    system, job = _checkpoint_snapshot_confirmed(tmp_path)
+    _force_mutation_completed(system.store, job.job_id)
+    return system, system.job(job.job_id)
+
+
+def _checkpoint_health_started_unknown(tmp_path: Path):
+    """An UNKNOWN health verdict leaves the job ACTIVE here durably
+    (test_an_unknown_health_verdict_writes_no_verdict_and_never_retries) --
+    the exact case explicit Resume exists to re-evaluate."""
+
+    system = _system(tmp_path, health=["unknown"])
+    job = _start(system)
+    system.worker.run_once()
+    return system, system.job(job.job_id)
+
+
+def _checkpoint_health_completed_failed(tmp_path: Path):
+    """A definitive FAILED verdict -- the one ACTIVE checkpoint with no
+    worker continuation at all (test_a_failed_health_verdict_leaves_the_job_
+    rollback_capable_and_idle exercises the same shape)."""
+
+    system = _system(tmp_path, health=["failed"])
+    job = _start(system)
+    system.worker.run_once()
+    return system, system.job(job.job_id)
+
+
+def _checkpoint_rollback_may_have_started(tmp_path: Path):
+    system, job = _checkpoint_health_completed_failed(tmp_path)
+    armed = system.authority.arm_package_update_rollback(
+        job.job_id, _canonical(system.ownership, system.identity)
+    )
+    return system, armed
+
+
+def _checkpoint_rollback_completed(tmp_path: Path):
+    """Terminal: the job is `rolled_back`, never ACTIVE, by the time this
+    checkpoint is reached."""
+
+    system, job = _checkpoint_rollback_may_have_started(tmp_path)
+    system.complete_pve_rollback()
+    system.worker.run_once()
+    return system, system.job(job.job_id)
+
+
+def _checkpoint_succeeded(tmp_path: Path):
+    """Terminal: the ordinary happy path."""
+
+    system = _system(tmp_path)
+    job = _start(system)
+    system.worker.run_once()
+    return system, system.job(job.job_id)
+
+
+#: (label, builder, expected `can_resume_update`). Every
+#: `PackageUpdateCheckpoint` member is represented, plus one non-checkpoint
+#: terminal case (`succeeded`) that must be false purely because the job is
+#: no longer ACTIVE at all.
+_RESUME_CHECKPOINT_CASES = (
+    ("issued", _checkpoint_issued, True),
+    ("preflight_passed", _checkpoint_preflight_passed, True),
+    ("snapshot_may_have_started", _checkpoint_snapshot_may_have_started, True),
+    ("snapshot_confirmed", _checkpoint_snapshot_confirmed, True),
+    ("mutation_may_have_started", _checkpoint_mutation_may_have_started, True),
+    ("mutation_completed", _checkpoint_mutation_completed, True),
+    ("health_started_unknown", _checkpoint_health_started_unknown, True),
+    ("health_completed_failed", _checkpoint_health_completed_failed, False),
+    ("rollback_may_have_started", _checkpoint_rollback_may_have_started, True),
+    ("rollback_completed_terminal", _checkpoint_rollback_completed, False),
+    ("succeeded_terminal", _checkpoint_succeeded, False),
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "builder", "expected"),
+    _RESUME_CHECKPOINT_CASES,
+    ids=[case[0] for case in _RESUME_CHECKPOINT_CASES],
+)
+def test_resume_capability_matches_worker_continuation_per_checkpoint(
+    tmp_path: Path, label: str, builder, expected: bool
+) -> None:
+    system, job = builder(tmp_path)
+    capabilities = InventoryPublication(
+        system.store, system.authority, package_update_activated=True
+    ).read_operator_availability().resources[0]
+    assert capabilities["can_resume_update"] is expected, label
+
+
+def test_resume_capability_requires_activation(tmp_path: Path) -> None:
+    """Witness I: activation gates resume exactly like every other Human1
+    control, even from an otherwise resume-capable checkpoint."""
+
+    system, job = _checkpoint_health_started_unknown(tmp_path)
+    active = InventoryPublication(
+        system.store, system.authority, package_update_activated=True
+    ).read_operator_availability().resources[0]
+    inactive = InventoryPublication(
+        system.store, system.authority, package_update_activated=False
+    ).read_operator_availability().resources[0]
+    assert active["can_resume_update"] is True
+    assert inactive["can_resume_update"] is False
+
+
+def test_resume_endpoint_still_wakes_worker_despite_hidden_capability(
+    tmp_path: Path,
+) -> None:
+    """Witness C: the capability is a presentation hint, never authority.
+
+    Pressing Resume at `health_completed` still returns 202 and wakes the
+    worker -- the route performs no checkpoint policy of its own -- but the
+    real worker deterministically makes no progress, exactly as it already
+    did before this fix. Hiding the capability changes what HA advertises,
+    never what the backend accepts or does.
+    """
+
+    system = ApiSystem(tmp_path, health=["failed"])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+        job_id = started["job_id"]
+
+        capabilities = InventoryPublication(
+            system.store, system.authority, package_update_activated=True
+        ).read_operator_availability().resources[0]
+        assert capabilities["can_resume_update"] is False
+
+        response = system.post(
+            f"/r0/v1/resources/{system.resource_id}/package-update/resume"
+        )
+        assert response.status_code == 202
+        assert response.json()["job_id"] == job_id
+
+        cycle = system.run_worker()
+        assert cycle.stop_reason == "health_failed"
+        final = system.store.active_package_update_job()
+        assert final.checkpoint is PackageUpdateCheckpoint.HEALTH_COMPLETED
+        assert final.status is PackageUpdateJobStatus.ACTIVE
+    finally:
+        system.close()
 
 
 def test_the_active_job_witness_answers_the_product_updater(api) -> None:
