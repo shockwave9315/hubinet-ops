@@ -5,7 +5,10 @@ the durable job is, and the timestamps that say how far it got. It never
 carries the frozen package rows, the per-probe health results, the append-only
 event log, helper output, or command text -- those are exact material an
 operator reads through the explicit response-capable action that exists for
-them, never something every coordinator poll drags into entity state.
+them, never something every coordinator poll drags into entity state. The
+per-probe health results and the event log ARE part of that explicit action's
+own response (``PackageUpdateJobView``, validated below) -- only the concise
+snapshot *summary* excludes them.
 
 Home Assistant validates this shape independently rather than rendering
 whatever arrives, exactly like every other part of this contract. Two rules
@@ -26,7 +29,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .enums import PackageUpdateHealthOutcome, PackageUpdateJobState
+from .enums import (
+    HealthProbeKind,
+    HealthProbeOutcome,
+    PackageUpdateHealthOutcome,
+    PackageUpdateJobState,
+)
+from .health_contract_validation import (
+    MAX_HEALTH_PROBES,
+    MAX_HEALTH_PROBE_TARGET_LENGTH,
+)
 from .primitives import _require_enum_instance, _require_text, _require_uuid_identity
 
 if TYPE_CHECKING:
@@ -49,6 +61,37 @@ PACKAGE_UPDATE_CHECKPOINTS: frozenset[str] = frozenset(
         "health_completed",
         "rollback_may_have_started",
         "rollback_completed",
+    }
+)
+
+#: Mirrors `app/inventory/health_observation.py::HEALTH_PROBE_REASONS`, the
+#: backend's closed durable reason taxonomy. Home Assistant validates this
+#: independently rather than trusting the payload, exactly like
+#: `PACKAGE_UPDATE_CHECKPOINTS` above: a reason outside this bounded set is
+#: refused rather than rendered as if it were operator-meaningful text, and
+#: nothing here is raw guest output -- every token is a fixed classification
+#: the backend itself chose.
+HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
+    {
+        "unit_active",
+        "container_running",
+        "container_healthy",
+        "unit_not_active",
+        "container_not_running",
+        "container_absent",
+        "container_unhealthy",
+        "container_health_starting",
+        "container_has_no_healthcheck",
+        "probe_target_not_exact",
+        "probe_target_ambiguous",
+        "guest_unavailable",
+        "command_failed",
+        "command_timed_out",
+        "malformed_output",
+        "docker_daemon_unavailable",
+        "host_unreachable",
+        "host_response_rejected",
+        "resource_context_changed",
     }
 )
 
@@ -200,3 +243,44 @@ def validate_package_update_job_view(view: "PackageUpdateJobView") -> None:
             raise ValueError("job event level is not a known level")
         if event.stage not in PACKAGE_UPDATE_CHECKPOINTS:
             raise ValueError("job event stage is not a known checkpoint")
+    _validate_package_update_job_health_probes(view)
+
+
+def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> None:
+    """Validate the per-probe health evidence, if any is present.
+
+    Present only once a definitive verdict was durably recorded -- exactly
+    when ``health_outcome`` is also present -- and never otherwise: a job
+    with no verdict has no per-probe results to show, and a payload claiming
+    otherwise is outside the contract.
+    """
+
+    probes = view.health_probes
+    if len(probes) > MAX_HEALTH_PROBES:
+        raise ValueError("job health_probes exceeds the maximum probe count")
+    if bool(probes) != (view.health_outcome is not None):
+        raise ValueError(
+            "job health_probes must be present exactly when a definitive "
+            "health verdict is present"
+        )
+    seen_indexes: set[int] = set()
+    for probe in probes:
+        if type(probe.probe_index) is not int or probe.probe_index < 0:
+            raise ValueError("job health probe index must be a non-negative integer")
+        if probe.probe_index in seen_indexes:
+            raise ValueError("job health probes contain a duplicate index")
+        seen_indexes.add(probe.probe_index)
+        _require_enum_instance(probe.kind, HealthProbeKind, "job health probe kind")
+        _require_text(probe.target, "job health probe target")
+        if len(probe.target) > MAX_HEALTH_PROBE_TARGET_LENGTH:
+            raise ValueError("job health probe target is too long")
+        _require_enum_instance(
+            probe.outcome, HealthProbeOutcome, "job health probe outcome"
+        )
+        _require_text(probe.checked_at, "job health probe checked_at")
+        if probe.reason not in HEALTH_PROBE_REASONS:
+            raise ValueError(
+                "job health probe reason is not a known bounded token"
+            )
+    if probes and seen_indexes != set(range(len(probes))):
+        raise ValueError("job health probes are not canonically indexed")

@@ -2675,8 +2675,26 @@ is UNKNOWN. No English stderr is parsed.
 
 `docker_container_healthy` is never downgraded to "running". It requires
 `.State.Running` true **and** `.State.Health.Status` exactly `healthy`. Not
-running, `unhealthy`, `starting`, and *no HEALTHCHECK at all* are each a
-definitive FAIL, because the operator specifically demanded Docker health.
+running, `unhealthy`, and *no HEALTHCHECK at all* are each a definitive FAIL,
+because the operator specifically demanded Docker health.
+
+**`starting` is UNKNOWN, not FAILED (post-Human1 correction).** Docker enters
+this state automatically on every container start or restart, before its
+first health probe can even run — it is Docker's own transient bookkeeping,
+never a workload verdict. A real Human1 update job that legitimately
+restarted Docker/containerd as part of its approved package plan observed
+every declared container `starting` at the instant this probe ran and
+`healthy` again seconds later, with no operator or product action in
+between. The original design classified `starting` as a definitive FAIL
+alongside `unhealthy`; live evidence showed that turns an ordinary
+package-triggered restart into a false durable health failure. `starting`
+now reports `unknown`/`container_health_starting`, which — like
+`docker_daemon_unavailable` — writes no durable verdict at all: the job stays
+ACTIVE at `health_started` with its snapshot and rollback authority intact,
+and an operator asks again through the existing `resume_update` control. No
+retry policy, timer, or grace period was added to reach this: it reuses
+exactly the UNKNOWN/no-verdict/explicit-resume path this stage already had
+for every other unevaluable probe.
 
 ### Restart, retry, and rollback
 

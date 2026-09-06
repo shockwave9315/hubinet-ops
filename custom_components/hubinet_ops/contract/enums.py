@@ -163,6 +163,22 @@ class HealthProbeKind(StrEnum):
     DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
 
 
+class HealthProbeOutcome(StrEnum):
+    """What ONE frozen probe was durably observed to be, once evaluated.
+
+    Unlike ``PackageUpdateHealthOutcome`` (the job's own ALL-OF verdict, which
+    has no ``unknown`` member because an unevaluable job writes nothing
+    durable), an individual probe's result row genuinely can be ``UNKNOWN``
+    inside an otherwise FAILED job: one proven failure is enough to fail the
+    whole ALL-OF, and a sibling probe that could not be evaluated is still
+    truthful history the operator needs, not something to hide.
+    """
+
+    PASSED = "passed"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
 class HealthContractStatus(StrEnum):
     """Whether a resource has a declared meaning of healthy.
 

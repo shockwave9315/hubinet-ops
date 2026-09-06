@@ -85,7 +85,9 @@ async def async_unload_entry(
     if not unloaded:
         return False
     coordinators = hass.data.get(DOMAIN, {}).get(DATA_COORDINATORS, {})
-    coordinators.pop(entry.entry_id, None)
+    coordinator = coordinators.pop(entry.entry_id, None)
+    if coordinator is not None:
+        coordinator.async_clear_health_contract_repairs()
     if not coordinators:
         async_unload_services(hass)
     return True

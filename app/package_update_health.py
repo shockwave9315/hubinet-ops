@@ -1,11 +1,14 @@
-"""Dark job-bound healthcheck execution for package update jobs.
+"""Job-bound healthcheck execution for package update jobs.
 
-**Not production-reachable.** Nothing in `app/inventory_runtime.py`, the HTTP
-API, the Home Assistant integration, the discovery scheduler, or the package
-scan scheduler constructs or calls anything in this module, and
-`tests/test_r0_architecture_regression.py` proves it stays that way. It exists
-so the last missing half of the update lifecycle can be built and adversarially
-tested before it is ever activated.
+**Production reachable, through the one worker.** `app/inventory_runtime.py`
+constructs this orchestrator and composes it into the one
+`PackageUpdateWorker` when `package_update.enabled` is configured true (see
+"Production activation" in `ARCHITECTURE.md`). No route, scheduler, or the
+Home Assistant integration calls into it directly -- the worker is the only
+caller, entering this stage at `mutation_completed` or `health_started`. This
+module still contains no host I/O, no write-ahead uncertainty checkpoint, and
+no policy of its own: it composes authority and one read-only dark host
+boundary, exactly as documented below.
 
 ## What this stage answers, and what it refuses to answer
 

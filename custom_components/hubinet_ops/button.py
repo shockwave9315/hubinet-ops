@@ -218,6 +218,21 @@ def _job_message(job: dict[str, Any], strings: Mapping[str, str]) -> str:
     lines = [
         f"- **{label}:** {_cell(value, unknown=unknown)}" for label, value in facts
     ]
+    if job["health_probes"]:
+        lines.extend(
+            ("", f"### {_tr(strings, 'job.health_probes.heading')}", "")
+        )
+        outcome_labels = {
+            outcome: _tr(strings, f"job.health_probes.outcome.{outcome}")
+            for outcome in ("passed", "failed", "unknown")
+        }
+        lines.extend(
+            f"- {_cell(probe['kind'], unknown=unknown)} — "
+            f"{_cell(probe['target'], unknown=unknown)} — "
+            f"**{outcome_labels.get(probe['outcome'], unknown)}** — "
+            f"{_cell(probe['reason'], unknown=unknown)}"
+            for probe in job["health_probes"]
+        )
     if job["events"]:
         lines.extend(("", f"### {_tr(strings, 'job.recent_events')}", ""))
         lines.extend(

@@ -12,6 +12,7 @@ from .enums import (
     DetailStatus,
     HealthContractStatus,
     HealthProbeKind,
+    HealthProbeOutcome,
     LifecycleState,
     NodeAvailability,
     ObservationalContinuity,
@@ -437,6 +438,26 @@ class PackageUpdateJobEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class PackageUpdateJobHealthProbeResult:
+    """One frozen probe's durable, definitive result, as an operator reads it.
+
+    Every field is a bounded typed authority fact -- never raw helper
+    stdout/stderr and never command text. ``kind``/``target`` are this job's
+    own frozen probe material (already shown by ``view_health_contract``);
+    ``outcome``/``checked_at``/``reason`` are what the one definitive health
+    finalization boundary recorded for it. Empty for a job with no durable
+    verdict yet; complete, one row per frozen probe, once one exists.
+    """
+
+    probe_index: int
+    kind: HealthProbeKind
+    target: str
+    outcome: HealthProbeOutcome
+    checked_at: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class PackageUpdateJobView:
     """One complete package-update job, as an explicit action returns it.
 
@@ -444,9 +465,15 @@ class PackageUpdateJobView:
     Flat by design: Home Assistant renders these as a response mapping, and a
     nested shape would only invite a template to reach into it. Every field
     but one is a durable authority fact -- no helper output, no PVE task log,
-    no command text, no package rows, and no per-probe results.
+    no command text, and no package rows. ``health_probes`` IS included
+    (post-Human1 correction): a real operator had to read the backend's
+    SQLite database directly to learn which frozen probe failed and why, so
+    the per-probe evidence this stage already computes -- kind, target,
+    outcome, checked-at, and a bounded reason token -- is now part of the
+    explicit readback too. It stays empty until a definitive verdict exists.
 
-    ``rollback_available`` is the one exception, and deliberately so (GitHub
+    ``rollback_available`` is the one *authority-freshness* exception, and
+    deliberately so (GitHub
     review P2 #3, Option A): it is the backend's own fresh, current-target-
     checked verdict -- the same proof
     ``InventoryAuthority.arm_package_update_rollback`` requires -- not merely
@@ -478,6 +505,7 @@ class PackageUpdateJobView:
     terminalized_at: str | None = None
     terminal_reason: str | None = None
     events: tuple[PackageUpdateJobEvent, ...] = ()
+    health_probes: tuple[PackageUpdateJobHealthProbeResult, ...] = ()
 
     def __post_init__(self) -> None:
         _require_uuid_identity(self.job_id, "job_id")

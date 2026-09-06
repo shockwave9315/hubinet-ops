@@ -276,15 +276,58 @@ _RETRYABLE_ISSUANCE_REFUSALS = frozenset(
 )
 
 
+def _package_update_health_probes_body(job: PackageUpdateJob) -> list[dict[str, Any]]:
+    """Render this job's completed per-probe health evidence, if any.
+
+    Empty until a definitive verdict is durably recorded: `health_probe_results`
+    is written only as one complete set, atomically with the verdict, never
+    partially. Bounded by the same `health_contract_probe_count` ceiling
+    (<= `MAX_HEALTH_PROBES`) as the frozen contract itself, and every field is
+    a durable typed authority fact -- the probe's own frozen `kind`/`target`
+    plus its recorded `outcome`, `checked_at`, and bounded `reason` token.
+    Never raw helper stdout/stderr and never command text; the store's own
+    read path (`_package_update_job_health`) already refuses to hand back a
+    job whose frozen probes and result set are not coherent, so this is
+    defense in depth rather than the load-bearing proof.
+    """
+
+    if not job.health_probe_results:
+        return []
+    frozen_by_index = {probe.probe_index: probe for probe in job.health_probes}
+    probes: list[dict[str, Any]] = []
+    for result in sorted(job.health_probe_results, key=lambda r: r.probe_index):
+        probe = frozen_by_index.get(result.probe_index)
+        if probe is None:  # pragma: no cover - store already refuses this
+            continue
+        probes.append(
+            {
+                "index": result.probe_index,
+                "kind": probe.kind.value,
+                "target": probe.target,
+                "outcome": result.outcome.value,
+                "checked_at": result.checked_at,
+                "reason": result.reason,
+            }
+        )
+    return probes
+
+
 def _package_update_job_body(
     job: PackageUpdateJob, *, store: InventoryAuthorityStore, activated: bool
 ) -> dict[str, Any]:
     """Render one job as bounded typed facts.
 
     Deliberately absent: helper stdout/stderr, raw PVE task logs, command
-    text, credentials, the frozen package rows, and the per-probe health
-    result rows. What an operator needs here is what the job IS and what it
-    is doing; exact material is read through the actions that exist for it.
+    text, credentials, and the frozen package rows -- those are exact
+    material an operator reads through the actions that exist for them
+    (``view_update_plan``). The completed health verdict's per-probe results
+    ARE included here (kind, target, outcome, checked_at, and a bounded
+    reason token): a FAILED or UNKNOWN health result is only actionable if an
+    operator can see which probe produced it and why without shell/SQLite
+    access. This corrects the Human1 job-readback contract's original
+    per-probe exclusion once live evidence showed it made a real failure
+    undiagnosable from Home Assistant; every field below is still bounded,
+    typed, and drawn only from durable authority -- never raw guest output.
     """
 
     return {
@@ -315,6 +358,7 @@ def _package_update_job_body(
             "started_at": job.health_started_at,
             "completed_at": job.health_completed_at,
             "outcome": None if job.health_outcome is None else job.health_outcome.value,
+            "probes": _package_update_health_probes_body(job),
         },
         "rollback": {
             "operation_id": job.rollback_operation_id,

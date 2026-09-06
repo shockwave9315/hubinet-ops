@@ -41,6 +41,10 @@ from .const import (
     MODEL_QEMU,
     MODEL_SOURCE,
 )
+from .repairs import (
+    async_clear_health_contract_repairs,
+    async_sync_health_contract_repairs,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -276,6 +280,13 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
         # authority. Reloading Home Assistant intentionally empties it.
         self.reviewed_update_plans: dict[str, ReviewedUpdatePlanReference] = {}
         self.operator_availability: OperatorAvailabilityView
+        # HUMAN1-HEALTH-CONTRACT-ONBOARDING-01 (defect A): which resources
+        # currently carry the "approved but unconfigured" Repair issue, so a
+        # resource that stops qualifying gets its issue cleared rather than
+        # left behind. UX/presentation bookkeeping only -- never persisted,
+        # never backend authority, and recomputed from the same published
+        # snapshot on every refresh.
+        self._health_contract_repair_resource_ids: frozenset[str] = frozenset()
 
     def operator_capabilities(self, resource_id: str) -> OperatorCapabilities:
         """Return backend-owned point-in-time availability for one resource."""
@@ -438,7 +449,32 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
         self.operator_availability = availability
         self._invalidate_stale_plan_reviews(incoming)
         self._async_publish_inventory(incoming)
+        self._health_contract_repair_resource_ids = (
+            async_sync_health_contract_repairs(
+                self.hass,
+                entry_id=self.config_entry.entry_id,
+                snapshot=incoming,
+                previously_raised_resource_ids=(
+                    self._health_contract_repair_resource_ids
+                ),
+            )
+        )
         return incoming
+
+    def async_clear_health_contract_repairs(self) -> None:
+        """Remove every Repair issue this coordinator currently owns.
+
+        Called on unload: a removed or reloaded config entry must not leave
+        a stale Repairs entry pointing at a coordinator that no longer
+        exists.
+        """
+
+        async_clear_health_contract_repairs(
+            self.hass,
+            entry_id=self.config_entry.entry_id,
+            resource_ids=self._health_contract_repair_resource_ids,
+        )
+        self._health_contract_repair_resource_ids = frozenset()
 
     def _async_publish_inventory(self, data: HubinetOpsSnapshot) -> None:
         """Synchronize device relationships and notify platforms of additions."""

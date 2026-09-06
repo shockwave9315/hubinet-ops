@@ -271,13 +271,27 @@
         "health_result": "Health result",
         "rollback_available": "Rollback available",
         "terminal_reason": "Terminal reason"
+      },
+      "health_probes": {
+        "heading": "Per-probe health evidence",
+        "outcome": {
+          "passed": "PASSED",
+          "failed": "FAILED",
+          "unknown": "UNKNOWN"
+        }
       }
     },
     "health": {
       "title": "Hubinet Ops health contract — {name}",
-      "unconfigured": "No health contract is configured. This is **unconfigured**, not healthy, and a package update cannot start until a contract is declared.",
+      "unconfigured": "No health contract is configured. This is **unconfigured**, not healthy, and a package update cannot start until a contract is declared. Declare one with the **`hubinet_ops.set_health_contract`** action for this device — reachable from this device's **Actions** tab, or from Developer Tools → Actions — naming each required probe kind (`systemd_unit_active`, `docker_container_running`, or `docker_container_healthy`) and its target.",
       "revision": "Revision",
       "all_required": "Every probe below is required:"
+    }
+  },
+  "issues": {
+    "health_contract_unconfigured": {
+      "title": "{name}: package update blocked on a missing health contract",
+      "description": "The reviewed package plan for **{name}** is approved, but no health contract is declared, so **Start approved update** stays disabled. That is deliberate: Hubinet Ops never invents what \"healthy\" means for your workload — you declare it.\n\nDeclare one with the `hubinet_ops.set_health_contract` action for this device, reachable from this device's **Actions** tab or from Developer Tools → Actions. Name each required probe kind (`systemd_unit_active`, `docker_container_running`, or `docker_container_healthy`) and its target. This issue clears itself automatically once a contract exists for this resource."
     }
   },
   "exceptions": {

@@ -271,13 +271,27 @@
         "health_result": "Wynik kontroli kondycji",
         "rollback_available": "Wycofanie dostępne",
         "terminal_reason": "Powód zakończenia"
+      },
+      "health_probes": {
+        "heading": "Szczegółowe wyniki sond kondycji",
+        "outcome": {
+          "passed": "POZYTYWNY",
+          "failed": "NEGATYWNY",
+          "unknown": "NIEZNANY"
+        }
       }
     },
     "health": {
       "title": "Kontrakt kondycji Hubinet Ops — {name}",
-      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany.",
+      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany. Zadeklaruj go za pomocą akcji **`hubinet_ops.set_health_contract`** dla tego urządzenia — dostępnej z zakładki **Akcje** tego urządzenia lub z Narzędzi deweloperskich → Akcje — podając każdy wymagany rodzaj sondy (`systemd_unit_active`, `docker_container_running` lub `docker_container_healthy`) i jej cel.",
       "revision": "Rewizja",
       "all_required": "Wszystkie poniższe sondy są wymagane:"
+    }
+  },
+  "issues": {
+    "health_contract_unconfigured": {
+      "title": "{name}: aktualizacja pakietów zablokowana brakiem kontraktu kondycji",
+      "description": "Przejrzany plan pakietów dla **{name}** jest zatwierdzony, ale nie zadeklarowano kontraktu kondycji, więc przycisk **Rozpocznij zatwierdzoną aktualizację** pozostaje wyłączony. To celowe: Hubinet Ops nigdy nie wymyśla, co oznacza „zdrowy” dla Twojego obciążenia — Ty to deklarujesz.\n\nZadeklaruj kontrakt za pomocą akcji `hubinet_ops.set_health_contract` dla tego urządzenia, dostępnej z zakładki **Akcje** tego urządzenia lub z Narzędzi deweloperskich → Akcje. Podaj każdy wymagany rodzaj sondy (`systemd_unit_active`, `docker_container_running` lub `docker_container_healthy`) i jej cel. To zgłoszenie zniknie automatycznie, gdy tylko kontrakt dla tego zasobu zostanie utworzony."
     }
   },
   "exceptions": {

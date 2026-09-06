@@ -40,7 +40,6 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
             "container_not_running",
             "container_absent",
             "container_unhealthy",
-            "container_health_starting",
             "container_has_no_healthcheck",
         }
     ),
@@ -56,6 +55,14 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
             "host_unreachable",
             "host_response_rejected",
             "resource_context_changed",
+            # Docker's OWN transient state, entered automatically by every
+            # container (re)start before its first health probe can run --
+            # never a workload verdict. A package-triggered Docker/containerd
+            # restart produces this on a workload that is about to report
+            # healthy again on its own; see `deploy/hubinet-package-health-
+            # helper.py` and ARCHITECTURE.md, "Job-bound healthcheck
+            # execution".
+            "container_health_starting",
         }
     ),
 }

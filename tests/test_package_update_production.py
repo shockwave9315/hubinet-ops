@@ -1832,9 +1832,72 @@ def test_readback_reports_bounded_typed_facts_and_no_raw_output(api) -> None:
     rendered = response.text
     for forbidden in ("stdout", "stderr", "apt-get", BEARER, "PRIVATE KEY"):
         assert forbidden not in rendered, forbidden
-    # No package rows and no per-probe results in the readback.
+    # No package rows in the readback -- exact material for that stays
+    # behind the review action. Per-probe health evidence, by contrast, IS
+    # now included (post-Human1 correction): see the dedicated test below.
     assert "packages" not in body
-    assert "health_probe_results" not in body
+
+
+def test_readback_includes_bounded_per_probe_health_evidence_on_failure(
+    tmp_path: Path,
+) -> None:
+    """Post-Human1 correction: a real operator had to read the authority
+    SQLite database directly to learn which frozen probe failed and why.
+    The explicit readback now carries exactly that -- kind, target, outcome,
+    checked_at, and a bounded reason token -- and nothing more."""
+
+    system = ApiSystem(tmp_path, health=["failed"])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "active"
+        assert body["health"]["outcome"] == "failed"
+        probes = body["health"]["probes"]
+        assert probes == [
+            {
+                "index": 0,
+                "kind": "docker_container_running",
+                "target": "web",
+                "outcome": "failed",
+                "checked_at": probes[0]["checked_at"],
+                "reason": "container_not_running",
+            },
+            {
+                "index": 1,
+                "kind": "systemd_unit_active",
+                "target": "nginx.service",
+                "outcome": "failed",
+                "checked_at": probes[1]["checked_at"],
+                "reason": "unit_not_active",
+            },
+        ]
+        rendered = response.text
+        for forbidden in ("stdout", "stderr", "apt-get", BEARER, "PRIVATE KEY"):
+            assert forbidden not in rendered, forbidden
+    finally:
+        system.close()
+
+
+def test_readback_carries_no_probes_before_a_definitive_verdict(api) -> None:
+    """No verdict yet means no per-probe evidence yet -- never a synthesized
+    "everything unknown" row set."""
+
+    started = api.start().json()
+    response = api.get(f"/r0/v1/resources/{api.resource_id}/package-update")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == started["job_id"]
+    assert body["health"]["outcome"] is None
+    assert body["health"]["probes"] == []
 
 
 def test_readback_rollback_available_requires_current_job_target(

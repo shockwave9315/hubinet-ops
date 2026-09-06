@@ -623,7 +623,6 @@ def test_a_healthy_container_passes() -> None:
     ("state", "reason"),
     (
         ((True, "unhealthy"), "container_unhealthy"),
-        ((True, "starting"), "container_health_starting"),
         ((True, "<none>"), "container_has_no_healthcheck"),
         ((False, "healthy"), "container_not_running"),
     ),
@@ -638,6 +637,21 @@ def test_docker_health_is_never_downgraded_to_merely_running(
     guest.containers["web"] = state
     assert _evaluate(guest, (("docker_container_healthy", "web"),)) == [
         ("failed", reason)
+    ]
+
+
+def test_docker_health_starting_is_unknown_not_failed() -> None:
+    """Live Human1 evidence: a package update that restarts Docker/containerd
+    puts every container's health state machine through "starting" again on
+    a perfectly healthy workload. That is Docker's own transient state, not
+    a workload verdict, so it must never become a durable FAIL -- unlike
+    `unhealthy`, `<none>`, and not-running above, which stay definitive
+    failures because the operator specifically demanded Docker health."""
+
+    guest = FakeGuest()
+    guest.containers["web"] = (True, "starting")
+    assert _evaluate(guest, (("docker_container_healthy", "web"),)) == [
+        ("unknown", "container_health_starting")
     ]
 
 

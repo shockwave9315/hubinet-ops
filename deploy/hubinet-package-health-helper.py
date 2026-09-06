@@ -62,9 +62,20 @@ failure for a name still present, unavailable daemon, or unusable listing is
 UNKNOWN.
 
 **`docker_container_healthy` is never downgraded to "running".** It requires
-`.State.Running` true AND `.State.Health.Status` exactly `healthy`. A container
-with no HEALTHCHECK, or one reporting `starting` or `unhealthy`, is a
-definitive FAIL, because the operator specifically demanded Docker health.
+`.State.Running` true AND `.State.Health.Status` exactly `healthy`. A
+container with no HEALTHCHECK, or one reporting `unhealthy`, is a definitive
+FAIL, because the operator specifically demanded Docker health. `starting` is
+different: Docker's own documented state machine enters it automatically
+after every container (re)start and can only leave it for `healthy` or
+`unhealthy` once `--health-start-period` and the first probe elapse, so it is
+not a workload verdict at all -- it is the daemon saying "no verdict yet".
+Live Human1 evidence proved this the hard way: a package update that
+legitimately restarts Docker/containerd restarts every container's health
+state machine too, and the guest was observed and reported `healthy` again
+within seconds, after this helper had already durably recorded a FAIL. So
+`starting` is UNKNOWN, not FAILED -- it is never a pass and never durable
+error either; the caller may simply ask again, exactly like
+`docker_daemon_unavailable`.
 """
 
 from __future__ import annotations
@@ -794,7 +805,12 @@ def evaluate_docker_container_healthy(
     if health == "unhealthy":
         return "failed", "container_unhealthy"
     if health == "starting":
-        return "failed", "container_health_starting"
+        # Docker's own state machine, not a workload verdict: every container
+        # (re)start passes through "starting" before its first health probe
+        # can even run, so a package-triggered Docker/containerd restart
+        # produces this transiently on a perfectly healthy workload. Report
+        # no verdict rather than a false FAIL; the caller may ask again.
+        return "unknown", "container_health_starting"
     if health == "<none>":
         return "failed", "container_has_no_healthcheck"
     raise ProbeUnknown("malformed_output")

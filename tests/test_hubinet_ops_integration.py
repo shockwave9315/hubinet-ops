@@ -29,6 +29,7 @@ from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers import service as service_helper
 from homeassistant.helpers.translation import async_get_translations
 from homeassistant.helpers.update_coordinator import UpdateFailed
@@ -43,6 +44,7 @@ from custom_components.hubinet_ops.api import (
     HealthContractSummary,
     HealthProbe,
     HealthProbeKind,
+    HealthProbeOutcome,
     HubinetOpsApi,
     HubinetOpsCannotConnect,
     HubinetOpsConflict,
@@ -67,6 +69,7 @@ from custom_components.hubinet_ops.api import (
     PackagePlanApprovalStatus,
     PackageUpdateHealthOutcome,
     PackageUpdateJobEvent,
+    PackageUpdateJobHealthProbeResult,
     PackageUpdateJobState,
     PackageUpdateJobSummary,
     PackageUpdateJobView,
@@ -5095,6 +5098,111 @@ async def test_view_health_contract_reports_unconfigured_without_faking_a_contra
     assert response["fingerprint"] is None
 
 
+# ---------------------------------------------------------------------------
+# Defect A (post-Human1): a real operator reviewed and approved a plan,
+# reached a disabled Start button, learned the health contract was
+# unconfigured, and had no discoverable native continuation from the
+# resource device. A Repairs issue is the fix: native, visible from
+# Settings -> Repairs without reading source code, and it grants no
+# authority -- it only points at the existing `set_health_contract` action.
+# ---------------------------------------------------------------------------
+
+
+def _health_contract_repair_ids(hass: HomeAssistant) -> set[str]:
+    return {
+        issue.issue_id
+        for issue in ir.async_get(hass).issues.values()
+        if issue.domain == DOMAIN
+        and issue.issue_id.startswith("health_contract_unconfigured::")
+    }
+
+
+@pytest.mark.asyncio
+async def test_approved_but_unconfigured_resource_raises_a_repair_issue(
+    hass: HomeAssistant,
+) -> None:
+    """Exactly the live dead end: reviewed, approved, and stuck."""
+
+    planned = exact_plan_resource(approved=True)
+    assert planned.resource_id == RESOURCE_CT
+    assert planned.package_plan_approval.status is PackagePlanApprovalStatus.APPROVED
+    assert planned.health_contract.status is HealthContractStatus.UNCONFIGURED
+
+    await setup_entry(hass, FakeTransport([snapshot((planned,))]))
+
+    issues = _health_contract_repair_ids(hass)
+    assert len(issues) == 1
+    issue = ir.async_get(hass).issues[(DOMAIN, next(iter(issues)))]
+    assert issue.is_fixable is False
+    assert issue.severity == ir.IssueSeverity.WARNING
+    assert issue.translation_key == "health_contract_unconfigured"
+    assert issue.translation_placeholders == {"name": "CT101 Cloudflared"}
+
+
+@pytest.mark.asyncio
+async def test_no_repair_issue_before_a_plan_is_approved(
+    hass: HomeAssistant,
+) -> None:
+    """An ordinary freshly enrolled resource is not yet blocked on anything --
+    raising this issue before an operator even tries to update would be
+    noise, not a discoverable continuation."""
+
+    await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+
+    assert _health_contract_repair_ids(hass) == set()
+
+
+@pytest.mark.asyncio
+async def test_repair_issue_clears_once_a_health_contract_is_declared(
+    hass: HomeAssistant,
+) -> None:
+    """The issue is recomputed every refresh, never durable HA state: once
+    the operator declares a contract, it disappears on its own."""
+
+    planned = exact_plan_resource(approved=True)
+    configured = replace(
+        planned,
+        health_contract=HealthContractSummary(
+            status=HealthContractStatus.CONFIGURED,
+            revision=1,
+            fingerprint="c" * 64,
+            probe_count=1,
+            updated_at="2026-08-08T12:05:00+00:00",
+        ),
+    )
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [
+                snapshot((INITIAL_RESOURCES[0], planned, INITIAL_RESOURCES[2])),
+                snapshot(
+                    (INITIAL_RESOURCES[0], configured, INITIAL_RESOURCES[2]),
+                    inventory_revision=11,
+                    published_state_revision=21,
+                ),
+            ]
+        ),
+    )
+    assert len(_health_contract_repair_ids(hass)) == 1
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert _health_contract_repair_ids(hass) == set()
+
+
+@pytest.mark.asyncio
+async def test_repair_issue_is_cleared_on_unload(hass: HomeAssistant) -> None:
+    planned = exact_plan_resource(approved=True)
+    entry = await setup_entry(hass, FakeTransport([snapshot((planned,))]))
+    assert len(_health_contract_repair_ids(hass)) == 1
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert _health_contract_repair_ids(hass) == set()
+
+
 @pytest.mark.asyncio
 async def test_set_health_contract_serializes_the_complete_declared_set(
     hass: HomeAssistant,
@@ -5447,6 +5555,7 @@ def job_view(
     rollback_available: bool = False,
     terminalized_at: str | None = None,
     events: tuple[PackageUpdateJobEvent, ...] = (),
+    health_probes: tuple[PackageUpdateJobHealthProbeResult, ...] = (),
 ) -> PackageUpdateJobView:
     return PackageUpdateJobView(
         job_id=JOB_ID,
@@ -5463,12 +5572,92 @@ def job_view(
         mutation_completed_at="2026-08-08T11:09:00+00:00",
         health_contract_revision=3,
         health_started_at=None,
-        health_completed_at=None,
+        health_completed_at=(
+            "2026-09-06T13:40:23.444652+00:00" if health_outcome else None
+        ),
         health_outcome=health_outcome,
         rollback_available=rollback_available,
         terminalized_at=terminalized_at,
         events=events,
+        health_probes=health_probes,
     )
+
+
+def _probe_result(
+    *,
+    probe_index: int = 0,
+    kind: HealthProbeKind = HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+    target: str = "web",
+    outcome: HealthProbeOutcome = HealthProbeOutcome.FAILED,
+    reason: str = "container_unhealthy",
+) -> PackageUpdateJobHealthProbeResult:
+    return PackageUpdateJobHealthProbeResult(
+        probe_index=probe_index,
+        kind=kind,
+        target=target,
+        outcome=outcome,
+        checked_at="2026-08-08T11:10:00+00:00",
+        reason=reason,
+    )
+
+
+def test_job_view_accepts_coherent_per_probe_health_evidence() -> None:
+    job_view(
+        checkpoint="health_completed",
+        health_outcome=PackageUpdateHealthOutcome.FAILED,
+        health_probes=(_probe_result(),),
+    )
+
+
+def test_job_view_rejects_probes_without_a_definitive_verdict() -> None:
+    """`health_probes` may exist only once a verdict does -- a job with no
+    verdict has nothing definitive to show."""
+
+    with pytest.raises(ValueError):
+        job_view(health_outcome=None, health_probes=(_probe_result(),))
+
+
+def test_job_view_rejects_a_verdict_with_no_probe_evidence() -> None:
+    """The inverse: a completed verdict always has its complete result set."""
+
+    with pytest.raises(ValueError):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(),
+        )
+
+
+def test_job_view_rejects_a_duplicate_probe_index() -> None:
+    with pytest.raises(ValueError):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(
+                _probe_result(probe_index=0),
+                _probe_result(probe_index=0, target="other"),
+            ),
+        )
+
+
+def test_job_view_rejects_a_non_contiguous_probe_index() -> None:
+    with pytest.raises(ValueError):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(_probe_result(probe_index=1),),
+        )
+
+
+def test_job_view_rejects_a_reason_outside_the_bounded_taxonomy() -> None:
+    """Never render raw guest output as if it were a classification token."""
+
+    with pytest.raises(ValueError):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(_probe_result(reason="totally made up nonsense"),),
+        )
 
 
 @pytest.mark.asyncio
@@ -5616,6 +5805,171 @@ async def test_view_update_job_returns_bounded_facts_as_response_data(
         assert "hubinet-pre-update-0001" not in str(state.attributes)
 
 
+# ---------------------------------------------------------------------------
+# Defect C (post-Human1): the explicit job readback must carry per-probe
+# health evidence. A real operator had to read the backend's SQLite database
+# directly to learn which frozen probe failed and why; the explicit
+# `view_update_job` action/notification is where that evidence belongs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_view_update_job_response_carries_per_probe_health_evidence(
+    hass: HomeAssistant,
+) -> None:
+    probes = (
+        PackageUpdateJobHealthProbeResult(
+            probe_index=0,
+            kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+            target="weatherhub-redis-1",
+            outcome=HealthProbeOutcome.UNKNOWN,
+            checked_at="2026-09-06T13:40:23.444652+00:00",
+            reason="container_health_starting",
+        ),
+        PackageUpdateJobHealthProbeResult(
+            probe_index=1,
+            kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+            target="weatherhub-weather-api-1",
+            outcome=HealthProbeOutcome.UNKNOWN,
+            checked_at="2026-09-06T13:40:23.444652+00:00",
+            reason="container_health_starting",
+        ),
+    )
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_jobs={
+            RESOURCE_CT: job_view(
+                checkpoint="health_completed",
+                health_outcome=PackageUpdateHealthOutcome.FAILED,
+                rollback_available=True,
+                health_probes=probes,
+            )
+        },
+    )
+    entry = await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_JOB,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response["health_probes"] == [
+        {
+            "index": 0,
+            "kind": "docker_container_healthy",
+            "target": "weatherhub-redis-1",
+            "outcome": "unknown",
+            "checked_at": "2026-09-06T13:40:23.444652+00:00",
+            "reason": "container_health_starting",
+        },
+        {
+            "index": 1,
+            "kind": "docker_container_healthy",
+            "target": "weatherhub-weather-api-1",
+            "outcome": "unknown",
+            "checked_at": "2026-09-06T13:40:23.444652+00:00",
+            "reason": "container_health_starting",
+        },
+    ]
+    # Answers exactly the operator's real questions: which probe, which
+    # target, FAILED or UNKNOWN, and why -- without shell/SQLite access.
+    assert "weatherhub-redis-1" in str(response["health_probes"])
+    assert "container_health_starting" in str(response["health_probes"])
+
+    # Still bounded, typed material -- never entity attributes.
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    for item in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id):
+        if not item.unique_id.startswith(f"{key}:"):
+            continue
+        state = hass.states.get(item.entity_id)
+        assert state is not None
+        assert "health_probes" not in state.attributes
+        assert "weatherhub-redis-1" not in str(state.attributes)
+
+
+@pytest.mark.asyncio
+async def test_view_update_job_notification_lists_which_probe_failed_and_why(
+    hass: HomeAssistant,
+) -> None:
+    """The persistent-notification rendering an operator actually reads.
+
+    Real Human1 evidence: three ``docker_container_healthy`` probes all
+    failed with the same bounded reason, and the operator had to read the
+    backend's SQLite database directly to learn that. This is the fix.
+    """
+
+    probes = (
+        PackageUpdateJobHealthProbeResult(
+            probe_index=0,
+            kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+            target="weatherhub-redis-1",
+            outcome=HealthProbeOutcome.UNKNOWN,
+            checked_at="2026-09-06T13:40:23.444652+00:00",
+            reason="container_health_starting",
+        ),
+    )
+    active = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        package_update_job=PackageUpdateJobSummary(
+            state=PackageUpdateJobState.ACTIVE,
+            job_id=JOB_ID,
+            checkpoint="health_completed",
+            issued_at="2026-08-08T11:00:00+00:00",
+            package_count=24,
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_started_at="2026-08-08T11:09:00+00:00",
+            health_completed_at="2026-09-06T13:40:23.444652+00:00",
+            snapshot_confirmed_at="2026-08-08T11:01:00+00:00",
+            mutation_completed_at="2026-08-08T11:08:00+00:00",
+            rollback_available=True,
+        ),
+    )
+    transport = FakeTransport(
+        [snapshot((active,))],
+        package_update_jobs={
+            RESOURCE_CT: job_view(
+                checkpoint="health_completed",
+                health_outcome=PackageUpdateHealthOutcome.FAILED,
+                rollback_available=True,
+                health_probes=probes,
+            )
+        },
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(can_view_update_job=True)
+        },
+    )
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "view_update_job"
+                )
+            },
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    create_notification.assert_called_once()
+    message = create_notification.call_args.args[1]
+    # `_cell` escapes Markdown-structural punctuation (including `-`/`_`) in
+    # exact backend data, exactly like every other rendered notification.
+    assert r"weatherhub\-redis\-1" in message
+    assert r"container\_health\_starting" in message
+    assert r"docker\_container\_healthy" in message
+
+
 @pytest.mark.asyncio
 async def test_resume_and_rollback_name_only_the_resource(
     hass: HomeAssistant,
@@ -5629,6 +5983,7 @@ async def test_resume_and_rollback_name_only_the_resource(
                 checkpoint="health_completed",
                 health_outcome=PackageUpdateHealthOutcome.FAILED,
                 rollback_available=True,
+                health_probes=(_probe_result(),),
             )
         },
     )

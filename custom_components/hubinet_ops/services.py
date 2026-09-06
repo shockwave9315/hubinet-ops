@@ -478,10 +478,14 @@ def _job_response(
 ) -> dict[str, Any]:
     """Render one job as an action response.
 
-    Response data, never entity state. Bounded to durable authority facts:
-    no helper output, no PVE task log, no command text, no package rows, and
-    no per-probe results. ``health_outcome`` is ``None`` when no definitive
-    verdict has been recorded, and ``None`` is emphatically not a pass.
+    Response data, never entity state. Bounded to durable authority facts: no
+    helper output, no PVE task log, no command text, and no package rows.
+    ``health_outcome`` is ``None`` when no definitive verdict has been
+    recorded, and ``None`` is emphatically not a pass. ``health_probes`` IS
+    included (post-Human1 correction): each frozen probe's kind, target,
+    outcome, checked-at, and bounded reason token, so a FAILED or UNKNOWN
+    health result is actionable from Home Assistant without shell/SQLite
+    access. It stays empty until a definitive verdict exists.
     """
 
     return {
@@ -519,6 +523,17 @@ def _job_response(
                 "message": event.message,
             }
             for event in job.events
+        ],
+        "health_probes": [
+            {
+                "index": probe.probe_index,
+                "kind": probe.kind.value,
+                "target": probe.target,
+                "outcome": probe.outcome.value,
+                "checked_at": probe.checked_at,
+                "reason": probe.reason,
+            }
+            for probe in job.health_probes
         ],
     }
 

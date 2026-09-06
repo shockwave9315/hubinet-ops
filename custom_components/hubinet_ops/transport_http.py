@@ -30,6 +30,7 @@ from .api import (
     HealthContractSummary,
     HealthProbe,
     HealthProbeKind,
+    HealthProbeOutcome,
     HubinetOpsApi,
     HubinetOpsApiFactory,
     HubinetOpsCannotConnect,
@@ -55,6 +56,7 @@ from .api import (
     PackagePlanApprovalStatus,
     PackageUpdateHealthOutcome,
     PackageUpdateJobEvent,
+    PackageUpdateJobHealthProbeResult,
     PackageUpdateJobState,
     PackageUpdateJobSummary,
     PackageUpdateJobView,
@@ -466,6 +468,17 @@ def _package_update_job_view(
                     message=str(event["message"]),
                 )
                 for event in payload.get("events", ())
+            ),
+            health_probes=tuple(
+                PackageUpdateJobHealthProbeResult(
+                    probe_index=int(probe["index"]),
+                    kind=HealthProbeKind(probe["kind"]),
+                    target=str(probe["target"]),
+                    outcome=HealthProbeOutcome(probe["outcome"]),
+                    checked_at=str(probe["checked_at"]),
+                    reason=str(probe["reason"]),
+                )
+                for probe in health.get("probes", ())
             ),
         )
     except HubinetOpsInvalidResponse:

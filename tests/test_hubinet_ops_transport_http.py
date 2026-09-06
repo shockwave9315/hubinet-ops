@@ -37,6 +37,8 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.hubinet_ops.api import (
     BackendInformation,
     DetailStatus,
+    HealthProbeKind,
+    HealthProbeOutcome,
     HubinetOpsCannotConnect,
     HubinetOpsConflict,
     HubinetOpsInvalidAuth,
@@ -1131,6 +1133,92 @@ def _rollback_job_payload(resource_id: str) -> dict[str, Any]:
             "available": True,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Post-Human1 correction: per-probe health evidence must survive the real
+# backend JSON payload -> PackageUpdateJobView parse, not only the
+# FakeTransport shortcut the rest of the integration suite uses. A real
+# operator test needed exactly this evidence and it was durably computed by
+# the backend but never reached Home Assistant -- see ARCHITECTURE.md and
+# STATUS.md, "Job-bound healthcheck execution".
+# ---------------------------------------------------------------------------
+
+
+def test_package_update_job_view_parses_per_probe_health_evidence() -> None:
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_completed"
+    payload["health"] = {
+        "contract_revision": 3,
+        "started_at": "2026-09-06T13:40:16.792041+00:00",
+        "completed_at": "2026-09-06T13:40:23.444652+00:00",
+        "outcome": "failed",
+        "probes": [
+            {
+                "index": 0,
+                "kind": "docker_container_healthy",
+                "target": "weatherhub-redis-1",
+                "outcome": "unknown",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "container_health_starting",
+            },
+            {
+                "index": 1,
+                "kind": "docker_container_healthy",
+                "target": "weatherhub-weather-api-1",
+                "outcome": "unknown",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "container_health_starting",
+            },
+        ],
+    }
+
+    view = _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+    assert len(view.health_probes) == 2
+    first = view.health_probes[0]
+    assert first.probe_index == 0
+    assert first.kind is HealthProbeKind.DOCKER_CONTAINER_HEALTHY
+    assert first.target == "weatherhub-redis-1"
+    assert first.outcome is HealthProbeOutcome.UNKNOWN
+    assert first.reason == "container_health_starting"
+    assert first.checked_at == "2026-09-06T13:40:23.444652+00:00"
+
+
+def test_package_update_job_view_defaults_to_no_probes_when_absent() -> None:
+    """A job with no durable verdict carries no per-probe evidence at all --
+    an absent ``probes`` key must not be treated as a parse failure."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    assert "probes" not in payload["health"]
+
+    view = _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+    assert view.health_probes == ()
+
+
+def test_package_update_job_view_rejects_an_unknown_probe_outcome() -> None:
+    """A malformed backend answer must fail closed, never render a guess."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_completed"
+    payload["health"] = {
+        "contract_revision": 3,
+        "outcome": "failed",
+        "probes": [
+            {
+                "index": 0,
+                "kind": "docker_container_healthy",
+                "target": "web",
+                "outcome": "maybe",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "container_health_starting",
+            },
+        ],
+    }
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
 
 
 class _DelayedRollbackServer:

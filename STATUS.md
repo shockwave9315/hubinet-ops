@@ -730,8 +730,12 @@ lifecycle "Production activation" describes.
   absence merely because the daemon answers. Only a successful bounded fixed
   listing of every complete container name that omits the requested exact name
   proves absence. `docker_container_healthy` is never downgraded to
-  "running": not running, `unhealthy`, `starting`, and no HEALTHCHECK at all
-  are each a definitive failure.
+  "running": not running, `unhealthy`, and no HEALTHCHECK at all are each a
+  definitive failure. `starting` is UNKNOWN rather than a definitive failure
+  (post-Human1 correction) -- it is Docker's own transient post-restart
+  state, entered automatically before any health probe can run, never a
+  workload verdict; see "Job-bound healthcheck execution" below and
+  `ARCHITECTURE.md`.
 - **Atomic final live-target proof.** The backend re-proves the exact
   resource/locator context before the host call and once as an early rejection
   after it; the helper's single guest dispatcher revalidates before every `pct
@@ -760,6 +764,27 @@ lifecycle "Production activation" describes.
   host-local `pct exec`, so the provisioned role stays exactly the audit-only
   pair. Human0 proved both a passing frozen contract and a deterministic failed
   frozen contract against real update jobs.
+- **Post-Human1 correction: `docker_container_healthy`'s `starting` status is
+  UNKNOWN, not FAILED.** A real Human1 operator test approved a package plan
+  that legitimately restarted Docker/containerd; every declared container was
+  observed `starting` at the instant health ran and `healthy` again seconds
+  later with no operator action in between, but the original classification
+  durably recorded a FAILED verdict anyway. `starting` now reports
+  `unknown`/`container_health_starting` -- no durable verdict, no retry
+  policy or grace period added, and the job stays ACTIVE at `health_started`
+  for an operator to resume, exactly like every other unevaluable probe. See
+  `ARCHITECTURE.md`, "Job-bound healthcheck execution".
+- **Post-Human1 addition: per-probe health evidence is readable from Home
+  Assistant.** The explicit job readback (`GET .../package-update`, the
+  `start_update`/`resume_update`/`rollback_update`/`view_update_job`
+  responses, and the native `view_update_job` HA action/notification) now
+  include each frozen probe's `kind`, `target`, `outcome`, `checked_at`, and
+  bounded `reason` token once a definitive verdict exists. A real operator
+  had to read the authority SQLite database directly to learn that three
+  probes had failed with the same bounded reason; this closes that gap
+  without exposing raw helper stdout/stderr, command text, or unbounded
+  attributes -- every field is a durable, typed, bounded authority fact
+  already computed by this stage.
 
 ## Production activation (implemented)
 
@@ -862,6 +887,18 @@ The operator-triggered update lifecycle is production reachable.
 - The authority schema remains v19. Operator availability is transient
   presentation data and richer job summaries are revisioned publication facts;
   no new durable authority state was needed.
+- **Post-Human1 live-defect remediation.** A real operator test exposed two
+  further HA-facing gaps, both closed without new durable authority: (1) an
+  operator who reviews and approves a plan but has not yet declared a health
+  contract now sees a native Home Assistant Repair (Settings → Repairs)
+  naming the existing `set_health_contract` action, instead of a silent dead
+  end after a disabled Start button; (2) the explicit job readback
+  (`view_update_job`, and the response of `start_update`/`resume_update`/
+  `rollback_update`) now includes each frozen probe's kind, target, outcome,
+  checked-at time, and bounded reason token once a definitive verdict exists,
+  so a FAILED or UNKNOWN health result is answerable from Home Assistant
+  without shell/SQLite access. Neither change stores new durable HA state or
+  lets Home Assistant choose a health contract on the operator's behalf.
 
 ### Next — Human1 follow-ons deliberately deferred
 
