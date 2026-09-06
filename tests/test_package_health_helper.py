@@ -1437,6 +1437,31 @@ def test_a_real_round_trip_produces_typed_probe_results(tmp_path: Path) -> None:
     assert result.last_round_span_ms is not None
 
 
+def test_a_real_discovery_round_trip_produces_a_typed_result(tmp_path: Path) -> None:
+    """Real authority -> real SSH transport JSON encoding -> the real
+    deployed helper's discovery engine -> a typed, bounded result. Proves
+    the SECOND operation is genuinely reachable through the same boundary
+    the first one already is."""
+
+    from tests.test_package_update_health import _mutated_job
+
+    _, _, authority, resource, _, _, _ = _mutated_job(tmp_path)
+    request = authority.resource_health_discovery_request(resource.resource_id)
+    guest = DiscoveryGuest()
+    guest.vmid = request.vmid
+    guest.current_node = request.expected_node
+    guest.docker_info = {"web": ("running", "healthcheck")}
+
+    result = _transport(_round_trip_runner(guest)).discover_health_candidates(request)
+
+    assert result.status.value == "ok"
+    assert result.recommendation_basis.value == "docker_healthcheck"
+    assert len(result.candidates) == 1
+    assert result.candidates[0].target == "web"
+    assert result.candidates[0].kind.value == "docker_container_healthy"
+    assert result.candidates[0].recommended is True
+
+
 def test_the_transport_refuses_an_answer_about_another_job(tmp_path: Path) -> None:
     from app.package_update_health import PackageUpdateHealthError
     from app.package_scan_host_control import BoundedProcessResult
@@ -1695,3 +1720,357 @@ def test_backend_eligibility_and_standalone_helper_grammars_are_identical() -> N
     assert helper.SYSTEMD_UNIT_RE.pattern == SYSTEMD_UNIT_PATTERN
     assert helper.SYSTEMD_UNIT_SUFFIXES == SYSTEMD_UNIT_SUFFIXES
     assert helper.DOCKER_NAME_RE.pattern == DOCKER_NAME_PATTERN
+
+
+# ===========================================================================
+# discover_health_candidates (v20): a SECOND typed read-only operation on
+# this same boundary. Ephemeral -- this file persists nothing, ever.
+# ===========================================================================
+
+
+class DiscoveryGuest:
+    """A deterministic stand-in for discovery's own batched commands --
+    distinct from `FakeGuest` above (different argv shapes entirely)."""
+
+    def __init__(self) -> None:
+        self.vmid = VMID
+        self.node = NODE
+        self.current_node = NODE
+        self.present = True
+        self.running = True
+        self.resource_type = "lxc"
+        self.docker_daemon_up = True
+        #: name -> (status, "healthcheck"|"none")
+        self.docker_info: dict[str, tuple[str, str]] = {}
+        #: (unit, unit-file-state)
+        self.unit_files: list[tuple[str, str]] = []
+        self.failed_units: list[str] = []
+        #: unit -> property dict; defaults to a plausible package-installed
+        #: enabled unit if not overridden.
+        self.unit_props: dict[str, dict[str, str]] = {}
+        self.commands: list[tuple[str, ...]] = []
+
+    def __call__(self, argv, timeout, max_output):
+        self.commands.append(tuple(argv))
+        if argv[:2] == ("pvesh", "get") and argv[2] == "/cluster/status":
+            return self._ok(
+                json.dumps([{"type": "node", "name": self.node, "local": 1}]).encode()
+            )
+        if argv[:2] == ("pvesh", "get") and argv[2] == "/cluster/resources":
+            rows = []
+            if self.present:
+                rows.append(
+                    {
+                        "vmid": self.vmid,
+                        "type": self.resource_type,
+                        "node": self.current_node,
+                        "status": "running" if self.running else "stopped",
+                    }
+                )
+            return self._ok(json.dumps(rows).encode())
+        if argv[:2] == ("pct", "exec"):
+            return self._guest(argv[4:])
+        raise AssertionError(f"unexpected host command: {argv}")
+
+    def _guest(self, tail):
+        assert tail[0] == "env" and tail[1] == "LC_ALL=C", tail
+        command = tail[2]
+        if command == "docker":
+            return self._docker(tail)
+        if command == "systemctl":
+            return self._systemctl(tail)
+        raise AssertionError(f"unexpected guest command: {tail}")
+
+    def _docker(self, tail):
+        if tail[3] == "ps":
+            if not self.docker_daemon_up:
+                return helper.CommandResult(1, b"", b"daemon down")
+            return self._ok(
+                b"".join(
+                    json.dumps(name).encode() + b"\n" for name in self.docker_info
+                )
+            )
+        assert tail[3] == "inspect", tail
+        assert tail[7] == helper._DOCKER_DISCOVERY_INSPECT_FORMAT, tail
+        requested = tail[9:]
+        lines = []
+        for name in requested:
+            if name in self.docker_info:
+                status, hc = self.docker_info[name]
+                lines.append(f"/{name}\t{status}\t{hc}")
+        return self._ok(("\n".join(lines) + "\n").encode() if lines else b"")
+
+    def _systemctl(self, tail):
+        if tail[3] == "list-unit-files":
+            lines = [f"{unit}    {state}    -" for unit, state in self.unit_files]
+            return self._ok(("\n".join(lines) + "\n").encode())
+        if tail[3] == "list-units":
+            return self._ok(
+                ("\n".join(self.failed_units) + "\n").encode()
+                if self.failed_units
+                else b""
+            )
+        assert tail[3] == "show", tail
+        requested = tail[tail.index("--") + 1 :]
+        blocks = []
+        for unit in requested:
+            props = self.unit_props.get(
+                unit,
+                {
+                    "Id": unit,
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "UnitFileState": "enabled",
+                    "FragmentPath": f"/usr/lib/systemd/system/{unit}",
+                },
+            )
+            blocks.append("\n".join(f"{key}={value}" for key, value in props.items()))
+        return self._ok(("\n\n".join(blocks) + "\n").encode())
+
+    @staticmethod
+    def _ok(stdout: bytes):
+        return helper.CommandResult(0, stdout, b"")
+
+
+def _discover(guest) -> dict:
+    return helper.discover_health_candidates(
+        guest, guest.vmid, guest.current_node, guest.node
+    )
+
+
+def test_docker_healthcheck_candidates_are_recommended_over_everything() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {
+        "web": ("running", "healthcheck"),
+        "redis": ("running", "none"),
+    }
+    guest.unit_files = [("nginx.service", "enabled")]
+    result = _discover(guest)
+    assert result["status"] == "ok"
+    assert result["recommendation_basis"] == "docker_healthcheck"
+    by_target = {c["target"]: c for c in result["candidates"]}
+    assert by_target["web"]["kind"] == "docker_container_healthy"
+    assert by_target["web"]["recommended"] is True
+    # A Docker container without a HEALTHCHECK is still a real candidate --
+    # candidate existence is separate from what gets recommended.
+    assert by_target["redis"]["kind"] == "docker_container_running"
+    assert by_target["redis"]["recommended"] is False
+    # Docker HEALTHCHECK candidates outrank systemd entirely.
+    assert by_target["nginx.service"]["recommended"] is False
+
+
+def test_docker_running_candidates_recommended_when_none_healthchecked() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {"redis": ("running", "none"), "web": ("exited", "none")}
+    result = _discover(guest)
+    assert result["recommendation_basis"] == "docker_running"
+    assert all(c["recommended"] for c in result["candidates"])
+    assert all(c["kind"] == "docker_container_running" for c in result["candidates"])
+
+
+def test_a_single_systemd_workload_candidate_is_recommended() -> None:
+    guest = DiscoveryGuest()
+    guest.unit_files = [
+        ("mariadb.service", "enabled"),
+        ("ssh.service", "enabled"),
+        ("docker.service", "enabled"),
+    ]
+    guest.unit_props = {
+        "mariadb.service": {
+            "Id": "mariadb.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "UnitFileState": "enabled",
+            "FragmentPath": "/usr/lib/systemd/system/mariadb.service",
+        },
+    }
+    result = _discover(guest)
+    assert result["status"] == "ok"
+    assert result["recommendation_basis"] == "single_systemd_candidate"
+    by_target = {c["target"]: c for c in result["candidates"]}
+    assert by_target["mariadb.service"]["recommended"] is True
+    assert by_target["mariadb.service"]["role_hint"] == "workload_candidate"
+    assert by_target["mariadb.service"]["origin"] == "package_unit"
+    # Package origin does NOT imply platform -- confirmed by the assertion
+    # above staying "workload_candidate" despite a /usr/lib FragmentPath.
+    assert by_target["ssh.service"]["role_hint"] == "platform"
+    assert by_target["ssh.service"]["recommended"] is False
+    assert by_target["docker.service"]["role_hint"] == "runtime"
+    assert by_target["docker.service"]["recommended"] is False
+
+
+def test_multiple_systemd_workload_candidates_are_ambiguous() -> None:
+    guest = DiscoveryGuest()
+    guest.unit_files = [
+        ("mariadb.service", "enabled"),
+        ("mosquitto.service", "enabled"),
+    ]
+    result = _discover(guest)
+    assert result["status"] == "ambiguous_candidates"
+    assert result["recommendation_basis"] is None
+    assert all(not c["recommended"] for c in result["candidates"])
+    assert {c["target"] for c in result["candidates"]} == {
+        "mariadb.service",
+        "mosquitto.service",
+    }
+
+
+def test_a_failed_package_service_is_still_a_workload_candidate() -> None:
+    """A failed unit is discovered through the union with `list-units
+    --state=failed`, even when its unit file is not separately enabled."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = []
+    guest.failed_units = ["mosquitto.service loaded failed failed Mosquitto"]
+    guest.unit_props = {
+        "mosquitto.service": {
+            "Id": "mosquitto.service",
+            "LoadState": "loaded",
+            "ActiveState": "failed",
+            "UnitFileState": "enabled",
+            "FragmentPath": "/usr/lib/systemd/system/mosquitto.service",
+        },
+    }
+    result = _discover(guest)
+    assert result["status"] == "ok"
+    assert result["recommendation_basis"] == "single_systemd_candidate"
+    assert result["candidates"][0]["target"] == "mosquitto.service"
+    assert result["candidates"][0]["observed_state"] == "failed"
+
+
+def test_no_workload_candidates_recommends_the_guest_fallback() -> None:
+    """Platform-only systemd units (ssh, cron) are not a meaningful
+    workload -- the fallback is recommended, and those units still appear
+    in the response for operator visibility, just never recommended."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = [("ssh.service", "enabled"), ("cron.service", "enabled")]
+    result = _discover(guest)
+    assert result["status"] == "no_candidates"
+    assert result["recommendation_basis"] == "guest_fallback"
+    guest_candidates = [c for c in result["candidates"] if c["adapter"] == "guest"]
+    assert guest_candidates == [
+        {
+            "adapter": "guest",
+            "kind": "guest_operational",
+            "target": None,
+            "observed_state": "unknown",
+            "origin": None,
+            "role_hint": "workload_candidate",
+            "recommended": True,
+            "rationale": "guest_fallback",
+        }
+    ]
+    platform_targets = {
+        c["target"] for c in result["candidates"] if c["adapter"] == "systemd"
+    }
+    assert platform_targets == {"ssh.service", "cron.service"}
+    assert all(
+        not c["recommended"] for c in result["candidates"] if c["adapter"] == "systemd"
+    )
+
+
+def test_docker_uncertainty_never_produces_the_guest_fallback() -> None:
+    """CRITICAL frozen rule: discovery uncertainty in EITHER family must
+    never be read as "no workload exists"."""
+
+    guest = DiscoveryGuest()
+    guest.docker_daemon_up = False
+    guest.unit_files = []  # systemd discovery alone would otherwise be "no
+    # workload" -- must not matter once Docker is undecidable.
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+    assert result["candidates"] == []
+
+
+def test_systemd_command_failure_never_produces_the_guest_fallback() -> None:
+    guest = DiscoveryGuest()
+    original = guest._systemctl
+
+    def broken(tail):
+        if tail[3] == "list-unit-files":
+            return helper.CommandResult(1, b"", b"boom")
+        return original(tail)
+
+    guest._systemctl = broken
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+
+
+def test_docker_discovery_bound_is_enforced() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {
+        f"c{i}": ("running", "none") for i in range(helper.MAX_DOCKER_DISCOVERY_NAMES + 1)
+    }
+    result = _discover(guest)
+    assert result["status"] == "too_many_candidates"
+    assert result["candidates"] == []
+
+
+def test_no_candidates_at_all_is_distinct_from_guest_fallback_status() -> None:
+    """An entirely bare guest (no Docker, no discoverable systemd units at
+    all) still recommends the fallback -- "no candidates" is not a
+    terminal refusal, it is exactly when the fallback applies."""
+
+    guest = DiscoveryGuest()
+    result = _discover(guest)
+    assert result["recommendation_basis"] == "guest_fallback"
+
+
+def test_a_guest_that_is_not_running_is_reported_not_faked_as_bare() -> None:
+    guest = DiscoveryGuest()
+    guest.running = False
+    response = helper.handle_discover_request(
+        {
+            "request_version": 1,
+            "operation": "discover_health_candidates",
+            "target": {"vmid": VMID, "expected_node": NODE},
+            "ownership": {
+                "resource_id": str(uuid.uuid4()),
+                "binding_id": str(uuid.uuid4()),
+                "locator_generation": 1,
+                "resource_continuity_revision": 1,
+                "backend_instance_id": str(uuid.uuid4()),
+            },
+        },
+        runner=guest,
+    )
+    assert response["ok"] is True
+    assert response["discovery_status"] == "guest_unavailable"
+    assert response["candidates"] == []
+
+
+def test_discovery_request_never_accepts_a_job_id_or_workload_selector() -> None:
+    payload = {
+        "request_version": 1,
+        "operation": "discover_health_candidates",
+        "target": {"vmid": VMID, "expected_node": NODE},
+        "ownership": {
+            "resource_id": str(uuid.uuid4()),
+            "binding_id": str(uuid.uuid4()),
+            "locator_generation": 1,
+            "resource_continuity_revision": 1,
+            "backend_instance_id": str(uuid.uuid4()),
+            "job_id": str(uuid.uuid4()),
+        },
+    }
+    with pytest.raises(helper.RequestError, match="exact discovery shape"):
+        helper.validate_discover_request(payload)
+
+
+def test_the_evaluate_acceptance_marker_is_unaffected_by_discovery() -> None:
+    """The byte-identical bootstrap/updater acceptance marker still fires
+    for anything that is not literally the new operation -- including an
+    entirely empty payload, which `handle_request`'s dispatch must still
+    route to the SAME existing evaluate-request validation."""
+
+    with pytest.raises(
+        helper.RequestError, match="request must have the exact health-evaluation shape"
+    ):
+        helper.validate_request({})
+    with pytest.raises(
+        helper.RequestError, match="request must have the exact health-evaluation shape"
+    ):
+        helper.handle_request({}, runner=DiscoveryGuest())

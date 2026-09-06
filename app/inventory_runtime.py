@@ -655,17 +655,23 @@ def _thaw(value: Any) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class PackageUpdateRuntime:
-    """The production update composition: one worker, one read-only observer.
+    """The production update composition: one worker, two read-only observers.
 
     ``snapshot_host_control`` is held here, beside the worker, for exactly one
     reason: the explicit operator rollback route must obtain a FRESH canonical
     PVE snapshot listing before it may arm anything, and
     ``inspect_job_snapshot_state`` is the existing read-only operation that
     produces one. It submits nothing, seals nothing, and creates nothing.
+
+    ``health_host_control`` is held here for the same shape of reason (v20,
+    post-Human1 Stage 3B): the health-candidate-discovery route calls its
+    SECOND typed operation directly, entirely outside the worker/job
+    lifecycle -- discovery is not bound to any package-update job.
     """
 
     worker: PackageUpdateWorker
     snapshot_host_control: PackageUpdateSnapshotHostControl
+    health_host_control: SshPackageUpdateHealthHostControl
 
 
 def _build_package_update_runtime(
@@ -748,6 +754,7 @@ def _build_package_update_runtime(
             health=PackageUpdateHealthOrchestrator(authority, health_host_control),
         ),
         snapshot_host_control=snapshot_host_control,
+        health_host_control=health_host_control,
     )
 
 
@@ -1456,6 +1463,64 @@ def create_read_only_app(
             "resource_id": resource_id,
             "status": "unconfigured",
             "cleared": cleared,
+        }
+
+    def _discovery_candidate_body(candidate: Any) -> dict[str, Any]:
+        return {
+            "adapter": candidate.adapter.value,
+            "kind": candidate.kind.value,
+            "target": candidate.target,
+            "observed_state": candidate.observed_state,
+            "origin": None if candidate.origin is None else candidate.origin.value,
+            "role_hint": candidate.role_hint.value,
+            "recommended": candidate.recommended,
+            "rationale": candidate.rationale,
+        }
+
+    @app.get(
+        f"{API_PREFIX}/resources/{{resource_id}}/health-candidates",
+        dependencies=[Depends(_require_bearer_token)],
+    )
+    def discover_health_candidates_route(
+        resource_id: Annotated[str, ApiPath(pattern=_CANONICAL_UUID_PATTERN)],
+    ) -> dict[str, Any]:
+        """Ephemeral health-candidate discovery (v20, post-Human1 Stage 3B).
+
+        Read-only, and creates NO durable authority: nothing here is
+        persisted, revisioned, or fingerprinted. An operator who wants a
+        durable health contract from what this returns still explicitly
+        confirms it through the existing typed health-contract mutation
+        (``PUT .../health-contract``) -- this route only ever answers "what
+        candidates exist right now", never "declare this".
+        """
+
+        runtime = _require_activated()
+        try:
+            request = authority.resource_health_discovery_request(resource_id)
+        except AuthorityNotFound as exc:
+            raise _health_contract_error(404, "resource_not_found", str(exc)) from exc
+        except AuthorityConflict as exc:
+            raise _health_contract_error(409, "resource_not_current", str(exc)) from exc
+        try:
+            result = runtime.health_host_control.discover_health_candidates(request)
+        except Exception:  # noqa: BLE001 - any failure here is undecidable
+            return {
+                "resource_id": resource_id,
+                "discovery_status": "undecidable",
+                "candidates": [],
+                "recommendation_basis": None,
+            }
+        return {
+            "resource_id": resource_id,
+            "discovery_status": result.status.value,
+            "candidates": [
+                _discovery_candidate_body(candidate) for candidate in result.candidates
+            ],
+            "recommendation_basis": (
+                None
+                if result.recommendation_basis is None
+                else result.recommendation_basis.value
+            ),
         }
 
     return app

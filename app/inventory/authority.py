@@ -43,6 +43,7 @@ from .models import (
     PackageUpdateEventType,
     PackageUpdateExecutionOutcome,
     PackageUpdateHealthRequest,
+    ResourceHealthDiscoveryRequest,
     PackageUpdateJob,
     PackageUpdateJobHealthProbe,
     PackageUpdateJobStatus,
@@ -4295,6 +4296,48 @@ class InventoryAuthority:
         """
 
         return self.package_update_job(job_id).health_probes
+
+    def resource_health_discovery_request(
+        self, resource_id: str
+    ) -> ResourceHealthDiscoveryRequest:
+        """Assemble the typed request for the dark boundary's SECOND
+        operation: ephemeral health-candidate discovery (v20, post-Human1
+        Stage 3B).
+
+        Unlike :meth:`package_update_health_request`, this is not bound to
+        any job -- it reads the resource's CURRENT executable binding
+        directly, through the exact same narrow predicate package scanning
+        uses (`_require_package_scan_target`): present, active, LXC, with a
+        current binding and an available current node. Discovery is
+        read-only and creates no authority of its own, so there is no
+        "frozen generation" to re-prove afterwards the way a health
+        evaluation's verdict must be -- the caller re-derives this same
+        request fresh for its own next call if it needs to.
+        """
+
+        canonical_resource_id = _require_uuid(resource_id, "resource_id")
+        with self._store._read_transaction() as connection:
+            row = self._require_package_scan_target(connection, canonical_resource_id)
+            if str(row["resource_type"]) != "lxc":
+                raise AuthorityConflict(
+                    "health candidate discovery supports LXC resources only"
+                )
+            backend_instance_id = str(
+                connection.execute(
+                    "SELECT backend_instance_id FROM backend_instance"
+                ).fetchone()["backend_instance_id"]
+            )
+            return ResourceHealthDiscoveryRequest(
+                backend_instance_id=backend_instance_id,
+                resource_id=canonical_resource_id,
+                binding_id=str(row["binding_id"]),
+                locator_generation=int(row["locator_generation"]),
+                resource_continuity_revision=int(
+                    row["resource_continuity_revision"]
+                ),
+                vmid=int(row["vmid"]),
+                expected_node=str(row["external_node_name"]),
+            )
 
     def package_update_health_request(
         self, job_id: str

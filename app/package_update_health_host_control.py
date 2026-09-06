@@ -38,11 +38,19 @@ import re
 from typing import Any
 
 from app.inventory import (
+    HealthDiscoveryAdapter,
+    HealthDiscoveryCandidate,
+    HealthDiscoveryOrigin,
+    HealthDiscoveryRecommendationBasis,
+    HealthDiscoveryResult,
+    HealthDiscoveryRoleHint,
+    HealthDiscoveryStatus,
     HealthProbeKind,
     HealthProbeOutcome,
     MAX_HEALTH_PROBES,
     MAX_HEALTH_PROBE_TARGET_LENGTH,
     PackageUpdateHealthRequest,
+    ResourceHealthDiscoveryRequest,
 )
 from app.inventory_runtime_config import (
     PACKAGE_UPDATE_HEALTH_OBSERVATION_INTERVAL_SECONDS,
@@ -147,6 +155,64 @@ class SshPackageUpdateHealthHostControl:
         self, request: PackageUpdateHealthRequest
     ) -> HostHealthResult:
         return self._request("evaluate_health_contract", request)
+
+    def discover_health_candidates(
+        self, request: ResourceHealthDiscoveryRequest
+    ) -> HealthDiscoveryResult:
+        """The SECOND typed operation on this SAME boundary/key (v20,
+        post-Human1 Stage 3B): ephemeral candidate discovery. Never a
+        selector, a workload name, or a command -- only the resource's own
+        current typed context, exactly like the request it is built from.
+        """
+
+        if not isinstance(request, ResourceHealthDiscoveryRequest):
+            raise ValueError("a typed discovery request is required")
+        for field in ("backend_instance_id", "resource_id", "binding_id"):
+            value = getattr(request, field)
+            if not isinstance(value, str) or not _UUID_RE.fullmatch(value):
+                raise ValueError(f"{field} must be a canonical UUID")
+        if type(request.vmid) is not int or not 100 <= request.vmid <= 999_999_999:
+            raise ValueError("vmid must be a valid PVE integer VMID")
+        if not isinstance(request.expected_node, str) or not _NODE_RE.fullmatch(
+            request.expected_node
+        ):
+            raise ValueError("expected_node is invalid")
+        for field in ("locator_generation", "resource_continuity_revision"):
+            value = getattr(request, field)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{field} must be a positive integer")
+
+        payload = {
+            "request_version": 1,
+            "operation": "discover_health_candidates",
+            "target": {
+                "vmid": request.vmid,
+                "expected_node": request.expected_node,
+            },
+            "ownership": {
+                "resource_id": request.resource_id,
+                "resource_continuity_revision": (
+                    request.resource_continuity_revision
+                ),
+                "binding_id": request.binding_id,
+                "locator_generation": request.locator_generation,
+                "backend_instance_id": request.backend_instance_id,
+            },
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > _MAX_REQUEST_BYTES:
+            raise PackageUpdateHealthError(
+                "host-control request exceeded its structural bound"
+            )
+        result = self._runner(
+            self._argv(self._timeout_seconds),
+            encoded,
+            float(self._timeout_seconds),
+            self._max_result_bytes,
+        )
+        return self._parse_discovery(result, request)
 
     # -- transport -------------------------------------------------------
 
@@ -432,6 +498,183 @@ class SshPackageUpdateHealthHostControl:
             span_ms if type(span_ms) is int and 0 <= span_ms <= 3_600_000 else None
         )
         return bounded_rounds, bounded_seconds, bounded_span_ms
+
+    #: Independent of the transport's general `max_result_bytes`: discovery's
+    #: OWN bounded response ceiling (frozen architecture, Stage 3B).
+    _MAX_DISCOVERY_RESPONSE_BYTES = 64 * 1024
+    _MAX_DISCOVERY_CANDIDATES = 128
+
+    _DISCOVERY_STATUSES = frozenset(
+        {
+            "ok",
+            "no_candidates",
+            "ambiguous_candidates",
+            "guest_unavailable",
+            "undecidable",
+            "too_many_candidates",
+        }
+    )
+    _DISCOVERY_RECOMMENDATION_BASES = frozenset(
+        {
+            "docker_healthcheck",
+            "docker_running",
+            "single_systemd_candidate",
+            "guest_fallback",
+        }
+    )
+    _DISCOVERY_ADAPTERS = frozenset({"docker", "systemd", "guest"})
+    _DISCOVERY_ORIGINS = frozenset(
+        {"local_unit", "package_unit", "generated", "alias", "unknown_origin"}
+    )
+    _DISCOVERY_ROLE_HINTS = frozenset(
+        {"workload_candidate", "runtime", "platform", "ambiguous"}
+    )
+
+    def _parse_discovery(
+        self, result: BoundedProcessResult, request: ResourceHealthDiscoveryRequest
+    ) -> HealthDiscoveryResult:
+        if result.timed_out:
+            raise PackageUpdateHealthError(
+                "host-control discovery request timed out",
+                reason="command_timed_out",
+            )
+        if result.output_exceeded:
+            raise PackageUpdateHealthError(
+                "host-control discovery result exceeded its configured bound",
+                reason="malformed_output",
+            )
+        if result.returncode != 0 and not result.stdout:
+            raise PackageUpdateHealthError(
+                "host-control discovery SSH execution failed",
+                reason="host_unreachable",
+            )
+        if len(result.stdout) > self._MAX_DISCOVERY_RESPONSE_BYTES:
+            raise PackageUpdateHealthError(
+                "host-control discovery response exceeded its bounded size"
+            )
+        try:
+            payload = json.loads(result.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise PackageUpdateHealthError(
+                "host-control returned a malformed discovery response"
+            ) from exc
+        if not isinstance(payload, Mapping) or payload.get("response_version") != 1:
+            raise PackageUpdateHealthError(
+                "host-control returned an unsupported discovery response"
+            )
+        if payload.get("resource_id") != request.resource_id:
+            raise PackageUpdateHealthError(
+                "host-control discovery answered about a different resource"
+            )
+        if payload.get("ok") is not True:
+            raise PackageUpdateHealthError(
+                "host-control refused the discovery request"
+            )
+        status = payload.get("discovery_status")
+        if status not in self._DISCOVERY_STATUSES:
+            raise PackageUpdateHealthError(
+                "host-control returned an unknown discovery status"
+            )
+        raw_candidates = payload.get("candidates")
+        if not isinstance(raw_candidates, list):
+            raise PackageUpdateHealthError(
+                "host-control returned a malformed discovery candidate list"
+            )
+        if len(raw_candidates) > self._MAX_DISCOVERY_CANDIDATES:
+            raise PackageUpdateHealthError(
+                "host-control returned more discovery candidates than permitted"
+            )
+        candidates = tuple(
+            self._parse_discovery_candidate(raw) for raw in raw_candidates
+        )
+        raw_basis = payload.get("recommendation_basis")
+        if raw_basis is not None and raw_basis not in self._DISCOVERY_RECOMMENDATION_BASES:
+            raise PackageUpdateHealthError(
+                "host-control returned an unknown discovery recommendation basis"
+            )
+        return HealthDiscoveryResult(
+            status=HealthDiscoveryStatus(status),
+            candidates=candidates,
+            recommendation_basis=(
+                None
+                if raw_basis is None
+                else HealthDiscoveryRecommendationBasis(raw_basis)
+            ),
+        )
+
+    def _parse_discovery_candidate(self, raw: Any) -> HealthDiscoveryCandidate:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "adapter",
+            "kind",
+            "target",
+            "observed_state",
+            "origin",
+            "role_hint",
+            "recommended",
+            "rationale",
+        }:
+            raise PackageUpdateHealthError(
+                "host-control returned a malformed discovery candidate"
+            )
+        adapter = raw["adapter"]
+        if adapter not in self._DISCOVERY_ADAPTERS:
+            raise PackageUpdateHealthError(
+                "host-control returned an unknown discovery adapter"
+            )
+        try:
+            kind = HealthProbeKind(raw["kind"])
+        except ValueError as exc:
+            raise PackageUpdateHealthError(
+                "host-control returned an unsupported discovery candidate kind"
+            ) from exc
+        target = raw["target"]
+        if kind is HealthProbeKind.GUEST_OPERATIONAL:
+            if target is not None:
+                raise PackageUpdateHealthError(
+                    "host-control returned a target for a guest discovery candidate"
+                )
+        elif (
+            not isinstance(target, str)
+            or not 1 <= len(target) <= MAX_HEALTH_PROBE_TARGET_LENGTH
+        ):
+            raise PackageUpdateHealthError(
+                "host-control returned an invalid discovery candidate target"
+            )
+        observed_state = raw["observed_state"]
+        if not isinstance(observed_state, str) or not 1 <= len(observed_state) <= 100:
+            raise PackageUpdateHealthError(
+                "host-control returned an invalid discovery observed_state"
+            )
+        origin = raw["origin"]
+        if origin is not None and origin not in self._DISCOVERY_ORIGINS:
+            raise PackageUpdateHealthError(
+                "host-control returned an unknown discovery candidate origin"
+            )
+        role_hint = raw["role_hint"]
+        if role_hint not in self._DISCOVERY_ROLE_HINTS:
+            raise PackageUpdateHealthError(
+                "host-control returned an unknown discovery candidate role_hint"
+            )
+        recommended = raw["recommended"]
+        if type(recommended) is not bool:
+            raise PackageUpdateHealthError(
+                "host-control returned a non-boolean discovery recommended flag"
+            )
+        rationale = raw["rationale"]
+        if not isinstance(rationale, str) or not 1 <= len(rationale) <= 100:
+            raise PackageUpdateHealthError(
+                "host-control returned an invalid discovery rationale"
+            )
+        return HealthDiscoveryCandidate(
+            adapter=HealthDiscoveryAdapter(adapter),
+            kind=kind,
+            target=target,
+            observed_state=observed_state,
+            origin=None if origin is None else HealthDiscoveryOrigin(origin),
+            role_hint=HealthDiscoveryRoleHint(role_hint),
+            recommended=recommended,
+            rationale=rationale,
+        )
 
     @staticmethod
     def _parse_probe(raw: Any) -> HostProbeResult:

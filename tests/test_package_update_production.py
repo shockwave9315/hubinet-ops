@@ -43,6 +43,8 @@ import pytest
 
 from app.inventory import (
     AuthorityConflict,
+    HealthDiscoveryResult,
+    HealthDiscoveryStatus,
     HealthOutcome,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -276,6 +278,13 @@ class ScriptedHealthHostControl:
             contract_fingerprint=request.health_contract_fingerprint,
             probes=probes,
             evaluation_status=HealthEvaluationStatus.DECISIVE,
+        )
+
+    def discover_health_candidates(self, request):
+        return HealthDiscoveryResult(
+            status=HealthDiscoveryStatus.NO_CANDIDATES,
+            candidates=(),
+            recommendation_basis=None,
         )
 
 
@@ -1622,6 +1631,7 @@ class ApiSystem:
             return PackageUpdateRuntime(
                 worker=_DeferredWorker(seed),
                 snapshot_host_control=_DeferredSnapshotHost(seed),
+                health_host_control=_DeferredHealthHost(seed),
             )
 
         # The same fake clock the seeded authority used. Without it the
@@ -1693,6 +1703,16 @@ class _DeferredWorker:
 
     def stop(self, *, grace_seconds: float = 30.0) -> None:
         pass
+
+
+class _DeferredHealthHost:
+    """Forwards ephemeral discovery to the fixture's scripted boundary."""
+
+    def __init__(self, system: ProductionSystem) -> None:
+        self._system = system
+
+    def discover_health_candidates(self, request):
+        return self._system.health_host.discover_health_candidates(request)
 
 
 class _DeferredSnapshotHost:
@@ -1994,6 +2014,75 @@ def test_readback_includes_bounded_observation_evidence_when_unresolved(
             f"/r0/v1/resources/{system.resource_id}/package-update/resume"
         )
         assert resumed.status_code == 202
+    finally:
+        system.close()
+
+
+# ===========================================================================
+# Health-candidate discovery (v20, post-Human1 Stage 3B): ephemeral, and
+# reachable only through the real route -> real authority -> the health
+# host control's SECOND typed operation.
+# ===========================================================================
+
+
+def test_discover_health_candidates_route_persists_nothing(tmp_path: Path) -> None:
+    system = ApiSystem(tmp_path)
+    try:
+        before = system.store.record_counts()
+
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/health-candidates"
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["resource_id"] == system.resource_id
+        assert body["discovery_status"] == "no_candidates"
+        assert body["candidates"] == []
+        assert body["recommendation_basis"] is None
+
+        after = system.store.record_counts()
+        assert after == before
+    finally:
+        system.close()
+
+
+def test_discover_health_candidates_requires_activation(tmp_path: Path) -> None:
+    system = ApiSystem(tmp_path, activated=False)
+    try:
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/health-candidates"
+        )
+        assert response.status_code == 503
+        assert response.json()["detail"]["error"] == "package_update_not_activated"
+    finally:
+        system.close()
+
+
+def test_discover_health_candidates_requires_authentication(tmp_path: Path) -> None:
+    system = ApiSystem(tmp_path)
+    try:
+        response = system.client.get(
+            f"/r0/v1/resources/{system.resource_id}/health-candidates"
+        )
+        assert response.status_code in (401, 403)
+    finally:
+        system.close()
+
+
+def test_resource_health_discovery_request_assembles_current_context(
+    tmp_path: Path,
+) -> None:
+    system = ApiSystem(tmp_path)
+    try:
+        request = system.authority.resource_health_discovery_request(
+            system.resource_id
+        )
+        assert request.resource_id == system.resource_id
+        assert request.vmid > 0
+        assert request.expected_node
+        assert request.locator_generation > 0
+        assert request.resource_continuity_revision > 0
     finally:
         system.close()
 

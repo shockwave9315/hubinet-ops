@@ -1110,6 +1110,117 @@ class PackageUpdateHealthRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ResourceHealthDiscoveryRequest:
+    """Everything the dark health boundary's SECOND typed operation is told,
+    for one ephemeral candidate-discovery read (v20, post-Human1 Stage 3B).
+
+    Assembled entirely from the resource's CURRENT authority context -- no
+    job envelope, because discovery is not bound to any package-update job.
+    There is deliberately no ``job_id`` and no field through which an
+    operator could supply a workload name, a command, or a selector string:
+    this asks "what candidates exist", never "check this one thing".
+    """
+
+    backend_instance_id: str
+    resource_id: str
+    binding_id: str
+    locator_generation: int
+    resource_continuity_revision: int
+    vmid: int
+    expected_node: str
+
+
+class HealthDiscoveryAdapter(StrEnum):
+    """The supported v0.5 discovery adapters. Closed on purpose -- see
+    `ARCHITECTURE.md`, "Job-bound healthcheck execution": Podman, s6, runit,
+    HTTP, and TCP adapters are explicitly future work, never invented here."""
+
+    DOCKER = "docker"
+    SYSTEMD = "systemd"
+    GUEST = "guest"
+
+
+class HealthDiscoveryOrigin(StrEnum):
+    """Where a systemd candidate's unit file came from. Neutral: a
+    PACKAGE_UNIT is not thereby "platform" -- see `HealthDiscoveryRoleHint`.
+    Always ``None`` for a Docker or guest candidate."""
+
+    LOCAL_UNIT = "local_unit"
+    PACKAGE_UNIT = "package_unit"
+    GENERATED = "generated"
+    ALIAS = "alias"
+    UNKNOWN_ORIGIN = "unknown_origin"
+
+
+class HealthDiscoveryRoleHint(StrEnum):
+    """A structural hint, never a health fact. ``PLATFORM``/``RUNTIME`` are
+    small code-owned exclusions (container/init-system machinery, never a
+    guessed-at deny-list); a real workload is never excluded merely for
+    having a package origin."""
+
+    WORKLOAD_CANDIDATE = "workload_candidate"
+    RUNTIME = "runtime"
+    PLATFORM = "platform"
+    AMBIGUOUS = "ambiguous"
+
+
+class HealthDiscoveryStatus(StrEnum):
+    """What discovery could truthfully determine. Distinguishes "no workload
+    exists" from every shape of "could not tell" -- the frozen rule
+    `guest_operational` recommendation depends on: uncertainty must NEVER be
+    read as proof of absence."""
+
+    OK = "ok"
+    NO_CANDIDATES = "no_candidates"
+    AMBIGUOUS_CANDIDATES = "ambiguous_candidates"
+    GUEST_UNAVAILABLE = "guest_unavailable"
+    UNDECIDABLE = "undecidable"
+    TOO_MANY_CANDIDATES = "too_many_candidates"
+
+
+class HealthDiscoveryRecommendationBasis(StrEnum):
+    """The bounded, backend-owned rationale for what (if anything) discovery
+    recommended. Home Assistant renders this as a translated token; it never
+    computes or infers one itself."""
+
+    DOCKER_HEALTHCHECK = "docker_healthcheck"
+    DOCKER_RUNNING = "docker_running"
+    SINGLE_SYSTEMD_CANDIDATE = "single_systemd_candidate"
+    GUEST_FALLBACK = "guest_fallback"
+
+
+@dataclass(frozen=True, slots=True)
+class HealthDiscoveryCandidate:
+    """One ephemeral candidate health probe. Never persisted -- discovery
+    creates no authority; only an explicit health-contract mutation does.
+
+    ``target`` is ``None`` for, and only for, a ``guest`` adapter candidate
+    (``kind=guest_operational``), exactly like a declared probe.
+    """
+
+    adapter: HealthDiscoveryAdapter
+    kind: HealthProbeKind
+    target: str | None
+    observed_state: str
+    origin: HealthDiscoveryOrigin | None
+    role_hint: HealthDiscoveryRoleHint
+    recommended: bool
+    #: A bounded, backend-owned classification token -- never a sentence
+    #: composed here, so Home Assistant can translate it without carrying
+    #: backend-authored English text.
+    rationale: str
+
+
+@dataclass(frozen=True, slots=True)
+class HealthDiscoveryResult:
+    """The complete, bounded, ephemeral answer to one discovery read."""
+
+    status: HealthDiscoveryStatus
+    candidates: tuple[HealthDiscoveryCandidate, ...]
+    recommendation_basis: HealthDiscoveryRecommendationBasis | None
+
+
+@dataclass(frozen=True, slots=True)
 class PackageUpdateRollbackIdentity:
     """One package update job's single deterministic same-job rollback.
 

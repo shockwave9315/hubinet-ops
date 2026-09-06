@@ -221,6 +221,7 @@ def test_2_only_reads_and_exact_authority_metadata_writes_exist(tmp_path: Path) 
         "/r0/v1/operator-availability": {"GET"},
         "/r0/v1/resources/{resource_id}/package-plan-approval": {"PUT"},
         "/r0/v1/resources/{resource_id}/health-contract": {"GET", "PUT", "DELETE"},
+        "/r0/v1/resources/{resource_id}/health-candidates": {"GET"},
         "/r0/v1/resources/{resource_id}/package-update": {"GET", "POST"},
         "/r0/v1/resources/{resource_id}/package-update/resume": {"POST"},
         "/r0/v1/resources/{resource_id}/package-update/rollback": {"POST"},

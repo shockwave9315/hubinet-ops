@@ -1495,6 +1495,580 @@ def evaluate_health_contract_settling(
     }
 
 
+# ---------------------------------------------------------------------------
+# discover_health_candidates -- the SECOND typed read-only operation on this
+# SAME dedicated boundary/helper/key (v20, post-Human1 Stage 3B). Ephemeral:
+# creates no authority, persists nothing, and accepts no operator-supplied
+# workload name, command, or selector -- only the resource's own current
+# typed context. Supported adapters: docker, systemd, guest (a fallback, not
+# a fourth workload adapter).
+# ---------------------------------------------------------------------------
+
+MAX_DOCKER_DISCOVERY_NAMES = 64
+MAX_SYSTEMD_DISCOVERY_UNITS = 128
+MAX_DISCOVERY_CANDIDATES = 128
+MAX_RECOMMENDED_PROBES = 32
+MAX_DISCOVERY_RESPONSE_BYTES = 64 * 1024
+DISCOVERY_DEADLINE_SECONDS = 60.0
+
+_DOCKER_DISCOVERY_INSPECT_FORMAT = (
+    "{{.Name}}\t{{.State.Status}}\t"
+    "{{if .Config.Healthcheck}}healthcheck{{else}}none{{end}}"
+)
+
+#: Exact code-owned exclusions -- never a distro-specific deny-list grown ad
+#: hoc. A PACKAGE_UNIT origin never demotes a candidate by itself; only
+#: these small, structural, name-based rules do.
+_SYSTEMD_RUNTIME_UNITS = frozenset(
+    {"docker.service", "containerd.service", "podman.service", "cri-o.service"}
+)
+_SYSTEMD_PLATFORM_UNITS = frozenset(
+    {
+        "ssh.service",
+        "sshd.service",
+        "cron.service",
+        "dbus.service",
+        "rsyslog.service",
+        "qemu-guest-agent.service",
+        "unattended-upgrades.service",
+    }
+)
+_SYSTEMD_PLATFORM_PREFIXES = ("systemd-", "getty@", "getty.", "serial-getty@")
+
+#: `list-unit-files` states this discovery considers as candidate SOURCES.
+#: `static`/`masked`/`alias`/`generated`/`transient` are not operator-facing
+#: enable/disable choices and are excluded -- an "alias" entry in particular
+#: would only ever re-list a unit already reachable under its canonical name.
+_SYSTEMD_DISCOVERY_UNIT_FILE_STATES = frozenset(
+    {"enabled", "enabled-runtime", "disabled"}
+)
+
+
+def _systemd_discovery_role_hint(unit: str) -> str:
+    if unit in _SYSTEMD_RUNTIME_UNITS:
+        return "runtime"
+    if unit in _SYSTEMD_PLATFORM_UNITS or unit.startswith(_SYSTEMD_PLATFORM_PREFIXES):
+        return "platform"
+    return "workload_candidate"
+
+
+def _systemd_discovery_origin(fragment_path: str) -> str:
+    if not fragment_path:
+        return "unknown_origin"
+    if fragment_path.startswith(
+        ("/etc/systemd/system/", "/usr/local/lib/systemd/system/")
+    ):
+        return "local_unit"
+    if fragment_path.startswith(("/lib/systemd/system/", "/usr/lib/systemd/system/")):
+        return "package_unit"
+    if fragment_path.startswith("/run/systemd/"):
+        return "generated"
+    return "unknown_origin"
+
+
+def _discover_docker_candidates(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    *,
+    remaining_budget: float,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Returns ``(candidates, undecided_status)``. ``undecided_status`` is
+    ``None`` on a truthful, complete read (zero candidates included, since a
+    guest can legitimately have no Docker containers at all); otherwise one
+    of the bounded discovery statuses this family could not get past.
+    """
+
+    try:
+        result = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            (
+                "env",
+                "LC_ALL=C",
+                "docker",
+                "ps",
+                "--all",
+                "--no-trunc",
+                "--format",
+                DOCKER_NAME_LIST_FORMAT,
+            ),
+            max_output=1024 * 1024,
+            timeout=_clamped_command_timeout(remaining_budget),
+        )
+    except (ProbeUnknown, HealthError):
+        return [], "undecidable"
+    if result.timed_out or result.output_exceeded or result.returncode != 0:
+        # Never read "the daemon did not answer" as "there is no Docker" --
+        # that would be exactly the uncertainty-as-absence the frozen
+        # architecture forbids.
+        return [], "undecidable"
+    names: list[str] = []
+    try:
+        stdout = result.stdout.decode("utf-8")
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            listed = json.loads(line)
+            if not isinstance(listed, str) or not listed:
+                return [], "undecidable"
+            names.append(listed)
+    except (UnicodeDecodeError, ValueError):
+        return [], "undecidable"
+    if not names:
+        return [], None
+    if len(names) > MAX_DOCKER_DISCOVERY_NAMES:
+        return [], "too_many_candidates"
+
+    try:
+        inspected = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            (
+                "env",
+                "LC_ALL=C",
+                "docker",
+                "inspect",
+                "--type",
+                "container",
+                "--format",
+                _DOCKER_DISCOVERY_INSPECT_FORMAT,
+                "--",
+                *names,
+            ),
+            data_arguments=names,
+            max_output=64 * 1024 * len(names),
+            timeout=_clamped_command_timeout(remaining_budget),
+        )
+    except (ProbeUnknown, HealthError):
+        return [], "undecidable"
+    if inspected.timed_out or inspected.output_exceeded:
+        return [], "undecidable"
+
+    candidates: list[dict[str, Any]] = []
+    try:
+        stdout = inspected.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return [], "undecidable"
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) != 3 or not fields[0].startswith("/"):
+            continue
+        name, status, healthcheck = fields[0][1:], fields[1], fields[2]
+        if name not in names:
+            continue
+        has_healthcheck = healthcheck == "healthcheck"
+        candidates.append(
+            {
+                "adapter": "docker",
+                "kind": (
+                    "docker_container_healthy"
+                    if has_healthcheck
+                    else "docker_container_running"
+                ),
+                "target": name,
+                "observed_state": status if status else "unknown",
+                "origin": None,
+                "role_hint": "workload_candidate",
+                "recommended": False,
+                "rationale": (
+                    "docker_healthcheck_present"
+                    if has_healthcheck
+                    else "docker_container_exists"
+                ),
+            }
+        )
+    return candidates, None
+
+
+def _discover_systemd_candidates(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    *,
+    remaining_budget: float,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Returns ``(candidates, undecided_status)``, exactly like the Docker
+    family above."""
+
+    try:
+        listed = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            (
+                "env",
+                "LC_ALL=C",
+                "systemctl",
+                "list-unit-files",
+                "--type=service",
+                "--no-legend",
+                "--no-pager",
+            ),
+            max_output=1024 * 1024,
+            timeout=_clamped_command_timeout(remaining_budget),
+        )
+        failed = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            (
+                "env",
+                "LC_ALL=C",
+                "systemctl",
+                "list-units",
+                "--all",
+                "--type=service",
+                "--state=failed",
+                "--no-legend",
+                "--no-pager",
+            ),
+            max_output=1024 * 1024,
+            timeout=_clamped_command_timeout(remaining_budget),
+        )
+    except (ProbeUnknown, HealthError):
+        return [], "undecidable"
+    if listed.timed_out or listed.output_exceeded or listed.returncode != 0:
+        return [], "undecidable"
+    if failed.timed_out or failed.output_exceeded or failed.returncode != 0:
+        return [], "undecidable"
+
+    units: list[str] = []
+    seen: set[str] = set()
+    try:
+        for line in listed.stdout.decode("utf-8").splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            unit, state = parts[0], parts[1]
+            if (
+                state in _SYSTEMD_DISCOVERY_UNIT_FILE_STATES
+                and SYSTEMD_UNIT_RE.fullmatch(unit)
+                and unit.endswith(SYSTEMD_UNIT_SUFFIXES)
+                and "@" not in unit
+                and unit not in seen
+            ):
+                units.append(unit)
+                seen.add(unit)
+        for line in failed.stdout.decode("utf-8").splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            unit = parts[0].lstrip("●").strip()
+            if (
+                SYSTEMD_UNIT_RE.fullmatch(unit)
+                and unit.endswith(SYSTEMD_UNIT_SUFFIXES)
+                and "@" not in unit
+                and unit not in seen
+            ):
+                units.append(unit)
+                seen.add(unit)
+    except UnicodeDecodeError:
+        return [], "undecidable"
+
+    if not units:
+        return [], None
+    if len(units) > MAX_SYSTEMD_DISCOVERY_UNITS:
+        return [], "too_many_candidates"
+
+    try:
+        result = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            (
+                "env",
+                "LC_ALL=C",
+                "systemctl",
+                "show",
+                "--no-pager",
+                "--property=Id",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=UnitFileState",
+                "--property=FragmentPath",
+                "--",
+                *units,
+            ),
+            data_arguments=units,
+            max_output=64 * 1024 * len(units),
+            timeout=_clamped_command_timeout(remaining_budget),
+        )
+    except (ProbeUnknown, HealthError):
+        return [], "undecidable"
+    if result.timed_out or result.output_exceeded:
+        return [], "undecidable"
+    try:
+        stdout = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return [], "undecidable"
+    blocks = [block for block in stdout.strip().split("\n\n") if block.strip()]
+    if len(blocks) != len(units):
+        return [], "undecidable"
+
+    candidates: list[dict[str, Any]] = []
+    for unit, block in zip(units, blocks, strict=True):
+        properties: dict[str, str] = {}
+        for line in block.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            properties.setdefault(key, value)
+        if properties.get("LoadState") != "loaded":
+            continue
+        fragment_path = properties.get("FragmentPath", "")
+        origin = _systemd_discovery_origin(fragment_path)
+        # The requested unit and the answer's own Id can differ for an
+        # alias (verified: ssh.service/sshd.service share one Id) -- report
+        # it under the name actually requested, but flag the origin.
+        if properties.get("Id") and properties["Id"] != unit:
+            origin = "alias"
+        candidates.append(
+            {
+                "adapter": "systemd",
+                "kind": "systemd_unit_active",
+                "target": unit,
+                "observed_state": properties.get("ActiveState", "unknown"),
+                "origin": origin,
+                "role_hint": _systemd_discovery_role_hint(unit),
+                "recommended": False,
+                "rationale": "systemd_unit_file_present",
+            }
+        )
+    return candidates, None
+
+
+def discover_health_candidates(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    *,
+    monotonic: Clock = time.monotonic,
+) -> dict[str, Any]:
+    """One bounded, ephemeral candidate-discovery read. Never persists
+    anything; the caller (the backend) is the only place authority for a
+    health contract can ever be created, and only via an explicit operator
+    confirmation through the existing typed health-contract mutation.
+    """
+
+    start = monotonic()
+    deadline = start + DISCOVERY_DEADLINE_SECONDS
+
+    docker_candidates, docker_status = _discover_docker_candidates(
+        runner,
+        vmid,
+        expected_node,
+        local_node,
+        remaining_budget=max(0.0, deadline - monotonic()),
+    )
+    systemd_candidates, systemd_status = _discover_systemd_candidates(
+        runner,
+        vmid,
+        expected_node,
+        local_node,
+        remaining_budget=max(0.0, deadline - monotonic()),
+    )
+
+    # CRITICAL frozen rule: discovery uncertainty in EITHER family must
+    # never be read as "no workload exists" -- it stops here, undecided,
+    # and never reaches the guest-fallback recommendation below.
+    if docker_status is not None or systemd_status is not None:
+        status = next(s for s in (docker_status, systemd_status) if s is not None)
+        return {"status": status, "candidates": [], "recommendation_basis": None}
+
+    candidates = docker_candidates + systemd_candidates
+    if len(candidates) > MAX_DISCOVERY_CANDIDATES:
+        return {
+            "status": "too_many_candidates",
+            "candidates": [],
+            "recommendation_basis": None,
+        }
+
+    # Recommendation: backend-owned priority order, computed here (never by
+    # Home Assistant, never re-derived from a separate "current health"
+    # read -- current unhealthy state must never suppress candidacy).
+    docker_healthchecked = [
+        c for c in docker_candidates if c["kind"] == "docker_container_healthy"
+    ]
+    recommendation_basis: str | None = None
+    if docker_healthchecked:
+        for candidate in docker_healthchecked:
+            candidate["recommended"] = True
+        recommendation_basis = "docker_healthcheck"
+    elif docker_candidates:
+        for candidate in docker_candidates:
+            candidate["recommended"] = True
+        recommendation_basis = "docker_running"
+    else:
+        workload_candidates = [
+            c for c in systemd_candidates if c["role_hint"] == "workload_candidate"
+        ]
+        if len(workload_candidates) == 1:
+            workload_candidates[0]["recommended"] = True
+            recommendation_basis = "single_systemd_candidate"
+        elif len(workload_candidates) > 1:
+            return {
+                "status": "ambiguous_candidates",
+                "candidates": candidates[:MAX_DISCOVERY_CANDIDATES],
+                "recommendation_basis": None,
+            }
+        else:
+            # Positively completed discovery, both families, with NO
+            # meaningful supported workload candidate -- Docker or systemd
+            # -- found at all. The ONLY circumstance in which the guest
+            # fallback may be recommended. Any platform/runtime systemd
+            # units still found stay in the response for operator
+            # visibility; they are not thrown away, just never recommended.
+            candidates.append(
+                {
+                    "adapter": "guest",
+                    "kind": "guest_operational",
+                    "target": None,
+                    "observed_state": "unknown",
+                    "origin": None,
+                    "role_hint": "workload_candidate",
+                    "recommended": True,
+                    "rationale": "guest_fallback",
+                }
+            )
+            recommendation_basis = "guest_fallback"
+
+    recommended_count = sum(1 for c in candidates if c["recommended"])
+    if recommended_count > MAX_RECOMMENDED_PROBES:
+        # Never silently truncate an ALL-OF recommended set.
+        for candidate in candidates:
+            candidate["recommended"] = False
+        return {
+            "status": "too_many_candidates",
+            "candidates": candidates[:MAX_DISCOVERY_CANDIDATES],
+            "recommendation_basis": None,
+        }
+
+    if recommendation_basis == "guest_fallback":
+        status = "no_candidates"
+    elif candidates:
+        status = "ok"
+    else:
+        status = "no_candidates"
+    return {
+        "status": status,
+        "candidates": candidates[:MAX_DISCOVERY_CANDIDATES],
+        "recommendation_basis": recommendation_basis,
+    }
+
+
+def validate_discover_request(payload: Any) -> dict[str, Any]:
+    """Accept exactly one request shape for the discovery operation.
+
+    No ``job_id``, no operator-supplied workload name, no command, no
+    selector string -- only the resource's own current typed context.
+    """
+
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "request_version",
+        "operation",
+        "target",
+        "ownership",
+    }:
+        raise RequestError("request must have the exact discovery shape")
+    if (
+        payload["request_version"] != 1
+        or payload["operation"] != "discover_health_candidates"
+    ):
+        raise RequestError("unknown host-control operation")
+
+    target = payload["target"]
+    if not isinstance(target, Mapping) or set(target) != {"vmid", "expected_node"}:
+        raise RequestError("target must have the exact discovery shape")
+    vmid = target["vmid"]
+    if type(vmid) is not int or not 100 <= vmid <= 999_999_999:
+        raise RequestError("vmid must be a valid PVE integer VMID")
+    expected_node = target["expected_node"]
+    if not isinstance(expected_node, str) or not NODE_RE.fullmatch(expected_node):
+        raise RequestError("expected_node is invalid")
+
+    ownership = payload["ownership"]
+    if not isinstance(ownership, Mapping) or set(ownership) != {
+        "resource_id",
+        "binding_id",
+        "locator_generation",
+        "resource_continuity_revision",
+        "backend_instance_id",
+    }:
+        raise RequestError("ownership must have the exact discovery shape")
+    normalized_ownership = {
+        "resource_id": _canonical_uuid(ownership["resource_id"], "resource_id"),
+        "binding_id": _canonical_uuid(ownership["binding_id"], "binding_id"),
+        "locator_generation": _positive_integer(
+            ownership["locator_generation"], "locator_generation"
+        ),
+        "resource_continuity_revision": _positive_integer(
+            ownership["resource_continuity_revision"],
+            "resource_continuity_revision",
+        ),
+        "backend_instance_id": _canonical_uuid(
+            ownership["backend_instance_id"], "backend_instance_id"
+        ),
+    }
+    return {
+        "vmid": vmid,
+        "expected_node": expected_node,
+        "ownership": normalized_ownership,
+    }
+
+
+def handle_discover_request(
+    payload: Any,
+    *,
+    runner: Runner = _run_bounded,
+    monotonic: Clock = time.monotonic,
+) -> dict[str, Any]:
+    request = validate_discover_request(payload)
+    vmid = request["vmid"]
+    expected_node = request["expected_node"]
+    resource_id = request["ownership"]["resource_id"]
+    try:
+        local_node = _local_node(runner)
+        revalidate_live_target(runner, vmid, expected_node)
+    except HealthError as exc:
+        classification = (
+            "guest_unavailable"
+            if exc.classification in ("guest_unavailable", "stale_target")
+            else "undecidable"
+        )
+        return {
+            "response_version": 1,
+            "ok": True,
+            "resource_id": resource_id,
+            "discovery_status": classification,
+            "candidates": [],
+            "recommendation_basis": None,
+        }
+    discovered = discover_health_candidates(
+        runner, vmid, expected_node, local_node, monotonic=monotonic
+    )
+    return {
+        "response_version": 1,
+        "ok": True,
+        "resource_id": resource_id,
+        "discovery_status": discovered["status"],
+        "candidates": discovered["candidates"],
+        "recommendation_basis": discovered["recommendation_basis"],
+    }
+
+
 def handle_request(
     payload: Any,
     *,
@@ -1502,6 +2076,18 @@ def handle_request(
     monotonic: Clock = time.monotonic,
     sleep: Sleeper = time.sleep,
 ) -> dict[str, Any]:
+    # Dispatch on operation, but ONLY for the exact new operation name --
+    # anything else (including a missing/malformed `operation`, or an
+    # entirely empty payload) falls straight through to the EXISTING
+    # evaluate-request validation below, so the byte-identical bootstrap/
+    # updater acceptance marker ("request must have the exact health-
+    # evaluation shape") is produced for every payload it was ever produced
+    # for before this operation existed.
+    if isinstance(payload, Mapping) and payload.get("operation") == (
+        "discover_health_candidates"
+    ):
+        return handle_discover_request(payload, runner=runner, monotonic=monotonic)
+
     request = validate_request(payload)
     vmid = request["vmid"]
     expected_node = request["expected_node"]
