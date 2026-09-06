@@ -54,6 +54,7 @@ from app.inventory import (
     aggregate_health_outcome,
 )
 from app.package_update_health import (
+    HealthEvaluationStatus,
     HealthStageStatus,
     HostHealthResult,
     HostProbeResult,
@@ -1523,6 +1524,15 @@ class FakeHealthHostControl:
                 )
                 for probe, outcome in zip(request.probes, outcomes)
             ),
+            # A round containing an UNKNOWN probe can never be decisive by
+            # construction; derived here from the same `outcomes` this fake
+            # already builds probes from, so every existing caller of this
+            # shared fake gets a coherent evaluation_status for free.
+            evaluation_status=(
+                HealthEvaluationStatus.UNRESOLVED
+                if any(outcome is HealthProbeOutcome.UNKNOWN for outcome in outcomes)
+                else HealthEvaluationStatus.DECISIVE
+            ),
         )
         if self.mutate is not None:
             result = self.mutate(result)
@@ -1643,6 +1653,7 @@ def test_a_lost_or_malformed_host_answer_is_unknown_and_retryable(
                 contract_revision=result.contract_revision + 1,
                 contract_fingerprint=result.contract_fingerprint,
                 probes=result.probes,
+                evaluation_status=result.evaluation_status,
             )
         )
     orchestrator = PackageUpdateHealthOrchestrator(authority, host)
@@ -1804,6 +1815,7 @@ def _host_result(job, **overrides):
             )
             for probe in job.health_probes
         ),
+        "evaluation_status": HealthEvaluationStatus.DECISIVE,
     }
     base.update(overrides)
     return HostHealthResult(**base)
@@ -2126,6 +2138,204 @@ def test_a_job_that_moved_on_mid_attempt_still_reports_no_verdict(
     assert result.status is HealthStageStatus.UNKNOWN
     assert result.job.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
     assert result.job.health_outcome is None
+
+
+# ===========================================================================
+# 11.5 Decisive vs unresolved: a durable verdict requires a DECISIVE round,
+# never inferred from the probe outcomes alone. PR #80 review findings.
+# ===========================================================================
+
+
+def test_failed_plus_unknown_at_deadline_is_unknown_never_failed(
+    tmp_path: Path,
+) -> None:
+    """A non-decisive round with one FAILED and one UNKNOWN probe (the
+    settling deadline hit mid-round) must never become a durable FAILED
+    verdict -- the ALL-OF proof that made a single FAILED probe enough
+    requires a COMPLETE decisive round, and this one is not."""
+
+    _, store, authority, _, _, _, job = _mutated_job(tmp_path)
+    host = FakeHealthHostControl(
+        outcomes=(HealthProbeOutcome.FAILED, HealthProbeOutcome.UNKNOWN)
+    )
+
+    result = PackageUpdateHealthOrchestrator(authority, host).evaluate_job_health(
+        job.job_id
+    )
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert result.job.health_outcome is None
+    assert result.job.health_completed_at is None
+    assert result.job.health_probe_results == ()
+
+
+def test_all_passed_but_unresolved_round_is_unknown_never_passed(
+    tmp_path: Path,
+) -> None:
+    """Every probe reads PASSED, but the host says the round was NOT
+    decisive (e.g. round span exceeded the bound, or it was the first
+    round). A clean-looking last observation from a non-decisive round is
+    not proof of anything and must never become a durable PASSED verdict."""
+
+    _, store, authority, _, _, _, job = _mutated_job(tmp_path)
+    host = FakeHealthHostControl(
+        mutate=lambda result: HostHealthResult(
+            contract_revision=result.contract_revision,
+            contract_fingerprint=result.contract_fingerprint,
+            probes=result.probes,
+            evaluation_status=HealthEvaluationStatus.UNRESOLVED,
+            settling_rounds=1,
+            settling_seconds=20.0,
+            last_round_span_ms=25_000,
+        )
+    )
+
+    result = PackageUpdateHealthOrchestrator(authority, host).evaluate_job_health(
+        job.job_id
+    )
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.health_outcome is None
+    assert result.job.health_completed_at is None
+    # No "blocking probe" exists (every probe read PASSED) -- the generic,
+    # honest classification for an answer that cannot be believed as a
+    # verdict is used instead of fabricating a per-probe reason.
+    event = store.list_package_update_job_events(job.job_id)[-1]
+    assert event.details["reason"] == "host_response_rejected"
+    assert event.details["rounds"] == 1
+    assert event.details["settled_seconds"] == 20.0
+
+
+def test_all_passed_in_a_decisive_round_is_passed(tmp_path: Path) -> None:
+    _, _, authority, _, _, _, job = _mutated_job(tmp_path)
+    host = FakeHealthHostControl(
+        outcomes=(HealthProbeOutcome.PASSED, HealthProbeOutcome.PASSED)
+    )
+
+    result = PackageUpdateHealthOrchestrator(authority, host).evaluate_job_health(
+        job.job_id
+    )
+
+    assert result.status is HealthStageStatus.PASSED
+    assert result.job.status is PackageUpdateJobStatus.SUCCEEDED
+    assert result.job.health_outcome is HealthOutcome.PASSED
+
+
+def test_one_failed_no_unknown_in_a_decisive_round_is_failed(tmp_path: Path) -> None:
+    _, _, authority, _, _, _, job = _mutated_job(tmp_path)
+    host = FakeHealthHostControl(
+        outcomes=(HealthProbeOutcome.FAILED, HealthProbeOutcome.PASSED)
+    )
+
+    result = PackageUpdateHealthOrchestrator(authority, host).evaluate_job_health(
+        job.job_id
+    )
+
+    assert result.status is HealthStageStatus.FAILED
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.health_outcome is HealthOutcome.FAILED
+
+
+def test_a_decisive_claim_with_an_unknown_probe_is_a_contradiction(
+    tmp_path: Path,
+) -> None:
+    """The host claiming BOTH "this round was decisive" AND "one probe
+    remained unknown" is self-contradictory -- decisive means every probe
+    resolved, by definition. Neither half of the contradiction is believed;
+    the whole answer is rejected."""
+
+    _, _, _, _, _, _, job = _mutated_job(tmp_path)
+    with pytest.raises(PackageUpdateHealthError, match="decisive"):
+        validate_host_health_result(
+            job,
+            _host_result(
+                job,
+                evaluation_status=HealthEvaluationStatus.DECISIVE,
+                probes=tuple(
+                    HostProbeResult(
+                        probe_index=probe.probe_index,
+                        kind=probe.kind,
+                        target=probe.target,
+                        outcome=(
+                            HealthProbeOutcome.UNKNOWN
+                            if probe.probe_index == 0
+                            else HealthProbeOutcome.PASSED
+                        ),
+                        reason=(
+                            "command_timed_out"
+                            if probe.probe_index == 0
+                            else (
+                                "unit_active"
+                                if probe.kind is HealthProbeKind.SYSTEMD_UNIT_ACTIVE
+                                else "container_running"
+                            )
+                        ),
+                    )
+                    for probe in job.health_probes
+                ),
+            ),
+        )
+
+
+def test_orchestrator_never_persists_a_verdict_from_a_contradictory_payload(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, _, _, _, job = _mutated_job(tmp_path)
+    host = FakeHealthHostControl(
+        outcomes=(HealthProbeOutcome.PASSED, HealthProbeOutcome.UNKNOWN),
+        mutate=lambda result: HostHealthResult(
+            contract_revision=result.contract_revision,
+            contract_fingerprint=result.contract_fingerprint,
+            probes=result.probes,
+            evaluation_status=HealthEvaluationStatus.DECISIVE,
+        ),
+    )
+
+    result = PackageUpdateHealthOrchestrator(authority, host).evaluate_job_health(
+        job.job_id
+    )
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.health_outcome is None
+    assert result.job.health_completed_at is None
+    assert result.job.health_probe_results == ()
+
+
+@pytest.mark.parametrize(
+    "outcomes",
+    (
+        (HealthProbeOutcome.PASSED, HealthProbeOutcome.PASSED),
+        (HealthProbeOutcome.FAILED, HealthProbeOutcome.PASSED),
+    ),
+)
+def test_unresolved_evaluation_status_can_never_become_a_durable_verdict(
+    tmp_path: Path, outcomes: tuple[HealthProbeOutcome, ...]
+) -> None:
+    """Direct proof of the frozen rule, independent of what the probes say:
+    `evaluation_status == unresolved` alone is enough to refuse persisting
+    ANY verdict, even when every individual probe outcome would otherwise
+    have aggregated cleanly."""
+
+    _, store, authority, _, _, _, job = _mutated_job(tmp_path)
+    host = FakeHealthHostControl(
+        outcomes=outcomes,
+        mutate=lambda result: HostHealthResult(
+            contract_revision=result.contract_revision,
+            contract_fingerprint=result.contract_fingerprint,
+            probes=result.probes,
+            evaluation_status=HealthEvaluationStatus.UNRESOLVED,
+        ),
+    )
+    result = PackageUpdateHealthOrchestrator(authority, host).evaluate_job_health(
+        job.job_id
+    )
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.health_completed_at is None
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
 
 
 # ===========================================================================

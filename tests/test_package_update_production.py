@@ -63,6 +63,7 @@ from app.package_scan_scheduler import PackageScanScheduler
 from app.inventory_runtime import PackageUpdateRuntime, create_read_only_app
 from app.inventory_runtime_config import parse_r0_runtime_config
 from app.package_update_health import (
+    HealthEvaluationStatus,
     HostHealthResult,
     HostProbeResult,
     PackageUpdateHealthOrchestrator,
@@ -229,6 +230,7 @@ class ScriptedHealthHostControl:
                 contract_revision=request.health_contract_revision,
                 contract_fingerprint=request.health_contract_fingerprint,
                 probes=(),
+                evaluation_status=HealthEvaluationStatus.UNRESOLVED,
                 reason="guest_unavailable",
             )
         if outcome == "probe_unknown":
@@ -250,6 +252,7 @@ class ScriptedHealthHostControl:
                     )
                     for index, probe in enumerate(request.probes)
                 ),
+                evaluation_status=HealthEvaluationStatus.UNRESOLVED,
                 settling_rounds=37,
                 settling_seconds=180.0,
                 last_round_span_ms=42,
@@ -272,6 +275,7 @@ class ScriptedHealthHostControl:
             contract_revision=request.health_contract_revision,
             contract_fingerprint=request.health_contract_fingerprint,
             probes=probes,
+            evaluation_status=HealthEvaluationStatus.DECISIVE,
         )
 
 

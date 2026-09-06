@@ -52,6 +52,7 @@ from app.package_scan_host_control import (
 from app.package_update_health import (
     HOST_REFUSAL_REASONS,
     HOST_PROBE_REASONS,
+    HealthEvaluationStatus,
     HostHealthResult,
     HostProbeResult,
     PackageUpdateHealthError,
@@ -347,6 +348,15 @@ class SshPackageUpdateHealthHostControl:
         probes: list[HostProbeResult] = []
         for raw in raw_probes:
             probes.append(self._parse_probe(raw))
+        raw_status = payload.get("evaluation_status")
+        # Exact membership, never a coerced/normalized comparison: a
+        # malformed or missing evaluation_status is refused outright rather
+        # than defaulted to either DECISIVE or UNRESOLVED.
+        if raw_status not in ("decisive", "unresolved"):
+            raise PackageUpdateHealthError(
+                "host-control returned an unknown evaluation status"
+            )
+        evaluation_status = HealthEvaluationStatus(raw_status)
         (
             settling_rounds,
             settling_seconds,
@@ -356,6 +366,7 @@ class SshPackageUpdateHealthHostControl:
             contract_revision=revision,
             contract_fingerprint=fingerprint,
             probes=tuple(probes),
+            evaluation_status=evaluation_status,
             reason=(
                 str(payload["reason"])[:100]
                 if isinstance(payload.get("reason"), str)

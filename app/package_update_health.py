@@ -195,6 +195,32 @@ class HealthStageStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class HealthEvaluationStatus(StrEnum):
+    """Whether the HOST's own bounded settling window reached a round that
+    may be aggregated into a durable verdict at all.
+
+    This is the explicit, typed carrier of "decisiveness" the frozen
+    architecture requires: a durable PASS or FAIL may come ONLY from one
+    complete DECISIVE round (every probe resolved, the round itself
+    completed within its bound, and it was not the first round). Inferring
+    decisiveness a second time from the probe outcomes alone -- "every probe
+    happens to be PASSED or FAILED, so it must have been decisive" -- would
+    silently accept a round that only LOOKS complete because the settling
+    deadline or round cap cut it off mid-transition. This orchestrator checks
+    this field BEFORE ever calling `aggregate_health_outcome`; neither the
+    backend elsewhere nor Home Assistant may re-derive it.
+    """
+
+    #: Every probe in this round resolved (none transient); PASSED/FAILED is
+    #: this round's proven complete ALL-OF verdict, and may be persisted.
+    DECISIVE = "decisive"
+    #: The settling deadline, round cap, or guest-command ceiling was
+    #: reached with at least one probe still transient, OR a structurally
+    #: broken target makes a decisive round unreachable by construction.
+    #: Never aggregated into a verdict, whatever the individual probes say.
+    UNRESOLVED = "unresolved"
+
+
 @dataclass(frozen=True, slots=True)
 class HostProbeResult:
     """What the dark host reported about ONE frozen probe."""
@@ -219,6 +245,10 @@ class HostHealthResult:
     contract_revision: int
     contract_fingerprint: str
     probes: tuple[HostProbeResult, ...]
+    #: Explicit, typed decisiveness -- see `HealthEvaluationStatus`. Required
+    #: (no default): a caller that has not decided whether a round was
+    #: decisive must not be able to silently default into either answer.
+    evaluation_status: HealthEvaluationStatus
     #: Bounded classification text for a whole-request failure. Never raw
     #: stdout, stderr, or command text.
     reason: str | None = None
@@ -340,14 +370,53 @@ class PackageUpdateHealthOrchestrator:
         except PackageUpdateHealthError as exc:
             return self._unknown(job.job_id, exc.reason, str(exc))
 
+        # F. The explicit, typed decisiveness carrier is checked BEFORE any
+        # aggregation -- never re-derived from the probe outcomes alone. A
+        # non-decisive round (the settling deadline/round-cap was reached
+        # with a probe still transient, or a structurally broken target
+        # makes decisiveness unreachable by construction) may look
+        # all-PASSED or contain exactly one FAILED probe, but that is NOT
+        # proof of anything: only a decisive round's complete observation
+        # set may ever become a durable verdict.
+        if host_result.evaluation_status is not HealthEvaluationStatus.DECISIVE:
+            unresolved_probe = next(
+                (
+                    observation
+                    for observation in observations
+                    if observation.outcome is HealthProbeOutcome.UNKNOWN
+                ),
+                None,
+            )
+            # A non-decisive round need not contain any UNKNOWN probe at all
+            # (e.g. every probe read PASSED, but the round itself ran too
+            # long to trust, or this was the first round) -- there is no
+            # single "blocking probe" reason to report in that case, so the
+            # generic, honest classification for an answer that cannot be
+            # believed as a verdict is used instead.
+            blocking_reason = (
+                unresolved_probe.reason
+                if unresolved_probe is not None
+                else "host_response_rejected"
+            )
+            return self._unknown(
+                job.job_id,
+                blocking_reason,
+                "the host's bounded settling window did not reach a "
+                f"decisive round ({blocking_reason})",
+                probe_evidence=observations,
+                settling_rounds=host_result.settling_rounds,
+                settling_seconds=host_result.settling_seconds,
+                last_round_span_ms=host_result.last_round_span_ms,
+            )
+
         outcome = aggregate_health_outcome(
             observation.outcome for observation in observations
         )
-        if outcome is HealthOutcome.UNKNOWN:
-            # Report the FIRST unevaluable probe's own reason rather than a
-            # generic one: "the Docker daemon did not answer" is what the
-            # operator needs, and it is already a bounded token from the
-            # closed taxonomy.
+        if outcome is HealthOutcome.UNKNOWN:  # pragma: no cover - defense in
+            # depth only: `validate_host_health_result` already refuses a
+            # DECISIVE payload carrying any UNKNOWN probe, so this is
+            # structurally unreachable, and it stays here in case that
+            # invariant is ever loosened by mistake.
             blocking = next(
                 observation
                 for observation in observations
@@ -451,11 +520,20 @@ def validate_host_health_result(
     - each outcome is one of the three known values;
     - each reason is a bounded token the HOST is allowed to report, is
       consistent with the outcome it accompanies, and is possible for the
-      kind of probe it claims to describe.
+      kind of probe it claims to describe;
+    - ``evaluation_status`` is a known value, and is never DECISIVE while any
+      probe is UNKNOWN -- a decisive round is, by the frozen definition,
+      exactly one where every probe resolved with no transient state, so a
+      host claiming both at once is contradicting itself and is rejected
+      outright rather than believed either way.
     """
 
     if not isinstance(result, HostHealthResult):
         raise PackageUpdateHealthError("a typed host health result is required")
+    if not isinstance(result.evaluation_status, HealthEvaluationStatus):
+        raise PackageUpdateHealthError(
+            "host returned an unknown evaluation status"
+        )
     if result.contract_revision != job.health_contract_revision:
         raise PackageUpdateHealthError(
             "host answered about a different health contract revision"
@@ -519,6 +597,13 @@ def validate_host_health_result(
                 outcome=outcome,
                 reason=reason,
             )
+        )
+    if result.evaluation_status is HealthEvaluationStatus.DECISIVE and any(
+        observation.outcome is HealthProbeOutcome.UNKNOWN
+        for observation in observations
+    ):
+        raise PackageUpdateHealthError(
+            "host claimed a decisive round while a probe remained unknown"
         )
     return tuple(observations)
 
