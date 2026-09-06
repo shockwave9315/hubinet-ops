@@ -4651,7 +4651,14 @@ class InventoryAuthority:
         return self._store.package_update_job(canonical_job_id)
 
     def record_package_update_health_outcome_unknown(
-        self, job_id: str, reason: str
+        self,
+        job_id: str,
+        reason: str,
+        *,
+        probe_evidence: Sequence[HealthProbeObservation] = (),
+        settling_rounds: int | None = None,
+        settling_seconds: float | None = None,
+        last_round_span_ms: int | None = None,
     ) -> PackageUpdateJob:
         """Record that a health evaluation could not reach a verdict.
 
@@ -4665,11 +4672,41 @@ class InventoryAuthority:
         cause a second destructive action, so an unresolved evaluation needs
         no uncertainty fence and no host journal -- it simply may be run
         again.
+
+        ``probe_evidence`` is bounded, typed, per-probe OBSERVATION evidence
+        from the LAST COMPLETE settling round the caller observed -- never a
+        verdict, and never merged from more than one round. Only ``index``,
+        ``outcome``, and ``reason`` are persisted: immutable ``kind``/
+        ``target`` are already durable on the job's frozen probe rows and are
+        joined from there at read time, never repeated into event JSON. This
+        is what lets an operator see an UNKNOWN result's exact blocking
+        probe(s) without shell or SQLite access (`app/inventory_runtime.py`,
+        ``_package_update_health_probes_body``).
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
         bounded_reason = _require_health_probe_reason(reason)
         recorded_at = _timestamp(self._now())
+        details: dict[str, object] = {"reason": bounded_reason}
+        if probe_evidence:
+            details["probes"] = [
+                {
+                    "index": int(observation.probe_index),
+                    "outcome": HealthProbeOutcome(observation.outcome).value,
+                    "reason": _require_health_probe_reason(observation.reason),
+                }
+                for observation in probe_evidence
+            ]
+        if type(settling_rounds) is int and 0 <= settling_rounds <= 1000:
+            details["rounds"] = settling_rounds
+        if (
+            isinstance(settling_seconds, (int, float))
+            and not isinstance(settling_seconds, bool)
+            and 0 <= settling_seconds <= 3600
+        ):
+            details["settled_seconds"] = round(float(settling_seconds), 3)
+        if type(last_round_span_ms) is int and 0 <= last_round_span_ms <= 3_600_000:
+            details["last_round_span_ms"] = last_round_span_ms
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
@@ -4692,7 +4729,7 @@ class InventoryAuthority:
                     "this job's frozen health contract could not be "
                     "evaluated truthfully; no verdict was recorded"
                 ),
-                details={"reason": bounded_reason},
+                details=details,
             )
         return self._store.package_update_job(canonical_job_id)
 

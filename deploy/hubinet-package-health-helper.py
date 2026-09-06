@@ -1,15 +1,46 @@
 #!/usr/bin/env python3
 """Forced-command PVE boundary for Hubinet's sole health-evaluation operation.
 
-**Dark and NOT deployed.** No bootstrap or updater path installs this file, no
-`authorized_keys` entry exists for it, no key is provisioned, and it requires
-no PVE API privilege beyond the audit-only pair the product already has: it
-uses host-local `pct exec`, not a PVE mutation endpoint.
+**Deployed.** `deploy/lib/bootstrap-update-boundaries.sh` and
+`deploy/update-proxmox-0.5.sh` install this file as one of the five
+package-update forced-command boundaries (snapshot, plan simulation,
+mutation, rollback, health), each behind its own dedicated key and its own
+root-owned forced command. It requires no PVE API privilege beyond the
+audit-only pair the product already has: it uses host-local `pct exec`, not a
+PVE mutation endpoint.
 
 It exposes exactly ONE typed operation, `evaluate_health_contract`, and that
 operation is READ-ONLY. It cannot create, delete, start, stop, snapshot, roll
 back, upgrade, install, or remove anything, and there is no path through it
 that accepts remote command text.
+
+## Bounded health settling, inside this one call
+
+A single `evaluate_health_contract` request may take up to
+`SETTLING_DEADLINE_SECONDS` (180s) to answer, because it owns the ENTIRE
+bounded settling window described in `ARCHITECTURE.md`, "Job-bound healthcheck
+execution", not one instantaneous sample. Every declared probe restarts
+Docker's or systemd's own state machine on an ordinary package-triggered
+restart, and a normal successful update must not durably fail, or require a
+manual re-run, merely because that restart has not finished settling yet.
+
+So this file repeatedly observes the COMPLETE frozen probe set in bounded
+ROUNDS, each one batched per family (at most one `docker ps`, one
+`docker inspect`, and one `systemctl show` per round -- never one guest
+command per probe), until either:
+
+- a ROUND is decisive (every probe resolved with no transient state, the
+  round itself completed within `MAX_ROUND_SPAN_SECONDS`, and this is at
+  least the `MIN_DECISIVE_ROUND`-th round) and every probe passed, or one
+  failed definitively -- both cases terminate immediately with that verdict;
+- the bounded deadline, round count, or guest-command ceiling is reached
+  first, in which case the answer is UNKNOWN, carrying only the LAST COMPLETE
+  round's evidence -- evidence from different rounds is never merged into one
+  verdict.
+
+`PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS = 300` on the backend side
+(`app/inventory_runtime_config.py`) already gives this settling window its
+transport headroom: 180s of settling plus per-command allowance and margin.
 
 ## Why the commands are what they are
 
@@ -27,60 +58,79 @@ probe built on it could pass because some other unit is up, which is exactly
 the false PASS this stage refuses to be capable of.
 
 So the operation is `systemctl show`, which prints one blank-line-separated
-property block per matched unit, and three things make the requested object
-exact:
+property block per matched unit, and this file requests every frozen systemd
+target in ONE such call:
 
 1. `--` IS honoured here (verified: `systemctl show ... -- --help` reports
    `Id=--help.service` rather than printing usage), so an option-like target
    can never be consumed as an option;
-2. the target must match a strict unit-name charset that contains none of
+2. every target must match a strict unit-name charset that contains none of
    systemd's glob characters `*`, `?`, `[` -- necessary because a pattern can
    legitimately match exactly ONE unit (verified: `ssh?service` matched only
-   `ssh.service`), so "exactly one block" alone is not sufficient;
-3. exactly one property block must come back.
+   `ssh.service`), so "one block per requested unit" alone is not sufficient;
+3. blocks are mapped back to targets BY POSITION, never by the returned `Id`:
+   verified that `ssh.service` and `sshd.service` are aliases of the SAME
+   unit and both report `Id=ssh.service`, so two distinct requested targets
+   can legitimately share one `Id`, and only the batched call's own
+   request-order answers "which target is this block about".
+4. `ActiveState=active` is the only PASS. `activating`/`deactivating`/
+   `reloading`, and an `inactive`/`failed` unit that still carries a
+   non-empty `Job` (verified: `systemctl show --property=Job` is empty while
+   idle and numeric mid-transition), are all UNKNOWN this round -- systemd's
+   own transient states, not a workload verdict. An `inactive`/`failed` unit
+   with an EMPTY `Job`, `maintenance`, and `LoadState=not-found` (which
+   systemd reports as a normal success with `ActiveState=inactive`) are
+   definitive FAILs. An unreadable, empty, or wrong-count answer is UNKNOWN.
+   "The command ran" is never a PASS.
 
-`ActiveState=active` is the only PASS. Any other known state is a definitive
-FAIL, including `LoadState=not-found`, which systemd reports as a normal
-success with `ActiveState=inactive`. An unreadable, empty, or multi-block
-answer is UNKNOWN. "The command ran" is never a PASS.
+**Docker.** Every frozen Docker target -- for BOTH probe kinds together -- is
+inspected in ONE batched `docker inspect` call. `docker inspect` resolves a
+container by name OR by ID prefix (verified), so the returned `.Name` is
+compared against the requested target and matched BY NAME, never by position
+or ID prefix: verified that a missing target among several does not shift the
+others, and does not stop the present ones from still being printed. `--type
+container` stops an image of the same name matching, and `--` is honoured
+(verified: `-- --help` is treated as a container name). The `--format`
+template is a constant owned by this file; no part of it is built from a
+request.
 
-**Docker.** `docker inspect` resolves a container by name OR by ID prefix
-(verified), so the returned `.Name` is compared against the requested target:
-an ID-prefix resolution reports a different name and is refused rather than
-accepted as the named container. `--type container` stops an image of the same
-name matching, and `--` is honoured (verified: `-- --help` is treated as a
-container name). The `--format` template is a constant owned by this file; no
-part of it is built from a request.
-
-`docker inspect` exits 1 for absence and for other failures, and telling them
-apart by matching English stderr would be fragile. A fixed daemon oracle
-(`docker ps --all --no-trunc --quiet`) runs before the probe. After a failing
-inspect, another fixed command lists every complete container name as one JSON
-string; only a successful, bounded, well-formed listing that does not contain
-the requested exact name proves absence. A timeout, overflow, generic inspect
-failure for a name still present, unavailable daemon, or unusable listing is
-UNKNOWN.
+A fixed daemon oracle (`docker ps --all --no-trunc --format json .Names`,
+verified to emit one JSON string per existing container regardless of state)
+runs FIRST, once per round, for every family member: it is both the daemon
+liveness proof and the complete, positively-proven container-name universe.
+A requested target absent from that universe is definitively absent; a
+target present in it that the batched inspect still could not read cleanly is
+UNKNOWN, never absence, because the daemon already proved a moment earlier
+that the name exists.
 
 **`docker_container_healthy` is never downgraded to "running".** It requires
-`.State.Running` true AND `.State.Health.Status` exactly `healthy`. A
-container with no HEALTHCHECK, or one reporting `unhealthy`, is a definitive
-FAIL, because the operator specifically demanded Docker health. `starting` is
-different: Docker's own documented state machine enters it automatically
-after every container (re)start and can only leave it for `healthy` or
-`unhealthy` once `--health-start-period` and the first probe elapse, so it is
-not a workload verdict at all -- it is the daemon saying "no verdict yet".
-Live Human1 evidence proved this the hard way: a package update that
-legitimately restarts Docker/containerd restarts every container's health
-state machine too, and the guest was observed and reported `healthy` again
-within seconds, after this helper had already durably recorded a FAIL. So
-`starting` is UNKNOWN, not FAILED -- it is never a pass and never durable
-error either; the caller may simply ask again, exactly like
-`docker_daemon_unavailable`.
+`.State.Status` exactly `running` AND `.State.Health.Status` exactly
+`healthy`. A container with no HEALTHCHECK, or one reporting `unhealthy`, is
+a definitive FAIL, because the operator specifically demanded Docker health.
+`starting` is different: Docker's own documented state machine enters it
+automatically after every container (re)start and can only leave it for
+`healthy` or `unhealthy` once `--health-start-period` and the first probe
+elapse, so it is not a workload verdict at all -- it is the daemon saying "no
+verdict yet". Live Human1 evidence proved this the hard way: a package update
+that legitimately restarts Docker/containerd restarts every container's
+health state machine too, and the guest was observed and reported `healthy`
+again within seconds, after this helper had already durably recorded a FAIL
+under the OLD, unbatched, un-settled design. So `starting` is UNKNOWN, not
+FAILED, and this file's bounded settling loop exists precisely so an ordinary
+restart resolves it automatically rather than needing a manual re-run.
+
+**The full transient family, not only `starting`.** `.State.Status` values
+`created` (not started yet), `restarting`, and `removing` are, symmetrically,
+Docker's own transient lifecycle states for EITHER Docker probe kind: none of
+them is a workload verdict, and every one of them normally resolves within
+seconds. `exited`, `dead`, and `paused` are definitive FAILs for both kinds --
+none of the three means "running", and continuing to wait for them would be
+mistaking a settled failure for one still in flight.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import json
 import os
@@ -107,6 +157,38 @@ PROBE_KINDS = (
     "docker_container_running",
     "docker_container_healthy",
 )
+
+# ---------------------------------------------------------------------------
+# Bounded health settling -- backend-owned defaults, never HA-owned and never
+# request-supplied. See ARCHITECTURE.md, "Job-bound healthcheck execution".
+# ---------------------------------------------------------------------------
+
+#: The whole evaluation gives up and reports UNKNOWN (never a guess) once
+#: this many seconds have elapsed since the first round started.
+SETTLING_DEADLINE_SECONDS = 180.0
+#: Sleep between rounds when the previous one was not decisive.
+OBSERVATION_INTERVAL_SECONDS = 5.0
+#: A round whose own guest commands took longer than this to answer is never
+#: decisive, whichever way it points: a slow round may be describing state
+#: that has already moved on again by the time it is read.
+MAX_ROUND_SPAN_SECONDS = 15.0
+#: No verdict -- PASS or FAIL -- may ever be reached before this round index.
+#: Round 1 runs immediately after a package mutation that may itself still be
+#: settling Docker/systemd, and a same-round coincidence is not enough
+#: evidence either way.
+MIN_DECISIVE_ROUND = 2
+#: A hard structural ceiling on rounds attempted, independent of the wall
+#: clock deadline above (defends against a clock that misbehaves).
+MAX_SETTLING_ROUNDS = 40
+#: At most this many guest commands (`pct exec` invocations) in ONE round,
+#: whatever the probe count: one batched `docker ps`, one batched
+#: `docker inspect`, one batched `systemctl show`.
+MAX_COMMANDS_PER_ROUND = 3
+#: A hard ceiling on guest commands across the WHOLE settling window.
+MAX_GUEST_COMMANDS = 160
+
+Clock = Callable[[], float]
+Sleeper = Callable[[float], None]
 
 #: Execution-time systemd unit-name validation. Deliberately the SMALLEST
 #: restriction that makes the requested object unambiguous, and every part of
@@ -145,12 +227,14 @@ SYSTEMD_UNIT_SUFFIXES = (
 DOCKER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}")
 
 #: A CONSTANT owned by this file. Never built from a request, never
-#: interpolated, and never extended by a caller. The `<none>` branch is what
-#: lets `docker_container_healthy` tell "no HEALTHCHECK configured" apart from
-#: a health status, which it must, because the first is a definitive failure
-#: of a probe that specifically demanded Docker health.
+#: interpolated, and never extended by a caller. `.Name` is required to map a
+#: batched answer back onto its exact requested target, never by position and
+#: never by ID prefix. The `<none>` branches are what let `docker_container_
+#: healthy` tell "no HEALTHCHECK configured" apart from a health status, and
+#: what makes an absent `.State.Health` block (a container Docker has not yet
+#: computed health for) distinguishable from a real value.
 DOCKER_INSPECT_FORMAT = (
-    "{{.Name}}\t{{.State.Running}}\t"
+    "{{.Name}}\t{{.State.Status}}\t{{.State.Restarting}}\t"
     "{{if .State.Health}}{{.State.Health.Status}}{{else}}<none>{{end}}"
 )
 
@@ -160,14 +244,42 @@ DOCKER_INSPECT_FORMAT_FLAG = "--format"
 
 #: Fixed positive absence proof.  Docker 26.1.5 was verified to accept this
 #: exact `ps` shape and emit each container's complete `.Names` value as one
-#: JSON string.  JSON keeps parsing exact without stderr-language matching.
+#: JSON string, for every container regardless of state -- the daemon
+#: liveness oracle and the complete existing-name universe in one call.
 DOCKER_NAME_LIST_FORMAT = "{{json .Names}}"
 
-#: systemd ActiveState values that are a definitive NOT-active. Anything
-#: outside this set and "active" is an answer this helper does not understand,
-#: which is UNKNOWN rather than a guess in either direction.
-SYSTEMD_INACTIVE_STATES = frozenset(
-    {"inactive", "failed", "activating", "deactivating", "reloading", "maintenance"}
+#: `.State.Status` values that mean the container is not, and is not about to
+#: become, healthy or running: none of the three means "running", and none of
+#: them resolves itself the way `created`/`restarting`/`removing` do.
+DOCKER_DEFINITIVE_FAIL_STATUSES = frozenset({"exited", "dead", "paused"})
+#: `.State.Status` values that are Docker's own transient lifecycle, entered
+#: automatically and expected to resolve on their own within seconds.
+DOCKER_TRANSIENT_STATUSES = frozenset({"created", "restarting", "removing"})
+_DOCKER_TRANSIENT_REASONS = {
+    "created": "container_not_started_yet",
+    "restarting": "container_restarting",
+    "removing": "container_removing",
+}
+
+#: systemd ActiveState values whose meaning depends on `Job`: a pending job
+#: means the unit is mid-transition (UNKNOWN, `unit_job_pending`); an empty
+#: one means it has genuinely settled at rest (definitive FAIL).
+SYSTEMD_JOB_DEPENDENT_STATES = frozenset({"inactive", "failed"})
+#: ActiveState values that are systemd's own transient job states,
+#: unconditionally -- `Job` is not consulted for these because systemd
+#: reports them only while a job is already in flight.
+_SYSTEMD_TRANSIENT_REASONS = {
+    "activating": "unit_activating",
+    "deactivating": "unit_deactivating",
+    "reloading": "unit_reloading",
+}
+#: Every ActiveState value this helper can interpret at all. Anything else is
+#: an answer this helper does not understand, which is UNKNOWN rather than a
+#: guess in either direction.
+SYSTEMD_KNOWN_ACTIVE_STATES = (
+    frozenset({"active", "maintenance"})
+    | SYSTEMD_JOB_DEPENDENT_STATES
+    | frozenset(_SYSTEMD_TRANSIENT_REASONS)
 )
 
 
@@ -202,15 +314,6 @@ class ProbeUnknown(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
-
-
-class _ContainerAbsent(RuntimeError):
-    """The daemon answered and reported no such container.
-
-    Internal control flow only. It exists so "definitely absent" can be
-    distinguished from "could not tell" by the DAEMON having answered, rather
-    than by matching Docker's English error text.
-    """
 
 
 def _run_bounded(
@@ -263,21 +366,21 @@ def _run_bounded(
     )
 
 
-def _canonical_uuid(value: Any, field: str) -> str:
+def _canonical_uuid(value: Any, field_name: str) -> str:
     if not isinstance(value, str):
-        raise RequestError(f"{field} must be a canonical UUID")
+        raise RequestError(f"{field_name} must be a canonical UUID")
     try:
         parsed = uuid.UUID(value)
     except ValueError as exc:
-        raise RequestError(f"{field} must be a canonical UUID") from exc
+        raise RequestError(f"{field_name} must be a canonical UUID") from exc
     if parsed.int == 0 or str(parsed) != value:
-        raise RequestError(f"{field} must be a canonical UUID")
+        raise RequestError(f"{field_name} must be a canonical UUID")
     return value
 
 
-def _positive_integer(value: Any, field: str) -> int:
+def _positive_integer(value: Any, field_name: str) -> int:
     if type(value) is not int or value <= 0:
-        raise RequestError(f"{field} must be a positive integer")
+        raise RequestError(f"{field_name} must be a positive integer")
     return value
 
 
@@ -287,7 +390,15 @@ def validate_request(payload: Any) -> dict[str, Any]:
     Every authority fact arrives typed and is validated here. There is no
     field through which a caller could pass a command, an option, an argv
     fragment, a format template, an environment variable, or a probe kind
-    outside the three the product defines.
+    outside the three the product defines. This exact top-level shape, and
+    the exact "request must have the exact health-evaluation shape" message
+    below, are a bootstrap/updater acceptance marker: `deploy/lib/bootstrap-
+    update-boundaries.sh`, `deploy/lib/update-boundaries.sh`, and
+    `tests/_bootstrap_fake_pve.py` all assert this literal string to prove
+    the deployed forced command is genuinely this helper. Bounded settling
+    changes nothing about the REQUEST shape -- the deadline, interval, and
+    round bounds above are constants this file owns, not request fields --
+    so that marker stays byte-identical.
     """
 
     if not isinstance(payload, Mapping) or set(payload) != {
@@ -435,8 +546,8 @@ def revalidate_live_target(runner: Runner, vmid: int, expected_node: str) -> Non
     The backend proves it still names the intended resource INCARNATION; only
     the host can prove the live PVE target. A VMID is an execution locator,
     not an identity: PVE can free one and reuse it at any moment, and a health
-    PASS recorded against a replacement guest would be a false statement about
-    a workload this job never updated -- read-only or not.
+    verdict recorded against a replacement guest would be a false statement
+    about a workload this job never updated -- read-only or not.
     """
 
     result = _command(
@@ -485,26 +596,27 @@ def _run_guest_command(
     local_node: str,
     tail: tuple[str, ...],
     *,
-    data_argument: str | None = None,
+    data_arguments: Sequence[str] = (),
     max_output: int = MAX_COMMAND_OUTPUT_BYTES,
 ) -> CommandResult:
     """Run one fixed ``pct exec`` shape on the node that currently holds it.
 
     **This dispatcher owns the live-target invariant**, exactly as the
-    mutation helper's does: every single guest command is preceded here by its
-    own fresh :func:`revalidate_live_target`, so no caller can amortize one
-    check across two commands and send the second to a replacement guest.
+    mutation helper's does: every single guest command -- one batched Docker
+    or systemd call per round, never one call per probe -- is preceded here
+    by its own fresh :func:`revalidate_live_target`, so no caller can amortize
+    one check across two rounds and send a later one to a replacement guest.
 
-    ``tail`` is a fixed argv shape built by this file, with at most one
-    element that came from the request -- a probe target that has already
-    passed its kind-specific execution-time validation. A non-local guest is
-    routed to its expected cluster member over root's existing passwordless
-    inter-node SSH trust Proxmox itself provisions, exactly as the scan,
-    execution, and mutation helpers do; no new Hubinet credential exists on
-    that node. Unlike those helpers, this one routes an element that originated
-    outside the file: ``data_argument`` names it, and it is proved shell-inert
-    before it may cross that boundary. Every other element is a constant this
-    file owns.
+    ``tail`` is a fixed argv shape built by this file, with zero or more
+    elements that came from the request -- probe targets that have already
+    passed their kind-specific execution-time validation. A non-local guest
+    is routed to its expected cluster member over root's existing
+    passwordless inter-node SSH trust Proxmox itself provisions, exactly as
+    the scan, execution, and mutation helpers do; no new Hubinet credential
+    exists on that node. Unlike those helpers, this one routes elements that
+    originated outside the file: ``data_arguments`` names them, and each is
+    proved shell-inert before it may cross that boundary. Every other element
+    is a constant this file owns.
     """
 
     revalidate_live_target(runner, vmid, expected_node)
@@ -517,19 +629,20 @@ def _run_guest_command(
         # remote login shell.
         #
         # Shell quoting is deliberately NOT the mechanism that makes the
-        # caller's target safe here. The kind-specific validation already
+        # caller's targets safe here. The kind-specific validation already
         # restricts a target to characters a shell reads as nothing at all,
-        # and this makes that a CHECKED property rather than a claim: if the
+        # and this makes that a CHECKED property rather than a claim: if any
         # request-derived element would need a quote adding, it is not what
-        # this file believes it is, and the probe is reported unevaluable
-        # instead of being handed to a shell that might read it.
+        # this file believes it is, and the whole batched command is reported
+        # unevaluable instead of being handed to a shell that might read it.
         #
         # The constants around it -- notably the Docker `--format` template,
         # whose braces this file owns -- are quoted normally. Their content is
         # fixed and reviewed; the caller's is not, and only the caller's is
         # subject to this rule.
-        if data_argument is not None and shlex.quote(data_argument) != data_argument:
-            raise ProbeUnknown("probe_target_not_exact")
+        for data_argument in data_arguments:
+            if shlex.quote(data_argument) != data_argument:
+                raise ProbeUnknown("probe_target_not_exact")
         argv = (
             "ssh",
             "-T",
@@ -556,77 +669,18 @@ def _decode(result: CommandResult) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The three probe kinds. Each returns (outcome, reason) or raises ProbeUnknown.
+# Structural, host-independent target validation. Computed ONCE, never
+# per-round: a target's charset either names one exact object or it never
+# will, no matter how many times the guest is asked.
 # ---------------------------------------------------------------------------
 
 
 def _require_exact_systemd_unit(target: str) -> str:
     if not SYSTEMD_UNIT_RE.fullmatch(target) or target.startswith("-"):
-        # Contains a glob character, a path separator, whitespace, or
-        # something systemd would escape: it does not name one exact unit.
         raise ProbeUnknown("probe_target_not_exact")
     if not target.endswith(SYSTEMD_UNIT_SUFFIXES):
         raise ProbeUnknown("probe_target_not_exact")
     return target
-
-
-def evaluate_systemd_unit_active(
-    runner: Runner, vmid: int, expected_node: str, local_node: str, target: str
-) -> tuple[str, str]:
-    unit = _require_exact_systemd_unit(target)
-    result = _run_guest_command(
-        runner,
-        vmid,
-        expected_node,
-        local_node,
-        (
-            "env",
-            "LC_ALL=C",
-            "systemctl",
-            "show",
-            "--no-pager",
-            "--property=Id",
-            "--property=LoadState",
-            "--property=ActiveState",
-            # `--` is verified to end option parsing here, so an option-like
-            # target is a unit name and never a new option.
-            "--",
-            unit,
-        ),
-        data_argument=unit,
-        max_output=64 * 1024,
-    )
-    stdout = _decode(result)
-    if result.returncode != 0:
-        # systemctl show succeeds even for a unit that does not exist, so a
-        # non-zero exit means the command itself could not run -- no systemd
-        # in the guest, a broken bus, a permission problem. Never a verdict.
-        raise ProbeUnknown("command_failed")
-    blocks = [block for block in stdout.strip().split("\n\n") if block.strip()]
-    if len(blocks) != 1:
-        # More than one block means the target matched more than one unit
-        # despite the charset check; zero means the answer was empty. Neither
-        # is a statement about the requested unit.
-        raise ProbeUnknown("probe_target_ambiguous" if blocks else "malformed_output")
-    properties: dict[str, str] = {}
-    for line in blocks[0].splitlines():
-        if "=" not in line:
-            raise ProbeUnknown("malformed_output")
-        key, value = line.split("=", 1)
-        if key in properties:
-            raise ProbeUnknown("malformed_output")
-        properties[key] = value
-    if set(properties) != {"Id", "LoadState", "ActiveState"}:
-        raise ProbeUnknown("malformed_output")
-    active_state = properties["ActiveState"]
-    if active_state == "active":
-        return "passed", "unit_active"
-    if active_state in SYSTEMD_INACTIVE_STATES:
-        # Includes LoadState=not-found, which systemd reports as a normal
-        # ActiveState=inactive: a unit that does not exist is definitively
-        # not active, and the operator said it must be.
-        return "failed", "unit_not_active"
-    raise ProbeUnknown("malformed_output")
 
 
 def _require_exact_docker_name(target: str) -> str:
@@ -635,195 +689,473 @@ def _require_exact_docker_name(target: str) -> str:
     return target
 
 
-def _docker_daemon_answered(
-    runner: Runner, vmid: int, expected_node: str, local_node: str
-) -> bool:
-    """Fixed, argument-less proof that the guest's Docker daemon answered.
+def _guest_family_reason(exc: ProbeUnknown | HealthError) -> str:
+    """Map a whole-family guest-command failure onto its bounded reason.
 
-    `docker ps` requires the daemon, takes nothing from the request, and exits
-    0 only when the daemon responded. This initial oracle proves Docker is
-    reachable before evaluation; it does not classify a later non-zero
-    `docker inspect` as absence. Definitive absence requires the separate
-    bounded exact-name proof in `_docker_exact_name_is_absent`.
+    ``HealthError`` here means the LIVE-TARGET REVALIDATION that precedes
+    every guest command failed -- the guest went away, moved node, or
+    stopped mid-round. That is never a failure of the workload the operator
+    declared, so it is reported exactly like any other unevaluable family,
+    never raised past this round.
     """
 
+    if isinstance(exc, ProbeUnknown):
+        return exc.reason
+    return (
+        "guest_unavailable"
+        if exc.classification in ("guest_unavailable", "stale_target")
+        else "command_failed"
+    )
+
+
+def _structural_probe_outcome(kind: str, target: str) -> tuple[str, str] | None:
+    """A fixed, round-independent (outcome, reason) if the target can never
+    settle, else ``None`` meaning "ask the guest"."""
+
+    try:
+        if kind == "systemd_unit_active":
+            _require_exact_systemd_unit(target)
+        else:
+            _require_exact_docker_name(target)
+    except ProbeUnknown as exc:
+        return "unknown", exc.reason
+    return None
+
+
+# ---------------------------------------------------------------------------
+# One batched round: at most one systemd command and at most two Docker
+# commands, whatever the probe count.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _RoundBudget:
+    """Bounded guest-command accounting across the WHOLE settling window."""
+
+    used: int = 0
+
+    def spend(self) -> None:
+        self.used += 1
+        if self.used > MAX_GUEST_COMMANDS:
+            raise ProbeUnknown("command_failed")
+
+
+def _systemd_round(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    targets: Sequence[str],
+    budget: _RoundBudget,
+) -> dict[str, tuple[str, str]]:
+    """One batched ``systemctl show`` covering every requested unit.
+
+    Returns ``{target: (outcome, reason)}`` for exactly the requested
+    targets, mapped BY POSITION -- never by the returned ``Id``, because
+    verified alias behaviour (``ssh.service``/``sshd.service``) means two
+    distinct requested targets can report the identical ``Id``.
+    """
+
+    if not targets:
+        return {}
+    budget.spend()
     try:
         result = _run_guest_command(
             runner,
             vmid,
             expected_node,
             local_node,
-            ("env", "LC_ALL=C", "docker", "ps", "--all", "--no-trunc", "--quiet"),
+            (
+                "env",
+                "LC_ALL=C",
+                "systemctl",
+                "show",
+                "--no-pager",
+                "--property=Id",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=Job",
+                "--",
+                *targets,
+            ),
+            data_arguments=targets,
+            max_output=64 * 1024 * max(1, len(targets)),
+        )
+    except (ProbeUnknown, HealthError) as exc:
+        reason = _guest_family_reason(exc)
+        return {target: ("unknown", reason) for target in targets}
+    if result.timed_out:
+        return {target: ("unknown", "command_timed_out") for target in targets}
+    if result.output_exceeded:
+        return {target: ("unknown", "malformed_output") for target in targets}
+    if result.returncode != 0:
+        # systemctl show succeeds even for a unit that does not exist, so a
+        # non-zero exit means the command itself could not run -- no systemd
+        # in the guest, a broken bus, a permission problem. Never a verdict.
+        return {target: ("unknown", "command_failed") for target in targets}
+    try:
+        stdout = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return {target: ("unknown", "malformed_output") for target in targets}
+    blocks = [block for block in stdout.strip().split("\n\n") if block.strip()]
+    if len(blocks) != len(targets):
+        # A mismatched block count means the batched answer cannot be
+        # trusted to map positionally at all -- never guess which target a
+        # stray or missing block belongs to.
+        reason = "probe_target_ambiguous" if len(blocks) > len(targets) else (
+            "malformed_output"
+        )
+        return {target: ("unknown", reason) for target in targets}
+    outcomes: dict[str, tuple[str, str]] = {}
+    for target, block in zip(targets, blocks, strict=True):
+        properties: dict[str, str] = {}
+        malformed = False
+        for line in block.splitlines():
+            if "=" not in line:
+                malformed = True
+                break
+            key, value = line.split("=", 1)
+            if key in properties:
+                malformed = True
+                break
+            properties[key] = value
+        if malformed or set(properties) != {"Id", "LoadState", "ActiveState", "Job"}:
+            outcomes[target] = ("unknown", "malformed_output")
+            continue
+        outcomes[target] = _classify_systemd_active_state(
+            properties["ActiveState"], properties["Job"]
+        )
+    return outcomes
+
+
+def _classify_systemd_active_state(active_state: str, job: str) -> tuple[str, str]:
+    if active_state == "active":
+        return "passed", "unit_active"
+    if active_state in _SYSTEMD_TRANSIENT_REASONS:
+        return "unknown", _SYSTEMD_TRANSIENT_REASONS[active_state]
+    if active_state in SYSTEMD_JOB_DEPENDENT_STATES:
+        if job.strip():
+            return "unknown", "unit_job_pending"
+        # Includes LoadState=not-found, which systemd reports as a normal
+        # ActiveState=inactive: a unit that does not exist is definitively
+        # not active, and the operator said it must be.
+        return "failed", "unit_not_active"
+    if active_state == "maintenance":
+        return "failed", "unit_not_active"
+    return "unknown", "malformed_output"
+
+
+def _docker_daemon_names(
+    runner: Runner, vmid: int, expected_node: str, local_node: str, budget: _RoundBudget
+) -> frozenset[str] | tuple[str, str]:
+    """The fixed daemon oracle: every existing container name, or a family
+    (outcome, reason) if the daemon could not be read this round."""
+
+    budget.spend()
+    try:
+        result = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            (
+                "env",
+                "LC_ALL=C",
+                "docker",
+                "ps",
+                "--all",
+                "--no-trunc",
+                "--format",
+                DOCKER_NAME_LIST_FORMAT,
+            ),
             max_output=1024 * 1024,
         )
-    except ProbeUnknown:
-        return False
-    return (
-        not result.timed_out and not result.output_exceeded and result.returncode == 0
-    )
-
-
-def _inspect_container(
-    runner: Runner, vmid: int, expected_node: str, local_node: str, name: str
-) -> tuple[str, bool, str]:
-    """Return ``(name, running, health)`` for exactly the requested container."""
-
-    result = _run_guest_command(
-        runner,
-        vmid,
-        expected_node,
-        local_node,
-        (
-            "env",
-            "LC_ALL=C",
-            "docker",
-            "inspect",
-            # Stops an image of the same name from being inspected instead.
-            "--type",
-            "container",
-            DOCKER_INSPECT_FORMAT_FLAG,
-            DOCKER_INSPECT_FORMAT,
-            # Verified to end option parsing, so an option-like container name
-            # is a name and never a new option.
-            "--",
-            name,
-        ),
-        data_argument=name,
-        max_output=64 * 1024,
-    )
-    # A real timeout kills the process, so it normally carries BOTH
-    # `timed_out=True` and a negative return code.  Execution bounds must win
-    # before any return-code interpretation or absence proof.
+    except (ProbeUnknown, HealthError) as exc:
+        return "unknown", _guest_family_reason(exc)
     if result.timed_out:
-        raise ProbeUnknown("command_timed_out")
+        return "unknown", "command_timed_out"
     if result.output_exceeded:
-        raise ProbeUnknown("malformed_output")
+        return "unknown", "malformed_output"
     if result.returncode != 0:
-        # A live daemon does not make every inspect error mean absence.  Only
-        # a separate exact-name inventory may prove the name is not present.
-        if _docker_exact_name_is_absent(
-            runner, vmid, expected_node, local_node, name
-        ):
-            raise _ContainerAbsent()
-        raise ProbeUnknown("command_failed")
-    stdout = _decode(result)
-    lines = [line for line in stdout.splitlines() if line.strip()]
-    if len(lines) != 1:
-        raise ProbeUnknown("malformed_output")
-    fields = lines[0].split("\t")
-    if len(fields) != 3:
-        raise ProbeUnknown("malformed_output")
-    observed_name, running, health = fields
-    # `docker inspect` also resolves a container by ID PREFIX, and reports the
-    # container's real name with a leading '/'. Requiring an exact match is
-    # what stops a hex-looking target passing because it happened to prefix
-    # some other container's id.
-    if observed_name != f"/{name}":
-        raise ProbeUnknown("probe_target_not_exact")
-    if running not in ("true", "false"):
-        raise ProbeUnknown("malformed_output")
-    return observed_name, running == "true", health
-
-
-def _docker_exact_name_is_absent(
-    runner: Runner, vmid: int, expected_node: str, local_node: str, name: str
-) -> bool:
-    """Positively prove an exact container name is absent from a live daemon.
-
-    The argv and format are fixed.  Every listed name is decoded as one JSON
-    string and compared for exact equality.  An unavailable, timed-out,
-    overflowing, non-zero, or malformed listing is UNKNOWN, never absence.
-    """
-
-    result = _run_guest_command(
-        runner,
-        vmid,
-        expected_node,
-        local_node,
-        (
-            "env",
-            "LC_ALL=C",
-            "docker",
-            "ps",
-            "--all",
-            "--no-trunc",
-            "--format",
-            DOCKER_NAME_LIST_FORMAT,
-        ),
-        max_output=1024 * 1024,
-    )
-    stdout = _decode(result)
-    if result.returncode != 0:
-        raise ProbeUnknown("docker_daemon_unavailable")
+        return "unknown", "docker_daemon_unavailable"
+    try:
+        stdout = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return "unknown", "malformed_output"
     names: list[str] = []
     for line in stdout.splitlines():
         try:
             listed = json.loads(line)
-        except (TypeError, ValueError) as exc:
-            raise ProbeUnknown("malformed_output") from exc
+        except (TypeError, ValueError):
+            return "unknown", "malformed_output"
         if not isinstance(listed, str) or not listed:
-            raise ProbeUnknown("malformed_output")
+            return "unknown", "malformed_output"
         names.append(listed)
-    return name not in names
+    return frozenset(names)
 
 
-def evaluate_docker_container_running(
-    runner: Runner, vmid: int, expected_node: str, local_node: str, target: str
-) -> tuple[str, str]:
-    name = _require_exact_docker_name(target)
-    if not _docker_daemon_answered(runner, vmid, expected_node, local_node):
-        raise ProbeUnknown("docker_daemon_unavailable")
+def _docker_inspect_batch(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    targets: Sequence[str],
+    budget: _RoundBudget,
+) -> dict[str, tuple[str, str, str]] | tuple[str, str]:
+    """One batched ``docker inspect``. Returns ``{name: (status, restarting,
+    health)}`` for every target it could read, mapped BY NAME -- never by
+    position, because a missing target among several does not shift the
+    others -- or a family (outcome, reason) if the command itself failed."""
+
+    if not targets:
+        return {}
+    budget.spend()
     try:
-        _, running, _ = _inspect_container(
-            runner, vmid, expected_node, local_node, name
+        result = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            (
+                "env",
+                "LC_ALL=C",
+                "docker",
+                "inspect",
+                "--type",
+                "container",
+                DOCKER_INSPECT_FORMAT_FLAG,
+                DOCKER_INSPECT_FORMAT,
+                "--",
+                *targets,
+            ),
+            data_arguments=targets,
+            max_output=64 * 1024 * max(1, len(targets)),
         )
-    except _ContainerAbsent:
-        return "failed", "container_absent"
-    if running:
-        return "passed", "container_running"
-    return "failed", "container_not_running"
-
-
-def evaluate_docker_container_healthy(
-    runner: Runner, vmid: int, expected_node: str, local_node: str, target: str
-) -> tuple[str, str]:
-    name = _require_exact_docker_name(target)
-    if not _docker_daemon_answered(runner, vmid, expected_node, local_node):
-        raise ProbeUnknown("docker_daemon_unavailable")
+    except (ProbeUnknown, HealthError) as exc:
+        return "unknown", _guest_family_reason(exc)
+    if result.timed_out:
+        return "unknown", "command_timed_out"
+    if result.output_exceeded:
+        return "unknown", "malformed_output"
     try:
-        _, running, health = _inspect_container(
-            runner, vmid, expected_node, local_node, name
-        )
-    except _ContainerAbsent:
-        return "failed", "container_absent"
-    if not running:
+        stdout = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return "unknown", "malformed_output"
+    parsed: dict[str, tuple[str, str, str]] = {}
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) != 4:
+            continue
+        name, status, restarting, health = fields
+        if not name.startswith("/"):
+            continue
+        if restarting not in ("true", "false"):
+            continue
+        # `docker inspect` reports the container's own name with a leading
+        # '/'. Requiring the stripped form to be a target we asked about is
+        # what stops a hex-looking target passing because it happened to
+        # prefix some OTHER container's id under ID-prefix resolution.
+        parsed[name[1:]] = (status, restarting, health)
+    if result.returncode != 0 and not parsed:
+        return "unknown", "command_failed"
+    return parsed
+
+
+def _classify_docker_container(
+    kind: str, status: str, restarting: str, health: str
+) -> tuple[str, str]:
+    if restarting == "true" or status == "restarting":
+        return "unknown", "container_restarting"
+    if status in DOCKER_TRANSIENT_STATUSES:
+        return "unknown", _DOCKER_TRANSIENT_REASONS[status]
+    if status in DOCKER_DEFINITIVE_FAIL_STATUSES:
         return "failed", "container_not_running"
-    # The operator specifically demanded Docker HEALTHCHECK health, so none of
-    # these may be downgraded to "well, it is running".
+    if status != "running":
+        return "unknown", "malformed_output"
+    if kind == "docker_container_running":
+        return "passed", "container_running"
+    # docker_container_healthy: running is necessary but not sufficient.
     if health == "healthy":
         return "passed", "container_healthy"
     if health == "unhealthy":
         return "failed", "container_unhealthy"
     if health == "starting":
-        # Docker's own state machine, not a workload verdict: every container
-        # (re)start passes through "starting" before its first health probe
-        # can even run, so a package-triggered Docker/containerd restart
-        # produces this transiently on a perfectly healthy workload. Report
-        # no verdict rather than a false FAIL; the caller may ask again.
         return "unknown", "container_health_starting"
     if health == "<none>":
         return "failed", "container_has_no_healthcheck"
-    raise ProbeUnknown("malformed_output")
+    return "unknown", "malformed_output"
 
 
-EVALUATORS: dict[str, Callable[..., tuple[str, str]]] = {
-    "systemd_unit_active": evaluate_systemd_unit_active,
-    "docker_container_running": evaluate_docker_container_running,
-    "docker_container_healthy": evaluate_docker_container_healthy,
-}
+def _docker_round(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    probes: Sequence[dict[str, Any]],
+    budget: _RoundBudget,
+) -> dict[int, tuple[str, str]]:
+    """One round's worth of Docker probes: at most one ``docker ps`` and one
+    ``docker inspect``, batched across every Docker target regardless of how
+    many probes -- of either Docker kind -- request it."""
+
+    if not probes:
+        return {}
+    targets = sorted({str(probe["target"]) for probe in probes})
+    daemon_names = _docker_daemon_names(runner, vmid, expected_node, local_node, budget)
+    if isinstance(daemon_names, tuple):
+        outcome, reason = daemon_names
+        return {probe["index"]: (outcome, reason) for probe in probes}
+    present = [target for target in targets if target in daemon_names]
+    absent = {target for target in targets if target not in daemon_names}
+    inspected = _docker_inspect_batch(
+        runner, vmid, expected_node, local_node, present, budget
+    )
+    if isinstance(inspected, tuple):
+        family_outcome, family_reason = inspected
+        inspected_by_name: dict[str, tuple[str, str, str]] = {}
+    else:
+        family_outcome = family_reason = None
+        inspected_by_name = inspected
+    results: dict[int, tuple[str, str]] = {}
+    for probe in probes:
+        target = str(probe["target"])
+        index = int(probe["index"])
+        if target in absent:
+            results[index] = ("failed", "container_absent")
+            continue
+        record = inspected_by_name.get(target)
+        if record is None:
+            if family_outcome is not None:
+                results[index] = (family_outcome, family_reason or "command_failed")
+            else:
+                # The daemon oracle proved this name exists a moment ago, but
+                # the batched inspect could not read it cleanly this round --
+                # a race or a transient glitch, never absence.
+                results[index] = ("unknown", "command_failed")
+            continue
+        status, restarting, health = record
+        results[index] = _classify_docker_container(
+            str(probe["kind"]), status, restarting, health
+        )
+    return results
 
 
-def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, Any]:
+def _run_one_round(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    probes: Sequence[dict[str, Any]],
+    budget: _RoundBudget,
+) -> dict[int, tuple[str, str]]:
+    """Observe EVERY still-live frozen probe in one bounded batched round."""
+
+    systemd_probes = [p for p in probes if p["kind"] == "systemd_unit_active"]
+    docker_probes = [p for p in probes if p["kind"] != "systemd_unit_active"]
+
+    results: dict[int, tuple[str, str]] = {}
+    if systemd_probes:
+        targets = [str(p["target"]) for p in systemd_probes]
+        by_target = _systemd_round(
+            runner, vmid, expected_node, local_node, targets, budget
+        )
+        for probe in systemd_probes:
+            results[int(probe["index"])] = by_target[str(probe["target"])]
+    if docker_probes:
+        results.update(
+            _docker_round(runner, vmid, expected_node, local_node, docker_probes, budget)
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Bounded settling: repeat full rounds until a decisive verdict or a bound.
+# ---------------------------------------------------------------------------
+
+
+def evaluate_health_contract_settling(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    probes: Sequence[dict[str, Any]],
+    *,
+    monotonic: Clock = time.monotonic,
+    sleep: Sleeper = time.sleep,
+) -> dict[str, Any]:
+    """Drive one bounded settling window over the complete frozen probe set.
+
+    Returns a dict with ``probes`` (index -> (outcome, reason)), ``rounds``,
+    ``settled_seconds``, and ``last_round_span_ms``. Every terminal decision
+    -- PASS, FAIL, or a deadline/bound UNKNOWN -- uses exactly ONE round's
+    complete observation set; evidence from different rounds is never merged
+    to manufacture a verdict (the required regression: an earlier PASS
+    contributes no terminal authority once a later round observes FAIL).
+    """
+
+    # Structural target problems are round-independent: fixed forever, and
+    # never worth spending a guest command on.
+    structural: dict[int, tuple[str, str]] = {}
+    live_probes: list[dict[str, Any]] = []
+    for probe in probes:
+        outcome = _structural_probe_outcome(str(probe["kind"]), str(probe["target"]))
+        if outcome is None:
+            live_probes.append(probe)
+        else:
+            structural[int(probe["index"])] = outcome
+
+    budget = _RoundBudget()
+    start = monotonic()
+    round_index = 0
+    last_results: dict[int, tuple[str, str]] = dict(structural)
+    last_round_span_ms = 0
+
+    while True:
+        round_index += 1
+        round_start = monotonic()
+        fresh = _run_one_round(
+            runner, vmid, expected_node, local_node, live_probes, budget
+        )
+        round_span = monotonic() - round_start
+        last_round_span_ms = int(round_span * 1000)
+        last_results = {**structural, **fresh}
+
+        any_transient = any(
+            outcome == "unknown" for outcome, _ in last_results.values()
+        )
+        decisive = (
+            round_span <= MAX_ROUND_SPAN_SECONDS
+            and round_index >= MIN_DECISIVE_ROUND
+            and not any_transient
+        )
+        if decisive:
+            break
+        elapsed = monotonic() - start
+        if (
+            elapsed >= SETTLING_DEADLINE_SECONDS
+            or round_index >= MAX_SETTLING_ROUNDS
+            or budget.used >= MAX_GUEST_COMMANDS
+        ):
+            break
+        sleep(OBSERVATION_INTERVAL_SECONDS)
+
+    return {
+        "probes": last_results,
+        "rounds": round_index,
+        "settled_seconds": monotonic() - start,
+        "last_round_span_ms": last_round_span_ms,
+    }
+
+
+def handle_request(
+    payload: Any,
+    *,
+    runner: Runner = _run_bounded,
+    monotonic: Clock = time.monotonic,
+    sleep: Sleeper = time.sleep,
+) -> dict[str, Any]:
     request = validate_request(payload)
     vmid = request["vmid"]
     expected_node = request["expected_node"]
@@ -842,24 +1174,19 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
             },
         }
 
+    settled = evaluate_health_contract_settling(
+        runner,
+        vmid,
+        expected_node,
+        local_node,
+        request["probes"],
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    by_index: dict[int, tuple[str, str]] = settled["probes"]
     probes: list[dict[str, Any]] = []
     for probe in request["probes"]:
-        evaluator = EVALUATORS[probe["kind"]]
-        try:
-            outcome, reason = evaluator(
-                runner, vmid, expected_node, local_node, probe["target"]
-            )
-        except ProbeUnknown as exc:
-            outcome, reason = "unknown", exc.reason
-        except HealthError as exc:
-            # A whole-host problem observed mid-probe (the guest went away,
-            # moved node, or stopped). It makes THIS probe unevaluable; it is
-            # never a failure of the workload the operator declared.
-            outcome, reason = "unknown", (
-                "guest_unavailable"
-                if exc.classification in ("guest_unavailable", "stale_target")
-                else "command_failed"
-            )
+        outcome, reason = by_index[probe["index"]]
         probes.append(
             {
                 "index": probe["index"],
@@ -880,6 +1207,14 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
             "fingerprint": request["fingerprint"],
         },
         "probes": probes,
+        # Bounded settling metadata: never guest output, never a command, and
+        # never more than three small integers. Persisted by the backend only
+        # alongside a truthful UNKNOWN, never merged into a verdict's proof.
+        "settling": {
+            "rounds": settled["rounds"],
+            "settled_seconds": round(float(settled["settled_seconds"]), 3),
+            "last_round_span_ms": settled["last_round_span_ms"],
+        },
     }
 
 

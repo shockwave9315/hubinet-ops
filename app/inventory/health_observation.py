@@ -6,6 +6,16 @@ from .models import HealthProbeKind, HealthProbeOutcome
 
 
 # Closed durable taxonomy.  Raw guest output never becomes a reason.
+#
+# Bounded health settling (ARCHITECTURE.md, "Job-bound healthcheck execution")
+# closes the entire transient-health family, not only Docker `starting`: every
+# token below is either a POSITIVE proof (PASSED), a proof the declared object
+# exists but does not satisfy the probe (FAILED, never recheckable once
+# durable), or a truthful non-answer that a bounded settling round may
+# legitimately see again on its very next observation (UNKNOWN). A reason is
+# added here only when the helper and the backend both need to name the exact
+# same fact; see `deploy/hubinet-package-health-helper.py` for the guest-side
+# state machine that produces each one.
 HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
     {
         "unit_active",
@@ -17,6 +27,13 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "container_unhealthy",
         "container_health_starting",
         "container_has_no_healthcheck",
+        "container_restarting",
+        "container_not_started_yet",
+        "container_removing",
+        "unit_activating",
+        "unit_deactivating",
+        "unit_reloading",
+        "unit_job_pending",
         "probe_target_not_exact",
         "probe_target_ambiguous",
         "guest_unavailable",
@@ -55,14 +72,28 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
             "host_unreachable",
             "host_response_rejected",
             "resource_context_changed",
-            # Docker's OWN transient state, entered automatically by every
+            # Docker's OWN transient states, entered automatically by every
             # container (re)start before its first health probe can run --
             # never a workload verdict. A package-triggered Docker/containerd
-            # restart produces this on a workload that is about to report
-            # healthy again on its own; see `deploy/hubinet-package-health-
-            # helper.py` and ARCHITECTURE.md, "Job-bound healthcheck
-            # execution".
+            # restart produces these on a workload that is about to settle
+            # back to a definitive state on its own; see
+            # `deploy/hubinet-package-health-helper.py` and ARCHITECTURE.md,
+            # "Job-bound healthcheck execution".
             "container_health_starting",
+            "container_restarting",
+            "container_not_started_yet",
+            "container_removing",
+            # systemd's own transient job states, symmetrically: a unit mid
+            # (de)activation or reload is not yet a verdict either way, and
+            # `unit_job_pending` is the same fact for a unit currently
+            # inactive/failed with systemd's own Job property still pending --
+            # `systemctl show --property=Job` is the load-bearing distinction
+            # from a settled, empty-Job inactive/failed unit, which stays
+            # `unit_not_active` and definitive.
+            "unit_activating",
+            "unit_deactivating",
+            "unit_reloading",
+            "unit_job_pending",
         }
     ),
 }
@@ -70,6 +101,10 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
 HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
     "unit_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
     "unit_not_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "unit_activating": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "unit_deactivating": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "unit_reloading": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "unit_job_pending": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
     "container_running": frozenset({HealthProbeKind.DOCKER_CONTAINER_RUNNING}),
     "container_healthy": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
     "container_not_running": frozenset(
@@ -79,6 +114,24 @@ HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
         }
     ),
     "container_absent": frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+    "container_restarting": frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+    "container_not_started_yet": frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+    "container_removing": frozenset(
         {
             HealthProbeKind.DOCKER_CONTAINER_RUNNING,
             HealthProbeKind.DOCKER_CONTAINER_HEALTHY,

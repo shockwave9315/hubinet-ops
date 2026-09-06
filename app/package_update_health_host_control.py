@@ -1,10 +1,14 @@
 """Dark bounded SSH transport for job-bound healthcheck evaluation.
 
-**Not production-reachable and not deployed.** No production configuration,
-key, or `authorized_keys` entry exists for this channel:
-`app/inventory_runtime.py` never constructs it, and neither bootstrap nor the
-product updater installs its helper or key. It is instantiated only by
-hermetic tests in this stage.
+**Production reachable, through the one worker.** `app/inventory_runtime.py`
+constructs this transport and composes it into the one
+`PackageUpdateHealthOrchestrator` when `package_update.enabled` is configured
+with a health private key (see "Production activation" in
+`ARCHITECTURE.md`). `deploy/lib/bootstrap-update-boundaries.sh` and
+`deploy/update-proxmox-0.5.sh` provision its dedicated key and forced-command
+`authorized_keys` entry as one of the five package-update host-control
+boundaries; `deploy/hubinet-package-health-helper.py` is the deployed helper
+on the other end.
 
 It is a separate, purpose-specific client from the scan, snapshot, execution,
 mutation, and rollback transports, and deliberately does not resurrect the
@@ -343,6 +347,11 @@ class SshPackageUpdateHealthHostControl:
         probes: list[HostProbeResult] = []
         for raw in raw_probes:
             probes.append(self._parse_probe(raw))
+        (
+            settling_rounds,
+            settling_seconds,
+            last_round_span_ms,
+        ) = self._parse_settling(payload.get("settling"))
         return HostHealthResult(
             contract_revision=revision,
             contract_fingerprint=fingerprint,
@@ -352,7 +361,44 @@ class SshPackageUpdateHealthHostControl:
                 if isinstance(payload.get("reason"), str)
                 else None
             ),
+            settling_rounds=settling_rounds,
+            settling_seconds=settling_seconds,
+            last_round_span_ms=last_round_span_ms,
         )
+
+    @staticmethod
+    def _parse_settling(
+        raw: Any,
+    ) -> tuple[int | None, float | None, int | None]:
+        """Parse the host's bounded settling metadata, defensively.
+
+        Absent or malformed metadata never rejects an otherwise-valid answer
+        -- it is observability, not proof -- so a missing or malformed
+        ``settling`` block simply yields ``None`` for every field rather than
+        raising. Bounds mirror the helper's own: at most
+        ``SETTLING_DEADLINE_SECONDS`` plus a small margin of settled seconds,
+        and a small bounded round/span count.
+        """
+
+        if not isinstance(raw, Mapping):
+            return None, None, None
+        rounds = raw.get("rounds")
+        seconds = raw.get("settled_seconds")
+        span_ms = raw.get("last_round_span_ms")
+        bounded_rounds = (
+            rounds if type(rounds) is int and 0 <= rounds <= 1000 else None
+        )
+        bounded_seconds = (
+            float(seconds)
+            if isinstance(seconds, (int, float))
+            and not isinstance(seconds, bool)
+            and 0 <= seconds <= 3600
+            else None
+        )
+        bounded_span_ms = (
+            span_ms if type(span_ms) is int and 0 <= span_ms <= 3_600_000 else None
+        )
+        return bounded_rounds, bounded_seconds, bounded_span_ms
 
     @staticmethod
     def _parse_probe(raw: Any) -> HostProbeResult:

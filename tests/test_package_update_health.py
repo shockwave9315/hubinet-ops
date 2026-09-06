@@ -2140,7 +2140,11 @@ def test_a_job_that_moved_on_mid_attempt_still_reports_no_verdict(
 
 
 def _end_to_end(tmp_path: Path, configure=None, *, probes=None):
-    from tests.test_package_health_helper import FakeGuest, helper as real_helper
+    from tests.test_package_health_helper import (
+        FakeClock,
+        FakeGuest,
+        helper as real_helper,
+    )
     from app.package_scan_host_control import BoundedProcessResult
     from app.package_update_health_host_control import (
         SshPackageUpdateHealthHostControl,
@@ -2155,10 +2159,15 @@ def _end_to_end(tmp_path: Path, configure=None, *, probes=None):
     guest.node = guest.current_node = request.expected_node
     if configure is not None:
         configure(guest)
+    # Bounded settling needs >= 2 rounds before any verdict; an instantly
+    # advancing fake clock proves the same behaviour without a real sleep.
+    clock = FakeClock()
 
     def runner(argv, stdin, timeout, max_bytes):
         payload = json.loads(stdin.decode("utf-8"))
-        response = real_helper.handle_request(payload, runner=guest)
+        response = real_helper.handle_request(
+            payload, runner=guest, monotonic=clock.monotonic, sleep=clock.sleep
+        )
         return BoundedProcessResult(
             returncode=0 if response.get("ok") else 1,
             stdout=json.dumps(response).encode("utf-8"),
@@ -2197,7 +2206,7 @@ def test_end_to_end_a_stopped_unit_fails_and_keeps_rollback_authority(
     tmp_path: Path,
 ) -> None:
     def stop_the_unit(guest):
-        guest.units["nginx.service"] = ("loaded", "failed")
+        guest.units["nginx.service"] = ("loaded", "failed", "")
 
     store, authority, guest, result = _end_to_end(tmp_path, stop_the_unit)
 
@@ -2298,7 +2307,7 @@ def test_end_to_end_docker_health_is_required_when_it_was_asked_for(
     tmp_path: Path,
 ) -> None:
     def make_it_merely_running(guest):
-        guest.containers["web"] = (True, "unhealthy")
+        guest.containers["web"] = ("running", "false", "unhealthy")
 
     store, authority, guest, result = _end_to_end(
         tmp_path,

@@ -165,6 +165,13 @@ HOST_PROBE_REASONS: frozenset[str] = frozenset(
         "container_unhealthy",
         "container_health_starting",
         "container_has_no_healthcheck",
+        "container_restarting",
+        "container_not_started_yet",
+        "container_removing",
+        "unit_activating",
+        "unit_deactivating",
+        "unit_reloading",
+        "unit_job_pending",
         "probe_target_not_exact",
         "probe_target_ambiguous",
         "guest_unavailable",
@@ -215,6 +222,15 @@ class HostHealthResult:
     #: Bounded classification text for a whole-request failure. Never raw
     #: stdout, stderr, or command text.
     reason: str | None = None
+    #: Bounded settling metadata from the host's own bounded settling window
+    #: (ARCHITECTURE.md, "Job-bound healthcheck execution"): how many full
+    #: rounds it ran, the total wall time it spent settling, and the span of
+    #: the LAST round. Three small integers, never guest output. ``None``
+    #: only for an answer that predates this metadata (defence in depth; the
+    #: deployed helper always sends it).
+    settling_rounds: int | None = None
+    settling_seconds: float | None = None
+    last_round_span_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +358,10 @@ class PackageUpdateHealthOrchestrator:
                 blocking.reason,
                 "at least one frozen probe could not be evaluated truthfully "
                 f"({blocking.reason})",
+                probe_evidence=observations,
+                settling_rounds=host_result.settling_rounds,
+                settling_seconds=host_result.settling_seconds,
+                last_round_span_ms=host_result.last_round_span_ms,
             )
 
         # E. Re-prove the backend resource context AFTER the host answered.
@@ -371,7 +391,15 @@ class PackageUpdateHealthOrchestrator:
         )
 
     def _unknown(
-        self, job_id: str, reason_token: str, detail: str
+        self,
+        job_id: str,
+        reason_token: str,
+        detail: str,
+        *,
+        probe_evidence: Sequence[HealthProbeObservation] = (),
+        settling_rounds: int | None = None,
+        settling_seconds: float | None = None,
+        last_round_span_ms: int | None = None,
     ) -> HealthStageResult:
         """Record a truthful non-answer and leave the job exactly as it was.
 
@@ -379,11 +407,23 @@ class PackageUpdateHealthOrchestrator:
         rollback, say -- the event can no longer be appended, and that is not
         an error worth raising: the outcome of THIS attempt is still "no
         verdict", and the job's real state is read back and returned.
+
+        ``probe_evidence`` is populated only when the host actually answered
+        and its per-probe observations were validated against the frozen
+        contract (an in-flight resource-context change or a whole-request
+        host refusal carries no such evidence to report). Bounded, typed,
+        never guest output -- see `InventoryAuthority.
+        record_package_update_health_outcome_unknown`.
         """
 
         try:
             job = self._authority.record_package_update_health_outcome_unknown(
-                job_id, reason_token
+                job_id,
+                reason_token,
+                probe_evidence=probe_evidence,
+                settling_rounds=settling_rounds,
+                settling_seconds=settling_seconds,
+                last_round_span_ms=last_round_span_ms,
             )
         except AuthorityConflict:
             job = self._authority.package_update_job(job_id)

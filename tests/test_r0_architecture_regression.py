@@ -1690,33 +1690,33 @@ def test_the_health_helper_builds_only_fixed_argv_around_a_data_target() -> None
     """A probe target is DATA, and the commands around it are constants.
 
     Asserted structurally over the AST rather than by substring: every string
-    inside the three probe evaluators must be a literal this file owns, so a
-    target can never be concatenated, formatted, or templated into command
-    text. The one interpolation allowed anywhere near Docker is the exact
-    `/`-prefixed name comparison, which is a CHECK on the answer, not part of
-    a command.
+    inside the batched round builders (one per family: systemd, and the two
+    Docker guest commands) must be a literal this file owns, so a target can
+    never be concatenated, formatted, or templated into command text -- it is
+    only ever star-unpacked as its own argv element(s). The one interpolation
+    allowed anywhere near Docker is the exact `/`-prefixed name comparison
+    used to map a batched answer back onto its target, which is a CHECK on
+    the answer, not part of a command.
     """
 
     path = REPO_ROOT / "deploy/hubinet-package-health-helper.py"
     module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    evaluators = {
+    builders = {
         node.name: node
         for node in module.body
         if isinstance(node, ast.FunctionDef)
-        and node.name.startswith("evaluate_")
+        and node.name in {"_systemd_round", "_docker_daemon_names", "_docker_inspect_batch"}
     }
-    assert set(evaluators) == {
-        "evaluate_systemd_unit_active",
-        "evaluate_docker_container_running",
-        "evaluate_docker_container_healthy",
+    assert set(builders) == {
+        "_systemd_round",
+        "_docker_daemon_names",
+        "_docker_inspect_batch",
     }
-    for name, node in evaluators.items():
+    for name, node in builders.items():
         for inner in ast.walk(node):
             # An f-string or a `%`/`.format()` call building a command would
             # be exactly the interpolation this stage forbids.
-            assert not isinstance(inner, ast.JoinedStr) or name.startswith(
-                "evaluate_docker"
-            ), name
+            assert not isinstance(inner, ast.JoinedStr), name
             if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
                 assert inner.func.attr != "format", name
 
