@@ -89,6 +89,7 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "unit_deactivating",
         "unit_reloading",
         "unit_job_pending",
+        "guest_operational_confirmed",
         "probe_target_not_exact",
         "probe_target_ambiguous",
         "guest_unavailable",
@@ -117,7 +118,12 @@ HEALTH_EVIDENCE_KINDS: frozenset[str] = frozenset({"observation", "verdict"})
 #: payload PR #80 review found HA was not independently proving impossible.
 HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
     HealthProbeOutcome.PASSED: frozenset(
-        {"unit_active", "container_running", "container_healthy"}
+        {
+            "unit_active",
+            "container_running",
+            "container_healthy",
+            "guest_operational_confirmed",
+        }
     ),
     HealthProbeOutcome.FAILED: frozenset(
         {
@@ -208,6 +214,7 @@ HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
             HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
         }
     ),
+    "guest_operational_confirmed": frozenset({HealthProbeKind.GUEST_OPERATIONAL}),
 }
 
 #: The two states in which no job material may be present at all.
@@ -402,9 +409,17 @@ def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> 
             raise ValueError("job health probes contain a duplicate index")
         seen_indexes.add(probe.probe_index)
         _require_enum_instance(probe.kind, HealthProbeKind, "job health probe kind")
-        _require_text(probe.target, "job health probe target")
-        if len(probe.target) > MAX_HEALTH_PROBE_TARGET_LENGTH:
-            raise ValueError("job health probe target is too long")
+        if probe.kind is HealthProbeKind.GUEST_OPERATIONAL:
+            if probe.target is not None:
+                raise ValueError(
+                    "a guest_operational job health probe must not carry a target"
+                )
+        else:
+            if probe.target is None:
+                raise ValueError("job health probe target is required for this kind")
+            _require_text(probe.target, "job health probe target")
+            if len(probe.target) > MAX_HEALTH_PROBE_TARGET_LENGTH:
+                raise ValueError("job health probe target is too long")
         _require_enum_instance(
             probe.outcome, HealthProbeOutcome, "job health probe outcome"
         )

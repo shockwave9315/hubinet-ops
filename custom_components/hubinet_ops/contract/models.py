@@ -245,10 +245,16 @@ class PackagePlanApprovalSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class HealthProbe:
-    """One required typed probe: `kind` selects fixed argv, `target` is data."""
+    """One required typed probe: `kind` selects fixed argv, `target` is data.
+
+    ``target`` is ``None`` for, and only for,
+    ``HealthProbeKind.GUEST_OPERATIONAL`` -- that kind names no container or
+    unit, and a faked target for it is exactly what the frozen design
+    forbids.
+    """
 
     kind: HealthProbeKind
-    target: str
+    target: str | None
 
     def __post_init__(self) -> None:
         validate_health_probe(self)
@@ -458,7 +464,8 @@ class PackageUpdateJobHealthProbeResult:
 
     probe_index: int
     kind: HealthProbeKind
-    target: str
+    #: ``None`` for, and only for, ``HealthProbeKind.GUEST_OPERATIONAL``.
+    target: str | None
     outcome: HealthProbeOutcome
     checked_at: str
     reason: str

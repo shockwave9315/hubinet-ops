@@ -101,11 +101,35 @@ def _probe_target(value: Any) -> str:
     return value
 
 
-_PROBE_SCHEMA = vol.Schema(
-    {
-        vol.Required(ATTR_KIND): vol.In([kind.value for kind in HealthProbeKind]),
-        vol.Required(ATTR_TARGET): _probe_target,
-    }
+def _require_probe_target_matches_kind(probe: dict[str, Any]) -> dict[str, Any]:
+    """``target`` is required for every kind except one.
+
+    ``guest_operational`` (v20) names no container or unit -- it must not
+    carry a target at all, never a faked one (``"guest"``, a VMID string).
+    """
+
+    kind = probe[ATTR_KIND]
+    target = probe.get(ATTR_TARGET)
+    if kind == HealthProbeKind.GUEST_OPERATIONAL.value:
+        if target is not None:
+            raise vol.Invalid(
+                "a guest_operational health probe must not carry a target"
+            )
+    elif target is None:
+        raise vol.Invalid("a target is required for this probe kind")
+    return probe
+
+
+_PROBE_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Required(ATTR_KIND): vol.In(
+                [kind.value for kind in HealthProbeKind]
+            ),
+            vol.Optional(ATTR_TARGET, default=None): vol.Any(None, _probe_target),
+        }
+    ),
+    _require_probe_target_matches_kind,
 )
 _VIEW_HEALTH_CONTRACT_SCHEMA = vol.Schema({vol.Required(ATTR_DEVICE_ID): str})
 _SET_HEALTH_CONTRACT_SCHEMA = vol.Schema(

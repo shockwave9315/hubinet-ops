@@ -5271,6 +5271,38 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
 
 
 @pytest.mark.asyncio
+async def test_set_health_contract_accepts_guest_operational_with_no_target(
+    hass: HomeAssistant,
+) -> None:
+    """v20: the one supported probe kind an operator may declare with no
+    target at all -- never a faked one."""
+
+    transport = FakeTransport([snapshot(INITIAL_RESOURCES)])
+    await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_SET_HEALTH_CONTRACT,
+        {
+            "device_id": resource_device_id(hass, RESOURCE_CT),
+            "probes": [{"kind": "guest_operational"}],
+        },
+        blocking=True,
+        return_response=True,
+    )
+    await hass.async_block_till_done()
+
+    assert transport.health_contract_writes == [
+        (
+            RESOURCE_CT,
+            (HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),),
+            None,
+        )
+    ]
+    assert response["probes"] == [{"kind": "guest_operational", "target": None}]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "probes",
     (
@@ -5288,6 +5320,10 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
                 "command": "rm -rf /",
             }
         ],
+        # v20: guest_operational must never carry a target -- never even a
+        # syntactically valid one.
+        [{"kind": "guest_operational", "target": "guest"}],
+        [{"kind": "guest_operational", "target": "nginx.service"}],
         [
             {"kind": "systemd_unit_active", "target": f"unit-{index}.service"}
             for index in range(33)

@@ -349,7 +349,12 @@ def _resource_health_contract(
             )
         probes = tuple(
             HealthProbe(
-                kind=HealthProbeKind(probe["kind"]), target=str(probe["target"])
+                kind=HealthProbeKind(probe["kind"]),
+                # `None` only for guest_operational -- `str(None)` would
+                # silently become the literal string "None".
+                target=(
+                    None if probe["target"] is None else str(probe["target"])
+                ),
             )
             for probe in payload["probes"]
         )
@@ -433,6 +438,24 @@ def _strict_int(value: Any, field: str) -> int:
     return value
 
 
+def _strict_probe_target(value: Any, kind: "HealthProbeKind", field: str) -> str | None:
+    """A probe target is a string for every kind except one.
+
+    ``guest_operational`` names no container or unit and MUST be exactly
+    JSON ``null``; every other kind requires the exact string type -- never
+    a coercion, and never a target silently accepted for the one kind that
+    must never carry one.
+    """
+
+    if kind is HealthProbeKind.GUEST_OPERATIONAL:
+        if value is not None:
+            raise HubinetOpsInvalidResponse(
+                f"{field} must be null for a guest_operational probe"
+            )
+        return None
+    return _strict_str(value, field)
+
+
 def _strict_bool(value: Any, field: str) -> bool:
     """Exact JSON type. ``bool("false")`` is ``True`` in Python -- exactly
     the false-negative-turned-false-positive this refuses to let happen for
@@ -441,6 +464,21 @@ def _strict_bool(value: Any, field: str) -> bool:
     if type(value) is not bool:
         raise HubinetOpsInvalidResponse(f"{field} must be a boolean")
     return value
+
+
+def _package_update_job_health_probe_result(
+    probe: Any,
+) -> PackageUpdateJobHealthProbeResult:
+    kind = HealthProbeKind(probe["kind"])
+    return PackageUpdateJobHealthProbeResult(
+        probe_index=_strict_int(probe["index"], "probe.index"),
+        kind=kind,
+        target=_strict_probe_target(probe["target"], kind, "probe.target"),
+        outcome=HealthProbeOutcome(probe["outcome"]),
+        checked_at=_strict_str(probe["checked_at"], "probe.checked_at"),
+        reason=_strict_str(probe["reason"], "probe.reason"),
+        definitive=_strict_bool(probe["definitive"], "probe.definitive"),
+    )
 
 
 def _package_update_job_view(
@@ -514,15 +552,7 @@ def _package_update_job_view(
                 for event in payload.get("events", ())
             ),
             health_probes=tuple(
-                PackageUpdateJobHealthProbeResult(
-                    probe_index=_strict_int(probe["index"], "probe.index"),
-                    kind=HealthProbeKind(probe["kind"]),
-                    target=_strict_str(probe["target"], "probe.target"),
-                    outcome=HealthProbeOutcome(probe["outcome"]),
-                    checked_at=_strict_str(probe["checked_at"], "probe.checked_at"),
-                    reason=_strict_str(probe["reason"], "probe.reason"),
-                    definitive=_strict_bool(probe["definitive"], "probe.definitive"),
-                )
+                _package_update_job_health_probe_result(probe)
                 for probe in health.get("probes", ())
             ),
             health_evidence=evidence,

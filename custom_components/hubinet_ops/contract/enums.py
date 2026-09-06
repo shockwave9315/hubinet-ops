@@ -161,6 +161,11 @@ class HealthProbeKind(StrEnum):
     SYSTEMD_UNIT_ACTIVE = "systemd_unit_active"
     DOCKER_CONTAINER_RUNNING = "docker_container_running"
     DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
+    #: A FALLBACK, not an application-health proof (v20): backend discovery
+    #: recommends this ONLY when no supported Docker/systemd workload
+    #: candidate was found. Carries no workload target -- see
+    #: `HealthProbe.target`.
+    GUEST_OPERATIONAL = "guest_operational"
 
 
 class HealthProbeOutcome(StrEnum):

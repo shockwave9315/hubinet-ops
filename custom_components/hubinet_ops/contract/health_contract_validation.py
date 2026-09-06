@@ -41,6 +41,14 @@ _FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 
 def validate_health_probe(probe: "HealthProbe") -> None:
     _require_enum_instance(probe.kind, HealthProbeKind, "health probe kind")
+    if probe.kind is HealthProbeKind.GUEST_OPERATIONAL:
+        if probe.target is not None:
+            raise ValueError(
+                "a guest_operational health probe must not carry a target"
+            )
+        return
+    if probe.target is None:
+        raise ValueError("health probe target is required for this kind")
     _require_text(probe.target, "health probe target")
     if len(probe.target) > MAX_HEALTH_PROBE_TARGET_LENGTH:
         raise ValueError("health probe target is too long")
