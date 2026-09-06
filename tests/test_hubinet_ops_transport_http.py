@@ -1147,12 +1147,13 @@ def _rollback_job_payload(resource_id: str) -> dict[str, Any]:
 
 def test_package_update_job_view_parses_per_probe_health_evidence() -> None:
     payload = _rollback_job_payload(RESOURCE_CT)
-    payload["checkpoint"] = "health_completed"
+    payload["checkpoint"] = "health_started"
     payload["health"] = {
         "contract_revision": 3,
         "started_at": "2026-09-06T13:40:16.792041+00:00",
-        "completed_at": "2026-09-06T13:40:23.444652+00:00",
-        "outcome": "failed",
+        "completed_at": None,
+        "outcome": None,
+        "evidence": "observation",
         "probes": [
             {
                 "index": 0,
@@ -1161,6 +1162,7 @@ def test_package_update_job_view_parses_per_probe_health_evidence() -> None:
                 "outcome": "unknown",
                 "checked_at": "2026-09-06T13:40:23.444652+00:00",
                 "reason": "container_health_starting",
+                "definitive": False,
             },
             {
                 "index": 1,
@@ -1169,12 +1171,14 @@ def test_package_update_job_view_parses_per_probe_health_evidence() -> None:
                 "outcome": "unknown",
                 "checked_at": "2026-09-06T13:40:23.444652+00:00",
                 "reason": "container_health_starting",
+                "definitive": False,
             },
         ],
     }
 
     view = _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
 
+    assert view.health_evidence == "observation"
     assert len(view.health_probes) == 2
     first = view.health_probes[0]
     assert first.probe_index == 0
@@ -1183,6 +1187,7 @@ def test_package_update_job_view_parses_per_probe_health_evidence() -> None:
     assert first.outcome is HealthProbeOutcome.UNKNOWN
     assert first.reason == "container_health_starting"
     assert first.checked_at == "2026-09-06T13:40:23.444652+00:00"
+    assert first.definitive is False
 
 
 def test_package_update_job_view_defaults_to_no_probes_when_absent() -> None:

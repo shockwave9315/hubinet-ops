@@ -477,9 +477,11 @@ def _package_update_job_view(
                     outcome=HealthProbeOutcome(probe["outcome"]),
                     checked_at=str(probe["checked_at"]),
                     reason=str(probe["reason"]),
+                    definitive=bool(probe["definitive"]),
                 )
                 for probe in health.get("probes", ())
             ),
+            health_evidence=health.get("evidence"),
         )
     except HubinetOpsInvalidResponse:
         raise
@@ -565,6 +567,7 @@ def _operator_capabilities(payload: Any) -> OperatorCapabilities:
         can_start_update=payload["can_start_update"],
         can_view_update_job=payload["can_view_update_job"],
         can_resume_update=payload["can_resume_update"],
+        can_rerun_health_evaluation=payload["can_rerun_health_evaluation"],
         can_rollback_update=payload["can_rollback_update"],
         can_view_health_contract=payload["can_view_health_contract"],
         can_configure_health_contract=payload["can_configure_health_contract"],

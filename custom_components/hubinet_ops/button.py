@@ -71,6 +71,12 @@ RESOURCE_BUTTONS = (
         capability="can_resume_update",
     ),
     HubinetOpsButtonDescription(
+        key="rerun_health_evaluation",
+        translation_key="rerun_health_evaluation",
+        icon="mdi:heart-cog-outline",
+        capability="can_rerun_health_evaluation",
+    ),
+    HubinetOpsButtonDescription(
         key="rollback_update",
         translation_key="rollback_update",
         icon="mdi:backup-restore",
@@ -219,9 +225,14 @@ def _job_message(job: dict[str, Any], strings: Mapping[str, str]) -> str:
         f"- **{label}:** {_cell(value, unknown=unknown)}" for label, value in facts
     ]
     if job["health_probes"]:
-        lines.extend(
-            ("", f"### {_tr(strings, 'job.health_probes.heading')}", "")
+        heading_key = (
+            "job.health_probes.heading"
+            if job.get("health_evidence") == "verdict"
+            else "job.health_probes.observation_heading"
         )
+        lines.extend(("", f"### {_tr(strings, heading_key)}", ""))
+        if job.get("health_evidence") == "observation":
+            lines.extend((_tr(strings, "job.health_probes.observation_note"), ""))
         outcome_labels = {
             outcome: _tr(strings, f"job.health_probes.outcome.{outcome}")
             for outcome in ("passed", "failed", "unknown")
@@ -371,7 +382,11 @@ class HubinetOpsResourceButton(HubinetOpsResourceEntity, ButtonEntity):
             job = await async_view_update_job(self.coordinator, self.resource_id)
         elif key == "start_update":
             job = await async_start_update(self.coordinator, self.resource_id)
-        elif key == "resume_update":
+        elif key in ("resume_update", "rerun_health_evaluation"):
+            # Both names call the exact same backend liveness entrypoint --
+            # only the truthful label an operator sees differs, matching
+            # whichever one capability was actually satisfied (never both at
+            # once; see `contract/resource_validation.py`).
             job = await async_resume_update(self.coordinator, self.resource_id)
         elif key == "rollback_update":
             job = await async_rollback_update(self.coordinator, self.resource_id)

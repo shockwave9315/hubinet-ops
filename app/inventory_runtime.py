@@ -80,6 +80,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.inventory import (
     AuthorityConflict,
     AuthorityNotFound,
+    HEALTH_PROBE_REASONS,
     HealthContractRevisionConflict,
     HealthProbeKind,
     InventoryAuthority,
@@ -89,6 +90,7 @@ from app.inventory import (
     MAX_HEALTH_PROBE_TARGET_LENGTH,
     MIN_HEALTH_PROBES,
     PackageUpdateCheckpoint,
+    PackageUpdateEventType,
     PackageUpdateIssuanceRefused,
     PackageUpdateJob,
     PackageUpdateJobStatus,
@@ -276,7 +278,9 @@ _RETRYABLE_ISSUANCE_REFUSALS = frozenset(
 )
 
 
-def _package_update_health_probes_body(job: PackageUpdateJob) -> list[dict[str, Any]]:
+def _package_update_health_verdict_probes_body(
+    job: PackageUpdateJob,
+) -> list[dict[str, Any]]:
     """Render this job's completed per-probe health evidence, if any.
 
     Empty until a definitive verdict is durably recorded: `health_probe_results`
@@ -307,9 +311,122 @@ def _package_update_health_probes_body(job: PackageUpdateJob) -> list[dict[str, 
                 "outcome": result.outcome.value,
                 "checked_at": result.checked_at,
                 "reason": result.reason,
+                # `evidence == "verdict"`: this row is DEFINITIVE and durable.
+                "definitive": True,
             }
         )
     return probes
+
+
+def _latest_health_outcome_unknown_event(
+    store: InventoryAuthorityStore, job_id: str
+) -> Any | None:
+    """The most recent bounded UNKNOWN health-evaluation event, if any.
+
+    Re-runs at ``health_started`` keep appending one such event per attempt;
+    only the LAST one describes the job's current unresolved state -- never
+    merged with an earlier attempt's evidence.
+    """
+
+    events = store.list_package_update_job_events(job_id, limit=200)
+    for event in reversed(events):
+        if event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN:
+            return event
+    return None
+
+
+def _package_update_health_observation_body(
+    job: PackageUpdateJob, *, store: InventoryAuthorityStore
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Render the LAST unresolved health evaluation's bounded evidence.
+
+    Only meaningful while the job is ACTIVE at ``health_started`` with no
+    durable verdict yet (see `_package_update_health_body`, which is the only
+    caller and already gates on that). ``kind``/``target`` are joined here
+    from the job's own frozen probe rows -- never repeated into event JSON,
+    per `InventoryAuthority.record_package_update_health_outcome_unknown`.
+    """
+
+    event = _latest_health_outcome_unknown_event(store, job.job_id)
+    if event is None:
+        return [], None
+    frozen_by_index = {probe.probe_index: probe for probe in job.health_probes}
+    raw_probes = event.details.get("probes")
+    probes: list[dict[str, Any]] = []
+    if isinstance(raw_probes, list):
+        for raw in raw_probes:
+            if not isinstance(raw, Mapping):
+                continue
+            index = raw.get("index")
+            outcome = raw.get("outcome")
+            reason = raw.get("reason")
+            frozen = (
+                frozen_by_index.get(index) if type(index) is int else None
+            )
+            if (
+                frozen is None
+                or not isinstance(outcome, str)
+                or not isinstance(reason, str)
+                or reason not in HEALTH_PROBE_REASONS
+            ):
+                continue
+            probes.append(
+                {
+                    "index": index,
+                    "kind": frozen.kind.value,
+                    "target": frozen.target,
+                    "outcome": outcome,
+                    "checked_at": event.created_at,
+                    "reason": reason,
+                    # `evidence == "observation"`: never a verdict, and never
+                    # merged from more than one round or attempt.
+                    "definitive": False,
+                }
+            )
+    settling: dict[str, Any] | None = None
+    rounds = event.details.get("rounds")
+    settled_seconds = event.details.get("settled_seconds")
+    last_round_span_ms = event.details.get("last_round_span_ms")
+    if rounds is not None or settled_seconds is not None or last_round_span_ms is not None:
+        settling = {
+            "rounds": rounds,
+            "settled_seconds": settled_seconds,
+            "last_round_span_ms": last_round_span_ms,
+        }
+    return probes, settling
+
+
+def _package_update_health_body(
+    job: PackageUpdateJob, *, store: InventoryAuthorityStore
+) -> dict[str, Any]:
+    """The job's complete health readback: a verdict, bounded observation
+    evidence, or neither yet.
+
+    ``evidence`` is exactly one of ``None`` (nothing to report yet),
+    ``"observation"`` (an unresolved evaluation's bounded per-probe evidence
+    -- never a verdict, never recheck-until-pass, and truthfully re-runnable
+    via the distinct `can_rerun_health_evaluation` capability), or
+    ``"verdict"`` (a durable, non-recheckable PASSED/FAILED result). A
+    verdict always wins once one exists -- `health_completed_at` is set
+    exactly once, by the same write-once boundary that would also stop any
+    further UNKNOWN event from being appended for this job.
+    """
+
+    verdict_probes = _package_update_health_verdict_probes_body(job)
+    if verdict_probes:
+        return {
+            "evidence": "verdict",
+            "probes": verdict_probes,
+            "settling": None,
+        }
+    if (
+        job.status is PackageUpdateJobStatus.ACTIVE
+        and job.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    ):
+        probes, settling = _package_update_health_observation_body(job, store=store)
+        if probes:
+            return {"evidence": "observation", "probes": probes, "settling": settling}
+    return {"evidence": None, "probes": [], "settling": None}
 
 
 def _package_update_job_body(
@@ -358,7 +475,7 @@ def _package_update_job_body(
             "started_at": job.health_started_at,
             "completed_at": job.health_completed_at,
             "outcome": None if job.health_outcome is None else job.health_outcome.value,
-            "probes": _package_update_health_probes_body(job),
+            **_package_update_health_body(job, store=store),
         },
         "rollback": {
             "operation_id": job.rollback_operation_id,

@@ -1006,6 +1006,7 @@ async def test_devices_and_entities_are_keyed_by_backend_resource_id(
             "start_update",
             "view_update_job",
             "resume_update",
+            "rerun_health_evaluation",
             "rollback_update",
             "view_health_contract",
             "pending_updates",
@@ -1202,6 +1203,7 @@ async def test_retained_and_successor_generations_share_vmid_without_collision(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     }
@@ -1272,6 +1274,7 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
         "pending_updates",
@@ -1284,6 +1287,7 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     }
@@ -1350,6 +1354,7 @@ async def test_replacement_transition_retains_old_entities_unavailable(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     }
@@ -1421,6 +1426,7 @@ async def test_present_unavailable_node_only_blocks_node_dependent_entities(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     }
@@ -1618,7 +1624,7 @@ async def test_view_update_plan_reads_fresh_snapshot_and_returns_exact_rows(
         )
         if item.unique_id.startswith(f"{resource_key}:")
     ]
-    assert len(resource_entities) == 26
+    assert len(resource_entities) == 27
     for item in resource_entities:
         state = hass.states.get(item.entity_id)
         assert state is not None
@@ -2711,6 +2717,7 @@ async def test_operator_availability_unsupported_route_falls_back_to_all_false(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     ):
@@ -5556,7 +5563,10 @@ def job_view(
     terminalized_at: str | None = None,
     events: tuple[PackageUpdateJobEvent, ...] = (),
     health_probes: tuple[PackageUpdateJobHealthProbeResult, ...] = (),
+    health_evidence: str | None = None,
 ) -> PackageUpdateJobView:
+    if health_evidence is None and health_probes:
+        health_evidence = "verdict"
     return PackageUpdateJobView(
         job_id=JOB_ID,
         request_id=REQUEST_ID,
@@ -5580,6 +5590,7 @@ def job_view(
         terminalized_at=terminalized_at,
         events=events,
         health_probes=health_probes,
+        health_evidence=health_evidence,
     )
 
 
@@ -5590,6 +5601,7 @@ def _probe_result(
     target: str = "web",
     outcome: HealthProbeOutcome = HealthProbeOutcome.FAILED,
     reason: str = "container_unhealthy",
+    definitive: bool = True,
 ) -> PackageUpdateJobHealthProbeResult:
     return PackageUpdateJobHealthProbeResult(
         probe_index=probe_index,
@@ -5598,6 +5610,7 @@ def _probe_result(
         outcome=outcome,
         checked_at="2026-08-08T11:10:00+00:00",
         reason=reason,
+        definitive=definitive,
     )
 
 
@@ -5864,6 +5877,7 @@ async def test_view_update_job_response_carries_per_probe_health_evidence(
             "outcome": "unknown",
             "checked_at": "2026-09-06T13:40:23.444652+00:00",
             "reason": "container_health_starting",
+            "definitive": True,
         },
         {
             "index": 1,
@@ -5872,8 +5886,10 @@ async def test_view_update_job_response_carries_per_probe_health_evidence(
             "outcome": "unknown",
             "checked_at": "2026-09-06T13:40:23.444652+00:00",
             "reason": "container_health_starting",
+            "definitive": True,
         },
     ]
+    assert response["health_evidence"] == "verdict"
     # Answers exactly the operator's real questions: which probe, which
     # target, FAILED or UNKNOWN, and why -- without shell/SQLite access.
     assert "weatherhub-redis-1" in str(response["health_probes"])

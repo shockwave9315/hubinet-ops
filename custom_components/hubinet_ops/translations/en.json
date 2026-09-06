@@ -121,6 +121,7 @@
       "start_update": {"name": "Start approved update"},
       "view_update_job": {"name": "View update job"},
       "resume_update": {"name": "Resume update job"},
+      "rerun_health_evaluation": {"name": "Re-run health evaluation"},
       "rollback_update": {"name": "Roll back this update"},
       "view_health_contract": {"name": "View health contract"}
     }
@@ -274,6 +275,8 @@
       },
       "health_probes": {
         "heading": "Per-probe health evidence",
+        "observation_heading": "Per-probe health evidence (unresolved)",
+        "observation_note": "This is bounded observation evidence from the last completed settling round, not a definitive verdict. The job stays active; press **Re-run health evaluation** to evaluate again.",
         "outcome": {
           "passed": "PASSED",
           "failed": "FAILED",

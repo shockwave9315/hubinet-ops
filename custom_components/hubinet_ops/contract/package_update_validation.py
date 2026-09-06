@@ -82,6 +82,13 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "container_unhealthy",
         "container_health_starting",
         "container_has_no_healthcheck",
+        "container_restarting",
+        "container_not_started_yet",
+        "container_removing",
+        "unit_activating",
+        "unit_deactivating",
+        "unit_reloading",
+        "unit_job_pending",
         "probe_target_not_exact",
         "probe_target_ambiguous",
         "guest_unavailable",
@@ -94,6 +101,13 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "resource_context_changed",
     }
 )
+
+#: Bounded settling evidence taxonomy (frozen post-Human1 health
+#: architecture, Stage 2). ``None`` means no evidence to show yet;
+#: ``"observation"`` is an unresolved evaluation's bounded per-probe
+#: evidence -- never a verdict, never recheck-until-pass; ``"verdict"`` is a
+#: durable, non-recheckable PASSED/FAILED result.
+HEALTH_EVIDENCE_KINDS: frozenset[str] = frozenset({"observation", "verdict"})
 
 #: The two states in which no job material may be present at all.
 _JOBLESS_STATES = (
@@ -249,19 +263,35 @@ def validate_package_update_job_view(view: "PackageUpdateJobView") -> None:
 def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> None:
     """Validate the per-probe health evidence, if any is present.
 
-    Present only once a definitive verdict was durably recorded -- exactly
-    when ``health_outcome`` is also present -- and never otherwise: a job
-    with no verdict has no per-probe results to show, and a payload claiming
-    otherwise is outside the contract.
+    Present only once there is something to show at all -- exactly when
+    ``health_evidence`` is also present -- and never otherwise: a job with
+    neither a verdict nor an unresolved evaluation's observation has nothing
+    to show, and a payload claiming otherwise is outside the contract.
+
+    ``health_evidence == "verdict"`` requires every probe ``definitive``;
+    ``"observation"`` requires every probe NOT ``definitive`` -- a payload
+    may never mix the two, and definitive evidence is exactly and only
+    durable verdict evidence (`app/inventory_runtime.py`,
+    ``_package_update_health_body``). ``"verdict"`` additionally requires
+    ``health_outcome`` to be present (the two are the same durable fact from
+    two sides); ``"observation"`` requires it absent -- a job with a durable
+    verdict never ALSO carries stale UNKNOWN observation evidence.
     """
 
     probes = view.health_probes
     if len(probes) > MAX_HEALTH_PROBES:
         raise ValueError("job health_probes exceeds the maximum probe count")
-    if bool(probes) != (view.health_outcome is not None):
+    if view.health_evidence is not None and view.health_evidence not in HEALTH_EVIDENCE_KINDS:
+        raise ValueError("job health_evidence is not a known evidence kind")
+    if bool(probes) != (view.health_evidence is not None):
         raise ValueError(
-            "job health_probes must be present exactly when a definitive "
-            "health verdict is present"
+            "job health_probes must be present exactly when health_evidence "
+            "is present"
+        )
+    if (view.health_evidence == "verdict") != (view.health_outcome is not None):
+        raise ValueError(
+            "job health_evidence must be \"verdict\" exactly when a "
+            "definitive health verdict is present"
         )
     seen_indexes: set[int] = set()
     for probe in probes:
@@ -281,6 +311,13 @@ def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> 
         if probe.reason not in HEALTH_PROBE_REASONS:
             raise ValueError(
                 "job health probe reason is not a known bounded token"
+            )
+        if type(probe.definitive) is not bool:
+            raise ValueError("job health probe definitive must be a boolean")
+        if probe.definitive != (view.health_evidence == "verdict"):
+            raise ValueError(
+                "job health probe definitive must match the job's own "
+                "health_evidence kind"
             )
     if probes and seen_indexes != set(range(len(probes))):
         raise ValueError("job health probes are not canonically indexed")

@@ -121,6 +121,7 @@
       "start_update": {"name": "Rozpocznij zatwierdzoną aktualizację"},
       "view_update_job": {"name": "Wyświetl zadanie aktualizacji"},
       "resume_update": {"name": "Wznów zadanie aktualizacji"},
+      "rerun_health_evaluation": {"name": "Ponów ocenę stanu zdrowia"},
       "rollback_update": {"name": "Wycofaj tę aktualizację"},
       "view_health_contract": {"name": "Wyświetl kontrakt zdrowia"}
     }
@@ -274,6 +275,8 @@
       },
       "health_probes": {
         "heading": "Szczegółowe wyniki sond kondycji",
+        "observation_heading": "Szczegółowe wyniki sond kondycji (nierozstrzygnięte)",
+        "observation_note": "To ograniczone dowody obserwacyjne z ostatniej ukończonej rundy stabilizacji, a nie ostateczny werdykt. Zadanie pozostaje aktywne; naciśnij **Ponów ocenę stanu zdrowia**, aby ocenić ponownie.",
         "outcome": {
           "passed": "POZYTYWNY",
           "failed": "NEGATYWNY",

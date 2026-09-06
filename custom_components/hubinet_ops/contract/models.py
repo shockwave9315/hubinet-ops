@@ -364,6 +364,7 @@ class OperatorCapabilities:
     can_start_update: bool = False
     can_view_update_job: bool = False
     can_resume_update: bool = False
+    can_rerun_health_evaluation: bool = False
     can_rollback_update: bool = False
     can_view_health_contract: bool = False
     can_configure_health_contract: bool = False
@@ -439,14 +440,20 @@ class PackageUpdateJobEvent:
 
 @dataclass(frozen=True, slots=True)
 class PackageUpdateJobHealthProbeResult:
-    """One frozen probe's durable, definitive result, as an operator reads it.
+    """One frozen probe's health evidence, as an operator reads it.
 
     Every field is a bounded typed authority fact -- never raw helper
     stdout/stderr and never command text. ``kind``/``target`` are this job's
     own frozen probe material (already shown by ``view_health_contract``);
-    ``outcome``/``checked_at``/``reason`` are what the one definitive health
-    finalization boundary recorded for it. Empty for a job with no durable
-    verdict yet; complete, one row per frozen probe, once one exists.
+    ``outcome``/``checked_at``/``reason`` are what was observed for it.
+
+    ``definitive`` distinguishes the two evidence kinds a job's
+    ``health_evidence`` can carry (frozen post-Human1 health architecture,
+    Stage 2): ``True`` means a durable, non-recheckable PASSED/FAILED
+    verdict (``health_evidence == "verdict"``); ``False`` means an unresolved
+    evaluation's bounded OBSERVATION evidence (``health_evidence ==
+    "observation"``) -- never a verdict, and never laundered into one by
+    re-running. Empty for a job with neither yet.
     """
 
     probe_index: int
@@ -455,6 +462,7 @@ class PackageUpdateJobHealthProbeResult:
     outcome: HealthProbeOutcome
     checked_at: str
     reason: str
+    definitive: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,6 +514,10 @@ class PackageUpdateJobView:
     terminal_reason: str | None = None
     events: tuple[PackageUpdateJobEvent, ...] = ()
     health_probes: tuple[PackageUpdateJobHealthProbeResult, ...] = ()
+    #: ``None`` (nothing to show yet), ``"observation"`` (bounded per-probe
+    #: evidence from an unresolved evaluation), or ``"verdict"`` (a durable
+    #: definitive result) -- see `PackageUpdateJobHealthProbeResult.definitive`.
+    health_evidence: str | None = None
 
     def __post_init__(self) -> None:
         _require_uuid_identity(self.job_id, "job_id")

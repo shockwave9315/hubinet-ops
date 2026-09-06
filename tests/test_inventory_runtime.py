@@ -366,6 +366,7 @@ def test_29_backend_and_snapshot_http_shape_matches_publication_contract(
         "can_start_update",
         "can_view_update_job",
         "can_resume_update",
+        "can_rerun_health_evaluation",
         "can_rollback_update",
         "can_view_health_contract",
         "can_configure_health_contract",

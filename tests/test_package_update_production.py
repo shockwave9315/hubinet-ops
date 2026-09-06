@@ -231,6 +231,29 @@ class ScriptedHealthHostControl:
                 probes=(),
                 reason="guest_unavailable",
             )
+        if outcome == "probe_unknown":
+            # A genuine per-probe UNKNOWN (a settling window that ended
+            # transient, e.g. Docker's own `starting`): the host DID answer,
+            # with bounded settling metadata, and each probe carries a real
+            # observation -- this is what durably persists as bounded
+            # OBSERVATION evidence.
+            return HostHealthResult(
+                contract_revision=request.health_contract_revision,
+                contract_fingerprint=request.health_contract_fingerprint,
+                probes=tuple(
+                    HostProbeResult(
+                        probe_index=index,
+                        kind=probe.kind,
+                        target=probe.target,
+                        outcome=HealthProbeOutcome.UNKNOWN,
+                        reason=_unknown_reason_for(probe.kind),
+                    )
+                    for index, probe in enumerate(request.probes)
+                ),
+                settling_rounds=37,
+                settling_seconds=180.0,
+                last_round_span_ms=42,
+            )
         probes = tuple(
             HostProbeResult(
                 probe_index=index,
@@ -250,6 +273,14 @@ class ScriptedHealthHostControl:
             contract_fingerprint=request.health_contract_fingerprint,
             probes=probes,
         )
+
+
+def _unknown_reason_for(kind: HealthProbeKind) -> str:
+    return {
+        HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_job_pending",
+        HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_restarting",
+        HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_health_starting",
+    }[kind]
 
 
 def _reason_for(kind: HealthProbeKind, outcome: str) -> str:
@@ -1869,6 +1900,7 @@ def test_readback_includes_bounded_per_probe_health_evidence_on_failure(
                 "outcome": "failed",
                 "checked_at": probes[0]["checked_at"],
                 "reason": "container_not_running",
+                "definitive": True,
             },
             {
                 "index": 1,
@@ -1877,11 +1909,87 @@ def test_readback_includes_bounded_per_probe_health_evidence_on_failure(
                 "outcome": "failed",
                 "checked_at": probes[1]["checked_at"],
                 "reason": "unit_not_active",
+                "definitive": True,
             },
         ]
+        assert body["health"]["evidence"] == "verdict"
         rendered = response.text
         for forbidden in ("stdout", "stderr", "apt-get", BEARER, "PRIVATE KEY"):
             assert forbidden not in rendered, forbidden
+    finally:
+        system.close()
+
+
+def test_readback_includes_bounded_observation_evidence_when_unresolved(
+    tmp_path: Path,
+) -> None:
+    """Stage 2 of the frozen post-Human1 health architecture: an unresolved
+    settling window is no longer a dead end without shell/SQLite access.
+
+    The job stays ACTIVE at `health_started` with no durable verdict, but the
+    readback now carries the LAST complete round's bounded per-probe
+    evidence (`definitive: false`) plus settling metadata, and the operator
+    sees a truthfully distinct `can_rerun_health_evaluation` capability
+    instead of the generic (and, for this checkpoint, now-hidden)
+    `can_resume_update`.
+    """
+
+    system = ApiSystem(tmp_path, health=["probe_unknown"])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "active"
+        assert body["checkpoint"] == "health_started"
+        assert body["health"]["outcome"] is None
+        assert body["health"]["evidence"] == "observation"
+        probes = body["health"]["probes"]
+        assert probes == [
+            {
+                "index": 0,
+                "kind": "docker_container_running",
+                "target": "web",
+                "outcome": "unknown",
+                "checked_at": probes[0]["checked_at"],
+                "reason": "container_restarting",
+                "definitive": False,
+            },
+            {
+                "index": 1,
+                "kind": "systemd_unit_active",
+                "target": "nginx.service",
+                "outcome": "unknown",
+                "checked_at": probes[1]["checked_at"],
+                "reason": "unit_job_pending",
+                "definitive": False,
+            },
+        ]
+        assert body["health"]["settling"] == {
+            "rounds": 37,
+            "settled_seconds": 180.0,
+            "last_round_span_ms": 42,
+        }
+        rendered = response.text
+        for forbidden in ("stdout", "stderr", "apt-get", BEARER, "PRIVATE KEY"):
+            assert forbidden not in rendered, forbidden
+
+        availability = system.get("/r0/v1/operator-availability").json()
+        capabilities = availability["resources"][0]
+        assert capabilities["can_rerun_health_evaluation"] is True
+        assert capabilities["can_resume_update"] is False
+
+        # The distinctly-labelled control still calls the SAME backend
+        # liveness entrypoint -- no new resubmission surface.
+        resumed = system.post(
+            f"/r0/v1/resources/{system.resource_id}/package-update/resume"
+        )
+        assert resumed.status_code == 202
     finally:
         system.close()
 
@@ -2166,7 +2274,12 @@ _RESUME_CHECKPOINT_CASES = (
     ("snapshot_confirmed", _checkpoint_snapshot_confirmed, True),
     ("mutation_may_have_started", _checkpoint_mutation_may_have_started, True),
     ("mutation_completed", _checkpoint_mutation_completed, True),
-    ("health_started_unknown", _checkpoint_health_started_unknown, True),
+    # Narrowed (frozen post-Human1 health architecture, Stage 2):
+    # `health_started` is no longer generic-Resume-capable. The worker still
+    # continues from it on the same wake, but the truthful, distinctly
+    # labelled capability for it is `can_rerun_health_evaluation` -- see
+    # `_RERUN_HEALTH_CHECKPOINT_CASES` below.
+    ("health_started_unknown", _checkpoint_health_started_unknown, False),
     ("health_completed_failed", _checkpoint_health_completed_failed, False),
     ("rollback_may_have_started", _checkpoint_rollback_may_have_started, True),
     ("rollback_completed_terminal", _checkpoint_rollback_completed, False),
@@ -2189,9 +2302,38 @@ def test_resume_capability_matches_worker_continuation_per_checkpoint(
     assert capabilities["can_resume_update"] is expected, label
 
 
+#: `can_rerun_health_evaluation` is true at EXACTLY one checkpoint: an ACTIVE
+#: job whose bounded settling window ended with no verdict. Reuses the same
+#: builders as `_RESUME_CHECKPOINT_CASES` above so the two capabilities are
+#: cross-checked as provably disjoint over every represented checkpoint.
+_RERUN_HEALTH_CHECKPOINT_CASES = tuple(
+    (label, builder, label == "health_started_unknown")
+    for label, builder, _ in _RESUME_CHECKPOINT_CASES
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "builder", "expected"),
+    _RERUN_HEALTH_CHECKPOINT_CASES,
+    ids=[case[0] for case in _RERUN_HEALTH_CHECKPOINT_CASES],
+)
+def test_rerun_health_capability_is_true_only_at_unresolved_health_started(
+    tmp_path: Path, label: str, builder, expected: bool
+) -> None:
+    system, job = builder(tmp_path)
+    capabilities = InventoryPublication(
+        system.store, system.authority, package_update_activated=True
+    ).read_operator_availability().resources[0]
+    assert capabilities["can_rerun_health_evaluation"] is expected, label
+    # The two capabilities never overlap: never both true for the same job.
+    assert not (
+        capabilities["can_resume_update"] and capabilities["can_rerun_health_evaluation"]
+    )
+
+
 def test_resume_capability_requires_activation(tmp_path: Path) -> None:
-    """Witness I: activation gates resume exactly like every other Human1
-    control, even from an otherwise resume-capable checkpoint."""
+    """Witness I: activation gates resume-family controls exactly like every
+    other Human1 control, even from an otherwise capable checkpoint."""
 
     system, job = _checkpoint_health_started_unknown(tmp_path)
     active = InventoryPublication(
@@ -2200,8 +2342,10 @@ def test_resume_capability_requires_activation(tmp_path: Path) -> None:
     inactive = InventoryPublication(
         system.store, system.authority, package_update_activated=False
     ).read_operator_availability().resources[0]
-    assert active["can_resume_update"] is True
+    assert active["can_resume_update"] is False
+    assert active["can_rerun_health_evaluation"] is True
     assert inactive["can_resume_update"] is False
+    assert inactive["can_rerun_health_evaluation"] is False
 
 
 def test_resume_endpoint_still_wakes_worker_despite_hidden_capability(

@@ -2678,23 +2678,56 @@ is UNKNOWN. No English stderr is parsed.
 running, `unhealthy`, and *no HEALTHCHECK at all* are each a definitive FAIL,
 because the operator specifically demanded Docker health.
 
-**`starting` is UNKNOWN, not FAILED (post-Human1 correction).** Docker enters
-this state automatically on every container start or restart, before its
-first health probe can even run — it is Docker's own transient bookkeeping,
-never a workload verdict. A real Human1 update job that legitimately
-restarted Docker/containerd as part of its approved package plan observed
-every declared container `starting` at the instant this probe ran and
-`healthy` again seconds later, with no operator or product action in
-between. The original design classified `starting` as a definitive FAIL
-alongside `unhealthy`; live evidence showed that turns an ordinary
-package-triggered restart into a false durable health failure. `starting`
-now reports `unknown`/`container_health_starting`, which — like
-`docker_daemon_unavailable` — writes no durable verdict at all: the job stays
-ACTIVE at `health_started` with its snapshot and rollback authority intact,
-and an operator asks again through the existing `resume_update` control. No
-retry policy, timer, or grace period was added to reach this: it reuses
-exactly the UNKNOWN/no-verdict/explicit-resume path this stage already had
-for every other unevaluable probe.
+**Bounded health settling closes the entire transient family, not only
+`starting` (post-Human1 Stage 1).** `starting` was Docker's first observed
+transient state (a real Human1 job that legitimately restarted
+Docker/containerd as part of its approved package plan observed every
+declared container `starting` at the instant this probe ran and `healthy`
+again seconds later, with no operator action in between), but it is one
+member of a general family: every ordinary package-triggered
+Docker/systemd restart puts the exact objects a health contract names
+through a state machine, and none of Docker's `starting`/`created`/
+`restarting`/`removing` or systemd's `activating`/`deactivating`/
+`reloading`/pending-`Job` states is a workload verdict.
+
+`deploy/hubinet-package-health-helper.py` now owns a **bounded settling
+window** entirely inside its one `evaluate_health_contract` round trip
+(`PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS = 300` already gave this transport
+the headroom): up to `SETTLING_DEADLINE_SECONDS` (180s), observing the
+COMPLETE frozen probe set every `OBSERVATION_INTERVAL_SECONDS` (5s), in
+ROUNDS batched per family — at most one `docker ps` (daemon oracle and
+positively-proven absence set, mapped by name), one `docker inspect`
+(batched across every Docker target, mapped by returned `.Name`, never by
+position or ID prefix), and one `systemctl show --property=Job` (batched
+across every systemd target, mapped BY POSITION — verified
+`ssh.service`/`sshd.service` share the identical `Id`) per round, never one
+guest command per probe. A round is **decisive** only once it is at least
+the `MIN_DECISIVE_ROUND`-th (2), completed within `MAX_ROUND_SPAN_SECONDS`
+(15s), and left no probe transient; only a decisive round may terminate the
+contract PASSED or FAILED, and evidence from different rounds is never
+merged — an earlier PASS contributes no terminal authority once a later
+round proves a different probe FAILED. Structural target problems
+(glob-like, ambiguous) are computed once, spend no guest command, and never
+wait out the window. `exited`/`dead`/`paused`, `unhealthy`, no HEALTHCHECK,
+and empty-`Job` `inactive`/`failed`/`maintenance` remain definitive FAILs,
+exactly as before.
+
+An evaluation that never settles either way within the bounded window
+writes no durable verdict — like `docker_daemon_unavailable` always did —
+but (Stage 2) now persists the LAST complete round's bounded per-probe
+evidence (index, outcome, reason — `kind`/`target` joined from the frozen
+probe rows, never repeated) plus settling metadata (rounds, settled
+seconds, last round span) in the job's event history, so an operator can see
+exactly which probe is still unresolved and why without shell or SQLite
+access. The job stays ACTIVE at `health_started` with its snapshot and
+rollback authority intact, and a **distinct** `can_rerun_health_evaluation`
+capability — never the generic `can_resume_update`, which is narrowed to
+exclude this checkpoint precisely because "Resume" is not a truthful label
+for what re-evaluating health does — lets an operator ask again through the
+same `/resume` liveness entrypoint. No retry policy, timer, or grace period
+exists ABOVE this bounded window: one worker wake performs one bounded
+settling attempt, and reaching its deadline still ends the attempt, exactly
+as reaching any other UNKNOWN classification always did.
 
 ### Restart, retry, and rollback
 
@@ -2744,12 +2777,15 @@ accepted verdict or a rollback that advanced the job.
 
 Through the one worker, at `mutation_completed` or `health_started`, and
 through nothing else -- see "Production update activation". One wake performs
-at most one truthful read-only attempt. A PASS terminalizes the job
-`SUCCEEDED`; a FAIL leaves it ACTIVE and rollback-capable and the worker idle;
-an UNKNOWN writes no verdict at all and leaves the evaluation repeatable,
-which an operator asks for through `resume_update`. There is still no retry
-interval, backoff, grace period, attempt count, or threshold, and this stage
-still makes zero calls into the rollback stage.
+at most one truthful bounded-settling attempt (up to 180s, inside the one host
+round trip -- see above). A PASS terminalizes the job `SUCCEEDED`; a FAIL
+leaves it ACTIVE and rollback-capable and the worker idle; an UNKNOWN writes
+no verdict at all and leaves the evaluation repeatable, which an operator asks
+for through the distinct `can_rerun_health_evaluation`-gated control (the
+generic `can_resume_update` excludes this checkpoint). There is still no retry
+interval, backoff, grace period, attempt count, or threshold ABOVE the one
+bounded settling window, and this stage still makes zero calls into the
+rollback stage.
 
 The health helper is deployed behind its own dedicated key and forced command
 and needs **no new PVE API privilege**: it reads through host-local `pct exec`,

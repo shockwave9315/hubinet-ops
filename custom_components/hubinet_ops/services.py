@@ -508,6 +508,7 @@ def _job_response(
         "health_outcome": (
             None if job.health_outcome is None else job.health_outcome.value
         ),
+        "health_evidence": job.health_evidence,
         "rollback_may_have_started_at": job.rollback_may_have_started_at,
         "rollback_completed_at": job.rollback_completed_at,
         "rollback_available": job.rollback_available,
@@ -532,6 +533,7 @@ def _job_response(
                 "outcome": probe.outcome.value,
                 "checked_at": probe.checked_at,
                 "reason": probe.reason,
+                "definitive": probe.definitive,
             }
             for probe in job.health_probes
         ],
