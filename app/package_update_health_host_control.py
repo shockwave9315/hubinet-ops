@@ -44,6 +44,10 @@ from app.inventory import (
     MAX_HEALTH_PROBE_TARGET_LENGTH,
     PackageUpdateHealthRequest,
 )
+from app.inventory_runtime_config import (
+    PACKAGE_UPDATE_HEALTH_OBSERVATION_INTERVAL_SECONDS,
+    PACKAGE_UPDATE_HEALTH_SETTLING_DEADLINE_SECONDS,
+)
 from app.package_scan_host_control import (
     BoundedProcessResult,
     ProcessRunner,
@@ -218,6 +222,18 @@ class SshPackageUpdateHealthHostControl:
                 "revision": request.health_contract_revision,
                 "fingerprint": request.health_contract_fingerprint,
                 "probes": list(probes),
+            },
+            # Backend-owned timing POLICY, stated on the wire rather than
+            # living only inside the helper (PR #80 review 2.5): the helper
+            # independently clamps this against its own hard ceilings before
+            # using it, so a compromised or buggy backend cannot request an
+            # arbitrarily large settling window. Home Assistant has no path
+            # to this boundary and never supplies or chooses either value.
+            "settling_policy": {
+                "deadline_seconds": PACKAGE_UPDATE_HEALTH_SETTLING_DEADLINE_SECONDS,
+                "observation_interval_seconds": (
+                    PACKAGE_UPDATE_HEALTH_OBSERVATION_INTERVAL_SECONDS
+                ),
             },
         }
         encoded = json.dumps(

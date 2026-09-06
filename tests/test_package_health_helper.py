@@ -301,6 +301,12 @@ def _request(probes, *, vmid: int = VMID, node: str = NODE) -> dict:
                 for index, (kind, target) in enumerate(probes)
             ],
         },
+        "settling_policy": {
+            "deadline_seconds": helper.DEFAULT_SETTLING_DEADLINE_SECONDS,
+            "observation_interval_seconds": (
+                helper.DEFAULT_OBSERVATION_INTERVAL_SECONDS
+            ),
+        },
     }
 
 
@@ -950,11 +956,15 @@ def test_persistent_transient_exhausts_the_deadline_as_unknown() -> None:
     # round that actually ran is the one just before cumulative sleep time
     # would reach the deadline.
     expected_rounds = int(
-        helper.SETTLING_DEADLINE_SECONDS // helper.OBSERVATION_INTERVAL_SECONDS
+        helper.DEFAULT_SETTLING_DEADLINE_SECONDS
+        // helper.DEFAULT_OBSERVATION_INTERVAL_SECONDS
     )
     assert response["settling"]["rounds"] == expected_rounds
     assert expected_rounds < helper.MAX_SETTLING_ROUNDS
-    assert response["settling"]["settled_seconds"] >= helper.SETTLING_DEADLINE_SECONDS
+    assert (
+        response["settling"]["settled_seconds"]
+        >= helper.DEFAULT_SETTLING_DEADLINE_SECONDS
+    )
     assert response["settling"]["last_round_span_ms"] >= 0
 
 
@@ -1105,6 +1115,114 @@ def test_the_helper_accepts_exactly_one_request_shape() -> None:
     ):
         with pytest.raises(helper.RequestError):
             helper.validate_request(payload)
+
+
+# ===========================================================================
+# Timing policy: backend-owned, but clamped against this file's own hard
+# ceilings. PR #80 review finding 2.5.
+# ===========================================================================
+
+
+def test_the_helper_refuses_a_malformed_settling_policy_shape() -> None:
+    payload = _request((("systemd_unit_active", "a.service"),))
+    payload["settling_policy"] = {"deadline_seconds": 180.0}
+    with pytest.raises(helper.RequestError, match="settling_policy"):
+        helper.validate_request(payload)
+
+
+@pytest.mark.parametrize("bad_value", ("180", True, None, [180]))
+def test_the_helper_refuses_a_non_numeric_settling_policy_value(bad_value) -> None:
+    payload = _request((("systemd_unit_active", "a.service"),))
+    payload["settling_policy"] = {
+        "deadline_seconds": bad_value,
+        "observation_interval_seconds": 5.0,
+    }
+    with pytest.raises(helper.RequestError):
+        helper.validate_request(payload)
+
+
+@pytest.mark.parametrize("bad_value", (0, -5, -0.001))
+def test_the_helper_refuses_a_non_positive_settling_policy_value(bad_value) -> None:
+    payload = _request((("systemd_unit_active", "a.service"),))
+    payload["settling_policy"] = {
+        "deadline_seconds": bad_value,
+        "observation_interval_seconds": 5.0,
+    }
+    with pytest.raises(helper.RequestError):
+        helper.validate_request(payload)
+
+
+def test_the_helper_clamps_an_oversized_requested_deadline() -> None:
+    """The backend states its policy; this file never trusts it past its
+    OWN hard ceilings -- a compromised or buggy backend cannot request an
+    arbitrarily large settling window."""
+
+    payload = _request((("systemd_unit_active", "a.service"),))
+    payload["settling_policy"] = {
+        "deadline_seconds": 10_000.0,
+        "observation_interval_seconds": 5.0,
+    }
+    request = helper.validate_request(payload)
+    assert request["settling_deadline_seconds"] == helper.MAX_SETTLING_DEADLINE_SECONDS
+
+
+def test_the_helper_clamps_an_undersized_requested_deadline() -> None:
+    payload = _request((("systemd_unit_active", "a.service"),))
+    payload["settling_policy"] = {
+        "deadline_seconds": 0.5,
+        "observation_interval_seconds": 5.0,
+    }
+    request = helper.validate_request(payload)
+    assert request["settling_deadline_seconds"] == helper.MIN_SETTLING_DEADLINE_SECONDS
+
+
+def test_the_helper_clamps_an_out_of_range_observation_interval() -> None:
+    payload = _request((("systemd_unit_active", "a.service"),))
+    payload["settling_policy"] = {
+        "deadline_seconds": 180.0,
+        "observation_interval_seconds": 999.0,
+    }
+    request = helper.validate_request(payload)
+    assert (
+        request["observation_interval_seconds"]
+        == helper.MAX_OBSERVATION_INTERVAL_SECONDS
+    )
+
+
+def test_a_requested_deadline_beyond_the_hard_ceiling_never_exceeds_it() -> None:
+    """End-to-end proof: a backend that (mistakenly, or maliciously) asked
+    for a much larger deadline than the product default never gets a
+    settling window longer than this file's own hard ceiling."""
+
+    guest = FakeGuest()
+    guest.containers["web"] = ("running", "false", "starting")
+    clock = FakeClock()
+    response = helper.handle_request(
+        {
+            **_request((("docker_container_healthy", "web"),)),
+            "settling_policy": {
+                "deadline_seconds": 10_000.0,
+                "observation_interval_seconds": 5.0,
+            },
+        },
+        runner=guest,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    assert response["settling"]["settled_seconds"] <= helper.MAX_SETTLING_DEADLINE_SECONDS
+
+
+def test_the_helper_accepts_the_product_default_policy_unchanged() -> None:
+    """The backend's actual product default (180s/5s) passes through
+    unclamped -- clamping never silently shrinks the frozen default."""
+
+    payload = _request((("systemd_unit_active", "a.service"),))
+    request = helper.validate_request(payload)
+    assert request["settling_deadline_seconds"] == helper.DEFAULT_SETTLING_DEADLINE_SECONDS
+    assert (
+        request["observation_interval_seconds"]
+        == helper.DEFAULT_OBSERVATION_INTERVAL_SECONDS
+    )
 
 
 def test_the_helper_refuses_an_unsupported_probe_kind() -> None:

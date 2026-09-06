@@ -16,13 +16,16 @@ that accepts remote command text.
 
 ## Bounded health settling, inside this one call
 
-A single `evaluate_health_contract` request may take up to
-`SETTLING_DEADLINE_SECONDS` (180s) to answer, because it owns the ENTIRE
-bounded settling window described in `ARCHITECTURE.md`, "Job-bound healthcheck
-execution", not one instantaneous sample. Every declared probe restarts
-Docker's or systemd's own state machine on an ordinary package-triggered
-restart, and a normal successful update must not durably fail, or require a
-manual re-run, merely because that restart has not finished settling yet.
+A single `evaluate_health_contract` request may take up to the backend's
+requested settling deadline (`DEFAULT_SETTLING_DEADLINE_SECONDS`, 180s by
+product default; the backend states its policy on the wire, and this file
+validates and clamps it against its own hard ceilings before using it -- see
+below) to answer, because it owns the ENTIRE bounded settling window
+described in `ARCHITECTURE.md`, "Job-bound healthcheck execution", not one
+instantaneous sample. Every declared probe restarts Docker's or systemd's own
+state machine on an ordinary package-triggered restart, and a normal
+successful update must not durably fail, or require a manual re-run, merely
+because that restart has not finished settling yet.
 
 So this file repeatedly observes the COMPLETE frozen probe set in bounded
 ROUNDS, each one batched per family (at most one `docker ps`, one
@@ -159,15 +162,44 @@ PROBE_KINDS = (
 )
 
 # ---------------------------------------------------------------------------
-# Bounded health settling -- backend-owned defaults, never HA-owned and never
-# request-supplied. See ARCHITECTURE.md, "Job-bound healthcheck execution".
+# Bounded health settling -- backend-owned TIMING POLICY, never HA-owned.
+# See ARCHITECTURE.md, "Job-bound healthcheck execution".
+#
+# The backend states its settling policy on the wire (`settling_policy` in
+# the request), and this file VALIDATES AND CLAMPS it against its own
+# code-owned hard ceilings before using it -- "backend owns timing policy,
+# privileged helper enforces hard ceilings" (frozen architecture). The
+# product default the backend actually sends is, and stays,
+# `DEFAULT_SETTLING_DEADLINE_SECONDS` / `DEFAULT_OBSERVATION_INTERVAL_
+# SECONDS` below; nothing about accepting a typed policy field loosens that
+# default, and Home Assistant never supplies or chooses either value -- it
+# has no path to this boundary at all.
 # ---------------------------------------------------------------------------
 
-#: The whole evaluation gives up and reports UNKNOWN (never a guess) once
-#: this many seconds have elapsed since the first round started.
-SETTLING_DEADLINE_SECONDS = 180.0
-#: Sleep between rounds when the previous one was not decisive.
-OBSERVATION_INTERVAL_SECONDS = 5.0
+#: The backend's own product-policy default -- what it actually sends today,
+#: and the value every existing behavioural guarantee in this file (and its
+#: docstring above) describes.
+DEFAULT_SETTLING_DEADLINE_SECONDS = 180.0
+#: Never below this, however the backend's policy is configured: a window
+#: this short could never even reach `MIN_DECISIVE_ROUND` at the default
+#: observation interval, defeating the whole point of bounded settling.
+MIN_SETTLING_DEADLINE_SECONDS = 30.0
+#: Never above this. `PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS = 300` on the
+#: backend side is the OUTER SSH transport timeout; this hard ceiling keeps
+#: settling comfortably inside it even after per-command allowance and the
+#: transport-return margin, so a compromised or buggy backend cannot request
+#: a deadline this file would let the outer transport kill mid-response.
+MAX_SETTLING_DEADLINE_SECONDS = 200.0
+#: The backend's own product-policy default observation interval.
+DEFAULT_OBSERVATION_INTERVAL_SECONDS = 5.0
+#: Never below this -- a busier interval than the product default buys
+#: nothing (every round is still batched per family) and multiplies guest
+#: command load for no benefit.
+MIN_OBSERVATION_INTERVAL_SECONDS = 1.0
+#: Never above this -- an interval this coarse could exhaust
+#: `MAX_SETTLING_ROUNDS` long before the deadline, or leave a genuinely
+#: fast-settling workload waiting far longer than necessary.
+MAX_OBSERVATION_INTERVAL_SECONDS = 30.0
 #: A round whose own guest commands took longer than this to answer is never
 #: decisive, whichever way it points: a slow round may be describing state
 #: that has already moved on again by the time it is read.
@@ -419,6 +451,49 @@ def _positive_integer(value: Any, field_name: str) -> int:
     return value
 
 
+def _clamp(value: float, *, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _validate_settling_policy(raw: Any) -> tuple[float, float]:
+    """Backend-stated timing policy, validated and CLAMPED against this
+    file's own hard ceilings -- "backend owns timing policy, privileged
+    helper enforces hard ceilings" (frozen architecture). A caller cannot
+    request an arbitrarily large (or small) deadline or interval: whatever
+    is asked for is silently bounded to what this file will actually permit,
+    never rejected outright for being merely out of range, so an otherwise
+    coherent evaluation is not refused wholesale over a policy value.
+    """
+
+    if not isinstance(raw, Mapping) or set(raw) != {
+        "deadline_seconds",
+        "observation_interval_seconds",
+    }:
+        raise RequestError("settling_policy must have the exact shape")
+    deadline = raw["deadline_seconds"]
+    interval = raw["observation_interval_seconds"]
+    if type(deadline) not in (int, float) or isinstance(deadline, bool):
+        raise RequestError("settling_policy.deadline_seconds must be numeric")
+    if type(interval) not in (int, float) or isinstance(interval, bool):
+        raise RequestError(
+            "settling_policy.observation_interval_seconds must be numeric"
+        )
+    if deadline <= 0 or interval <= 0:
+        raise RequestError("settling_policy values must be positive")
+    return (
+        _clamp(
+            float(deadline),
+            minimum=MIN_SETTLING_DEADLINE_SECONDS,
+            maximum=MAX_SETTLING_DEADLINE_SECONDS,
+        ),
+        _clamp(
+            float(interval),
+            minimum=MIN_OBSERVATION_INTERVAL_SECONDS,
+            maximum=MAX_OBSERVATION_INTERVAL_SECONDS,
+        ),
+    )
+
+
 def validate_request(payload: Any) -> dict[str, Any]:
     """Accept exactly one request shape, and nothing else.
 
@@ -430,10 +505,12 @@ def validate_request(payload: Any) -> dict[str, Any]:
     below, are a bootstrap/updater acceptance marker: `deploy/lib/bootstrap-
     update-boundaries.sh`, `deploy/lib/update-boundaries.sh`, and
     `tests/_bootstrap_fake_pve.py` all assert this literal string to prove
-    the deployed forced command is genuinely this helper. Bounded settling
-    changes nothing about the REQUEST shape -- the deadline, interval, and
-    round bounds above are constants this file owns, not request fields --
-    so that marker stays byte-identical.
+    the deployed forced command is genuinely this helper -- that stays
+    byte-identical even though the valid request shape below now ALSO
+    requires ``settling_policy`` (PR #80 review 2.5: the backend states its
+    timing policy on the wire rather than it living only inside this file),
+    because a payload missing every required top-level key still fails this
+    exact check with this exact message regardless of what that key set is.
     """
 
     if not isinstance(payload, Mapping) or set(payload) != {
@@ -442,6 +519,7 @@ def validate_request(payload: Any) -> dict[str, Any]:
         "target",
         "ownership",
         "health_contract",
+        "settling_policy",
     }:
         raise RequestError("request must have the exact health-evaluation shape")
     if (
@@ -449,6 +527,9 @@ def validate_request(payload: Any) -> dict[str, Any]:
         or payload["operation"] != "evaluate_health_contract"
     ):
         raise RequestError("unknown host-control operation")
+    settling_deadline_seconds, observation_interval_seconds = (
+        _validate_settling_policy(payload["settling_policy"])
+    )
 
     target = payload["target"]
     if not isinstance(target, Mapping) or set(target) != {"vmid", "expected_node"}:
@@ -529,6 +610,8 @@ def validate_request(payload: Any) -> dict[str, Any]:
         "revision": revision,
         "fingerprint": fingerprint,
         "probes": probes,
+        "settling_deadline_seconds": settling_deadline_seconds,
+        "observation_interval_seconds": observation_interval_seconds,
     }
 
 
@@ -1187,6 +1270,8 @@ def evaluate_health_contract_settling(
     local_node: str,
     probes: Sequence[dict[str, Any]],
     *,
+    settling_deadline_seconds: float = DEFAULT_SETTLING_DEADLINE_SECONDS,
+    observation_interval_seconds: float = DEFAULT_OBSERVATION_INTERVAL_SECONDS,
     monotonic: Clock = time.monotonic,
     sleep: Sleeper = time.sleep,
 ) -> dict[str, Any]:
@@ -1209,6 +1294,11 @@ def evaluate_health_contract_settling(
     would silently let a non-decisive round's last observation (e.g. one
     probe FAILED, one still transient, because the deadline hit mid-round)
     become a false durable verdict.
+
+    ``settling_deadline_seconds``/``observation_interval_seconds`` are the
+    caller's ALREADY-CLAMPED policy (`_validate_settling_policy`) -- this
+    function trusts them as given rather than re-clamping, exactly as it
+    trusts every other already-validated field in ``probes``.
     """
 
     # Structural target problems are round-independent: fixed forever, and
@@ -1229,7 +1319,7 @@ def evaluate_health_contract_settling(
             structural[int(probe["index"])] = outcome
 
     start = monotonic()
-    absolute_deadline = start + SETTLING_DEADLINE_SECONDS
+    absolute_deadline = start + settling_deadline_seconds
     budget = _RoundBudget()
 
     if not live_probes:
@@ -1310,7 +1400,7 @@ def evaluate_health_contract_settling(
         remaining_after = absolute_deadline - monotonic()
         if remaining_after <= 0:
             break
-        sleep(min(OBSERVATION_INTERVAL_SECONDS, remaining_after))
+        sleep(min(observation_interval_seconds, remaining_after))
 
     return {
         "probes": last_results,
@@ -1352,6 +1442,8 @@ def handle_request(
         expected_node,
         local_node,
         request["probes"],
+        settling_deadline_seconds=request["settling_deadline_seconds"],
+        observation_interval_seconds=request["observation_interval_seconds"],
         monotonic=monotonic,
         sleep=sleep,
     )
