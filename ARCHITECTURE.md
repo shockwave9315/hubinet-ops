@@ -74,7 +74,9 @@ Assistant re-enrollment.
 - `reconciliation.py` — applies one complete normalized snapshot inside the
   caller's transaction.
 - `publication.py` — assembles the published snapshot (backend, sources, nodes,
-  resources, revisions) in one consistent read transaction.
+  resources, revisions) in one consistent read transaction. Per-resource
+  operator capabilities are conservative read-only facts derived there; they
+  control presentation availability but never authorize or advance a mutation.
 
 `app/inventory_runtime.py` is the production composition root, served via its
 `create_app_from_env` factory
@@ -776,25 +778,51 @@ anything on them.
 
 `custom_components/hubinet_ops/` — one `DataUpdateCoordinator`, one snapshot
 fetch per refresh, structural validation of the payload in `contract/`, then
-devices and entities. The response-capable `view_update_plan` action accepts a
-native Hubinet resource-device selection, resolves its backend-owned
-`resource_id`, performs a separate fresh snapshot read, and returns exact
-package rows plus the exact approval reference. `approve_update_plan` forwards
-that caller-supplied reference unchanged to the backend and refreshes the
-coordinator after success. One concise resource sensor displays the
-backend-published `none | approved | stale | consumed` approval state. A
-successful job consumes its exact approval; `consumed` never collapses into
-`stale`, and a new explicit approval creates a new approval identity even when
-the current plan fingerprint is unchanged. Package rows do not become entity
-attributes or package-per-entity state.
+devices and entities. Existing dynamic LXC devices receive sensor,
+binary-sensor, and button entities; no second resource/VMID identity exists.
+
+The **Review update plan** button performs a separate fresh snapshot read and
+renders every exact package row in a persistent notification. The coordinator
+remembers only `(backend_instance_id, resource_id, scan_run_id,
+plan_fingerprint)` in memory. **Approve reviewed plan** fresh-reads again,
+requires that exact tuple, consumes the UX reference before making the
+potentially uncertain approval request, and then sends it unchanged to the
+backend, whose authority transaction independently revalidates it. A reload
+forgets the reference. A new scan run is a new reference even if its material
+fingerprint is identical. The response-capable actions share these handlers;
+they do not implement a parallel policy path.
+
+One concise resource sensor displays the backend-published
+`none | approved | stale | consumed` approval state. A successful job consumes
+its exact approval; `consumed` never collapses into `stale`, and a new explicit
+approval creates a new approval identity even when the current plan fingerprint
+is unchanged. Package rows do not become entity attributes or
+package-per-entity state.
 
 `view_health_contract`, `set_health_contract`, and `clear_health_contract` use
 that same resource-device selector rather than a second selection model. All
 three return response data; contract material — the probe list — is response
-data only, never entity attributes. A second concise resource sensor displays
-the backend-published `unsupported | unconfigured | configured` contract state,
-which is a statement about configuration and never a health result: no health
-result exists to publish.
+data only, never entity attributes. A native viewer button renders it on
+demand. Editing remains a typed action because a variable-length all-required
+probe set is not truthfully representable by a scalar Text, Select, or Number
+entity. A second concise resource sensor displays the backend-published
+`unsupported | unconfigured | configured` contract state, which is a statement
+about configuration and never a health result.
+
+The backend also publishes `operator_capabilities`: review, approve, start,
+view job, resume, rollback, and health-contract view/configuration hints. The
+integration validates their shape and uses them only for button availability.
+Every endpoint repeats its complete authority proof, so a raced capability can
+only lead to a refusal. Polling remains mutation-free and never interprets a
+capability as retry permission.
+
+Start/view/resume/rollback buttons share the response-capable action handlers.
+One start press generates one request ID once and makes one logical call; it is
+never blindly replayed after uncertainty. Job status, checkpoint, package
+count, definitive health outcome, and rollback availability are bounded
+entities. Exact job details and recent durable events are fetched and rendered
+only when the operator presses **View update job** (or an operation returns its
+job), without raw helper output or arbitrary command material.
 
 Diagnostic labels preserve those distinctions rather than inventing answers:
 an unavailable reboot-required sensor is explicitly labelled as unknown, the

@@ -29,19 +29,23 @@ a guest in Proxmox never requires touching this repository or its config.
   every endpoint except the deliberately unauthenticated minimal
   `/r0/v1/health` liveness probe, which exposes no inventory or credential
   data.
-- A native Home Assistant integration with dynamic devices and entities.
+- A native Home Assistant integration with dynamic resource devices, sensors,
+  a rollback binary sensor, and explicit operator buttons.
 - Automatic Debian/Ubuntu LXC package scanning with exact durable plans and
   Home Assistant summary entities.
-- Fresh exact-plan viewing through a native Hubinet resource-device selector,
-  explicit durable approval through a second native Home Assistant action, and
-  a concise backend-published approval-status sensor. Approval never executes
-  an update.
+- Fresh exact-plan review through a per-resource button and persistent
+  notification, followed by a separate **Approve reviewed plan** button. Home
+  Assistant remembers only the exact backend/resource/scan/fingerprint
+  reference reviewed during the current runtime, fresh-reads it again before
+  approval, and forgets it on reload. The backend independently revalidates
+  the same reference. Approval never executes an update.
 - Operator-declared per-resource health contracts: for each resource, the list
   of typed probes (`systemd_unit_active`, `docker_container_running`,
   `docker_container_healthy`) that must **all** hold for that workload to count
   as up. Managed through the `view_health_contract` / `set_health_contract` /
   `clear_health_contract` Home Assistant actions and the routes above, with a
-  concise contract-status sensor. A resource with no contract is
+  concise contract-status sensor and a per-resource **View health contract**
+  button. A resource with no contract is
   *unconfigured*, which is never "healthy" — and it can no longer be given an
   update job at all, because a job whose success criterion does not exist
   could never truthfully be called successful.
@@ -51,7 +55,11 @@ a guest in Proxmox never requires touching this repository or its config.
   operation, and health-checks the guest against the contract the job froze at
   issuance. Managed through the `start_update` / `view_update_job` /
   `resume_update` / `rollback_update` Home Assistant actions and the routes
-  above, with a concise per-resource job status sensor.
+  above, with per-resource **Start**, **View job**, **Resume**, and **Roll
+  back** buttons. Concise sensors show the latest job status, checkpoint,
+  package count, health outcome, and authoritative rollback availability;
+  exact bounded job details and recent durable events appear in a persistent
+  notification only when requested.
 - An automated Proxmox bootstrap that provisions the whole backend.
 - An in-place updater for an existing installation: install once, update
   many times, preserving identity/config/credentials.
@@ -136,8 +144,8 @@ That bearer token is **not** the Proxmox API token. Home Assistant never
 receives, stores, or handles a Proxmox credential — the integration has no
 PVE-facing code path at all, and HACS distributes code only.
 Today bootstrap stores the backend bearer in root-readable
-`/etc/hubinet-ops/agent.env`; Human1 includes a deliberate operator-facing
-handoff/retrieval path that does not expose it in ordinary logs or snapshots.
+`/etc/hubinet-ops/agent.env`. A dedicated operator-facing handoff/retrieval
+path that keeps it out of ordinary logs and snapshots remains planned.
 
 For integration development you may symlink `custom_components/hubinet_ops/`
 into a Home Assistant `config/custom_components/` directory instead. That is a
@@ -145,13 +153,37 @@ development fallback, not a supported installation method.
 
 ## Operator update workflow
 
-The current integration exposes the proven lifecycle through explicit Home
-Assistant actions: declare a health contract, view and approve a non-empty
-exact plan, start the update, inspect the last job, and explicitly request
-same-job rollback when appropriate. Approval still performs no mutation, one
-successful job consumes that approval, and UNKNOWN never authorizes success or
-retry. Human1 will turn these actions into a normal per-resource operator UX;
-Developer Tools remain a current interface, not the finished experience.
+Open the discovered LXC's Hubinet Ops device in Home Assistant. Its entities
+show current workload and package-scan state, pending count, plan approval,
+health-contract configuration, latest job status/checkpoint/package count,
+last definitive update health result, and rollback availability.
+
+For an update:
+
+1. Press **Review update plan**. Hubinet Ops fresh-reads the backend and opens
+   a persistent notification containing every exact package row.
+2. After reviewing it, press **Approve reviewed plan**. Approval is refused if
+   the backend identity, resource, scan run, or material fingerprint changed —
+   even when a new scan has the same fingerprint. A reload also requires a new
+   review.
+3. Press **Start approved update**. One press creates one request ID and one
+   logical backend invocation. The backend still owns approval, freshness,
+   targeting, single-flight, snapshot, mutation, health, and terminalization.
+4. Press **View update job** for bounded durable facts and recent events.
+   **Resume update job** is available only when the backend publishes an
+   active resumable job. **Roll back this update** is available only when the
+   backend publishes same-job rollback authority.
+
+The variable-length typed health probe list remains edited through the
+`set_health_contract` and `clear_health_contract` actions; forcing that list
+into a scalar text/select entity would weaken the typed contract. The native
+viewer and status sensor remove routine inspection from Developer Tools, while
+the actions remain available for initial or occasional contract editing and
+diagnostics.
+
+Approval performs no workload mutation, one successful job consumes its exact
+approval, and UNKNOWN never authorizes success or retry. There is no automatic
+update or automatic rollback.
 
 ## Development
 
