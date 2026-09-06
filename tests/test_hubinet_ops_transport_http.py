@@ -1226,6 +1226,90 @@ def test_package_update_job_view_rejects_an_unknown_probe_outcome() -> None:
         _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
 
 
+def _probe_health_payload(**probe_overrides) -> dict:
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_completed"
+    probe = {
+        "index": 0,
+        "kind": "docker_container_healthy",
+        "target": "web",
+        "outcome": "passed",
+        "checked_at": "2026-09-06T13:40:23.444652+00:00",
+        "reason": "container_healthy",
+        "definitive": True,
+    }
+    probe.update(probe_overrides)
+    payload["health"] = {
+        "contract_revision": 3,
+        "outcome": "passed",
+        "evidence": "verdict",
+        "probes": [probe],
+    }
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# PR #80 review finding 2.4.1: exact JSON types, never a coercion that turns
+# a malformed value into valid-looking data (`bool("false")` is `True`).
+# ---------------------------------------------------------------------------
+
+
+def test_package_update_job_view_rejects_a_string_boolean_for_definitive() -> None:
+    """`bool("false")` is `True` in Python -- exactly the false-positive this
+    must never let a malformed backend answer produce."""
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _probe_health_payload(definitive="false")
+        )
+
+
+def test_package_update_job_view_rejects_a_numeric_string_index() -> None:
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _probe_health_payload(index="0")
+        )
+
+
+def test_package_update_job_view_rejects_a_non_string_reason() -> None:
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _probe_health_payload(reason=123)
+        )
+
+
+def test_package_update_job_view_rejects_a_non_string_target() -> None:
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _probe_health_payload(target=["web"])
+        )
+
+
+def test_package_update_job_view_rejects_a_string_boolean_rollback_available() -> None:
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["rollback"]["available"] = "false"
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+def test_package_update_job_view_rejects_a_malformed_evidence_type() -> None:
+    payload = _probe_health_payload()
+    payload["health"]["evidence"] = 1
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+def test_package_update_job_view_rejects_a_failed_verdict_with_no_failed_probe() -> None:
+    """Independent HA-side proof that the aggregate verdict and the
+    accompanying per-probe rows agree -- a FAILED verdict with an all-PASSED
+    probe set is rejected, never rendered."""
+
+    payload = _probe_health_payload()
+    payload["health"]["outcome"] = "failed"
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
 class _DelayedRollbackServer:
     """A real local HTTP server that delays its rollback response by
     exactly `delay_seconds` of genuine wall-clock time before returning a

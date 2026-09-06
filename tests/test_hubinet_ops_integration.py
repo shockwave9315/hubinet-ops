@@ -5662,6 +5662,82 @@ def test_job_view_rejects_a_non_contiguous_probe_index() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# PR #80 review finding 2.4: HA must independently prove aggregate verdict
+# <-> per-probe coherence and per-probe kind/outcome/reason coherence, not
+# merely that each reason is a bounded token.
+# ---------------------------------------------------------------------------
+
+
+def test_job_view_rejects_a_failed_verdict_with_only_unknown_probes() -> None:
+    """The exact impossible payload PR #80 review named: a FAILED verdict
+    whose only probe is UNKNOWN -- an ALL-OF verdict of FAILED requires at
+    least one probe to be positively proven FAILED; UNKNOWN proves nothing
+    either way."""
+
+    with pytest.raises(ValueError, match="at least one probe"):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(
+                _probe_result(
+                    outcome=HealthProbeOutcome.UNKNOWN,
+                    reason="container_health_starting",
+                ),
+            ),
+        )
+
+
+def test_job_view_rejects_a_passed_verdict_with_a_failed_probe() -> None:
+    with pytest.raises(ValueError, match="every probe"):
+        job_view(
+            status=PackageUpdateJobState.SUCCEEDED,
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.PASSED,
+            health_probes=(
+                _probe_result(
+                    outcome=HealthProbeOutcome.FAILED, reason="container_unhealthy"
+                ),
+            ),
+        )
+
+
+def test_job_view_rejects_a_reason_that_contradicts_its_own_outcome() -> None:
+    """`container_health_starting` is an UNKNOWN-only token; pairing it with
+    `outcome=passed` is individually-typed nonsense."""
+
+    with pytest.raises(ValueError, match="contradicts its own outcome"):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(
+                _probe_result(
+                    outcome=HealthProbeOutcome.PASSED,
+                    reason="container_health_starting",
+                ),
+            ),
+        )
+
+
+def test_job_view_rejects_a_reason_impossible_for_its_probe_kind() -> None:
+    """`container_healthy` can never describe a `systemd_unit_active`
+    probe."""
+
+    with pytest.raises(ValueError, match="impossible for that probe kind"):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(
+                _probe_result(
+                    kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                    target="nginx.service",
+                    outcome=HealthProbeOutcome.PASSED,
+                    reason="container_healthy",
+                ),
+            ),
+        )
+
+
 def test_job_view_rejects_a_reason_outside_the_bounded_taxonomy() -> None:
     """Never render raw guest output as if it were a classification token."""
 
@@ -5835,17 +5911,17 @@ async def test_view_update_job_response_carries_per_probe_health_evidence(
             probe_index=0,
             kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
             target="weatherhub-redis-1",
-            outcome=HealthProbeOutcome.UNKNOWN,
+            outcome=HealthProbeOutcome.FAILED,
             checked_at="2026-09-06T13:40:23.444652+00:00",
-            reason="container_health_starting",
+            reason="container_unhealthy",
         ),
         PackageUpdateJobHealthProbeResult(
             probe_index=1,
             kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
             target="weatherhub-weather-api-1",
-            outcome=HealthProbeOutcome.UNKNOWN,
+            outcome=HealthProbeOutcome.FAILED,
             checked_at="2026-09-06T13:40:23.444652+00:00",
-            reason="container_health_starting",
+            reason="container_unhealthy",
         ),
     )
     transport = FakeTransport(
@@ -5874,18 +5950,18 @@ async def test_view_update_job_response_carries_per_probe_health_evidence(
             "index": 0,
             "kind": "docker_container_healthy",
             "target": "weatherhub-redis-1",
-            "outcome": "unknown",
+            "outcome": "failed",
             "checked_at": "2026-09-06T13:40:23.444652+00:00",
-            "reason": "container_health_starting",
+            "reason": "container_unhealthy",
             "definitive": True,
         },
         {
             "index": 1,
             "kind": "docker_container_healthy",
             "target": "weatherhub-weather-api-1",
-            "outcome": "unknown",
+            "outcome": "failed",
             "checked_at": "2026-09-06T13:40:23.444652+00:00",
-            "reason": "container_health_starting",
+            "reason": "container_unhealthy",
             "definitive": True,
         },
     ]
@@ -5893,7 +5969,7 @@ async def test_view_update_job_response_carries_per_probe_health_evidence(
     # Answers exactly the operator's real questions: which probe, which
     # target, FAILED or UNKNOWN, and why -- without shell/SQLite access.
     assert "weatherhub-redis-1" in str(response["health_probes"])
-    assert "container_health_starting" in str(response["health_probes"])
+    assert "container_unhealthy" in str(response["health_probes"])
 
     # Still bounded, typed material -- never entity attributes.
     key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
@@ -5922,9 +5998,9 @@ async def test_view_update_job_notification_lists_which_probe_failed_and_why(
             probe_index=0,
             kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
             target="weatherhub-redis-1",
-            outcome=HealthProbeOutcome.UNKNOWN,
+            outcome=HealthProbeOutcome.FAILED,
             checked_at="2026-09-06T13:40:23.444652+00:00",
-            reason="container_health_starting",
+            reason="container_unhealthy",
         ),
     )
     active = resource(
@@ -5982,7 +6058,7 @@ async def test_view_update_job_notification_lists_which_probe_failed_and_why(
     # `_cell` escapes Markdown-structural punctuation (including `-`/`_`) in
     # exact backend data, exactly like every other rendered notification.
     assert r"weatherhub\-redis\-1" in message
-    assert r"container\_health\_starting" in message
+    assert r"container\_unhealthy" in message
     assert r"docker\_container\_healthy" in message
 
 

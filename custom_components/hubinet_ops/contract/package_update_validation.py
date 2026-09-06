@@ -109,6 +109,107 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
 #: durable, non-recheckable PASSED/FAILED result.
 HEALTH_EVIDENCE_KINDS: frozenset[str] = frozenset({"observation", "verdict"})
 
+#: Mirrors `app/inventory/health_observation.py::HEALTH_PROBE_REASONS_BY_
+#: OUTCOME`. A reason token that is syntactically bounded (in
+#: `HEALTH_PROBE_REASONS`) but semantically impossible for the outcome it
+#: accompanies -- e.g. `container_health_starting` (an UNKNOWN-only token)
+#: paired with `outcome=passed` -- is exactly the kind of self-contradictory
+#: payload PR #80 review found HA was not independently proving impossible.
+HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
+    HealthProbeOutcome.PASSED: frozenset(
+        {"unit_active", "container_running", "container_healthy"}
+    ),
+    HealthProbeOutcome.FAILED: frozenset(
+        {
+            "unit_not_active",
+            "container_not_running",
+            "container_absent",
+            "container_unhealthy",
+            "container_has_no_healthcheck",
+        }
+    ),
+    HealthProbeOutcome.UNKNOWN: frozenset(
+        {
+            "probe_target_not_exact",
+            "probe_target_ambiguous",
+            "guest_unavailable",
+            "command_failed",
+            "command_timed_out",
+            "malformed_output",
+            "docker_daemon_unavailable",
+            "host_unreachable",
+            "host_response_rejected",
+            "resource_context_changed",
+            "container_health_starting",
+            "container_restarting",
+            "container_not_started_yet",
+            "container_removing",
+            "unit_activating",
+            "unit_deactivating",
+            "unit_reloading",
+            "unit_job_pending",
+        }
+    ),
+}
+
+#: Mirrors `app/inventory/health_observation.py::HEALTH_PROBE_REASON_KINDS`.
+#: A reason absent from this mapping is generic/structural (a whole-request
+#: or transport-level classification, e.g. `command_failed`) and legal for
+#: any probe kind; one present here is legal ONLY for the kind(s) listed --
+#: e.g. `container_healthy` can never accompany a `systemd_unit_active`
+#: probe, and `unit_not_active` can never accompany a Docker one.
+HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
+    "unit_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "unit_not_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "unit_activating": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "unit_deactivating": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "unit_reloading": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "unit_job_pending": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    "container_running": frozenset({HealthProbeKind.DOCKER_CONTAINER_RUNNING}),
+    "container_healthy": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
+    "container_not_running": frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+    "container_absent": frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+    "container_restarting": frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+    "container_not_started_yet": frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+    "container_removing": frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+    "container_unhealthy": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
+    "container_health_starting": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
+    "container_has_no_healthcheck": frozenset(
+        {HealthProbeKind.DOCKER_CONTAINER_HEALTHY}
+    ),
+    "docker_daemon_unavailable": frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+}
+
 #: The two states in which no job material may be present at all.
 _JOBLESS_STATES = (
     PackageUpdateJobState.UNSUPPORTED,
@@ -312,6 +413,22 @@ def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> 
             raise ValueError(
                 "job health probe reason is not a known bounded token"
             )
+        # Independent semantic coherence -- a probe kind/outcome/reason
+        # triple that is individually well-typed but jointly impossible
+        # (e.g. outcome=passed with reason=container_health_starting, an
+        # UNKNOWN-only token; or a systemd probe carrying a Docker-only
+        # reason) is refused here rather than rendered as if it described a
+        # real observation. Mirrors `app/inventory/health_observation.py::
+        # require_health_probe_semantics`.
+        if probe.reason not in HEALTH_PROBE_REASONS_BY_OUTCOME[probe.outcome]:
+            raise ValueError(
+                "job health probe reason contradicts its own outcome"
+            )
+        allowed_kinds = HEALTH_PROBE_REASON_KINDS.get(probe.reason)
+        if allowed_kinds is not None and probe.kind not in allowed_kinds:
+            raise ValueError(
+                "job health probe reason is impossible for that probe kind"
+            )
         if type(probe.definitive) is not bool:
             raise ValueError("job health probe definitive must be a boolean")
         if probe.definitive != (view.health_evidence == "verdict"):
@@ -321,3 +438,20 @@ def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> 
             )
     if probes and seen_indexes != set(range(len(probes))):
         raise ValueError("job health probes are not canonically indexed")
+    # Aggregate verdict <-> per-probe coherence, mirroring the backend's own
+    # ALL-OF aggregation (`app/inventory/models.py::aggregate_health_
+    # outcome`): a payload naming a verdict that the accompanying probe rows
+    # positively disprove is refused, never rendered as if it were truthful.
+    if view.health_evidence == "verdict":
+        if view.health_outcome is PackageUpdateHealthOutcome.PASSED and not all(
+            probe.outcome is HealthProbeOutcome.PASSED for probe in probes
+        ):
+            raise ValueError(
+                "a PASSED verdict requires every probe to have PASSED"
+            )
+        if view.health_outcome is PackageUpdateHealthOutcome.FAILED and not any(
+            probe.outcome is HealthProbeOutcome.FAILED for probe in probes
+        ):
+            raise ValueError(
+                "a FAILED verdict requires at least one probe to have FAILED"
+            )

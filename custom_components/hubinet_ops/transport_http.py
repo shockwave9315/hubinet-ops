@@ -410,6 +410,39 @@ def _default_package_update_job_summary(
     )
 
 
+def _strict_str(value: Any, field: str) -> str:
+    """Exact JSON type first, domain meaning second.
+
+    ``str(value)`` would silently turn a malformed non-string JSON value
+    into a valid-looking one (an int, a list, ``None``); this refuses it
+    outright instead, so a truly malformed backend answer fails closed as
+    ``HubinetOpsInvalidResponse`` rather than being normalized into
+    something that merely LOOKS like valid data.
+    """
+
+    if not isinstance(value, str):
+        raise HubinetOpsInvalidResponse(f"{field} must be a string")
+    return value
+
+
+def _strict_int(value: Any, field: str) -> int:
+    """Exact JSON type: a numeric-looking STRING (``"1"``) is not an int."""
+
+    if type(value) is not int:
+        raise HubinetOpsInvalidResponse(f"{field} must be an integer")
+    return value
+
+
+def _strict_bool(value: Any, field: str) -> bool:
+    """Exact JSON type. ``bool("false")`` is ``True`` in Python -- exactly
+    the false-negative-turned-false-positive this refuses to let happen for
+    a field an operator-visible capability or verdict may depend on."""
+
+    if type(value) is not bool:
+        raise HubinetOpsInvalidResponse(f"{field} must be a boolean")
+    return value
+
+
 def _package_update_job_view(
     resource_id: str, payload: Any
 ) -> PackageUpdateJobView:
@@ -419,7 +452,11 @@ def _package_update_job_view(
     flattens exactly the fields the integration is contracted to show and
     ignores nothing silently -- a missing required field raises rather than
     defaulting, because a job rendered with an invented field is a job
-    described untruthfully.
+    described untruthfully. Every field below is validated against its
+    EXACT JSON type before being trusted (PR #80 review 2.4.1): a
+    malformed-but-coercible value (a numeric string for an index, the
+    string ``"false"`` for a boolean) is refused rather than silently
+    normalized into valid-looking data.
     """
 
     if not isinstance(payload, Mapping):
@@ -434,15 +471,20 @@ def _package_update_job_view(
         health = payload["health"]
         rollback = payload["rollback"]
         outcome = health.get("outcome")
+        evidence = health.get("evidence")
+        if evidence is not None:
+            evidence = _strict_str(evidence, "health.evidence")
         return PackageUpdateJobView(
-            job_id=str(payload["job_id"]),
-            request_id=str(payload["request_id"]),
+            job_id=_strict_str(payload["job_id"], "job_id"),
+            request_id=_strict_str(payload["request_id"], "request_id"),
             resource_id=resource_id,
             status=PackageUpdateJobState(payload["status"]),
-            checkpoint=str(payload["checkpoint"]),
-            issued_at=str(payload["issued_at"]),
-            approved_plan_fingerprint=str(payload["approved_plan_fingerprint"]),
-            package_count=int(payload["package_count"]),
+            checkpoint=_strict_str(payload["checkpoint"], "checkpoint"),
+            issued_at=_strict_str(payload["issued_at"], "issued_at"),
+            approved_plan_fingerprint=_strict_str(
+                payload["approved_plan_fingerprint"], "approved_plan_fingerprint"
+            ),
+            package_count=_strict_int(payload["package_count"], "package_count"),
             snapshot_name=snapshot.get("name"),
             snapshot_confirmed_at=snapshot.get("confirmed_at"),
             mutation_may_have_started_at=mutation.get("may_have_started_at"),
@@ -455,33 +497,35 @@ def _package_update_job_view(
             ),
             rollback_may_have_started_at=rollback.get("may_have_started_at"),
             rollback_completed_at=rollback.get("completed_at"),
-            rollback_available=bool(rollback["available"]),
+            rollback_available=_strict_bool(
+                rollback["available"], "rollback.available"
+            ),
             terminalized_at=payload.get("terminalized_at"),
             terminal_reason=payload.get("terminal_reason"),
             events=tuple(
                 PackageUpdateJobEvent(
-                    sequence=int(event["sequence"]),
-                    created_at=str(event["created_at"]),
-                    level=str(event["level"]),
-                    stage=str(event["stage"]),
-                    event_type=str(event["event_type"]),
-                    message=str(event["message"]),
+                    sequence=_strict_int(event["sequence"], "event.sequence"),
+                    created_at=_strict_str(event["created_at"], "event.created_at"),
+                    level=_strict_str(event["level"], "event.level"),
+                    stage=_strict_str(event["stage"], "event.stage"),
+                    event_type=_strict_str(event["event_type"], "event.event_type"),
+                    message=_strict_str(event["message"], "event.message"),
                 )
                 for event in payload.get("events", ())
             ),
             health_probes=tuple(
                 PackageUpdateJobHealthProbeResult(
-                    probe_index=int(probe["index"]),
+                    probe_index=_strict_int(probe["index"], "probe.index"),
                     kind=HealthProbeKind(probe["kind"]),
-                    target=str(probe["target"]),
+                    target=_strict_str(probe["target"], "probe.target"),
                     outcome=HealthProbeOutcome(probe["outcome"]),
-                    checked_at=str(probe["checked_at"]),
-                    reason=str(probe["reason"]),
-                    definitive=bool(probe["definitive"]),
+                    checked_at=_strict_str(probe["checked_at"], "probe.checked_at"),
+                    reason=_strict_str(probe["reason"], "probe.reason"),
+                    definitive=_strict_bool(probe["definitive"], "probe.definitive"),
                 )
                 for probe in health.get("probes", ())
             ),
-            health_evidence=health.get("evidence"),
+            health_evidence=evidence,
         )
     except HubinetOpsInvalidResponse:
         raise
