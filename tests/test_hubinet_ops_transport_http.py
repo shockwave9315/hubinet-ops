@@ -37,6 +37,11 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.hubinet_ops.api import (
     BackendInformation,
     DetailStatus,
+    HealthDiscoveryAdapter,
+    HealthDiscoveryOrigin,
+    HealthDiscoveryRecommendationBasis,
+    HealthDiscoveryRoleHint,
+    HealthDiscoveryStatus,
     HealthProbeKind,
     HealthProbeOutcome,
     HubinetOpsCannotConnect,
@@ -1308,6 +1313,168 @@ def test_package_update_job_view_rejects_a_failed_verdict_with_no_failed_probe()
     payload["health"]["outcome"] = "failed"
     with pytest.raises(HubinetOpsInvalidResponse):
         _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3/4: ephemeral health-candidate discovery parsing. This is a plain
+# response parse, never a contract -- the backend persists nothing, and
+# these tests never touch a real Docker/systemd/HA surface.
+# ---------------------------------------------------------------------------
+
+
+def _discovery_candidate_payload(**overrides) -> dict:
+    candidate = {
+        "adapter": "docker",
+        "kind": "docker_container_healthy",
+        "target": "weatherhub-redis-1",
+        "observed_state": "running",
+        "origin": None,
+        "role_hint": "workload_candidate",
+        "recommended": True,
+        "rationale": "docker healthcheck reports healthy",
+    }
+    candidate.update(overrides)
+    return candidate
+
+
+def _discovery_payload(**overrides) -> dict:
+    payload = {
+        "resource_id": RESOURCE_CT,
+        "discovery_status": "ok",
+        "recommendation_basis": "docker_healthcheck",
+        "candidates": [_discovery_candidate_payload()],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_health_discovery_result_parses_a_recommended_docker_candidate() -> None:
+    result = _transport_http_module._health_discovery_result(
+        RESOURCE_CT, _discovery_payload()
+    )
+
+    assert result.resource_id == RESOURCE_CT
+    assert result.status is HealthDiscoveryStatus.OK
+    assert result.recommendation_basis is (
+        HealthDiscoveryRecommendationBasis.DOCKER_HEALTHCHECK
+    )
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.adapter is HealthDiscoveryAdapter.DOCKER
+    assert candidate.kind is HealthProbeKind.DOCKER_CONTAINER_HEALTHY
+    assert candidate.target == "weatherhub-redis-1"
+    assert candidate.origin is None
+    assert candidate.role_hint is HealthDiscoveryRoleHint.WORKLOAD_CANDIDATE
+    assert candidate.recommended is True
+    assert candidate.rationale == "docker healthcheck reports healthy"
+
+
+def test_health_discovery_result_defaults_to_no_candidates_when_absent() -> None:
+    payload = _discovery_payload(recommendation_basis=None, candidates=[])
+
+    result = _transport_http_module._health_discovery_result(RESOURCE_CT, payload)
+
+    assert result.candidates == ()
+    assert result.recommendation_basis is None
+
+
+def test_health_discovery_result_parses_a_null_target_guest_operational_candidate() -> None:
+    payload = _discovery_payload(
+        discovery_status="no_candidates",
+        recommendation_basis="guest_fallback",
+        candidates=[
+            _discovery_candidate_payload(
+                adapter="guest",
+                kind="guest_operational",
+                target=None,
+                observed_state="reachable",
+                role_hint="workload_candidate",
+                recommended=True,
+                rationale="no workload candidate found in either family",
+            )
+        ],
+    )
+
+    result = _transport_http_module._health_discovery_result(RESOURCE_CT, payload)
+
+    assert result.status is HealthDiscoveryStatus.NO_CANDIDATES
+    candidate = result.candidates[0]
+    assert candidate.kind is HealthProbeKind.GUEST_OPERATIONAL
+    assert candidate.target is None
+
+
+def test_health_discovery_result_rejects_a_different_resource_id() -> None:
+    payload = _discovery_payload(resource_id="00000000-0000-4000-8000-000000000000")
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._health_discovery_result(RESOURCE_CT, payload)
+
+
+def test_health_discovery_result_rejects_a_faked_target_for_guest_operational() -> None:
+    """The one rule this must never let slip: a fabricated target string
+    (never even a fake VMID) standing in for the fallback's real, targetless
+    identity."""
+
+    payload = _discovery_payload(
+        candidates=[
+            _discovery_candidate_payload(
+                adapter="guest", kind="guest_operational", target="guest"
+            )
+        ]
+    )
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._health_discovery_result(RESOURCE_CT, payload)
+
+
+def test_health_discovery_result_rejects_a_missing_target_for_a_named_kind() -> None:
+    payload = _discovery_payload(
+        candidates=[_discovery_candidate_payload(target=None)]
+    )
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._health_discovery_result(RESOURCE_CT, payload)
+
+
+def test_health_discovery_result_rejects_a_string_boolean_for_recommended() -> None:
+    """`bool("false")` is `True` in Python -- the same coercion trap already
+    closed for job health-probe parsing must be closed here too."""
+
+    payload = _discovery_payload(
+        candidates=[_discovery_candidate_payload(recommended="false")]
+    )
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._health_discovery_result(RESOURCE_CT, payload)
+
+
+def test_health_discovery_result_rejects_candidates_as_a_non_list() -> None:
+    payload = _discovery_payload(candidates={"not": "a list"})
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._health_discovery_result(RESOURCE_CT, payload)
+
+
+def test_health_discovery_result_rejects_an_unknown_status() -> None:
+    payload = _discovery_payload(discovery_status="something_else")
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._health_discovery_result(RESOURCE_CT, payload)
+
+
+async def test_fetch_health_candidates_gets_the_typed_route(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    """Proves the transport method calls the exact discovery route and
+    returns a parsed, typed result -- not a raw dict."""
+
+    aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/resources/{RESOURCE_CT}/health-candidates",
+        json=_discovery_payload(),
+    )
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    result = await transport.fetch_health_candidates(RESOURCE_CT)
+
+    assert result.resource_id == RESOURCE_CT
+    assert result.status is HealthDiscoveryStatus.OK
+    assert len(result.candidates) == 1
 
 
 class _DelayedRollbackServer:

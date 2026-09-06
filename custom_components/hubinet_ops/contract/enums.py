@@ -168,6 +168,59 @@ class HealthProbeKind(StrEnum):
     GUEST_OPERATIONAL = "guest_operational"
 
 
+class HealthDiscoveryAdapter(StrEnum):
+    """The supported v0.5 discovery adapters. Home Assistant never discovers
+    or classifies anything itself -- this only names which backend-owned
+    adapter produced a candidate."""
+
+    DOCKER = "docker"
+    SYSTEMD = "systemd"
+    GUEST = "guest"
+
+
+class HealthDiscoveryOrigin(StrEnum):
+    """Where a systemd candidate's unit file came from. Neutral: a
+    PACKAGE_UNIT is never thereby "platform"."""
+
+    LOCAL_UNIT = "local_unit"
+    PACKAGE_UNIT = "package_unit"
+    GENERATED = "generated"
+    ALIAS = "alias"
+    UNKNOWN_ORIGIN = "unknown_origin"
+
+
+class HealthDiscoveryRoleHint(StrEnum):
+    """A structural hint, never a health fact."""
+
+    WORKLOAD_CANDIDATE = "workload_candidate"
+    RUNTIME = "runtime"
+    PLATFORM = "platform"
+    AMBIGUOUS = "ambiguous"
+
+
+class HealthDiscoveryStatus(StrEnum):
+    """What discovery could truthfully determine. Home Assistant renders
+    this and never re-derives it -- in particular, it never treats an
+    inability to discover as proof that no workload exists."""
+
+    OK = "ok"
+    NO_CANDIDATES = "no_candidates"
+    AMBIGUOUS_CANDIDATES = "ambiguous_candidates"
+    GUEST_UNAVAILABLE = "guest_unavailable"
+    UNDECIDABLE = "undecidable"
+    TOO_MANY_CANDIDATES = "too_many_candidates"
+
+
+class HealthDiscoveryRecommendationBasis(StrEnum):
+    """The bounded, backend-owned rationale for what discovery recommended.
+    Home Assistant translates this token; it never computes one."""
+
+    DOCKER_HEALTHCHECK = "docker_healthcheck"
+    DOCKER_RUNNING = "docker_running"
+    SINGLE_SYSTEMD_CANDIDATE = "single_systemd_candidate"
+    GUEST_FALLBACK = "guest_fallback"
+
+
 class HealthProbeOutcome(StrEnum):
     """What ONE frozen probe was durably observed to be, once evaluated.
 

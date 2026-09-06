@@ -9,6 +9,13 @@ from .contract import (
     DetailStatus,
     HealthContractStatus,
     HealthContractSummary,
+    HealthDiscoveryAdapter,
+    HealthDiscoveryCandidate,
+    HealthDiscoveryOrigin,
+    HealthDiscoveryRecommendationBasis,
+    HealthDiscoveryResult,
+    HealthDiscoveryRoleHint,
+    HealthDiscoveryStatus,
     HealthProbe,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -133,6 +140,10 @@ class HubinetOpsTransport(Protocol):
     async def fetch_health_contract(self, resource_id: str) -> ResourceHealthContract:
         """Read one exact resource's complete declared health contract."""
 
+    async def fetch_health_candidates(self, resource_id: str) -> HealthDiscoveryResult:
+        """Ephemeral health-candidate discovery (v20). Read-only; the
+        backend persists nothing from this call."""
+
     async def replace_health_contract(
         self,
         resource_id: str,
@@ -214,6 +225,15 @@ class HubinetOpsApi:
         """Read one resource's declared health contract."""
 
         return await self._transport.fetch_health_contract(resource_id)
+
+    async def async_fetch_health_candidates(
+        self, resource_id: str
+    ) -> HealthDiscoveryResult:
+        """Ephemeral discovery read: never persisted, revisioned, or
+        fingerprinted. An operator confirms what they want through the
+        existing health-contract mutation, never automatically."""
+
+        return await self._transport.fetch_health_candidates(resource_id)
 
     async def async_replace_health_contract(
         self,

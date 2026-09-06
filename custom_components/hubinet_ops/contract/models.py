@@ -11,6 +11,11 @@ from typing import Any
 from .enums import (
     DetailStatus,
     HealthContractStatus,
+    HealthDiscoveryAdapter,
+    HealthDiscoveryOrigin,
+    HealthDiscoveryRecommendationBasis,
+    HealthDiscoveryRoleHint,
+    HealthDiscoveryStatus,
     HealthProbeKind,
     HealthProbeOutcome,
     LifecycleState,
@@ -30,6 +35,8 @@ from .enums import (
 )
 from .health_contract_validation import (
     validate_health_contract_summary,
+    validate_health_discovery_candidate,
+    validate_health_discovery_result,
     validate_health_probe,
     validate_resource_health_contract,
 )
@@ -304,6 +311,47 @@ class ResourceHealthContract:
     def __post_init__(self) -> None:
         _require_uuid_identity(self.resource_id, "resource_id")
         validate_resource_health_contract(self)
+
+
+@dataclass(frozen=True, slots=True)
+class HealthDiscoveryCandidate:
+    """One ephemeral candidate health probe, as backend discovery reports it.
+
+    Never persisted, never revisioned -- an operator confirming one turns it
+    into a real declared probe through the existing health-contract mutation,
+    which is the only place authority is ever created. ``target`` is
+    ``None`` for, and only for, a ``guest`` adapter candidate.
+    """
+
+    adapter: HealthDiscoveryAdapter
+    kind: HealthProbeKind
+    target: str | None
+    observed_state: str
+    origin: HealthDiscoveryOrigin | None
+    role_hint: HealthDiscoveryRoleHint
+    recommended: bool
+    rationale: str
+
+    def __post_init__(self) -> None:
+        validate_health_discovery_candidate(self)
+
+
+@dataclass(frozen=True, slots=True)
+class HealthDiscoveryResult:
+    """The complete, bounded, ephemeral answer to one discovery read."""
+
+    resource_id: str
+    status: HealthDiscoveryStatus
+    candidates: tuple[HealthDiscoveryCandidate, ...] = ()
+    recommendation_basis: HealthDiscoveryRecommendationBasis | None = None
+
+    def __post_init__(self) -> None:
+        _require_uuid_identity(self.resource_id, "resource_id")
+        validate_health_discovery_result(self)
+
+    @property
+    def recommended_candidates(self) -> tuple[HealthDiscoveryCandidate, ...]:
+        return tuple(candidate for candidate in self.candidates if candidate.recommended)
 
 
 @dataclass(frozen=True, slots=True)
