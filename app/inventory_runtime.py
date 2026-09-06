@@ -276,7 +276,9 @@ _RETRYABLE_ISSUANCE_REFUSALS = frozenset(
 )
 
 
-def _package_update_job_body(job: PackageUpdateJob) -> dict[str, Any]:
+def _package_update_job_body(
+    job: PackageUpdateJob, *, store: InventoryAuthorityStore
+) -> dict[str, Any]:
     """Render one job as bounded typed facts.
 
     Deliberately absent: helper stdout/stderr, raw PVE task logs, command
@@ -319,7 +321,7 @@ def _package_update_job_body(job: PackageUpdateJob) -> dict[str, Any]:
             "may_have_started_at": job.rollback_may_have_started_at,
             "task_upid": job.rollback_task_upid,
             "completed_at": job.rollback_completed_at,
-            "available": _rollback_available(job),
+            "available": _rollback_currently_available(store, job),
         },
         "terminalized_at": job.terminalized_at,
         "terminal_reason": job.terminal_reason,
@@ -328,10 +330,7 @@ def _package_update_job_body(job: PackageUpdateJob) -> dict[str, Any]:
 
 #: The exact four durable checkpoints from which
 #: :meth:`InventoryAuthority.arm_package_update_rollback` accepts an ACTIVE
-#: job. Mirrored here for a read-only *availability* hint in the readback
-#: body, never as a second eligibility decision: the arming transaction
-#: re-proves the whole rule itself, and a request that races past this hint
-#: is refused there, not here.
+#: job.
 _ROLLBACK_ELIGIBLE_CHECKPOINTS = (
     PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
     PackageUpdateCheckpoint.MUTATION_COMPLETED,
@@ -340,11 +339,67 @@ _ROLLBACK_ELIGIBLE_CHECKPOINTS = (
 )
 
 
-def _rollback_available(job: PackageUpdateJob) -> bool:
+def _rollback_checkpoint_eligible(job: PackageUpdateJob) -> bool:
+    """Whether this job's durable status/checkpoint COULD in principle
+    accept a same-job rollback.
+
+    Internal only. This is a historical/checkpoint fact, not operator
+    availability -- it says nothing about whether the exact workload the job
+    names is still the one currently at that identity. Never publish this
+    under the word "available"; see :func:`_rollback_currently_available`.
+    """
+
     return (
         job.status is PackageUpdateJobStatus.ACTIVE
         and job.checkpoint in _ROLLBACK_ELIGIBLE_CHECKPOINTS
     )
+
+
+def _rollback_currently_available(
+    store: InventoryAuthorityStore, job: PackageUpdateJob
+) -> bool:
+    """The one meaning every operator-visible "rollback available" must
+    share (GitHub review P2 #3, Option A): the backend currently considers
+    this exact same-job rollback available for explicit operator use, based
+    on the authority facts it can currently prove.
+
+    Reuses the EXACT proof
+    :meth:`InventoryAuthority.arm_package_update_rollback` itself requires
+    (`_post_mutation_job_context_is_current`) -- never a second,
+    differently-shaped copy of the same rules, and deliberately narrower
+    than plan/health currency: it does not require the guest to be running,
+    a current package plan, or a live health contract, because a stopped
+    guest recovering from a half-applied update -- with a stale plan and a
+    since-changed contract -- is exactly the case this must NOT hide.
+
+    This is still only a read-only hint: `arm_package_update_rollback`
+    re-proves the whole rule itself inside its own transaction, and a
+    request that races past this hint is refused there, never here.
+    """
+
+    if not _rollback_checkpoint_eligible(job):
+        return False
+    # `_post_mutation_job_context_is_current` only ever indexes the row by
+    # these exact keys (never iterates or inspects column count), so a
+    # plain mapping built from the already-typed job stands in for the
+    # `sqlite3.Row` the authority transaction itself passes it -- one
+    # target-context proof, not a second copy of its rules.
+    job_row = {
+        "resource_id": job.resource_id,
+        "inventory_source_id": job.inventory_source_id,
+        "expected_vmid": job.expected_vmid,
+        "expected_binding_id": job.expected_binding_id,
+        "expected_locator_generation": job.expected_locator_generation,
+        "expected_resource_continuity_revision": (
+            job.expected_resource_continuity_revision
+        ),
+        "expected_node_id": job.expected_node_id,
+        "expected_node_name": job.expected_node_name,
+    }
+    with store._read_connection() as connection:
+        return InventoryAuthority._post_mutation_job_context_is_current(
+            connection, job_row
+        )
 
 
 def _package_update_event_body(event: Any) -> dict[str, Any]:
@@ -851,7 +906,9 @@ def create_read_only_app(
                 422, "invalid_request", str(exc)
             ) from exc
         runtime.worker.wake()
-        return JSONResponse(status_code=202, content=_package_update_job_body(job))
+        return JSONResponse(
+            status_code=202, content=_package_update_job_body(job, store=store)
+        )
 
     @app.get(
         _PACKAGE_UPDATE_ROUTE, dependencies=[Depends(_require_bearer_token)]
@@ -869,7 +926,7 @@ def create_read_only_app(
         """
 
         job = _resource_job_or_error(resource_id)
-        body = _package_update_job_body(job)
+        body = _package_update_job_body(job, store=store)
         body["events"] = (
             []
             if events == 0
@@ -900,7 +957,7 @@ def create_read_only_app(
         job = store.active_package_update_job()
         return {
             "active": job is not None,
-            "job": None if job is None else _package_update_job_body(job),
+            "job": None if job is None else _package_update_job_body(job, store=store),
         }
 
     @app.post(
@@ -992,7 +1049,7 @@ def create_read_only_app(
         job = _active_job_for_resource_or_error(resource_id)
         runtime.worker.wake()
         return JSONResponse(
-            status_code=202, content=_package_update_job_body(job)
+            status_code=202, content=_package_update_job_body(job, store=store)
         )
 
     @app.post(
@@ -1081,7 +1138,7 @@ def create_read_only_app(
             ) from exc
         runtime.worker.wake()
         return JSONResponse(
-            status_code=202, content=_package_update_job_body(armed)
+            status_code=202, content=_package_update_job_body(armed, store=store)
         )
 
     # ------------------------------------------------------------------

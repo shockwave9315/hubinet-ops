@@ -5847,6 +5847,69 @@ async def test_the_update_job_sensor_summarizes_without_replicating(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("can_rollback_update", (True, False))
+async def test_rollback_available_surfaces_agree_from_one_authority_state(
+    hass: HomeAssistant, can_rollback_update: bool
+) -> None:
+    """GitHub review P2 #3, Option A: every operator-visible surface named
+    "rollback available" -- the binary sensor, the ordinary resource sensor
+    attribute, and the Rollback button -- must answer identically from the
+    SAME backend-published `can_rollback_update` capability, for both the
+    true and the false case, built from one constructed authority state."""
+
+    active = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        package_update_job=PackageUpdateJobSummary(
+            state=PackageUpdateJobState.ACTIVE,
+            job_id=JOB_ID,
+            checkpoint="health_completed",
+            issued_at="2026-08-08T11:00:00+00:00",
+            package_count=24,
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_started_at="2026-08-08T11:09:00+00:00",
+            health_completed_at="2026-08-08T11:10:00+00:00",
+            snapshot_confirmed_at="2026-08-08T11:01:00+00:00",
+            mutation_completed_at="2026-08-08T11:08:00+00:00",
+            # The durable checkpoint fact stays true regardless of the
+            # volatile capability below -- it must never be read as
+            # "currently available" on its own (see
+            # PackageUpdateJobSummary.rollback_available's own docstring).
+            rollback_available=True,
+        ),
+    )
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [snapshot((active,))],
+            operator_capabilities={
+                RESOURCE_CT: OperatorCapabilities(
+                    can_view_update_job=True,
+                    can_rollback_update=can_rollback_update,
+                )
+            },
+        ),
+    )
+
+    states = resource_entity_states(hass, entry, RESOURCE_CT)
+    binary_sensor_on = states["rollback_available"] == "on"
+
+    job_sensor_id = resource_entity_id(hass, entry, RESOURCE_CT, "package_update_job")
+    sensor_attribute = hass.states.get(job_sensor_id).attributes[
+        "package_update_rollback_available"
+    ]
+
+    rollback_button_id = resource_entity_id(hass, entry, RESOURCE_CT, "rollback_update")
+    button_available = hass.states.get(rollback_button_id).state != STATE_UNAVAILABLE
+
+    assert binary_sensor_on is can_rollback_update
+    assert sensor_attribute is can_rollback_update
+    assert button_available is can_rollback_update
+
+
+@pytest.mark.asyncio
 async def test_a_qemu_resource_reports_the_update_lifecycle_as_unsupported(
     hass: HomeAssistant,
 ) -> None:

@@ -1831,6 +1831,71 @@ def test_readback_reports_bounded_typed_facts_and_no_raw_output(api) -> None:
     assert "health_probe_results" not in body
 
 
+def test_readback_rollback_available_requires_current_job_target(
+    tmp_path: Path,
+) -> None:
+    """GitHub review P2 #3, Option A: the detailed job readback's
+    ``rollback.available`` must share the exact same current-target truth as
+    the backend's own rollback-arming proof
+    (``_post_mutation_job_context_is_current``) and the published
+    ``can_rollback_update`` capability -- never a checkpoint-only
+    approximation that can disagree with what the endpoint will actually
+    accept.
+    """
+
+    system = ApiSystem(tmp_path, health=["failed"])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "active"
+        assert body["checkpoint"] == "health_completed"
+
+        # Exact current target, node available: rollback-eligible checkpoint
+        # and current target agree -- TRUE.
+        assert body["rollback"]["available"] is True
+
+        resource = system.store.list_resources()[0]
+
+        # The exact node the job's target names becomes unavailable: the
+        # arming proof would refuse, so the readback must say so too.
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE inventory_nodes SET available=0 WHERE node_id=?",
+                (resource.current_node_id,),
+            )
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        assert response.json()["rollback"]["available"] is False
+
+        # Restore the node, then stop the guest: a failed mutation can
+        # legitimately leave it down, and recovery must not require
+        # `running` -- this must stay TRUE.
+        with system.store._transaction() as connection:
+            connection.execute(
+                "UPDATE inventory_nodes SET available=1 WHERE node_id=?",
+                (resource.current_node_id,),
+            )
+            connection.execute(
+                "UPDATE resource_incarnations SET status='stopped' "
+                "WHERE resource_id=?",
+                (resource.resource_id,),
+            )
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        assert response.json()["rollback"]["available"] is True
+    finally:
+        system.close()
+
+
 def test_the_active_job_witness_answers_the_product_updater(api) -> None:
     """The updater's fence reads this, and it must be exact."""
 

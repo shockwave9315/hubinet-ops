@@ -432,8 +432,18 @@ class HubinetOpsResourceSensor(HubinetOpsResourceEntity, SensorEntity):
             "package_update_health_completed_at": (
                 resource.package_update_job.health_completed_at
             ),
+            # GitHub review P2 #3, Option A: every operator-visible field
+            # named "rollback available" shares one meaning -- the backend
+            # currently considers this exact same-job rollback available for
+            # explicit operator use, not merely that its durable checkpoint
+            # could in principle accept one. Sourced from the SAME volatile
+            # `can_rollback_update` capability the Rollback button and the
+            # rollback binary sensor already use, never a second,
+            # independently-computed answer to the same question.
             "package_update_rollback_available": (
-                resource.package_update_job.rollback_available
+                self.coordinator.operator_capabilities(
+                    resource.resource_id
+                ).can_rollback_update
             ),
             "package_update_issued_at": resource.package_update_job.issued_at,
             "package_update_terminalized_at": (

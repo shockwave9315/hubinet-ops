@@ -306,6 +306,18 @@ class PackageUpdateJobSummary:
     A concise state, not a replica of the event log. Everything detailed --
     the frozen package rows, the per-probe results, the append-only events --
     is response data from an explicitly invoked action.
+
+    ``rollback_available`` here is durable CHECKPOINT ELIGIBILITY only --
+    exactly what the immutable, revisioned snapshot may ever carry: whether
+    this job's status/checkpoint could in principle accept a same-job
+    rollback. It says nothing about whether the exact workload identity the
+    job names is still current (that is a volatile fact and belongs outside
+    snapshot revisioning -- see ``OperatorCapabilities.can_rollback_update``
+    on ``OperatorAvailabilityView``, and ``PackageUpdateJobView.
+    rollback_available`` for the explicit-action readback, both of which
+    additionally require current-target validity). Never read this field to
+    answer "is rollback currently available" -- present it, if at all, as
+    history, not as an availability claim.
     """
 
     state: PackageUpdateJobState = PackageUpdateJobState.NOT_STARTED
@@ -430,9 +442,18 @@ class PackageUpdateJobView:
 
     Response data from an action an operator invoked, never entity state.
     Flat by design: Home Assistant renders these as a response mapping, and a
-    nested shape would only invite a template to reach into it. Everything
-    here is a durable authority fact -- no helper output, no PVE task log, no
-    command text, no package rows, and no per-probe results.
+    nested shape would only invite a template to reach into it. Every field
+    but one is a durable authority fact -- no helper output, no PVE task log,
+    no command text, no package rows, and no per-probe results.
+
+    ``rollback_available`` is the one exception, and deliberately so (GitHub
+    review P2 #3, Option A): it is the backend's own fresh, current-target-
+    checked verdict -- the same proof
+    ``InventoryAuthority.arm_package_update_rollback`` requires -- not merely
+    a durable checkpoint fact. This is the one meaning every operator-visible
+    "rollback available" in this integration converges on; contrast
+    ``PackageUpdateJobSummary.rollback_available``, which is durable
+    checkpoint eligibility only.
     """
 
     job_id: str
