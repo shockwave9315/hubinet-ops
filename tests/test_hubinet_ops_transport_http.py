@@ -47,11 +47,14 @@ from custom_components.hubinet_ops.api import (
     NodeSnapshot,
     NodeAvailability,
     ObservationalContinuity,
+    OperatorCapabilities,
+    OperatorAvailabilityView,
     PackageScanError,
     PackageScanSnapshot,
     PackageScanStatus,
     PresenceState,
     ResourceSnapshot,
+    ResourceOperatorAvailability,
     ResourceType,
     SourceContext,
 )
@@ -203,6 +206,45 @@ def _snapshot_json(item: HubinetOpsSnapshot) -> dict[str, Any]:
     }
 
 
+def _operator_availability_json(item: OperatorAvailabilityView) -> dict[str, Any]:
+    return {
+        "backend_instance_id": item.backend_instance_id,
+        "authority_published_state_revision": (
+            item.authority_published_state_revision
+        ),
+        "resources": [
+            {
+                "resource_id": resource.resource_id,
+                **{
+                    name: getattr(resource.capabilities, name)
+                    for name in resource.capabilities.__dataclass_fields__
+                },
+            }
+            for resource in item.resources
+        ],
+    }
+
+
+def _empty_operator_availability_json(
+    selected_snapshot: HubinetOpsSnapshot,
+) -> dict[str, Any]:
+    return _operator_availability_json(
+        OperatorAvailabilityView(
+            backend_instance_id=selected_snapshot.backend.backend_instance_id,
+            authority_published_state_revision=(
+                selected_snapshot.published_state_revision
+            ),
+            resources=tuple(
+                ResourceOperatorAvailability(
+                    resource_id=resource.resource_id,
+                    capabilities=OperatorCapabilities(),
+                )
+                for resource in selected_snapshot.resources
+            ),
+        )
+    )
+
+
 def _fixture_snapshot(
     *resources,
     source_run_sequence: int = 5,
@@ -283,6 +325,55 @@ async def test_29_snapshot_round_trip_matches_typed_contract(
 
     assert result == expected
     assert isinstance(result.resources[0].effective_capabilities, frozenset)
+
+
+@pytest.mark.asyncio
+async def test_operator_availability_round_trip_is_separate_from_snapshot(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    expected = OperatorAvailabilityView(
+        backend_instance_id=BACKEND_ID,
+        authority_published_state_revision=20,
+        resources=(
+            ResourceOperatorAvailability(
+                resource_id=RESOURCE_CT,
+                capabilities=OperatorCapabilities(
+                    can_review_update_plan=True,
+                    can_start_update=True,
+                    can_view_health_contract=True,
+                ),
+            ),
+        ),
+    )
+    aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability",
+        json=_operator_availability_json(expected),
+    )
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    assert await transport.fetch_operator_availability() == expected
+
+
+@pytest.mark.asyncio
+async def test_malformed_operator_availability_fails_closed(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability",
+        json={
+            "backend_instance_id": BACKEND_ID,
+            "authority_published_state_revision": 20,
+            "resources": [{"resource_id": RESOURCE_CT, "can_start_update": "yes"}],
+        },
+    )
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        await transport.fetch_operator_availability()
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +798,10 @@ async def test_33_diagnostics_redact_secrets_reaching_it_via_real_transport(
     payload = _fixture_snapshot(leaking)
     aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=_snapshot_json(payload))
     aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability",
+        json=_empty_operator_availability_json(payload),
+    )
+    aioclient_mock.get(
         f"{BASE_URL}/r0/v1/backend", json=_backend_json(backend_information())
     )
 
@@ -735,6 +830,10 @@ async def test_36_new_resource_appears_via_real_transport_without_reload(
     initial = _fixture_snapshot(resource(RESOURCE_VM, ResourceType.QEMU, 100, "Home Assistant"))
     aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=_snapshot_json(initial))
     aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability",
+        json=_empty_operator_availability_json(initial),
+    )
+    aioclient_mock.get(
         f"{BASE_URL}/r0/v1/backend", json=_backend_json(backend_information())
     )
 
@@ -758,6 +857,10 @@ async def test_36_new_resource_appears_via_real_transport_without_reload(
     )
     aioclient_mock.clear_requests()
     aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=_snapshot_json(updated))
+    aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability",
+        json=_empty_operator_availability_json(updated),
+    )
 
     await coordinator.async_refresh()
 
@@ -776,8 +879,13 @@ async def test_37_replacement_preserves_old_and_successor_via_real_transport(
     hass: HomeAssistant, aioclient_mock
 ) -> None:
     original = resource(RESOURCE_VM, ResourceType.QEMU, 100, "Home Assistant")
+    initial = _fixture_snapshot(original)
     aioclient_mock.get(
-        f"{BASE_URL}/r0/v1/snapshot", json=_snapshot_json(_fixture_snapshot(original))
+        f"{BASE_URL}/r0/v1/snapshot", json=_snapshot_json(initial)
+    )
+    aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability",
+        json=_empty_operator_availability_json(initial),
     )
     aioclient_mock.get(
         f"{BASE_URL}/r0/v1/backend", json=_backend_json(backend_information())
@@ -817,18 +925,21 @@ async def test_37_replacement_preserves_old_and_successor_via_real_transport(
     )
 
     aioclient_mock.clear_requests()
+    updated = _fixture_snapshot(
+        retired_original,
+        successor,
+        source_run_sequence=6,
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
     aioclient_mock.get(
         f"{BASE_URL}/r0/v1/snapshot",
-        json=_snapshot_json(
-            _fixture_snapshot(
-                retired_original,
-                successor,
-                source_run_sequence=6,
-                inventory_revision=11,
-                published_state_revision=21,
-                published_at="2026-08-08T12:01:00+00:00",
-            )
-        ),
+        json=_snapshot_json(updated),
+    )
+    aioclient_mock.get(
+        f"{BASE_URL}/r0/v1/operator-availability",
+        json=_empty_operator_availability_json(updated),
     )
 
     coordinator = entry.runtime_data

@@ -18,8 +18,9 @@ a guest in Proxmox never requires touching this repository or its config.
 
 - PVE autodiscovery of every node, LXC, and QEMU guest.
 - A durable SQLite inventory owned by the backend.
-- An HTTP API with read-only inventory routes (`GET /r0/v1/health`, `/backend`,
-  `/snapshot`), one authority-only exact-plan approval route, the
+- An HTTP API with read-only inventory/presentation routes (`GET /r0/v1/health`,
+  `/backend`, `/snapshot`, `/operator-availability`), one authority-only
+  exact-plan approval route, the
   authority-only per-resource health-contract routes
   (`GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`), and
   the explicit operator update controls
@@ -161,7 +162,9 @@ last definitive update health result, and rollback availability.
 For an update:
 
 1. Press **Review update plan**. Hubinet Ops fresh-reads the backend and opens
-   a persistent notification containing every exact package row.
+   a localized persistent notification containing every exact package row.
+   Backend text is rendered literally so it cannot create fake Markdown rows,
+   links, images, or instructions.
 2. After reviewing it, press **Approve reviewed plan**. Approval is refused if
    the backend identity, resource, scan run, or material fingerprint changed —
    even when a new scan has the same fingerprint. A reload also requires a new

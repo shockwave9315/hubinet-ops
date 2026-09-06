@@ -24,8 +24,11 @@ from .api import (
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     NodeSnapshot,
+    OperatorAvailabilityView,
+    OperatorCapabilities,
     ResourceSnapshot,
     ResourceType,
+    validate_operator_availability,
 )
 from .const import (
     DEFAULT_UPDATE_INTERVAL,
@@ -215,6 +218,12 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
         # UX state only. It is never persisted and grants no backend
         # authority. Reloading Home Assistant intentionally empties it.
         self.reviewed_update_plans: dict[str, ReviewedUpdatePlanReference] = {}
+        self.operator_availability: OperatorAvailabilityView
+
+    def operator_capabilities(self, resource_id: str) -> OperatorCapabilities:
+        """Return backend-owned point-in-time availability for one resource."""
+
+        return self.operator_availability.resources_by_id[resource_id]
 
     def remember_reviewed_update_plan(
         self, reference: ReviewedUpdatePlanReference
@@ -241,7 +250,9 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
                 incoming.backend.backend_instance_id
                 != reference.backend_instance_id
                 or resource is None
-                or not resource.operator_capabilities.can_approve_update_plan
+                or not self.operator_capabilities(
+                    resource_id
+                ).can_approve_update_plan
                 or resource.package_scan.scan_run_id != reference.scan_run_id
                 or resource.package_scan.plan_fingerprint
                 != reference.plan_fingerprint
@@ -255,6 +266,7 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
 
         try:
             incoming = await self.api.async_fetch_resource_snapshot()
+            availability = await self.api.async_fetch_operator_availability()
         except HubinetOpsInvalidAuth as err:
             raise ConfigEntryAuthFailed(
                 translation_domain=DOMAIN,
@@ -284,6 +296,15 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
                     translation_key="invalid_snapshot",
                 ) from err
 
+        try:
+            validate_operator_availability(availability, incoming)
+        except ValueError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_snapshot",
+            ) from err
+
+        self.operator_availability = availability
         self._invalidate_stale_plan_reviews(incoming)
         self._async_publish_inventory(incoming)
         return incoming

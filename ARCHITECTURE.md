@@ -73,10 +73,12 @@ Assistant re-enrollment.
   `configuration_error`, or `invalid`.
 - `reconciliation.py` — applies one complete normalized snapshot inside the
   caller's transaction.
-- `publication.py` — assembles the published snapshot (backend, sources, nodes,
-  resources, revisions) in one consistent read transaction. Per-resource
-  operator capabilities are conservative read-only facts derived there; they
-  control presentation availability but never authorize or advance a mutation.
+- `publication.py` — assembles the revisioned snapshot (backend, sources,
+  nodes, resources, revisions) in one consistent read transaction and exposes
+  a separate point-in-time operator-availability view. The latter contains
+  conservative backend-derived presentation facts, including runtime
+  activation and the product-update maintenance fence; it never authorizes or
+  advances a mutation.
 
 `app/inventory_runtime.py` is the production composition root, served via its
 `create_app_from_env` factory
@@ -84,6 +86,7 @@ Assistant re-enrollment.
 publication, PVE transport, the scheduler, and -- when `package_update.enabled`
 is configured true -- the five production update host controls and the one
 `PackageUpdateWorker`. It serves `GET /r0/v1/health`, `/backend`, `/snapshot`,
+`/operator-availability`,
 two families of authority-metadata mutation
 (`PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
 `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`), and the
@@ -809,12 +812,20 @@ entity. A second concise resource sensor displays the backend-published
 `unsupported | unconfigured | configured` contract state, which is a statement
 about configuration and never a health result.
 
-The backend also publishes `operator_capabilities`: review, approve, start,
-view job, resume, rollback, and health-contract view/configuration hints. The
-integration validates their shape and uses them only for button availability.
-Every endpoint repeats its complete authority proof, so a raced capability can
-only lead to a refusal. Polling remains mutation-free and never interprets a
-capability as retry permission.
+The backend also publishes review, approve, start, view-job, resume, rollback,
+and health-contract view/configuration availability through authenticated
+`GET /r0/v1/operator-availability`. This point-in-time view is deliberately
+separate from the immutable `/snapshot`: its
+`authority_published_state_revision` aligns the database-derived portion to
+the snapshot fetched in the same coordinator refresh, but is not a generation
+for volatile runtime activation or the filesystem maintenance fence. Thus one
+`published_state_revision` still names exactly one immutable snapshot even
+when either volatile fact changes. HA validates backend identity, authority
+revision, resource membership, and structural consistency, then uses the
+backend-supplied booleans only for button availability. Every mutation endpoint
+repeats its complete authority proof, so a raced capability can only lead to a
+refusal. Polling remains mutation-free and never interprets a capability as
+retry permission.
 
 Start/view/resume/rollback buttons share the response-capable action handlers.
 One start press generates one request ID once and makes one logical call; it is

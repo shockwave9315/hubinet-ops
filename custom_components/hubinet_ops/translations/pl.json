@@ -233,6 +233,53 @@
       }
     }
   },
+  "notifications": {
+    "common": {
+      "unknown": "Nieznane",
+      "yes": "Tak",
+      "no": "Nie",
+      "none": "Brak"
+    },
+    "plan": {
+      "title": "Plan aktualizacji Hubinet Ops — {name}",
+      "package_count": "Liczba aktualizacji pakietów: {count}",
+      "columns": {
+        "package": "Pakiet",
+        "architecture": "Architektura",
+        "installed": "Zainstalowana",
+        "candidate": "Dostępna",
+        "origin": "Źródło",
+        "security": "Bezpieczeństwo",
+        "description": "Opis"
+      },
+      "approval_instruction": "Sprawdź każdy wiersz, a następnie naciśnij **Zatwierdź przejrzany plan** dla tego zasobu. Zatwierdzenie zostanie odrzucone, jeśli zmieni się backend, zasób, skan lub odcisk materiału. Home Assistant zapomni ten przegląd po ponownym wczytaniu."
+    },
+    "approval": {
+      "title": "Plan Hubinet Ops zatwierdzony — {name}",
+      "message": "Dokładny przejrzany plan pakietów został zatwierdzony. Rozpoczęcie aktualizacji nadal wymaga osobnego, jawnego naciśnięcia."
+    },
+    "job": {
+      "title": "Aktualizacja pakietów Hubinet Ops — {name}",
+      "no_definitive_result": "Brak rozstrzygającego wyniku",
+      "recent_events": "Ostatnie trwałe zdarzenia",
+      "labels": {
+        "status": "Stan",
+        "checkpoint": "Punkt kontrolny",
+        "packages": "Pakiety",
+        "snapshot_confirmed": "Snapshot potwierdzony",
+        "mutation_completed": "Zmiana pakietów ukończona",
+        "health_result": "Wynik kontroli kondycji",
+        "rollback_available": "Wycofanie dostępne",
+        "terminal_reason": "Powód zakończenia"
+      }
+    },
+    "health": {
+      "title": "Kontrakt kondycji Hubinet Ops — {name}",
+      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany.",
+      "revision": "Rewizja",
+      "all_required": "Wszystkie poniższe sondy są wymagane:"
+    }
+  },
   "exceptions": {
     "cannot_connect": {
       "message": "Nie można połączyć się z backendem Hubinet Ops."

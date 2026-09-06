@@ -27,6 +27,7 @@ from .models import (
     InventorySourceSnapshot,
     NodeSnapshot,
     OperatorCapabilities,
+    OperatorAvailabilityView,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,
@@ -36,9 +37,11 @@ from .models import (
     PackageUpdateJobSummary,
     PackageUpdateJobView,
     ResourceHealthContract,
+    ResourceOperatorAvailability,
     ResourceSnapshot,
     SourceContext,
 )
+from .resource_validation import validate_operator_availability
 
 __all__ = (
     "BackendInformation",
@@ -54,6 +57,7 @@ __all__ = (
     "NodeSnapshot",
     "ObservationalContinuity",
     "OperatorCapabilities",
+    "OperatorAvailabilityView",
     "PackageScanStatus",
     "PackagePlanApprovalStatus",
     "PackageScanError",
@@ -68,6 +72,7 @@ __all__ = (
     "PackageUpdateJobView",
     "PresenceState",
     "ResourceHealthContract",
+    "ResourceOperatorAvailability",
     "ResourceSnapshot",
     "ResourceStateLevel",
     "ResourceType",
@@ -76,4 +81,5 @@ __all__ = (
     "SourceFreshness",
     "SourceHealth",
     "SourceHealthOrigin",
+    "validate_operator_availability",
 )

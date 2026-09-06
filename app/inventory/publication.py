@@ -60,6 +60,25 @@ class PublishedInventoryView:
         object.__setattr__(self, "resources", tuple(_freeze(item) for item in self.resources))
 
 
+@dataclass(frozen=True, slots=True)
+class PublishedOperatorAvailabilityView:
+    """One point-in-time operator-availability view outside snapshot revisioning.
+
+    ``authority_published_state_revision`` binds the database-derived portion
+    to the inventory snapshot HA fetched in the same coordinator refresh. It
+    does NOT identify this whole view: activation and the maintenance fence
+    are deliberately volatile runtime facts and may change while the authority
+    revision stays fixed.
+    """
+
+    backend_instance_id: str
+    authority_published_state_revision: int
+    resources: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "resources", tuple(_freeze(item) for item in self.resources))
+
+
 class InventoryPublication:
     def __init__(
         self,
@@ -79,7 +98,21 @@ class InventoryPublication:
         self._package_update_activated = package_update_activated
 
     def read(self) -> PublishedInventoryView:
-        """Materialize expiry and assemble one view in the same transaction."""
+        """Read only the revisioned, immutable inventory projection."""
+
+        inventory, _ = self._read_views()
+        return inventory
+
+    def read_operator_availability(self) -> PublishedOperatorAvailabilityView:
+        """Read current backend-owned presentation availability."""
+
+        _, availability = self._read_views()
+        return availability
+
+    def _read_views(
+        self,
+    ) -> tuple[PublishedInventoryView, PublishedOperatorAvailabilityView]:
+        """Assemble aligned inventory and availability views transactionally."""
 
         with self._store._transaction() as connection:
             decision_time = self._authority._authority_decision_time()
@@ -246,7 +279,7 @@ class InventoryPublication:
 
             sources = tuple(self._source(row) for row in source_rows)
             nodes = tuple(self._node(row) for row in node_rows)
-            resources = tuple(
+            resource_payloads = tuple(
                 self._resource(
                     connection,
                     row,
@@ -261,19 +294,44 @@ class InventoryPublication:
                 )
                 for row in resource_rows
             )
-            return PublishedInventoryView(
-                backend={
-                    "backend_instance_id": str(backend["backend_instance_id"]),
-                    "name": self._backend_name,
-                    "version": self._backend_version,
-                    "api_version": self._api_version,
-                },
-                sources=sources,
-                nodes=nodes,
-                resources=resources,
-                inventory_revision=int(backend["inventory_revision"]),
-                published_state_revision=int(backend["published_state_revision"]),
-                published_at=str(backend["published_at"]),
+            backend_payload = {
+                "backend_instance_id": str(backend["backend_instance_id"]),
+                "name": self._backend_name,
+                "version": self._backend_version,
+                "api_version": self._api_version,
+            }
+            revisioned_resources = tuple(
+                {
+                    key: value
+                    for key, value in resource.items()
+                    if key != "operator_capabilities"
+                }
+                for resource in resource_payloads
+            )
+            availability_resources = tuple(
+                {
+                    "resource_id": resource["resource_id"],
+                    **resource["operator_capabilities"],
+                }
+                for resource in resource_payloads
+            )
+            return (
+                PublishedInventoryView(
+                    backend=backend_payload,
+                    sources=sources,
+                    nodes=nodes,
+                    resources=revisioned_resources,
+                    inventory_revision=int(backend["inventory_revision"]),
+                    published_state_revision=int(backend["published_state_revision"]),
+                    published_at=str(backend["published_at"]),
+                ),
+                PublishedOperatorAvailabilityView(
+                    backend_instance_id=str(backend["backend_instance_id"]),
+                    authority_published_state_revision=int(
+                        backend["published_state_revision"]
+                    ),
+                    resources=availability_resources,
+                ),
             )
 
     @staticmethod

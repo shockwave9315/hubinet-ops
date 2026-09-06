@@ -182,10 +182,10 @@ def test_1_static_ast_scan_finds_no_denylisted_import_in_r0_modules() -> None:
 def test_2_only_reads_and_exact_authority_metadata_writes_exist(tmp_path: Path) -> None:
     """The R0 route table is an exact allowlist, not a shape.
 
-    Production activation adds exactly four routes, and each one is an
-    EXPLICIT operator control: start the approved update, read the job,
-    resume a recoverable one, and roll one back. Everything else this API
-    exposes still changes authority metadata only.
+    Production activation adds exactly four explicit update-control routes:
+    start the approved update, read the job, resume a recoverable one, and
+    roll one back. The operator-availability read is presentation data only.
+    Everything else this API exposes still changes authority metadata only.
 
     The fourth POST is not an operator control at all: it is the exclusive
     product-update maintenance fence, which the Hubinet product updater takes
@@ -218,6 +218,7 @@ def test_2_only_reads_and_exact_authority_metadata_writes_exist(tmp_path: Path) 
         "/r0/v1/health": {"GET"},
         "/r0/v1/backend": {"GET"},
         "/r0/v1/snapshot": {"GET"},
+        "/r0/v1/operator-availability": {"GET"},
         "/r0/v1/resources/{resource_id}/package-plan-approval": {"PUT"},
         "/r0/v1/resources/{resource_id}/health-contract": {"GET", "PUT", "DELETE"},
         "/r0/v1/resources/{resource_id}/package-update": {"GET", "POST"},
@@ -343,6 +344,32 @@ def test_29_backend_and_snapshot_http_shape_matches_publication_contract(
         assert field in resource
     assert isinstance(resource["effective_capabilities"], list)
     assert isinstance(resource["locator_generation"], int)
+    assert "operator_capabilities" not in resource
+
+    availability_body = client.get(
+        "/r0/v1/operator-availability", headers=headers
+    ).json()
+    assert availability_body["backend_instance_id"] == backend_body[
+        "backend_instance_id"
+    ]
+    assert (
+        availability_body["authority_published_state_revision"]
+        == snapshot_body["published_state_revision"]
+    )
+    assert len(availability_body["resources"]) == 1
+    availability = availability_body["resources"][0]
+    assert availability["resource_id"] == resource["resource_id"]
+    assert set(availability) == {
+        "resource_id",
+        "can_review_update_plan",
+        "can_approve_update_plan",
+        "can_start_update",
+        "can_view_update_job",
+        "can_resume_update",
+        "can_rollback_update",
+        "can_view_health_contract",
+        "can_configure_health_contract",
+    }
     # No credential-shaped field anywhere in the published/HTTP contract.
     assert "credential_reference" not in source
 
@@ -377,7 +404,14 @@ def test_30_backend_identity_stable_across_restart(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", ("/r0/v1/backend", "/r0/v1/snapshot"))
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/r0/v1/backend",
+        "/r0/v1/snapshot",
+        "/r0/v1/operator-availability",
+    ),
+)
 def test_32_missing_wrong_and_correct_token(tmp_path: Path, path: str) -> None:
     app, config = _build_app(tmp_path)
     client = TestClient(app)

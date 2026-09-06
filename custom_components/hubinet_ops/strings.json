@@ -273,6 +273,53 @@
       }
     }
   },
+  "notifications": {
+    "common": {
+      "unknown": "Unknown",
+      "yes": "Yes",
+      "no": "No",
+      "none": "None"
+    },
+    "plan": {
+      "title": "Hubinet Ops update plan — {name}",
+      "package_count": "{count} package update(s)",
+      "columns": {
+        "package": "Package",
+        "architecture": "Architecture",
+        "installed": "Installed",
+        "candidate": "Candidate",
+        "origin": "Origin",
+        "security": "Security",
+        "description": "Description"
+      },
+      "approval_instruction": "Review every row, then press **Approve reviewed plan** on this resource. Approval is refused if the backend, resource, scan, or material fingerprint changes. This review is forgotten when Home Assistant reloads."
+    },
+    "approval": {
+      "title": "Hubinet Ops plan approved — {name}",
+      "message": "The exact reviewed package plan was approved. Starting the update still requires a separate explicit press."
+    },
+    "job": {
+      "title": "Hubinet Ops package update — {name}",
+      "no_definitive_result": "No definitive result",
+      "recent_events": "Recent durable events",
+      "labels": {
+        "status": "Status",
+        "checkpoint": "Checkpoint",
+        "packages": "Packages",
+        "snapshot_confirmed": "Snapshot confirmed",
+        "mutation_completed": "Package mutation completed",
+        "health_result": "Health result",
+        "rollback_available": "Rollback available",
+        "terminal_reason": "Terminal reason"
+      }
+    },
+    "health": {
+      "title": "Hubinet Ops health contract — {name}",
+      "unconfigured": "No health contract is configured. This is **unconfigured**, not healthy, and a package update cannot start until a contract is declared.",
+      "revision": "Revision",
+      "all_required": "Every probe below is required:"
+    }
+  },
   "exceptions": {
     "cannot_connect": {
       "message": "Cannot connect to the Hubinet Ops backend."

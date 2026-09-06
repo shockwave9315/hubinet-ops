@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, override
+import html
+import re
+from typing import Any, Mapping, override
+import unicodedata
 
 from homeassistant.components import persistent_notification
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.translation import async_get_translations
 
 from .api import ResourceSnapshot, ResourceType
+from .const import DOMAIN
 from .coordinator import HubinetOpsConfigEntry, resource_device_name
 from .entity import HubinetOpsResourceEntity
 from .services import (
@@ -84,33 +89,90 @@ def _notification_id(entry_id: str, resource_id: str, kind: str) -> str:
     return f"hubinet_ops_{entry_id}_{resource_id}_{kind}"
 
 
-def _cell(value: Any) -> str:
-    """Render bounded backend data without letting it alter the table."""
+_MARKDOWN_PUNCTUATION = re.compile(r"([\\`*_{\[\]()#+\-.!|}>~])")
+
+
+def _visible_text(value: Any) -> str:
+    """Make control and format characters visible instead of structural."""
+
+    return "".join(
+        (
+            f"\\u{ord(character):04X}"
+            if unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"}
+            else character
+        )
+        for character in str(value)
+    )
+
+
+def _cell(value: Any, *, unknown: str) -> str:
+    """Render exact backend data without allowing Markdown structure."""
 
     if value is None:
-        return "Unknown"
-    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+        return unknown
+    escaped_html = html.escape(_visible_text(value), quote=False)
+    return _MARKDOWN_PUNCTUATION.sub(r"\\\1", escaped_html)
 
 
-def _plan_message(plan: dict[str, Any]) -> str:
+def _translation_key(key: str) -> str:
+    return f"component.{DOMAIN}.notifications.{key}"
+
+
+def _tr(strings: Mapping[str, str], key: str, **values: Any) -> str:
+    """Format one integration-owned notification translation."""
+
+    return strings[_translation_key(key)].format(**values)
+
+
+async def _notification_translations(hass: HomeAssistant) -> Mapping[str, str]:
+    return await async_get_translations(
+        hass,
+        hass.config.language,
+        "notifications",
+        integrations={DOMAIN},
+    )
+
+
+def _plan_message(plan: dict[str, Any], strings: Mapping[str, str]) -> str:
     packages = plan["packages"]
+    unknown = _tr(strings, "common.unknown")
     lines = [
-        f"**{plan['pending_count']} package update(s)**",
+        f"**{_tr(strings, 'plan.package_count', count=plan['pending_count'])}**",
         "",
-        "| Package | Architecture | Installed | Candidate | Origin | Security | Description |",
+        "| "
+        + " | ".join(
+            _tr(strings, f"plan.columns.{column}")
+            for column in (
+                "package",
+                "architecture",
+                "installed",
+                "candidate",
+                "origin",
+                "security",
+                "description",
+            )
+        )
+        + " |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     lines.extend(
         "| "
         + " | ".join(
             (
-                _cell(package["name"]),
-                _cell(package["architecture"]),
-                _cell(package["installed_version"]),
-                _cell(package["candidate_version"]),
-                _cell(package["origin"]),
-                "Yes" if package["security"] is True else "Unknown",
-                _cell(package["description"]),
+                _cell(package["name"], unknown=unknown),
+                _cell(package["architecture"], unknown=unknown),
+                _cell(package["installed_version"], unknown=unknown),
+                _cell(package["candidate_version"], unknown=unknown),
+                _cell(package["origin"], unknown=unknown),
+                _tr(
+                    strings,
+                    "common.yes"
+                    if package["security"] is True
+                    else "common.no"
+                    if package["security"] is False
+                    else "common.unknown",
+                ),
+                _cell(package["description"], unknown=unknown),
             )
         )
         + " |"
@@ -119,52 +181,70 @@ def _plan_message(plan: dict[str, Any]) -> str:
     lines.extend(
         (
             "",
-            "Review every row, then press **Approve reviewed plan** on this "
-            "resource. Approval is refused if the backend, resource, scan, or "
-            "material fingerprint changes. This review is forgotten when Home "
-            "Assistant reloads.",
+            _tr(strings, "plan.approval_instruction"),
         )
     )
     return "\n".join(lines)
 
 
-def _job_message(job: dict[str, Any]) -> str:
-    health = job["health_outcome"] or "No definitive result"
+def _job_message(job: dict[str, Any], strings: Mapping[str, str]) -> str:
+    unknown = _tr(strings, "common.unknown")
+    health = job["health_outcome"] or _tr(strings, "job.no_definitive_result")
     facts = (
-        ("Status", job["status"]),
-        ("Checkpoint", job["checkpoint"]),
-        ("Packages", job["package_count"]),
-        ("Snapshot confirmed", job["snapshot_confirmed_at"] or "No"),
-        ("Package mutation completed", job["mutation_completed_at"] or "No"),
-        ("Health result", health),
-        ("Rollback available", "Yes" if job["rollback_available"] else "No"),
-        ("Terminal reason", job["terminal_reason"] or "None"),
+        (_tr(strings, "job.labels.status"), job["status"]),
+        (_tr(strings, "job.labels.checkpoint"), job["checkpoint"]),
+        (_tr(strings, "job.labels.packages"), job["package_count"]),
+        (
+            _tr(strings, "job.labels.snapshot_confirmed"),
+            job["snapshot_confirmed_at"] or _tr(strings, "common.no"),
+        ),
+        (
+            _tr(strings, "job.labels.mutation_completed"),
+            job["mutation_completed_at"] or _tr(strings, "common.no"),
+        ),
+        (_tr(strings, "job.labels.health_result"), health),
+        (
+            _tr(strings, "job.labels.rollback_available"),
+            _tr(
+                strings,
+                "common.yes" if job["rollback_available"] else "common.no",
+            ),
+        ),
+        (
+            _tr(strings, "job.labels.terminal_reason"),
+            job["terminal_reason"] or _tr(strings, "common.none"),
+        ),
     )
-    lines = [f"- **{label}:** {_cell(value)}" for label, value in facts]
+    lines = [
+        f"- **{label}:** {_cell(value, unknown=unknown)}" for label, value in facts
+    ]
     if job["events"]:
-        lines.extend(("", "### Recent durable events", ""))
+        lines.extend(("", f"### {_tr(strings, 'job.recent_events')}", ""))
         lines.extend(
-            f"- `{_cell(event['created_at'])}` **{_cell(event['stage'])}** — "
-            f"{_cell(event['message'])}"
+            f"- {_cell(event['created_at'], unknown=unknown)} — "
+            f"{_cell(event['stage'], unknown=unknown)} — "
+            f"{_cell(event['message'], unknown=unknown)}"
             for event in job["events"]
         )
     return "\n".join(lines)
 
 
-def _health_contract_message(contract: dict[str, Any]) -> str:
+def _health_contract_message(
+    contract: dict[str, Any], strings: Mapping[str, str]
+) -> str:
     if contract["status"] == "unconfigured":
-        return (
-            "No health contract is configured. This is **unconfigured**, not "
-            "healthy, and a package update cannot start until a contract is declared."
-        )
+        return _tr(strings, "health.unconfigured")
+    unknown = _tr(strings, "common.unknown")
     lines = [
-        f"**Revision:** {contract['revision']}",
+        f"**{_tr(strings, 'health.revision')}:** "
+        f"{_cell(contract['revision'], unknown=unknown)}",
         "",
-        "Every probe below is required:",
+        _tr(strings, "health.all_required"),
         "",
     ]
     lines.extend(
-        f"- `{_cell(probe['kind'])}` — `{_cell(probe['target'])}`"
+        f"- {_cell(probe['kind'], unknown=unknown)} — "
+        f"{_cell(probe['target'], unknown=unknown)}"
         for probe in contract["probes"]
     )
     return "\n".join(lines)
@@ -208,7 +288,7 @@ class HubinetOpsResourceButton(HubinetOpsResourceEntity, ButtonEntity):
             return self.coordinator.reviewed_update_plan(self.resource_id) is not None
         return bool(
             getattr(
-                self.resource.operator_capabilities,
+                self.coordinator.operator_capabilities(self.resource_id),
                 self.entity_description.capability,
             )
         )
@@ -222,13 +302,14 @@ class HubinetOpsResourceButton(HubinetOpsResourceEntity, ButtonEntity):
 
         key = self.entity_description.key
         entry_id = self.coordinator.config_entry.entry_id
-        name = resource_device_name(self.resource)
+        name = _visible_text(resource_device_name(self.resource))
+        strings = await _notification_translations(self.hass)
         if key == "review_update_plan":
             plan = await async_review_update_plan(self.coordinator, self.resource_id)
             persistent_notification.async_create(
                 self.hass,
-                _plan_message(plan),
-                title=f"Hubinet Ops update plan — {name}",
+                _plan_message(plan, strings),
+                title=_tr(strings, "plan.title", name=name),
                 notification_id=_notification_id(entry_id, self.resource_id, "plan"),
             )
             return
@@ -238,9 +319,8 @@ class HubinetOpsResourceButton(HubinetOpsResourceEntity, ButtonEntity):
             )
             persistent_notification.async_create(
                 self.hass,
-                "The exact reviewed package plan was approved. Starting the "
-                "update still requires a separate explicit press.",
-                title=f"Hubinet Ops plan approved — {name}",
+                _tr(strings, "approval.message"),
+                title=_tr(strings, "approval.title", name=name),
                 notification_id=_notification_id(entry_id, self.resource_id, "plan"),
             )
             return
@@ -250,8 +330,8 @@ class HubinetOpsResourceButton(HubinetOpsResourceEntity, ButtonEntity):
             )
             persistent_notification.async_create(
                 self.hass,
-                _health_contract_message(contract),
-                title=f"Hubinet Ops health contract — {name}",
+                _health_contract_message(contract, strings),
+                title=_tr(strings, "health.title", name=name),
                 notification_id=_notification_id(entry_id, self.resource_id, "health"),
             )
             return
@@ -267,7 +347,7 @@ class HubinetOpsResourceButton(HubinetOpsResourceEntity, ButtonEntity):
             raise HomeAssistantError("unknown Hubinet Ops operator control")
         persistent_notification.async_create(
             self.hass,
-            _job_message(job),
-            title=f"Hubinet Ops package update — {name}",
+            _job_message(job, strings),
+            title=_tr(strings, "job.title", name=name),
             notification_id=_notification_id(entry_id, self.resource_id, "job"),
         )

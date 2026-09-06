@@ -44,6 +44,7 @@ from .api import (
     NodeSnapshot,
     ObservationalContinuity,
     OperatorCapabilities,
+    OperatorAvailabilityView,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,
@@ -58,6 +59,7 @@ from .api import (
     PackageUpdateJobView,
     PresenceState,
     ResourceHealthContract,
+    ResourceOperatorAvailability,
     ResourceSnapshot,
     ResourceStateLevel,
     ResourceType,
@@ -172,6 +174,7 @@ _START_REQUEST_TIMEOUT = aiohttp.ClientTimeout(
 
 _BACKEND_ROUTE = "/r0/v1/backend"
 _SNAPSHOT_ROUTE = "/r0/v1/snapshot"
+_OPERATOR_AVAILABILITY_ROUTE = "/r0/v1/operator-availability"
 _PACKAGE_PLAN_APPROVAL_ROUTE = (
     "/r0/v1/resources/{resource_id}/package-plan-approval"
 )
@@ -534,11 +537,6 @@ def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
             if "package_update_job" not in payload
             else _package_update_job_summary(payload["package_update_job"])
         ),
-        operator_capabilities=(
-            OperatorCapabilities()
-            if "operator_capabilities" not in payload
-            else _operator_capabilities(payload["operator_capabilities"])
-        ),
         termination_reason=payload.get("termination_reason"),
         successor_resource_id=payload.get("successor_resource_id"),
     )
@@ -556,6 +554,27 @@ def _operator_capabilities(payload: Any) -> OperatorCapabilities:
         can_rollback_update=payload["can_rollback_update"],
         can_view_health_contract=payload["can_view_health_contract"],
         can_configure_health_contract=payload["can_configure_health_contract"],
+    )
+
+
+def _operator_availability_view(payload: Any) -> OperatorAvailabilityView:
+    if not isinstance(payload, Mapping):
+        raise TypeError("operator availability must be an object")
+    resources = payload["resources"]
+    if not isinstance(resources, list):
+        raise TypeError("operator availability resources must be a list")
+    return OperatorAvailabilityView(
+        backend_instance_id=str(payload["backend_instance_id"]),
+        authority_published_state_revision=int(
+            payload["authority_published_state_revision"]
+        ),
+        resources=tuple(
+            ResourceOperatorAvailability(
+                resource_id=str(resource["resource_id"]),
+                capabilities=_operator_capabilities(resource),
+            )
+            for resource in resources
+        ),
     )
 
 
@@ -742,6 +761,15 @@ class HttpHubinetOpsTransport:
             return _snapshot_from_payload(payload)
         except (KeyError, TypeError, ValueError) as exc:
             raise HubinetOpsInvalidResponse(f"malformed Hubinet Ops snapshot: {exc}") from exc
+
+    async def fetch_operator_availability(self) -> OperatorAvailabilityView:
+        payload = await self._get(_OPERATOR_AVAILABILITY_ROUTE)
+        try:
+            return _operator_availability_view(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HubinetOpsInvalidResponse(
+                f"malformed Hubinet Ops operator availability: {exc}"
+            ) from exc
 
     async def approve_package_plan(
         self, resource_id: str, scan_run_id: str, plan_fingerprint: str

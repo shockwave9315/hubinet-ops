@@ -691,6 +691,28 @@ def create_read_only_app(
             "published_at": view.published_at,
         }
 
+    @app.get(
+        f"{API_PREFIX}/operator-availability",
+        dependencies=[Depends(_require_bearer_token)],
+    )
+    def operator_availability() -> dict[str, Any]:
+        """Current presentation availability, outside snapshot revisioning.
+
+        The authority revision aligns database-derived facts with a snapshot;
+        it is not a generation for this response. Runtime activation and the
+        product-update maintenance fence may change independently, while every
+        mutation route remains the final authority and revalidates its rule.
+        """
+
+        view = publication.read_operator_availability()
+        return {
+            "backend_instance_id": view.backend_instance_id,
+            "authority_published_state_revision": (
+                view.authority_published_state_revision
+            ),
+            "resources": [_thaw(item) for item in view.resources],
+        }
+
     @app.put(
         f"{API_PREFIX}/resources/{{resource_id}}/package-plan-approval",
         dependencies=[Depends(_require_bearer_token)],

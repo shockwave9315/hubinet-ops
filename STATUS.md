@@ -55,7 +55,8 @@
   successful job row the atomic durable consumption fact for its exact
   approval and adds a unique fence permitting at most one successful job per
   approval.
-- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`;
+- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`,
+  `/operator-availability`;
   authority-metadata mutations
   (`PUT /r0/v1/resources/{resource_id}/package-plan-approval`,
   `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`); and the
@@ -81,7 +82,8 @@
   response data, never as entity attributes. Per-resource buttons review and
   approve an exact plan, start/view/resume/roll back an update, and view the
   health contract. Exact plans, bounded job details/events, and contract probes
-  are rendered in persistent notifications only when explicitly requested.
+  are rendered in localized, Markdown-hardened persistent notifications only
+  when explicitly requested.
   `start_update`, `resume_update`, and `rollback_update` are explicit operator
   actions and are unreachable from coordinator polling. Distributed via HACS.
 - **Automatic Debian/Ubuntu LXC package scanning** — configurable six-hour
@@ -833,9 +835,13 @@ The operator-triggered update lifecycle is production reachable.
   attributes. Sensors expose concise state, scan, pending-count, approval,
   job, checkpoint, package-count, and health-result facts; one binary sensor
   exposes rollback availability.
-- The backend publishes conservative read-only operator capabilities. They
-  drive truthful button availability but grant no authority: every mutation
-  endpoint independently revalidates its full durable rule.
+- The backend publishes conservative read-only operator availability through a
+  separate authenticated endpoint. HA aligns it to the immutable revisioned
+  snapshot by backend identity, authority revision, and exact resource set.
+  Runtime activation and the filesystem product-update fence can therefore
+  change button availability without producing two different snapshots with
+  the same `published_state_revision`. These presentation facts grant no
+  authority: every mutation endpoint independently revalidates its full rule.
 - Plan review memory is deliberately ephemeral HA UX state. Approval performs
   a fresh read and requires the exact backend identity, resource ID, scan run,
   and material fingerprint previously reviewed. A changed plan, a new scan run
@@ -843,8 +849,9 @@ The operator-triggered update lifecycle is production reachable.
 - The existing actions remain as response-capable diagnostic/configuration
   interfaces. `approve_update_plan` now also requires the current-runtime
   reviewed reference, closing the former blind caller-supplied approval path.
-- The authority schema remains v19. Operator capabilities and richer job
-  summaries are publication facts; no new durable authority state was needed.
+- The authority schema remains v19. Operator availability is transient
+  presentation data and richer job summaries are revisioned publication facts;
+  no new durable authority state was needed.
 
 ### Next — Human1 follow-ons deliberately deferred
 

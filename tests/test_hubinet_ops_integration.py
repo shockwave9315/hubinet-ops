@@ -55,6 +55,7 @@ from custom_components.hubinet_ops.api import (
     NodeSnapshot,
     ObservationalContinuity,
     OperatorCapabilities,
+    OperatorAvailabilityView,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,
@@ -69,6 +70,7 @@ from custom_components.hubinet_ops.api import (
     PackageUpdateJobView,
     PresenceState,
     ResourceHealthContract,
+    ResourceOperatorAvailability,
     ResourceSnapshot,
     ResourceStateLevel,
     ResourceType,
@@ -77,6 +79,7 @@ from custom_components.hubinet_ops.api import (
     SourceFreshness,
     SourceHealth,
     SourceHealthOrigin,
+    validate_operator_availability,
 )
 from custom_components.hubinet_ops.const import (
     CONF_API_TOKEN,
@@ -295,7 +298,6 @@ def resource(
     package_plan_approval: PackagePlanApprovalSnapshot | None = None,
     health_contract: HealthContractSummary | None = None,
     package_update_job: PackageUpdateJobSummary | None = None,
-    operator_capabilities: OperatorCapabilities | None = None,
 ) -> ResourceSnapshot:
     if active_binding_id is None and presence in {
         PresenceState.PRESENT,
@@ -354,7 +356,6 @@ def resource(
                 )
             )
         ),
-        operator_capabilities=operator_capabilities or OperatorCapabilities(),
     )
 
 
@@ -432,6 +433,35 @@ def snapshot(
     )
 
 
+def operator_availability(
+    selected_snapshot: HubinetOpsSnapshot,
+    capabilities: dict[str, OperatorCapabilities] | None = None,
+    *,
+    backend_instance_id: str | None = None,
+    authority_published_state_revision: int | None = None,
+) -> OperatorAvailabilityView:
+    capabilities = capabilities or {}
+    return OperatorAvailabilityView(
+        backend_instance_id=(
+            backend_instance_id
+            if backend_instance_id is not None
+            else selected_snapshot.backend.backend_instance_id
+        ),
+        authority_published_state_revision=(
+            authority_published_state_revision
+            if authority_published_state_revision is not None
+            else selected_snapshot.published_state_revision
+        ),
+        resources=tuple(
+            ResourceOperatorAvailability(
+                resource_id=item.resource_id,
+                capabilities=capabilities.get(item.resource_id, OperatorCapabilities()),
+            )
+            for item in selected_snapshot.resources
+        ),
+    )
+
+
 class FakeTransport:
     def __init__(
         self,
@@ -444,6 +474,8 @@ class FakeTransport:
         health_contract_error: Exception | None = None,
         package_update_jobs: dict[str, PackageUpdateJobView] | None = None,
         package_update_error: Exception | None = None,
+        operator_capabilities: dict[str, OperatorCapabilities] | None = None,
+        operator_availability_views: Iterable[OperatorAvailabilityView] = (),
     ) -> None:
         self._snapshots = list(snapshots)
         self._index = 0
@@ -452,6 +484,11 @@ class FakeTransport:
         self.approval_error = approval_error
         self.validate_calls = 0
         self.snapshot_calls = 0
+        self._last_snapshot: HubinetOpsSnapshot | None = None
+        self.operator_capabilities = dict(operator_capabilities or {})
+        self._operator_availability_views = list(operator_availability_views)
+        self._operator_availability_index = 0
+        self.operator_availability_calls = 0
         self.approval_calls: list[tuple[str, str, str]] = []
         # Stands in for the backend's durable authority: a resource absent
         # from this mapping is unconfigured, which the real transport
@@ -494,7 +531,23 @@ class FakeTransport:
             raise HubinetOpsCannotConnect("no fake snapshot")
         selected = self._snapshots[min(self._index, len(self._snapshots) - 1)]
         self._index += 1
+        self._last_snapshot = selected
         return selected
+
+    async def fetch_operator_availability(self) -> OperatorAvailabilityView:
+        self.operator_availability_calls += 1
+        if self._operator_availability_views:
+            selected = self._operator_availability_views[
+                min(
+                    self._operator_availability_index,
+                    len(self._operator_availability_views) - 1,
+                )
+            ]
+            self._operator_availability_index += 1
+            return selected
+        if self._last_snapshot is None:
+            raise HubinetOpsCannotConnect("operator availability requested first")
+        return operator_availability(self._last_snapshot, self.operator_capabilities)
 
     async def approve_package_plan(
         self, resource_id: str, scan_run_id: str, plan_fingerprint: str
@@ -1492,12 +1545,6 @@ def exact_plan_resource(
             packages=packages,
         ),
         package_plan_approval=approval,
-        operator_capabilities=OperatorCapabilities(
-            can_review_update_plan=True,
-            can_approve_update_plan=True,
-            can_view_health_contract=True,
-            can_configure_health_contract=True,
-        ),
     )
 
 
@@ -1730,8 +1777,15 @@ async def test_view_update_plan_never_returns_reference_for_nonapprovable_state(
 def test_operator_capabilities_cannot_contradict_required_published_facts(
     capabilities: OperatorCapabilities,
 ) -> None:
+    selected = snapshot((INITIAL_RESOURCES[1],))
     with pytest.raises(ValueError):
-        replace(INITIAL_RESOURCES[1], operator_capabilities=capabilities)
+        validate_operator_availability(
+            operator_availability(
+                selected,
+                {RESOURCE_CT: capabilities},
+            ),
+            selected,
+        )
 
 
 @pytest.mark.asyncio
@@ -1866,7 +1920,6 @@ async def test_approval_sensor_uses_backend_stale_state_during_context_failure(
             status=PackagePlanApprovalStatus.STALE,
             approvable=False,
         ),
-        operator_capabilities=OperatorCapabilities(),
     )
     entry = await setup_entry(
         hass,
@@ -1887,6 +1940,11 @@ async def test_approval_sensor_uses_backend_stale_state_during_context_failure(
 
 
 def test_update_plan_action_metadata_and_polish_translations_are_structural() -> None:
+    def translation_shape(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: translation_shape(item) for key, item in value.items()}
+        return type(value)
+
     integration_root = (
         Path(__file__).parents[1] / "custom_components" / "hubinet_ops"
     )
@@ -1902,6 +1960,10 @@ def test_update_plan_action_metadata_and_polish_translations_are_structural() ->
     english = json.loads((integration_root / "translations" / "en.json").read_text())
     polish = json.loads((integration_root / "translations" / "pl.json").read_text())
     assert strings["services"] == english["services"]
+    assert strings["notifications"] == english["notifications"]
+    assert translation_shape(polish["notifications"]) == translation_shape(
+        english["notifications"]
+    )
     assert set(strings["services"]) == {
         SERVICE_VIEW_UPDATE_PLAN,
         SERVICE_APPROVE_UPDATE_PLAN,
@@ -2102,7 +2164,17 @@ async def test_plan_review_is_ephemeral_across_entry_reload(
     hass: HomeAssistant,
 ) -> None:
     planned = exact_plan_resource()
-    transport = FakeTransport([snapshot((planned,)), snapshot((planned,))])
+    transport = FakeTransport(
+        [snapshot((planned,)), snapshot((planned,))],
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(
+                can_review_update_plan=True,
+                can_approve_update_plan=True,
+                can_view_health_contract=True,
+                can_configure_health_contract=True,
+            )
+        },
+    )
     entry = await setup_entry(hass, transport)
     device_id = resource_device_id(hass, RESOURCE_CT)
     await hass.services.async_call(
@@ -2132,7 +2204,17 @@ async def test_native_review_button_shows_exact_plan_and_enables_approval(
     hass: HomeAssistant,
 ) -> None:
     planned = exact_plan_resource()
-    transport = FakeTransport([snapshot((planned,)), snapshot((planned,))])
+    transport = FakeTransport(
+        [snapshot((planned,)), snapshot((planned,))],
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(
+                can_review_update_plan=True,
+                can_approve_update_plan=True,
+                can_view_health_contract=True,
+                can_configure_health_contract=True,
+            )
+        },
+    )
     entry = await setup_entry(hass, transport)
     approve_id = resource_entity_id(
         hass, entry, RESOURCE_CT, "approve_reviewed_plan"
@@ -2157,9 +2239,160 @@ async def test_native_review_button_shows_exact_plan_and_enables_approval(
     assert hass.states.get(approve_id).state != STATE_UNAVAILABLE
     create_notification.assert_called_once()
     message = create_notification.call_args.args[1]
-    assert "apt" in message and "2.6.1" in message and "2.6.2" in message
-    assert "zlib1g" in message and "1.2.14" in message
+    assert "apt" in message and r"2\.6\.1" in message and r"2\.6\.2" in message
+    assert "zlib1g" in message and r"1\.2\.14" in message
     assert "Approve reviewed plan" in message
+
+
+@pytest.mark.asyncio
+async def test_plan_notification_neutralizes_hostile_valid_markdown_material(
+    hass: HomeAssistant,
+) -> None:
+    hostile = PackageScanPackage(
+        name="real-package\n| fake | row |",
+        architecture="amd64",
+        installed_version="1.0[review](https://example.invalid)",
+        candidate_version="2.0![approve](https://example.invalid/image)",
+        origin='<img src="https://example.invalid/track">',
+        description="# Approve now\n\u202econcealed",
+        security=None,
+    )
+    planned = exact_plan_resource(packages=(hostile,))
+    transport = FakeTransport(
+        [snapshot((planned,)), snapshot((planned,))],
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(can_review_update_plan=True)
+        },
+    )
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "review_update_plan"
+                )
+            },
+            blocking=True,
+        )
+
+    message = create_notification.call_args.args[1]
+    assert len([line for line in message.splitlines() if line.startswith("|")]) == 3
+    assert "\n| fake | row |" not in message
+    assert "<img" not in message
+    assert "![approve]" not in message
+    assert "[review](" not in message
+    assert "\u202e" not in message
+    assert r"\u202E" in message
+    assert r"2\.0\!\[approve\]\(https://example\.invalid/image\)" in message
+
+
+@pytest.mark.asyncio
+async def test_plan_notification_uses_polish_operator_translations(
+    hass: HomeAssistant,
+) -> None:
+    hass.config.language = "pl"
+    planned = exact_plan_resource()
+    transport = FakeTransport(
+        [snapshot((planned,)), snapshot((planned,))],
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(can_review_update_plan=True)
+        },
+    )
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "review_update_plan"
+                )
+            },
+            blocking=True,
+        )
+
+    assert create_notification.call_args.kwargs["title"].startswith(
+        "Plan aktualizacji Hubinet Ops"
+    )
+    message = create_notification.call_args.args[1]
+    assert "| Pakiet | Architektura | Zainstalowana | Dostępna |" in message
+    assert "Zatwierdź przejrzany plan" in message
+    assert "Nieznane" in message
+
+
+@pytest.mark.asyncio
+async def test_volatile_availability_can_change_without_changing_snapshot_revision(
+    hass: HomeAssistant,
+) -> None:
+    ready = replace(
+        exact_plan_resource(approved=True),
+        health_contract=HealthContractSummary(
+            status=HealthContractStatus.CONFIGURED,
+            revision=3,
+            fingerprint="c" * 64,
+            probe_count=1,
+            updated_at="2026-08-08T10:00:00+00:00",
+        ),
+    )
+    immutable_snapshot = snapshot((ready,))
+    available = operator_availability(
+        immutable_snapshot,
+        {RESOURCE_CT: OperatorCapabilities(can_start_update=True)},
+    )
+    fenced = operator_availability(immutable_snapshot)
+    transport = FakeTransport(
+        [immutable_snapshot, immutable_snapshot],
+        operator_availability_views=(available, fenced),
+    )
+    entry = await setup_entry(hass, transport)
+    start_id = resource_entity_id(hass, entry, RESOURCE_CT, "start_update")
+    assert hass.states.get(start_id).state != STATE_UNAVAILABLE
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.data == immutable_snapshot
+    assert hass.states.get(start_id).state == STATE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ("backend", "revision"))
+async def test_availability_must_align_with_backend_and_authority_revision(
+    hass: HomeAssistant, mismatch: str
+) -> None:
+    selected = snapshot((INITIAL_RESOURCES[1],))
+    transport = FakeTransport(
+        [selected, selected],
+        operator_availability_views=(
+            operator_availability(selected),
+            operator_availability(
+                selected,
+                backend_instance_id=(
+                    OTHER_BACKEND_ID if mismatch == "backend" else None
+                ),
+                authority_published_state_revision=(
+                    selected.published_state_revision + 1
+                    if mismatch == "revision"
+                    else None
+                ),
+            ),
+        ),
+    )
+    entry = await setup_entry(hass, transport)
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.last_update_success is False
+    assert entry.runtime_data.data == selected
 
 
 @pytest.mark.asyncio
@@ -2184,15 +2417,22 @@ async def test_native_job_controls_and_bounded_sensors_follow_capabilities(
             mutation_completed_at="2026-08-08T11:08:00+00:00",
             rollback_available=True,
         ),
-        operator_capabilities=OperatorCapabilities(
-            can_view_update_job=True,
-            can_resume_update=True,
-            can_rollback_update=True,
-            can_view_health_contract=True,
-            can_configure_health_contract=True,
+    )
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [snapshot((active,))],
+            operator_capabilities={
+                RESOURCE_CT: OperatorCapabilities(
+                    can_view_update_job=True,
+                    can_resume_update=True,
+                    can_rollback_update=True,
+                    can_view_health_contract=True,
+                    can_configure_health_contract=True,
+                )
+            },
         ),
     )
-    entry = await setup_entry(hass, FakeTransport([snapshot((active,))]))
     states = resource_entity_states(hass, entry, RESOURCE_CT)
     assert states["package_update_checkpoint"] == "health_completed"
     assert states["package_update_package_count"] == "24"
@@ -2217,13 +2457,6 @@ async def test_one_native_start_press_is_one_logical_invocation(
             probe_count=1,
             updated_at="2026-08-08T10:00:00+00:00",
         ),
-        operator_capabilities=OperatorCapabilities(
-            can_review_update_plan=True,
-            can_approve_update_plan=True,
-            can_start_update=True,
-            can_view_health_contract=True,
-            can_configure_health_contract=True,
-        ),
     )
     active = replace(
         ready,
@@ -2234,16 +2467,37 @@ async def test_one_native_start_press_is_one_logical_invocation(
             issued_at="2026-08-08T11:00:00+00:00",
             package_count=24,
         ),
-        operator_capabilities=OperatorCapabilities(
-            can_view_update_job=True,
-            can_resume_update=True,
-            can_view_health_contract=True,
-            can_configure_health_contract=True,
-        ),
     )
+    ready_snapshot = snapshot((ready,))
+    active_snapshot = snapshot((active,), published_state_revision=21)
     transport = FakeTransport(
-        [snapshot((ready,)), snapshot((active,), published_state_revision=21)],
+        [ready_snapshot, active_snapshot],
         package_update_jobs={RESOURCE_CT: job_view(checkpoint="issued")},
+        operator_availability_views=(
+            operator_availability(
+                ready_snapshot,
+                {
+                    RESOURCE_CT: OperatorCapabilities(
+                        can_review_update_plan=True,
+                        can_approve_update_plan=True,
+                        can_start_update=True,
+                        can_view_health_contract=True,
+                        can_configure_health_contract=True,
+                    )
+                },
+            ),
+            operator_availability(
+                active_snapshot,
+                {
+                    RESOURCE_CT: OperatorCapabilities(
+                        can_view_update_job=True,
+                        can_resume_update=True,
+                        can_view_health_contract=True,
+                        can_configure_health_contract=True,
+                    )
+                },
+            ),
+        ),
     )
     entry = await setup_entry(hass, transport)
     with patch(

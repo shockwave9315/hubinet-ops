@@ -18,6 +18,7 @@ from .contract import (
     NodeSnapshot,
     ObservationalContinuity,
     OperatorCapabilities,
+    OperatorAvailabilityView,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,
@@ -32,6 +33,7 @@ from .contract import (
     PackageUpdateJobView,
     PresenceState,
     ResourceHealthContract,
+    ResourceOperatorAvailability,
     ResourceSnapshot,
     ResourceStateLevel,
     ResourceType,
@@ -40,6 +42,7 @@ from .contract import (
     SourceFreshness,
     SourceHealth,
     SourceHealthOrigin,
+    validate_operator_availability,
 )
 
 
@@ -90,6 +93,9 @@ class HubinetOpsTransport(Protocol):
 
     async def fetch_resource_snapshot(self) -> HubinetOpsSnapshot:
         """Fetch one logical inventory/state/policy snapshot."""
+
+    async def fetch_operator_availability(self) -> OperatorAvailabilityView:
+        """Fetch point-in-time backend-owned operator availability."""
 
     async def approve_package_plan(
         self, resource_id: str, scan_run_id: str, plan_fingerprint: str
@@ -159,6 +165,11 @@ class HubinetOpsApi:
         """Fetch one logical snapshot for the coordinator."""
 
         return await self._transport.fetch_resource_snapshot()
+
+    async def async_fetch_operator_availability(self) -> OperatorAvailabilityView:
+        """Fetch current operator availability outside snapshot revisioning."""
+
+        return await self._transport.fetch_operator_availability()
 
     async def async_approve_package_plan(
         self, resource_id: str, scan_run_id: str, plan_fingerprint: str
@@ -249,6 +260,9 @@ class _UnconfiguredPhaseZeroTransport:
         raise self._error()
 
     async def fetch_resource_snapshot(self) -> HubinetOpsSnapshot:
+        raise self._error()
+
+    async def fetch_operator_availability(self) -> OperatorAvailabilityView:
         raise self._error()
 
     async def approve_package_plan(

@@ -25,13 +25,12 @@ from .primitives import (
 )
 
 if TYPE_CHECKING:
-    from .models import ResourceSnapshot
+    from .models import HubinetOpsSnapshot, OperatorAvailabilityView, ResourceSnapshot
 
 
 def validate_resource_snapshot(self: "ResourceSnapshot") -> None:
     from .models import (
         HealthContractSummary,
-        OperatorCapabilities,
         PackageUpdateJobSummary,
         PackagePlanApprovalSnapshot,
         PackageScanSnapshot,
@@ -47,8 +46,6 @@ def validate_resource_snapshot(self: "ResourceSnapshot") -> None:
         raise ValueError("health_contract must be a HealthContractSummary")
     if not isinstance(self.package_update_job, PackageUpdateJobSummary):
         raise ValueError("package_update_job must be a PackageUpdateJobSummary")
-    if not isinstance(self.operator_capabilities, OperatorCapabilities):
-        raise ValueError("operator_capabilities must be an OperatorCapabilities")
     _require_uuid_identity(self.resource_id, "resource_id")
     _require_uuid_identity(self.inventory_source_id, "inventory_source_id")
     for value, enum_type, field_name in (
@@ -119,35 +116,73 @@ def validate_resource_snapshot(self: "ResourceSnapshot") -> None:
             "effective capabilities require backend-published policy applicability"
         )
 
-    capabilities = self.operator_capabilities
-    if self.resource_type is not ResourceType.LXC and any(
-        getattr(capabilities, name) for name in capabilities.__dataclass_fields__
-    ):
-        raise ValueError("unsupported resources cannot publish operator capabilities")
+
+
+def validate_operator_availability(
+    view: "OperatorAvailabilityView", snapshot: "HubinetOpsSnapshot"
+) -> None:
+    """Bind volatile backend facts to one coherent authority projection.
+
+    This verifies consistency; it never derives permission. The backend still
+    supplies every boolean and every mutation endpoint re-proves its own rule.
+    """
+
+    if view.backend_instance_id != snapshot.backend.backend_instance_id:
+        raise ValueError("operator availability names a different backend")
     if (
-        capabilities.can_review_update_plan
-        or capabilities.can_approve_update_plan
-    ) and not self.package_plan_approval.approvable:
-        raise ValueError("plan capabilities require backend approvability")
-    has_job = self.package_update_job.state not in {
-        PackageUpdateJobState.UNSUPPORTED,
-        PackageUpdateJobState.NOT_STARTED,
-    }
-    if capabilities.can_view_update_job and not has_job:
-        raise ValueError("job view capability requires a published job")
-    if capabilities.can_resume_update and (
-        self.package_update_job.state is not PackageUpdateJobState.ACTIVE
+        view.authority_published_state_revision
+        != snapshot.published_state_revision
     ):
-        raise ValueError("resume capability requires an active job")
-    if capabilities.can_rollback_update and not self.package_update_job.rollback_available:
-        raise ValueError("rollback capability requires backend rollback availability")
-    if capabilities.can_start_update and (
-        self.package_plan_approval.status is not PackagePlanApprovalStatus.APPROVED
-        or self.health_contract.status is not HealthContractStatus.CONFIGURED
-    ):
-        raise ValueError(
-            "start capability requires an approved plan and configured health contract"
-        )
+        raise ValueError("operator availability is not aligned to the snapshot")
+    capabilities_by_id = view.resources_by_id
+    if set(capabilities_by_id) != set(snapshot.resources_by_id):
+        raise ValueError("operator availability resources do not match the snapshot")
+
+    any_active_job = any(
+        resource.package_update_job.state is PackageUpdateJobState.ACTIVE
+        for resource in snapshot.resources
+    )
+    for resource_id, capabilities in capabilities_by_id.items():
+        resource = snapshot.resources_by_id[resource_id]
+        if resource.resource_type is not ResourceType.LXC and any(
+            getattr(capabilities, name)
+            for name in capabilities.__dataclass_fields__
+        ):
+            raise ValueError(
+                "unsupported resources cannot publish operator availability"
+            )
+        if (
+            capabilities.can_review_update_plan
+            or capabilities.can_approve_update_plan
+        ) and not resource.package_plan_approval.approvable:
+            raise ValueError("plan availability requires backend approvability")
+        has_job = resource.package_update_job.state not in {
+            PackageUpdateJobState.UNSUPPORTED,
+            PackageUpdateJobState.NOT_STARTED,
+        }
+        if capabilities.can_view_update_job and not has_job:
+            raise ValueError("job view availability requires a published job")
+        if capabilities.can_resume_update and (
+            resource.package_update_job.state is not PackageUpdateJobState.ACTIVE
+        ):
+            raise ValueError("resume availability requires an active job")
+        if (
+            capabilities.can_rollback_update
+            and not resource.package_update_job.rollback_available
+        ):
+            raise ValueError(
+                "rollback availability requires backend rollback authority"
+            )
+        if capabilities.can_start_update and (
+            resource.package_plan_approval.status
+            is not PackagePlanApprovalStatus.APPROVED
+            or resource.health_contract.status
+            is not HealthContractStatus.CONFIGURED
+            or any_active_job
+        ):
+            raise ValueError(
+                "start availability contradicts the revisioned authority view"
+            )
 
 
 def _validate_state_matrix(self) -> None:

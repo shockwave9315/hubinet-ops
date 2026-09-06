@@ -7,6 +7,8 @@ import sys
 from types import ModuleType
 import uuid
 
+import pytest
+
 from app.inventory import (
     BaselineCompleteness,
     BaselineMode,
@@ -18,7 +20,9 @@ from app.inventory import (
     InventoryPublication,
     NormalizedDiscoverySnapshot,
     PackageScanPackage as AuthorityPackageScanPackage,
+    PackageUpdateIssuanceRefused,
     HealthProbeKind,
+    product_update_fence_path,
     ResourceHealthProbe,
     SourceAvailability,
 )
@@ -59,7 +63,6 @@ from custom_components.hubinet_ops.contract.models import (
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     NodeSnapshot,
-    OperatorCapabilities,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,
@@ -145,9 +148,6 @@ def contract_snapshot(view) -> HubinetOpsSnapshot:
                     ),
                     "package_update_job": _contract_package_update_job(
                         resource["package_update_job"]
-                    ),
-                    "operator_capabilities": OperatorCapabilities(
-                        **dict(resource["operator_capabilities"])
                     ),
                 }
             )
@@ -318,46 +318,76 @@ def test_operator_capabilities_are_backend_derived_and_activation_gated(
     reconcile(authority, source_id, resource_type="lxc")
     resource_id = approved_executable_resource(authority, store)
 
-    inactive = contract_snapshot(InventoryPublication(store, authority).read())
-    inactive_capabilities = inactive.resources[0].operator_capabilities
-    assert inactive_capabilities.can_review_update_plan
-    assert inactive_capabilities.can_approve_update_plan
-    assert not inactive_capabilities.can_start_update
+    inactive_publication = InventoryPublication(store, authority)
+    inactive_snapshot = inactive_publication.read()
+    inactive_capabilities = inactive_publication.read_operator_availability().resources[0]
+    assert inactive_capabilities["can_review_update_plan"]
+    assert inactive_capabilities["can_approve_update_plan"]
+    assert not inactive_capabilities["can_start_update"]
 
     active_publication = InventoryPublication(
         store, authority, package_update_activated=True
     )
-    before = contract_snapshot(active_publication.read()).resources[0]
-    assert before.operator_capabilities.can_start_update
-    assert before.operator_capabilities.can_view_health_contract
-    assert before.operator_capabilities.can_configure_health_contract
-    assert not before.operator_capabilities.can_view_update_job
+    active_snapshot = active_publication.read()
+    before = active_publication.read_operator_availability().resources[0]
+    assert active_snapshot == inactive_snapshot
+    assert before["can_start_update"]
+    assert before["can_view_health_contract"]
+    assert before["can_configure_health_contract"]
+    assert not before["can_view_update_job"]
 
     approval = store.package_plan_approval(resource_id)
     assert approval is not None
     authority.issue_package_update_job(
         resource_id, approval.approval_id, str(uuid.uuid4())
     )
-    after = contract_snapshot(active_publication.read()).resources[0]
-    assert not after.operator_capabilities.can_start_update
-    assert after.operator_capabilities.can_view_update_job
-    assert after.operator_capabilities.can_resume_update
-    assert not after.operator_capabilities.can_rollback_update
+    after = active_publication.read_operator_availability().resources[0]
+    assert not after["can_start_update"]
+    assert after["can_view_update_job"]
+    assert after["can_resume_update"]
+    assert not after["can_rollback_update"]
 
 
-def test_product_update_fence_suppresses_start_capability(tmp_path: Path) -> None:
+def test_product_update_fence_changes_only_volatile_operator_availability(
+    tmp_path: Path,
+) -> None:
     _, _, store, authority, source_id = make_system(tmp_path)
     reconcile(authority, source_id, resource_type="lxc")
-    approved_executable_resource(authority, store)
+    resource_id = approved_executable_resource(authority, store)
     publication = InventoryPublication(store, authority, package_update_activated=True)
-    assert contract_snapshot(publication.read()).resources[
-        0
-    ].operator_capabilities.can_start_update
+    before_snapshot = publication.read()
+    before_availability = publication.read_operator_availability()
+    assert before_availability.resources[0]["can_start_update"]
 
     authority.acquire_product_update_maintenance_fence("test-run")
-    assert not contract_snapshot(publication.read()).resources[
-        0
-    ].operator_capabilities.can_start_update
+    fenced_snapshot = publication.read()
+    fenced_availability = publication.read_operator_availability()
+    assert fenced_snapshot == before_snapshot
+    contract_snapshot(fenced_snapshot).validate_revision_successor(
+        contract_snapshot(before_snapshot)
+    )
+    assert (
+        fenced_availability.authority_published_state_revision
+        == before_availability.authority_published_state_revision
+        == before_snapshot.published_state_revision
+    )
+    assert not fenced_availability.resources[0]["can_start_update"]
+    approval = store.package_plan_approval(resource_id)
+    assert approval is not None
+    with pytest.raises(PackageUpdateIssuanceRefused) as refused:
+        authority.issue_package_update_job(
+            resource_id, approval.approval_id, str(uuid.uuid4())
+        )
+    assert refused.value.reason == "product_update_in_progress"
+
+    product_update_fence_path(store.path).unlink()
+    released_snapshot = publication.read()
+    released_availability = publication.read_operator_availability()
+    assert released_snapshot == before_snapshot
+    contract_snapshot(released_snapshot).validate_revision_successor(
+        contract_snapshot(fenced_snapshot)
+    )
+    assert released_availability.resources[0]["can_start_update"]
 
 
 def test_backend_publication_is_accepted_by_phase0_contract_oracle(tmp_path: Path) -> None:

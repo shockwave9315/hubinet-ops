@@ -32,7 +32,7 @@ from .health_contract_validation import (
     validate_health_probe,
     validate_resource_health_contract,
 )
-from .primitives import _immutable_mapping, _require_uuid_identity
+from .primitives import _immutable_mapping, _require_positive, _require_uuid_identity
 from .package_scan_validation import validate_package_scan_snapshot
 from .approval_validation import validate_package_plan_approval_snapshot
 from .package_update_validation import (
@@ -339,13 +339,11 @@ class PackageUpdateJobSummary:
 
 @dataclass(frozen=True, slots=True)
 class OperatorCapabilities:
-    """Read-only hints about actions backend authority currently accepts.
+    """One resource's point-in-time backend presentation availability.
 
-    These facts make the Home Assistant controls truthful without turning HA
-    into a second authority state machine. Every mutation endpoint still
-    independently revalidates the complete rule when an operator presses a
-    control, so a capability can become stale only in the safe direction: the
-    backend refuses the raced request.
+    This object deliberately lives in ``OperatorAvailabilityView``, not in the
+    revisioned inventory snapshot. Every mutation endpoint independently
+    revalidates the complete rule when an operator presses a control.
     """
 
     can_review_update_plan: bool = False
@@ -361,6 +359,50 @@ class OperatorCapabilities:
         for name in self.__dataclass_fields__:
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"operator capability {name} must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceOperatorAvailability:
+    """Current backend-owned presentation facts for one opaque resource."""
+
+    resource_id: str
+    capabilities: OperatorCapabilities
+
+    def __post_init__(self) -> None:
+        _require_uuid_identity(self.resource_id, "resource_id")
+        if not isinstance(self.capabilities, OperatorCapabilities):
+            raise ValueError("capabilities must be an OperatorCapabilities")
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorAvailabilityView:
+    """Volatile availability aligned to, but not versioned by, authority state."""
+
+    backend_instance_id: str
+    authority_published_state_revision: int
+    resources: tuple[ResourceOperatorAvailability, ...]
+
+    def __post_init__(self) -> None:
+        _require_uuid_identity(self.backend_instance_id, "backend_instance_id")
+        _require_positive(
+            self.authority_published_state_revision,
+            "authority_published_state_revision",
+        )
+        object.__setattr__(self, "resources", tuple(self.resources))
+        resource_ids = {resource.resource_id for resource in self.resources}
+        if len(resource_ids) != len(self.resources):
+            raise ValueError("operator availability contains duplicate resources")
+
+    @property
+    def resources_by_id(self) -> Mapping[str, OperatorCapabilities]:
+        """Return current availability keyed by backend resource identity."""
+
+        return MappingProxyType(
+            {
+                resource.resource_id: resource.capabilities
+                for resource in self.resources
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,9 +506,6 @@ class ResourceSnapshot:
     )
     package_update_job: PackageUpdateJobSummary = field(
         default_factory=PackageUpdateJobSummary
-    )
-    operator_capabilities: OperatorCapabilities = field(
-        default_factory=OperatorCapabilities
     )
     termination_reason: str | None = None
     successor_resource_id: str | None = None

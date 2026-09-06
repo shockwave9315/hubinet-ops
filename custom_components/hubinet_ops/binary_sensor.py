@@ -64,4 +64,6 @@ class HubinetOpsRollbackAvailableBinarySensor(
     @property
     @override
     def is_on(self) -> bool:
-        return self.resource.operator_capabilities.can_rollback_update
+        return self.coordinator.operator_capabilities(
+            self.resource_id
+        ).can_rollback_update
