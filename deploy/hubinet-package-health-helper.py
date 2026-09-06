@@ -187,8 +187,43 @@ MAX_COMMANDS_PER_ROUND = 3
 #: A hard ceiling on guest commands across the WHOLE settling window.
 MAX_GUEST_COMMANDS = 160
 
+#: Reserved off every clamped command timeout so this file can still finish
+#: classifying a round and assemble its own bounded JSON response before the
+#: OUTER SSH transport timeout (`PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS`,
+#: 300s) would kill it. This is what keeps "helper settling deadline = 180s"
+#: from ever becoming "actual helper runtime = 280s+, killed mid-command by
+#: the transport" -- every command this file issues is bounded by what is
+#: ACTUALLY left of the 180s settling budget, never by the fixed 60s
+#: allowance alone.
+_TRANSPORT_RETURN_MARGIN_SECONDS = 2.0
+#: A command is never issued with a timeout below this, however little
+#: settling budget remains -- a command still gets a chance to answer
+#: instantly rather than being skipped outright, and `subprocess` timeouts
+#: of exactly zero are not a meaningful bound.
+_MIN_COMMAND_TIMEOUT_SECONDS = 0.05
+
 Clock = Callable[[], float]
 Sleeper = Callable[[float], None]
+
+
+def _clamped_command_timeout(remaining_budget: float) -> float:
+    """The timeout for ONE guest/host command, bounded by what is ACTUALLY
+    left of the settling window -- never by `COMMAND_TIMEOUT_SECONDS` alone.
+
+    Frozen rule: never start an operation whose own bounded timeout could
+    exceed the remaining health-evaluation budget. A command that would only
+    get a sliver of time left still gets `_MIN_COMMAND_TIMEOUT_SECONDS`
+    rather than nothing -- it may simply time out quickly and honestly,
+    which this file already treats as a truthful UNKNOWN.
+    """
+
+    return max(
+        _MIN_COMMAND_TIMEOUT_SECONDS,
+        min(
+            COMMAND_TIMEOUT_SECONDS,
+            remaining_budget - _TRANSPORT_RETURN_MARGIN_SECONDS,
+        ),
+    )
 
 #: Execution-time systemd unit-name validation. Deliberately the SMALLEST
 #: restriction that makes the requested object unambiguous, and every part of
@@ -501,9 +536,10 @@ def _command(
     runner: Runner,
     argv: tuple[str, ...],
     *,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
     max_output: int = MAX_COMMAND_OUTPUT_BYTES,
 ) -> CommandResult:
-    return runner(argv, COMMAND_TIMEOUT_SECONDS, max_output)
+    return runner(argv, timeout, max_output)
 
 
 def _local_node(runner: Runner) -> str:
@@ -540,7 +576,13 @@ def _local_node(runner: Runner) -> str:
     return local_nodes[0]
 
 
-def revalidate_live_target(runner: Runner, vmid: int, expected_node: str) -> None:
+def revalidate_live_target(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    *,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+) -> None:
     """Independently prove the live PVE facts before touching the guest.
 
     The backend proves it still names the intended resource INCARNATION; only
@@ -548,6 +590,10 @@ def revalidate_live_target(runner: Runner, vmid: int, expected_node: str) -> Non
     not an identity: PVE can free one and reuse it at any moment, and a health
     verdict recorded against a replacement guest would be a false statement
     about a workload this job never updated -- read-only or not.
+
+    ``timeout`` is bounded by the caller to whatever settling budget actually
+    remains (frozen rule: never start an operation whose own timeout could
+    exceed the remaining evaluation budget) -- see `_clamped_command_timeout`.
     """
 
     result = _command(
@@ -561,6 +607,7 @@ def revalidate_live_target(runner: Runner, vmid: int, expected_node: str) -> Non
             "--output-format",
             "json",
         ),
+        timeout=timeout,
         max_output=4 * 1024 * 1024,
     )
     if result.timed_out or result.output_exceeded or result.returncode != 0:
@@ -598,6 +645,7 @@ def _run_guest_command(
     *,
     data_arguments: Sequence[str] = (),
     max_output: int = MAX_COMMAND_OUTPUT_BYTES,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
 ) -> CommandResult:
     """Run one fixed ``pct exec`` shape on the node that currently holds it.
 
@@ -617,12 +665,17 @@ def _run_guest_command(
     originated outside the file: ``data_arguments`` names them, and each is
     proved shell-inert before it may cross that boundary. Every other element
     is a constant this file owns.
+
+    ``timeout`` bounds BOTH the revalidation call and the guest command
+    itself -- the caller has already clamped it to what remains of the
+    bounded settling budget (`_clamped_command_timeout`), so neither can run
+    long enough by itself to blow through that budget.
     """
 
-    revalidate_live_target(runner, vmid, expected_node)
+    revalidate_live_target(runner, vmid, expected_node, timeout=timeout)
     inner = ("pct", "exec", str(vmid), "--", *tail)
     if expected_node == local_node:
-        result = _command(runner, inner, max_output=max_output)
+        result = _command(runner, inner, timeout=timeout, max_output=max_output)
     else:
         # Routing to another cluster member is the ONE place a command line
         # exists rather than an argv list, because that is what ssh hands the
@@ -651,7 +704,7 @@ def _run_guest_command(
             f"root@{expected_node}",
             shlex.join(inner),
         )
-        result = _command(runner, argv, max_output=max_output)
+        result = _command(runner, argv, timeout=timeout, max_output=max_output)
     if result.returncode == 255:
         raise ProbeUnknown("guest_unavailable")
     return result
@@ -730,14 +783,18 @@ def _structural_probe_outcome(kind: str, target: str) -> tuple[str, str] | None:
 
 @dataclass(slots=True)
 class _RoundBudget:
-    """Bounded guest-command accounting across the WHOLE settling window."""
+    """Bounded guest-command accounting across the WHOLE settling window.
+
+    A plain counter, not an enforcement point: the settling loop is what
+    stops issuing new rounds once ``used >= MAX_GUEST_COMMANDS`` (checked
+    between rounds, never mid-round), so this never needs to raise out of a
+    round already in progress.
+    """
 
     used: int = 0
 
     def spend(self) -> None:
         self.used += 1
-        if self.used > MAX_GUEST_COMMANDS:
-            raise ProbeUnknown("command_failed")
 
 
 def _systemd_round(
@@ -747,6 +804,8 @@ def _systemd_round(
     local_node: str,
     targets: Sequence[str],
     budget: _RoundBudget,
+    *,
+    remaining_budget: float,
 ) -> dict[str, tuple[str, str]]:
     """One batched ``systemctl show`` covering every requested unit.
 
@@ -754,6 +813,10 @@ def _systemd_round(
     targets, mapped BY POSITION -- never by the returned ``Id``, because
     verified alias behaviour (``ssh.service``/``sshd.service``) means two
     distinct requested targets can report the identical ``Id``.
+
+    ``remaining_budget`` is what is ACTUALLY left of the bounded settling
+    deadline; the guest command this issues is clamped to it and can never
+    run long enough by itself to blow through that deadline.
     """
 
     if not targets:
@@ -780,6 +843,7 @@ def _systemd_round(
             ),
             data_arguments=targets,
             max_output=64 * 1024 * max(1, len(targets)),
+            timeout=_clamped_command_timeout(remaining_budget),
         )
     except (ProbeUnknown, HealthError) as exc:
         reason = _guest_family_reason(exc)
@@ -846,7 +910,13 @@ def _classify_systemd_active_state(active_state: str, job: str) -> tuple[str, st
 
 
 def _docker_daemon_names(
-    runner: Runner, vmid: int, expected_node: str, local_node: str, budget: _RoundBudget
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    budget: _RoundBudget,
+    *,
+    remaining_budget: float,
 ) -> frozenset[str] | tuple[str, str]:
     """The fixed daemon oracle: every existing container name, or a family
     (outcome, reason) if the daemon could not be read this round."""
@@ -869,6 +939,7 @@ def _docker_daemon_names(
                 DOCKER_NAME_LIST_FORMAT,
             ),
             max_output=1024 * 1024,
+            timeout=_clamped_command_timeout(remaining_budget),
         )
     except (ProbeUnknown, HealthError) as exc:
         return "unknown", _guest_family_reason(exc)
@@ -901,6 +972,8 @@ def _docker_inspect_batch(
     local_node: str,
     targets: Sequence[str],
     budget: _RoundBudget,
+    *,
+    remaining_budget: float,
 ) -> dict[str, tuple[str, str, str]] | tuple[str, str]:
     """One batched ``docker inspect``. Returns ``{name: (status, restarting,
     health)}`` for every target it could read, mapped BY NAME -- never by
@@ -930,6 +1003,7 @@ def _docker_inspect_batch(
             ),
             data_arguments=targets,
             max_output=64 * 1024 * max(1, len(targets)),
+            timeout=_clamped_command_timeout(remaining_budget),
         )
     except (ProbeUnknown, HealthError) as exc:
         return "unknown", _guest_family_reason(exc)
@@ -995,6 +1069,8 @@ def _docker_round(
     local_node: str,
     probes: Sequence[dict[str, Any]],
     budget: _RoundBudget,
+    *,
+    remaining_budget: float,
 ) -> dict[int, tuple[str, str]]:
     """One round's worth of Docker probes: at most one ``docker ps`` and one
     ``docker inspect``, batched across every Docker target regardless of how
@@ -1003,14 +1079,27 @@ def _docker_round(
     if not probes:
         return {}
     targets = sorted({str(probe["target"]) for probe in probes})
-    daemon_names = _docker_daemon_names(runner, vmid, expected_node, local_node, budget)
+    daemon_names = _docker_daemon_names(
+        runner,
+        vmid,
+        expected_node,
+        local_node,
+        budget,
+        remaining_budget=remaining_budget,
+    )
     if isinstance(daemon_names, tuple):
         outcome, reason = daemon_names
         return {probe["index"]: (outcome, reason) for probe in probes}
     present = [target for target in targets if target in daemon_names]
     absent = {target for target in targets if target not in daemon_names}
     inspected = _docker_inspect_batch(
-        runner, vmid, expected_node, local_node, present, budget
+        runner,
+        vmid,
+        expected_node,
+        local_node,
+        present,
+        budget,
+        remaining_budget=remaining_budget,
     )
     if isinstance(inspected, tuple):
         family_outcome, family_reason = inspected
@@ -1049,6 +1138,8 @@ def _run_one_round(
     local_node: str,
     probes: Sequence[dict[str, Any]],
     budget: _RoundBudget,
+    *,
+    remaining_budget: float,
 ) -> dict[int, tuple[str, str]]:
     """Observe EVERY still-live frozen probe in one bounded batched round."""
 
@@ -1059,13 +1150,27 @@ def _run_one_round(
     if systemd_probes:
         targets = [str(p["target"]) for p in systemd_probes]
         by_target = _systemd_round(
-            runner, vmid, expected_node, local_node, targets, budget
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            targets,
+            budget,
+            remaining_budget=remaining_budget,
         )
         for probe in systemd_probes:
             results[int(probe["index"])] = by_target[str(probe["target"])]
     if docker_probes:
         results.update(
-            _docker_round(runner, vmid, expected_node, local_node, docker_probes, budget)
+            _docker_round(
+                runner,
+                vmid,
+                expected_node,
+                local_node,
+                docker_probes,
+                budget,
+                remaining_budget=remaining_budget,
+            )
         )
     return results
 
@@ -1088,15 +1193,32 @@ def evaluate_health_contract_settling(
     """Drive one bounded settling window over the complete frozen probe set.
 
     Returns a dict with ``probes`` (index -> (outcome, reason)), ``rounds``,
-    ``settled_seconds``, and ``last_round_span_ms``. Every terminal decision
-    -- PASS, FAIL, or a deadline/bound UNKNOWN -- uses exactly ONE round's
-    complete observation set; evidence from different rounds is never merged
-    to manufacture a verdict (the required regression: an earlier PASS
-    contributes no terminal authority once a later round observes FAIL).
+    ``settled_seconds``, ``last_round_span_ms``, and ``decisive`` (bool).
+    Every terminal decision -- PASS, FAIL, or a deadline/bound UNKNOWN -- uses
+    exactly ONE round's complete observation set; evidence from different
+    rounds is never merged to manufacture a verdict (the required regression:
+    an earlier PASS contributes no terminal authority once a later round
+    observes FAIL).
+
+    ``decisive`` is the explicit, typed carrier of "may this be aggregated
+    into a durable verdict at all" -- the caller (`handle_request`) echoes it
+    on the wire as ``evaluation_status``, and the backend orchestrator
+    (`app/package_update_health.py`) must check it BEFORE ever aggregating
+    probe outcomes into PASSED/FAILED. Inferring decisiveness a second time
+    from the probe outcomes alone -- in the backend, or in Home Assistant --
+    would silently let a non-decisive round's last observation (e.g. one
+    probe FAILED, one still transient, because the deadline hit mid-round)
+    become a false durable verdict.
     """
 
     # Structural target problems are round-independent: fixed forever, and
-    # never worth spending a guest command on.
+    # never worth spending a guest command on. A decisive round requires
+    # EVERY probe resolved with no transient state; a structurally broken
+    # target is unconditionally "unknown" every time it is looked at, so no
+    # amount of waiting can ever make a round containing one decisive. There
+    # is therefore nothing to gain by holding the whole evaluation open for
+    # the settling deadline -- it returns immediately, spending no sleep and
+    # no guest command on the probe(s) that can never resolve.
     structural: dict[int, tuple[str, str]] = {}
     live_probes: list[dict[str, Any]] = []
     for probe in probes:
@@ -1106,25 +1228,76 @@ def evaluate_health_contract_settling(
         else:
             structural[int(probe["index"])] = outcome
 
-    budget = _RoundBudget()
     start = monotonic()
-    round_index = 0
-    last_results: dict[int, tuple[str, str]] = dict(structural)
-    last_round_span_ms = 0
+    absolute_deadline = start + SETTLING_DEADLINE_SECONDS
+    budget = _RoundBudget()
 
-    while True:
-        round_index += 1
+    if not live_probes:
+        # Every probe is structural (or the contract is somehow empty of
+        # live probes): immediate, zero guest commands, never decisive.
+        return {
+            "probes": dict(structural),
+            "rounds": 0,
+            "settled_seconds": monotonic() - start,
+            "last_round_span_ms": 0,
+            "decisive": False,
+        }
+
+    if structural:
+        # A decisive round is unreachable BY CONSTRUCTION (see above), so
+        # continuing to loop for the OTHER, otherwise-live probes cannot
+        # ever produce a verdict either -- one honest observation round for
+        # them, then stop immediately rather than waiting out the deadline
+        # for something time cannot resolve.
+        remaining = max(0.0, absolute_deadline - monotonic())
         round_start = monotonic()
         fresh = _run_one_round(
-            runner, vmid, expected_node, local_node, live_probes, budget
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            live_probes,
+            budget,
+            remaining_budget=remaining,
+        )
+        round_span_ms = int((monotonic() - round_start) * 1000)
+        return {
+            "probes": {**structural, **fresh},
+            "rounds": 1,
+            "settled_seconds": monotonic() - start,
+            "last_round_span_ms": round_span_ms,
+            "decisive": False,
+        }
+
+    round_index = 0
+    last_results: dict[int, tuple[str, str]] = {}
+    last_round_span_ms = 0
+    decisive = False
+
+    while True:
+        # Never start a new round once the absolute deadline has passed --
+        # checked BEFORE any work for this round, including immediately
+        # after a sleep. Round 1 always runs regardless (there is otherwise
+        # no observation to report at all).
+        if round_index > 0 and monotonic() >= absolute_deadline:
+            break
+        round_index += 1
+        remaining = max(0.0, absolute_deadline - monotonic())
+        round_start = monotonic()
+        fresh = _run_one_round(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            live_probes,
+            budget,
+            remaining_budget=remaining,
         )
         round_span = monotonic() - round_start
         last_round_span_ms = int(round_span * 1000)
-        last_results = {**structural, **fresh}
+        last_results = fresh
 
-        any_transient = any(
-            outcome == "unknown" for outcome, _ in last_results.values()
-        )
+        any_transient = any(outcome == "unknown" for outcome, _ in last_results.values())
         decisive = (
             round_span <= MAX_ROUND_SPAN_SECONDS
             and round_index >= MIN_DECISIVE_ROUND
@@ -1132,20 +1305,19 @@ def evaluate_health_contract_settling(
         )
         if decisive:
             break
-        elapsed = monotonic() - start
-        if (
-            elapsed >= SETTLING_DEADLINE_SECONDS
-            or round_index >= MAX_SETTLING_ROUNDS
-            or budget.used >= MAX_GUEST_COMMANDS
-        ):
+        if round_index >= MAX_SETTLING_ROUNDS or budget.used >= MAX_GUEST_COMMANDS:
             break
-        sleep(OBSERVATION_INTERVAL_SECONDS)
+        remaining_after = absolute_deadline - monotonic()
+        if remaining_after <= 0:
+            break
+        sleep(min(OBSERVATION_INTERVAL_SECONDS, remaining_after))
 
     return {
         "probes": last_results,
         "rounds": round_index,
         "settled_seconds": monotonic() - start,
         "last_round_span_ms": last_round_span_ms,
+        "decisive": decisive,
     }
 
 
@@ -1207,6 +1379,11 @@ def handle_request(
             "fingerprint": request["fingerprint"],
         },
         "probes": probes,
+        # The explicit, typed carrier of "may this be aggregated into a
+        # durable verdict at all". The backend MUST check this before ever
+        # calling `aggregate_health_outcome` -- never re-infer decisiveness
+        # from the probe outcomes alone, in the backend or in Home Assistant.
+        "evaluation_status": "decisive" if settled["decisive"] else "unresolved",
         # Bounded settling metadata: never guest output, never a command, and
         # never more than three small integers. Persisted by the backend only
         # alongside a truthful UNKNOWN, never merged into a verdict's proof.

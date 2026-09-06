@@ -945,10 +945,12 @@ def test_persistent_transient_exhausts_the_deadline_as_unknown() -> None:
         }
     ]
     # The wall-clock deadline (180s / 5s observation interval) is reached
-    # before the structural MAX_SETTLING_ROUNDS=40 cap ever would be.
-    expected_rounds = (
-        int(helper.SETTLING_DEADLINE_SECONDS // helper.OBSERVATION_INTERVAL_SECONDS)
-        + 1
+    # before the structural MAX_SETTLING_ROUNDS=40 cap ever would be. The
+    # absolute deadline is checked BEFORE starting a new round, so the last
+    # round that actually ran is the one just before cumulative sleep time
+    # would reach the deadline.
+    expected_rounds = int(
+        helper.SETTLING_DEADLINE_SECONDS // helper.OBSERVATION_INTERVAL_SECONDS
     )
     assert response["settling"]["rounds"] == expected_rounds
     assert expected_rounds < helper.MAX_SETTLING_ROUNDS
@@ -956,20 +958,21 @@ def test_persistent_transient_exhausts_the_deadline_as_unknown() -> None:
     assert response["settling"]["last_round_span_ms"] >= 0
 
 
-def test_a_structural_target_problem_never_spends_a_guest_command() -> None:
-    """A target that can never settle is fixed forever, not host-dependent,
-    so it never spends a guest command trying -- even though the bounded
-    settling window still runs its course (this probe is the ONLY one, so
-    there is no other live probe whose own settling could still terminate
-    the window early)."""
+def test_a_structural_target_problem_returns_immediately() -> None:
+    """A target that can never settle is fixed forever, not host-dependent:
+    it must never wait out the settling deadline, since no amount of time
+    can ever make a structurally broken target resolve."""
 
     guest = FakeGuest()
     response = _evaluate_full(guest, (("systemd_unit_active", "nginx*"),))
     assert response["probes"][0]["outcome"] == "unknown"
     assert response["probes"][0]["reason"] == "probe_target_not_exact"
-    # No guest command was EVER spent on the structurally-broken target.
+    assert response["evaluation_status"] == "unresolved"
+    # No guest command was EVER spent on the structurally-broken target, and
+    # the evaluation returned immediately rather than waiting out 180s.
     assert not any(argv[:2] == ("pct", "exec") for argv in guest.commands)
-    assert response["settling"]["settled_seconds"] >= helper.SETTLING_DEADLINE_SECONDS
+    assert response["settling"]["rounds"] == 0
+    assert response["settling"]["settled_seconds"] < 1.0
 
 
 def test_a_round_slower_than_the_span_bound_is_never_decisive() -> None:
