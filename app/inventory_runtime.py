@@ -277,7 +277,7 @@ _RETRYABLE_ISSUANCE_REFUSALS = frozenset(
 
 
 def _package_update_job_body(
-    job: PackageUpdateJob, *, store: InventoryAuthorityStore
+    job: PackageUpdateJob, *, store: InventoryAuthorityStore, activated: bool
 ) -> dict[str, Any]:
     """Render one job as bounded typed facts.
 
@@ -321,7 +321,9 @@ def _package_update_job_body(
             "may_have_started_at": job.rollback_may_have_started_at,
             "task_upid": job.rollback_task_upid,
             "completed_at": job.rollback_completed_at,
-            "available": _rollback_currently_available(store, job),
+            "available": _rollback_currently_available(
+                store, job, activated=activated
+            ),
         },
         "terminalized_at": job.terminalized_at,
         "terminal_reason": job.terminal_reason,
@@ -356,28 +358,44 @@ def _rollback_checkpoint_eligible(job: PackageUpdateJob) -> bool:
 
 
 def _rollback_currently_available(
-    store: InventoryAuthorityStore, job: PackageUpdateJob
+    store: InventoryAuthorityStore, job: PackageUpdateJob, *, activated: bool
 ) -> bool:
     """The one meaning every operator-visible "rollback available" must
-    share (GitHub review P2 #3, Option A): the backend currently considers
-    this exact same-job rollback available for explicit operator use, based
-    on the authority facts it can currently prove.
+    share (GitHub review P2 #3, Option A, extended by
+    HUMAN1-ROLLBACK-ACTIVATION-01): the backend currently considers this
+    exact same-job rollback available for explicit operator use, based on
+    the authority facts it can currently prove.
 
-    Reuses the EXACT proof
-    :meth:`InventoryAuthority.arm_package_update_rollback` itself requires
-    (`_post_mutation_job_context_is_current`) -- never a second,
-    differently-shaped copy of the same rules, and deliberately narrower
-    than plan/health currency: it does not require the guest to be running,
-    a current package plan, or a live health contract, because a stopped
-    guest recovering from a half-applied update -- with a stale plan and a
-    since-changed contract -- is exactly the case this must NOT hide.
+    Three conjuncts, always in the same order every rollback-availability
+    surface applies:
+
+    1. ``activated`` -- the actual destructive route
+       (``POST .../package-update/rollback``, via ``_require_activated``)
+       refuses with ``package_update_not_activated`` when the package-update
+       runtime was never built. A readback claiming "available" while the
+       runtime that would arm it does not even exist is exactly the same
+       truthfulness defect as ignoring current-target validity, so it gets
+       the same fix rather than a second special case.
+    2. durable checkpoint/status eligibility
+       (:func:`_rollback_checkpoint_eligible`).
+    3. the EXACT proof
+       :meth:`InventoryAuthority.arm_package_update_rollback` itself
+       requires (`_post_mutation_job_context_is_current`) -- never a second,
+       differently-shaped copy of the same rules, and deliberately narrower
+       than plan/health currency: it does not require the guest to be
+       running, a current package plan, or a live health contract, because a
+       stopped guest recovering from a half-applied update -- with a stale
+       plan and a since-changed contract -- is exactly the case this must
+       NOT hide.
 
     This is still only a read-only hint: `arm_package_update_rollback`
     re-proves the whole rule itself inside its own transaction, and a
-    request that races past this hint is refused there, never here.
+    request that races past this hint is refused there, never here. The job
+    itself is still reported in full regardless of ``activated`` -- only
+    this one boolean changes, never the job's existence or its other facts.
     """
 
-    if not _rollback_checkpoint_eligible(job):
+    if not activated or not _rollback_checkpoint_eligible(job):
         return False
     # `_post_mutation_job_context_is_current` only ever indexes the row by
     # these exact keys (never iterates or inspects column count), so a
@@ -907,7 +925,10 @@ def create_read_only_app(
             ) from exc
         runtime.worker.wake()
         return JSONResponse(
-            status_code=202, content=_package_update_job_body(job, store=store)
+            status_code=202,
+            content=_package_update_job_body(
+                job, store=store, activated=package_update is not None
+            ),
         )
 
     @app.get(
@@ -926,7 +947,9 @@ def create_read_only_app(
         """
 
         job = _resource_job_or_error(resource_id)
-        body = _package_update_job_body(job, store=store)
+        body = _package_update_job_body(
+            job, store=store, activated=package_update is not None
+        )
         body["events"] = (
             []
             if events == 0
@@ -957,7 +980,13 @@ def create_read_only_app(
         job = store.active_package_update_job()
         return {
             "active": job is not None,
-            "job": None if job is None else _package_update_job_body(job, store=store),
+            "job": (
+                None
+                if job is None
+                else _package_update_job_body(
+                    job, store=store, activated=package_update is not None
+                )
+            ),
         }
 
     @app.post(
@@ -1049,7 +1078,10 @@ def create_read_only_app(
         job = _active_job_for_resource_or_error(resource_id)
         runtime.worker.wake()
         return JSONResponse(
-            status_code=202, content=_package_update_job_body(job, store=store)
+            status_code=202,
+            content=_package_update_job_body(
+                job, store=store, activated=package_update is not None
+            ),
         )
 
     @app.post(
@@ -1138,7 +1170,10 @@ def create_read_only_app(
             ) from exc
         runtime.worker.wake()
         return JSONResponse(
-            status_code=202, content=_package_update_job_body(armed, store=store)
+            status_code=202,
+            content=_package_update_job_body(
+                armed, store=store, activated=package_update is not None
+            ),
         )
 
     # ------------------------------------------------------------------

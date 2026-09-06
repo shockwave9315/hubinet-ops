@@ -845,14 +845,21 @@ the reads and advance the revision. The coordinator's own
   other failure on that route — 401/403, TLS/connection errors, timeouts,
   5xx, a malformed or structurally inconsistent body — remains an ordinary
   fail-closed coordinator failure and is never folded into this case.
-- *Bounded revision race.* A backend identity match, an identical resource
-  set, and a revision that merely disagrees (an intervening scan/discovery/
-  product-update commit landed between the two reads) gets exactly one
-  retry of the COMPLETE pair — both `/snapshot` and `/operator-availability`
-  refetched together, never mixed across attempts. A backend-identity or
-  resource-membership mismatch is never treated as this race and fails
-  closed on the first attempt; a revision mismatch still present after the
-  retry fails closed too. The bound is exactly one retry, never a loop.
+- *Bounded revision race.* A backend identity match plus a revision that
+  merely disagrees (an intervening scan/discovery/product-update commit
+  landed between the two reads) gets exactly one retry of the COMPLETE pair
+  — both `/snapshot` and `/operator-availability` refetched together, never
+  mixed across attempts — regardless of whether resource membership also
+  disagrees: that same intervening commit can legitimately add or remove a
+  resource in the very step that advances the revision, so requiring
+  membership to already match before retrying would refuse to heal exactly
+  that legal case (GitHub review P2 #1). A backend-identity mismatch is
+  never treated as this race. Nor is a resource-membership mismatch at an
+  IDENTICAL revision: the backend is then claiming both reads describe the
+  exact same published state, so disagreeing membership there is structural,
+  not a race. Either way it fails closed on the first attempt. A mismatch
+  still present after the one retry fails closed too. The bound is exactly
+  one retry, never a loop.
 
 Neither behavior weakens `validate_operator_availability`: it still runs
 against whichever pair the coordinator ultimately accepts, and a structural

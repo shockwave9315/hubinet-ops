@@ -1896,6 +1896,79 @@ def test_readback_rollback_available_requires_current_job_target(
         system.close()
 
 
+def test_readback_rollback_available_requires_activation(tmp_path: Path) -> None:
+    """HUMAN1-ROLLBACK-ACTIVATION-01.
+
+    A durable rollback-eligible job with an otherwise-current exact target
+    must not read back as "available" when the package-update runtime
+    itself was never activated -- the destructive route refuses with
+    `package_update_not_activated` before it would ever reach its own
+    current-target proof, so the readback must say so too. The job's other
+    facts, and its very existence, must still be reported in full: a
+    disabled runtime is never reported as an absent job.
+    """
+
+    seed = ProductionSystem(tmp_path, health=["failed"])
+    job = _start(seed)
+    seed.worker.run_once()
+    final = seed.job(job.job_id)
+    assert final.status is PackageUpdateJobStatus.ACTIVE
+    assert final.checkpoint is PackageUpdateCheckpoint.HEALTH_COMPLETED
+    resource_id = seed.resource.resource_id
+    db_path = seed.store.path
+    seed.store.close()
+
+    # No package_update_runtime_factory override needed to prove the
+    # deactivated shape -- `_api_config` declares no `package_update`
+    # section, so the ordinary composition root builds none, exactly the
+    # real "not configured" installation this finding is about.
+    app = create_read_only_app(
+        _api_config(db_path), start_scheduler=False, now=seed.clock
+    )
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {BEARER}"}
+    try:
+        response = client.get(
+            f"/r0/v1/resources/{resource_id}/package-update", headers=headers
+        )
+        assert response.status_code == 200
+        body = response.json()
+        # Witness B: the job is fully reported, never erased or hidden.
+        assert body["job_id"] == job.job_id
+        assert body["status"] == "active"
+        assert body["checkpoint"] == "health_completed"
+        # Witness A: activation gates availability even though checkpoint
+        # and current target are both otherwise eligible.
+        assert body["rollback"]["available"] is False
+
+        # Witness F: /package-update/active shares the exact same semantics
+        # (it renders the same job body).
+        active_body = client.get(
+            "/r0/v1/package-update/active", headers=headers
+        ).json()
+        assert active_body["active"] is True
+        assert active_body["job"]["job_id"] == job.job_id
+        assert active_body["job"]["rollback"]["available"] is False
+
+        # The explicit destructive route is unchanged: it still refuses
+        # before ever reaching the current-target proof.
+        rollback_response = client.post(
+            f"/r0/v1/resources/{resource_id}/package-update/rollback",
+            headers=headers,
+            json={},
+        )
+        assert rollback_response.status_code == 503
+        assert (
+            rollback_response.json()["detail"]["error"]
+            == "package_update_not_activated"
+        )
+    finally:
+        client.close()
+        app.state.package_scan_scheduler.stop()
+        app.state.scheduler.stop()
+        app.state.store.close()
+
+
 def test_the_active_job_witness_answers_the_product_updater(api) -> None:
     """The updater's fence reads this, and it must be exact."""
 
