@@ -32,6 +32,7 @@ from .api import (
     PackageUpdateJobState,
     PresenceState,
     ResourceSnapshot,
+    ResourceType,
     SecurityContinuity,
 )
 from .coordinator import HubinetOpsConfigEntry
@@ -69,6 +70,8 @@ class HubinetOpsResourceSensorDescription(SensorEntityDescription):
     requires_package_scan_success: bool = False
     requires_package_scan_completed: bool = False
     requires_reboot_known: bool = False
+    requires_package_update_job: bool = False
+    requires_lxc: bool = False
 
 
 SOURCE_SENSORS = (
@@ -200,6 +203,33 @@ RESOURCE_SENSORS = (
         # `view_update_job` action. This entity summarizes; it does not
         # replicate.
         value_fn=lambda resource: resource.package_update_job.state.value,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="package_update_checkpoint",
+        translation_key="resource_package_update_checkpoint",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda resource: resource.package_update_job.checkpoint,
+        requires_package_update_job=True,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="package_update_package_count",
+        translation_key="resource_package_update_package_count",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda resource: resource.package_update_job.package_count,
+        requires_package_update_job=True,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="package_update_health_outcome",
+        translation_key="resource_package_update_health_outcome",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.ENUM,
+        options=["not_recorded", "passed", "failed"],
+        value_fn=lambda resource: (
+            "not_recorded"
+            if resource.package_update_job.health_outcome is None
+            else resource.package_update_job.health_outcome.value
+        ),
+        requires_lxc=True,
     ),
     HubinetOpsResourceSensorDescription(
         key="pending_updates",
@@ -352,6 +382,12 @@ class HubinetOpsResourceSensor(HubinetOpsResourceEntity, SensorEntity):
             return False
         if description.requires_reboot_known and package_scan.reboot_required is None:
             return False
+        if description.requires_package_update_job and (
+            resource.package_update_job.job_id is None
+        ):
+            return False
+        if description.requires_lxc and resource.resource_type is not ResourceType.LXC:
+            return False
         return True
 
     @property
@@ -384,10 +420,20 @@ class HubinetOpsResourceSensor(HubinetOpsResourceEntity, SensorEntity):
             # detailed stays behind the explicit action.
             "package_update_job_id": resource.package_update_job.job_id,
             "package_update_checkpoint": resource.package_update_job.checkpoint,
+            "package_update_package_count": resource.package_update_job.package_count,
             "package_update_health_outcome": (
                 None
                 if resource.package_update_job.health_outcome is None
                 else resource.package_update_job.health_outcome.value
+            ),
+            "package_update_health_started_at": (
+                resource.package_update_job.health_started_at
+            ),
+            "package_update_health_completed_at": (
+                resource.package_update_job.health_completed_at
+            ),
+            "package_update_rollback_available": (
+                resource.package_update_job.rollback_available
             ),
             "package_update_issued_at": resource.package_update_job.issued_at,
             "package_update_terminalized_at": (

@@ -43,6 +43,7 @@ from .api import (
     NodeAvailability,
     NodeSnapshot,
     ObservationalContinuity,
+    OperatorCapabilities,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,
@@ -368,11 +369,15 @@ def _package_update_job_summary(payload: Any) -> PackageUpdateJobSummary:
         job_id=payload.get("job_id"),
         checkpoint=payload.get("checkpoint"),
         issued_at=payload.get("issued_at"),
+        package_count=payload.get("package_count"),
         health_outcome=(
             None if outcome is None else PackageUpdateHealthOutcome(outcome)
         ),
+        health_started_at=payload.get("health_started_at"),
+        health_completed_at=payload.get("health_completed_at"),
         snapshot_confirmed_at=payload.get("snapshot_confirmed_at"),
         mutation_completed_at=payload.get("mutation_completed_at"),
+        rollback_available=payload.get("rollback_available", False),
         rollback_completed_at=payload.get("rollback_completed_at"),
         terminalized_at=payload.get("terminalized_at"),
         terminal_reason=payload.get("terminal_reason"),
@@ -529,8 +534,28 @@ def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
             if "package_update_job" not in payload
             else _package_update_job_summary(payload["package_update_job"])
         ),
+        operator_capabilities=(
+            OperatorCapabilities()
+            if "operator_capabilities" not in payload
+            else _operator_capabilities(payload["operator_capabilities"])
+        ),
         termination_reason=payload.get("termination_reason"),
         successor_resource_id=payload.get("successor_resource_id"),
+    )
+
+
+def _operator_capabilities(payload: Any) -> OperatorCapabilities:
+    if not isinstance(payload, Mapping):
+        raise TypeError("operator_capabilities must be an object when present")
+    return OperatorCapabilities(
+        can_review_update_plan=payload["can_review_update_plan"],
+        can_approve_update_plan=payload["can_approve_update_plan"],
+        can_start_update=payload["can_start_update"],
+        can_view_update_job=payload["can_view_update_job"],
+        can_resume_update=payload["can_resume_update"],
+        can_rollback_update=payload["can_rollback_update"],
+        can_view_health_contract=payload["can_view_health_contract"],
+        can_configure_health_contract=payload["can_configure_health_contract"],
     )
 
 

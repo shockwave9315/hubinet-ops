@@ -592,7 +592,11 @@ def create_read_only_app(
         # and never assumed. Startup can mark nothing SUCCEEDED and can
         # resubmit nothing.
         package_update_worker.start()
-    publication = InventoryPublication(store, authority)
+    publication = InventoryPublication(
+        store,
+        authority,
+        package_update_activated=package_update is not None,
+    )
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:

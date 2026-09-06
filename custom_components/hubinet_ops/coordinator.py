@@ -8,6 +8,7 @@ licensed under Apache-2.0; see ``NOTICE.md`` and the vendored license.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -39,6 +40,16 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 type HubinetOpsConfigEntry = ConfigEntry[HubinetOpsCoordinator]
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedUpdatePlanReference:
+    """Ephemeral UI memory of one exact plan the operator reviewed."""
+
+    backend_instance_id: str
+    resource_id: str
+    scan_run_id: str
+    plan_fingerprint: str
 
 
 def source_registry_key(backend_instance_id: str, inventory_source_id: str) -> str:
@@ -201,6 +212,43 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
         self.new_resources_callbacks: list[
             Callable[[list[ResourceSnapshot]], None]
         ] = []
+        # UX state only. It is never persisted and grants no backend
+        # authority. Reloading Home Assistant intentionally empties it.
+        self.reviewed_update_plans: dict[str, ReviewedUpdatePlanReference] = {}
+
+    def remember_reviewed_update_plan(
+        self, reference: ReviewedUpdatePlanReference
+    ) -> None:
+        self.reviewed_update_plans[reference.resource_id] = reference
+        self.async_update_listeners()
+
+    def forget_reviewed_update_plan(self, resource_id: str) -> None:
+        if self.reviewed_update_plans.pop(resource_id, None) is not None:
+            self.async_update_listeners()
+
+    def reviewed_update_plan(
+        self, resource_id: str
+    ) -> ReviewedUpdatePlanReference | None:
+        return self.reviewed_update_plans.get(resource_id)
+
+    def _invalidate_stale_plan_reviews(self, incoming: HubinetOpsSnapshot) -> None:
+        """Discard UX references contradicted by a newer backend view."""
+
+        stale: list[str] = []
+        for resource_id, reference in self.reviewed_update_plans.items():
+            resource = incoming.resources_by_id.get(resource_id)
+            if (
+                incoming.backend.backend_instance_id
+                != reference.backend_instance_id
+                or resource is None
+                or not resource.operator_capabilities.can_approve_update_plan
+                or resource.package_scan.scan_run_id != reference.scan_run_id
+                or resource.package_scan.plan_fingerprint
+                != reference.plan_fingerprint
+            ):
+                stale.append(resource_id)
+        for resource_id in stale:
+            self.reviewed_update_plans.pop(resource_id, None)
 
     async def _async_update_data(self) -> HubinetOpsSnapshot:
         """Fetch one authoritative immutable Hubinet Ops snapshot."""
@@ -236,6 +284,7 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
                     translation_key="invalid_snapshot",
                 ) from err
 
+        self._invalidate_stale_plan_reviews(incoming)
         self._async_publish_inventory(incoming)
         return incoming
 

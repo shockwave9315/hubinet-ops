@@ -134,7 +134,35 @@
           "interrupted": "Interrupted",
           "manual_intervention": "Manual intervention"
         }
+      },
+      "resource_package_update_checkpoint": {
+        "name": "Update checkpoint"
+      },
+      "resource_package_update_package_count": {
+        "name": "Update package count"
+      },
+      "resource_package_update_health_outcome": {
+        "name": "Last update health result",
+        "state": {
+          "not_recorded": "No definitive result",
+          "passed": "Passed",
+          "failed": "Failed"
+        }
       }
+    },
+    "binary_sensor": {
+      "rollback_available": {
+        "name": "Rollback available"
+      }
+    },
+    "button": {
+      "review_update_plan": {"name": "Review update plan"},
+      "approve_reviewed_plan": {"name": "Approve reviewed plan"},
+      "start_update": {"name": "Start approved update"},
+      "view_update_job": {"name": "View update job"},
+      "resume_update": {"name": "Resume update job"},
+      "rollback_update": {"name": "Roll back this update"},
+      "view_health_contract": {"name": "View health contract"}
     }
   },
   "services": {
@@ -150,19 +178,11 @@
     },
     "approve_update_plan": {
       "name": "Approve update plan",
-      "description": "Approve the exact scan and fingerprint returned by View update plan.",
+      "description": "Approve only the exact plan most recently returned by View update plan during this Home Assistant runtime.",
       "fields": {
-        "resource_id": {
-          "name": "Resource ID",
-          "description": "Exact resource identity returned by View update plan."
-        },
-        "scan_run_id": {
-          "name": "Scan run ID",
-          "description": "Exact scan identity returned by View update plan."
-        },
-        "plan_fingerprint": {
-          "name": "Plan fingerprint",
-          "description": "Exact material plan fingerprint returned by View update plan."
+        "device_id": {
+          "name": "Resource",
+          "description": "Select the same workload resource whose exact plan you just reviewed."
         }
       }
     },

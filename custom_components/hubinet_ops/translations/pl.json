@@ -100,7 +100,29 @@
           "interrupted": "Przerwane",
           "manual_intervention": "Wymaga interwencji"
         }
+      },
+      "resource_package_update_checkpoint": {"name": "Punkt kontrolny aktualizacji"},
+      "resource_package_update_package_count": {"name": "Liczba pakietów aktualizacji"},
+      "resource_package_update_health_outcome": {
+        "name": "Ostatni wynik kontroli zdrowia po aktualizacji",
+        "state": {
+          "not_recorded": "Brak ostatecznego wyniku",
+          "passed": "Powodzenie",
+          "failed": "Niepowodzenie"
+        }
       }
+    },
+    "binary_sensor": {
+      "rollback_available": {"name": "Wycofanie dostępne"}
+    },
+    "button": {
+      "review_update_plan": {"name": "Przejrzyj plan aktualizacji"},
+      "approve_reviewed_plan": {"name": "Zatwierdź przejrzany plan"},
+      "start_update": {"name": "Rozpocznij zatwierdzoną aktualizację"},
+      "view_update_job": {"name": "Wyświetl zadanie aktualizacji"},
+      "resume_update": {"name": "Wznów zadanie aktualizacji"},
+      "rollback_update": {"name": "Wycofaj tę aktualizację"},
+      "view_health_contract": {"name": "Wyświetl kontrakt zdrowia"}
     }
   },
   "services": {
@@ -116,19 +138,11 @@
     },
     "approve_update_plan": {
       "name": "Zatwierdź plan aktualizacji",
-      "description": "Zatwierdza dokładne skanowanie i odcisk zwrócone przez akcję Wyświetl plan aktualizacji.",
+      "description": "Zatwierdza tylko dokładny plan ostatnio zwrócony przez akcję Wyświetl plan aktualizacji w bieżącym uruchomieniu Home Assistant.",
       "fields": {
-        "resource_id": {
-          "name": "Identyfikator zasobu",
-          "description": "Dokładna tożsamość zasobu zwrócona przez akcję Wyświetl plan aktualizacji."
-        },
-        "scan_run_id": {
-          "name": "Identyfikator skanowania",
-          "description": "Dokładna tożsamość skanowania zwrócona przez akcję Wyświetl plan aktualizacji."
-        },
-        "plan_fingerprint": {
-          "name": "Odcisk planu",
-          "description": "Dokładny odcisk materialnego planu zwrócony przez akcję Wyświetl plan aktualizacji."
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz ten sam zasób, którego dokładny plan został właśnie przejrzany."
         }
       }
     },

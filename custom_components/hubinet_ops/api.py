@@ -17,6 +17,7 @@ from .contract import (
     NodeAvailability,
     NodeSnapshot,
     ObservationalContinuity,
+    OperatorCapabilities,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,

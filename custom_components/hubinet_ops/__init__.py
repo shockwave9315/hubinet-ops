@@ -26,7 +26,7 @@ from .coordinator import HubinetOpsConfigEntry, HubinetOpsCoordinator
 from .services import async_setup_services, async_unload_services
 from .transport_http import http_api_factory
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
 
 
 def create_api_client(

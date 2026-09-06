@@ -312,9 +312,13 @@ class PackageUpdateJobSummary:
     job_id: str | None = None
     checkpoint: str | None = None
     issued_at: str | None = None
+    package_count: int | None = None
     health_outcome: PackageUpdateHealthOutcome | None = None
+    health_started_at: str | None = None
+    health_completed_at: str | None = None
     snapshot_confirmed_at: str | None = None
     mutation_completed_at: str | None = None
+    rollback_available: bool = False
     rollback_completed_at: str | None = None
     terminalized_at: str | None = None
     terminal_reason: str | None = None
@@ -331,6 +335,32 @@ class PackageUpdateJobSummary:
     @property
     def rollback_completed(self) -> bool:
         return self.state is PackageUpdateJobState.ROLLED_BACK
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorCapabilities:
+    """Read-only hints about actions backend authority currently accepts.
+
+    These facts make the Home Assistant controls truthful without turning HA
+    into a second authority state machine. Every mutation endpoint still
+    independently revalidates the complete rule when an operator presses a
+    control, so a capability can become stale only in the safe direction: the
+    backend refuses the raced request.
+    """
+
+    can_review_update_plan: bool = False
+    can_approve_update_plan: bool = False
+    can_start_update: bool = False
+    can_view_update_job: bool = False
+    can_resume_update: bool = False
+    can_rollback_update: bool = False
+    can_view_health_contract: bool = False
+    can_configure_health_contract: bool = False
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"operator capability {name} must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,6 +464,9 @@ class ResourceSnapshot:
     )
     package_update_job: PackageUpdateJobSummary = field(
         default_factory=PackageUpdateJobSummary
+    )
+    operator_capabilities: OperatorCapabilities = field(
+        default_factory=OperatorCapabilities
     )
     termination_reason: str | None = None
     successor_resource_id: str | None = None

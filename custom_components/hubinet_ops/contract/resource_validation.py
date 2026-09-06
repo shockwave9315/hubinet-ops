@@ -6,9 +6,12 @@ from typing import TYPE_CHECKING
 
 from .enums import (
     DetailStatus,
+    HealthContractStatus,
     LifecycleState,
     NodeAvailability,
     ObservationalContinuity,
+    PackageUpdateJobState,
+    PackagePlanApprovalStatus,
     PresenceState,
     ResourceStateLevel,
     ResourceType,
@@ -28,6 +31,7 @@ if TYPE_CHECKING:
 def validate_resource_snapshot(self: "ResourceSnapshot") -> None:
     from .models import (
         HealthContractSummary,
+        OperatorCapabilities,
         PackageUpdateJobSummary,
         PackagePlanApprovalSnapshot,
         PackageScanSnapshot,
@@ -43,6 +47,8 @@ def validate_resource_snapshot(self: "ResourceSnapshot") -> None:
         raise ValueError("health_contract must be a HealthContractSummary")
     if not isinstance(self.package_update_job, PackageUpdateJobSummary):
         raise ValueError("package_update_job must be a PackageUpdateJobSummary")
+    if not isinstance(self.operator_capabilities, OperatorCapabilities):
+        raise ValueError("operator_capabilities must be an OperatorCapabilities")
     _require_uuid_identity(self.resource_id, "resource_id")
     _require_uuid_identity(self.inventory_source_id, "inventory_source_id")
     for value, enum_type, field_name in (
@@ -111,6 +117,36 @@ def validate_resource_snapshot(self: "ResourceSnapshot") -> None:
     if not self.policy_applicable and self.effective_capabilities:
         raise ValueError(
             "effective capabilities require backend-published policy applicability"
+        )
+
+    capabilities = self.operator_capabilities
+    if self.resource_type is not ResourceType.LXC and any(
+        getattr(capabilities, name) for name in capabilities.__dataclass_fields__
+    ):
+        raise ValueError("unsupported resources cannot publish operator capabilities")
+    if (
+        capabilities.can_review_update_plan
+        or capabilities.can_approve_update_plan
+    ) and not self.package_plan_approval.approvable:
+        raise ValueError("plan capabilities require backend approvability")
+    has_job = self.package_update_job.state not in {
+        PackageUpdateJobState.UNSUPPORTED,
+        PackageUpdateJobState.NOT_STARTED,
+    }
+    if capabilities.can_view_update_job and not has_job:
+        raise ValueError("job view capability requires a published job")
+    if capabilities.can_resume_update and (
+        self.package_update_job.state is not PackageUpdateJobState.ACTIVE
+    ):
+        raise ValueError("resume capability requires an active job")
+    if capabilities.can_rollback_update and not self.package_update_job.rollback_available:
+        raise ValueError("rollback capability requires backend rollback availability")
+    if capabilities.can_start_update and (
+        self.package_plan_approval.status is not PackagePlanApprovalStatus.APPROVED
+        or self.health_contract.status is not HealthContractStatus.CONFIGURED
+    ):
+        raise ValueError(
+            "start capability requires an approved plan and configured health contract"
         )
 
 

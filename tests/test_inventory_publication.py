@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import sys
 from types import ModuleType
+import uuid
 
 from app.inventory import (
     BaselineCompleteness,
@@ -17,6 +18,8 @@ from app.inventory import (
     InventoryPublication,
     NormalizedDiscoverySnapshot,
     PackageScanPackage as AuthorityPackageScanPackage,
+    HealthProbeKind,
+    ResourceHealthProbe,
     SourceAvailability,
 )
 from app.inventory.discovery import ProviderGuestLocatorSet, ProviderNodeScope
@@ -56,6 +59,7 @@ from custom_components.hubinet_ops.contract.models import (
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     NodeSnapshot,
+    OperatorCapabilities,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,
@@ -142,6 +146,9 @@ def contract_snapshot(view) -> HubinetOpsSnapshot:
                     "package_update_job": _contract_package_update_job(
                         resource["package_update_job"]
                     ),
+                    "operator_capabilities": OperatorCapabilities(
+                        **dict(resource["operator_capabilities"])
+                    ),
                 }
             )
             for resource in view.resources
@@ -160,11 +167,15 @@ def _contract_package_update_job(value) -> PackageUpdateJobSummary:
         job_id=value["job_id"],
         checkpoint=value["checkpoint"],
         issued_at=value["issued_at"],
+        package_count=value["package_count"],
         health_outcome=(
             None if outcome is None else PackageUpdateHealthOutcome(outcome)
         ),
+        health_started_at=value["health_started_at"],
+        health_completed_at=value["health_completed_at"],
         snapshot_confirmed_at=value["snapshot_confirmed_at"],
         mutation_completed_at=value["mutation_completed_at"],
+        rollback_available=value["rollback_available"],
         rollback_completed_at=value["rollback_completed_at"],
         terminalized_at=value["terminalized_at"],
         terminal_reason=value["terminal_reason"],
@@ -285,6 +296,68 @@ def successful_package_scan(authority, resource_id):
         reboot_required=True,
     )
     return run, completed
+
+
+def approved_executable_resource(authority, store):
+    resource_id = store.list_resources()[0].resource_id
+    _, completed = successful_package_scan(authority, resource_id)
+    authority.replace_resource_health_contract(
+        resource_id,
+        (ResourceHealthProbe(HealthProbeKind.SYSTEMD_UNIT_ACTIVE, "demo.service"),),
+    )
+    authority.approve_package_plan(
+        resource_id, completed.scan_run_id, completed.plan_fingerprint
+    )
+    return resource_id
+
+
+def test_operator_capabilities_are_backend_derived_and_activation_gated(
+    tmp_path: Path,
+) -> None:
+    _, _, store, authority, source_id = make_system(tmp_path)
+    reconcile(authority, source_id, resource_type="lxc")
+    resource_id = approved_executable_resource(authority, store)
+
+    inactive = contract_snapshot(InventoryPublication(store, authority).read())
+    inactive_capabilities = inactive.resources[0].operator_capabilities
+    assert inactive_capabilities.can_review_update_plan
+    assert inactive_capabilities.can_approve_update_plan
+    assert not inactive_capabilities.can_start_update
+
+    active_publication = InventoryPublication(
+        store, authority, package_update_activated=True
+    )
+    before = contract_snapshot(active_publication.read()).resources[0]
+    assert before.operator_capabilities.can_start_update
+    assert before.operator_capabilities.can_view_health_contract
+    assert before.operator_capabilities.can_configure_health_contract
+    assert not before.operator_capabilities.can_view_update_job
+
+    approval = store.package_plan_approval(resource_id)
+    assert approval is not None
+    authority.issue_package_update_job(
+        resource_id, approval.approval_id, str(uuid.uuid4())
+    )
+    after = contract_snapshot(active_publication.read()).resources[0]
+    assert not after.operator_capabilities.can_start_update
+    assert after.operator_capabilities.can_view_update_job
+    assert after.operator_capabilities.can_resume_update
+    assert not after.operator_capabilities.can_rollback_update
+
+
+def test_product_update_fence_suppresses_start_capability(tmp_path: Path) -> None:
+    _, _, store, authority, source_id = make_system(tmp_path)
+    reconcile(authority, source_id, resource_type="lxc")
+    approved_executable_resource(authority, store)
+    publication = InventoryPublication(store, authority, package_update_activated=True)
+    assert contract_snapshot(publication.read()).resources[
+        0
+    ].operator_capabilities.can_start_update
+
+    authority.acquire_product_update_maintenance_fence("test-run")
+    assert not contract_snapshot(publication.read()).resources[
+        0
+    ].operator_capabilities.can_start_update
 
 
 def test_backend_publication_is_accepted_by_phase0_contract_oracle(tmp_path: Path) -> None:
