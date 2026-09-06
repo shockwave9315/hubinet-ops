@@ -30,6 +30,44 @@ _ROLLBACK_AVAILABLE_CHECKPOINTS = frozenset(
     }
 )
 
+#: GitHub review P2 (HUMAN1-RESUME-CHECKPOINT-01): every durable checkpoint
+#: an ACTIVE job can be at, EXCEPT the one from which
+#: ``app.package_update_worker.PackageUpdateWorker._step`` has no
+#: continuation at all.
+#:
+#: This deliberately mirrors ``_step``'s own dispatch as a second, explicit,
+#: closed set rather than importing it -- `app/inventory/` is an
+#: independently instantiable subsystem (see ``ARCHITECTURE.md``) and the
+#: worker module pulls in the execution/mutation/health/rollback host-control
+#: stages, which this read-only publication boundary must not depend on.
+#: Exactly the same deliberate-duplication shape this file already uses for
+#: `_ROLLBACK_AVAILABLE_CHECKPOINTS` above (which independently mirrors
+#: ``InventoryAuthority.arm_package_update_rollback``'s own accepted-entry
+#: checkpoints). A dedicated regression test drives the REAL worker through
+#: every one of these checkpoints and cross-checks this set against what it
+#: actually does, so the two can't silently drift apart.
+#:
+#: ``health_completed`` is excluded: reachable while ACTIVE only with a
+#: DEFINITIVE FAILED verdict (a PASSED one is inseparable from `succeeded`),
+#: and ``_step`` stops there with ``health_failed`` and no state change --
+#: PRODUCT.md has made no automatic compensation decision, and an explicit
+#: Resume press can never make that job progress. ``rollback_completed`` is
+#: never reachable while ACTIVE at all (the job is ``rolled_back`` by then);
+#: it is excluded here purely for closure/defense-in-depth, matching
+#: ``_step``'s own unreachable fallback for it.
+_RESUME_CAPABLE_CHECKPOINTS = frozenset(
+    {
+        "issued",
+        "preflight_passed",
+        "snapshot_may_have_started",
+        "snapshot_confirmed",
+        "mutation_may_have_started",
+        "mutation_completed",
+        "health_started",
+        "rollback_may_have_started",
+    }
+)
+
 
 def _freeze(value: Any) -> Any:
     if value is None or type(value) in {str, int, float, bool}:
@@ -727,6 +765,15 @@ class InventoryPublication:
         can_review = bool(approval["approvable"])
         has_job = job["state"] not in {"unsupported", "not_started"}
         active_job = job["state"] == "active"
+        # ACTIVE means the job still owns the global destructive slot; it
+        # does NOT mean an explicit Resume press has a meaningful
+        # continuation from the job's CURRENT durable checkpoint (GitHub
+        # review P2, HUMAN1-RESUME-CHECKPOINT-01). `health_completed` is the
+        # one ACTIVE checkpoint the worker deterministically cannot advance
+        # from -- see `_RESUME_CAPABLE_CHECKPOINTS`.
+        resumable_checkpoint = active_job and job["checkpoint"] in (
+            _RESUME_CAPABLE_CHECKPOINTS
+        )
         rollback_available = bool(job["rollback_available"])
         # The durable checkpoint fact above says a rollback COULD apply to
         # this job in principle; it says nothing about whether the exact
@@ -763,7 +810,9 @@ class InventoryPublication:
             "can_approve_update_plan": can_review,
             "can_start_update": can_start,
             "can_view_update_job": has_job,
-            "can_resume_update": self._package_update_activated and active_job,
+            "can_resume_update": (
+                self._package_update_activated and resumable_checkpoint
+            ),
             "can_rollback_update": (
                 self._package_update_activated and rollback_target_current
             ),
