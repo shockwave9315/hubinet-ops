@@ -136,7 +136,8 @@ class HealthProbeObservation:
 
     probe_index: int
     kind: HealthProbeKind
-    target: str
+    #: ``None`` for, and only for, ``HealthProbeKind.GUEST_OPERATIONAL``.
+    target: str | None
     outcome: HealthProbeOutcome
     reason: str
 
@@ -2276,7 +2277,14 @@ class InventoryAuthority:
             (str(job["job_id"]),),
         ).fetchall()
         frozen_material = [
-            (int(row["probe_index"]), str(row["kind"]), str(row["target"]))
+            (
+                int(row["probe_index"]),
+                str(row["kind"]),
+                # NULL only for guest_operational (v20); `str(None)` would
+                # silently become the string "None" and could never compare
+                # equal to the dataclass's real `None`.
+                None if row["target"] is None else str(row["target"]),
+            )
             for row in frozen
         ]
         current_material = [

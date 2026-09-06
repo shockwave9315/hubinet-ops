@@ -125,6 +125,7 @@ class FakeGuest:
         self.systemctl_stdout_override: str | None = None
         self.commands: list[tuple[str, ...]] = []
         self.timeout_on: str | None = None
+        self.guest_operational_ok = True
 
     # -- host commands -------------------------------------------------
 
@@ -153,6 +154,8 @@ class FakeGuest:
         raise AssertionError(f"unexpected host command: {argv}")
 
     def _guest(self, tail):
+        if tail == helper.GUEST_OPERATIONAL_COMMAND:
+            return self._guest_operational(tail)
         assert tail[0] == "env" and tail[1] == "LC_ALL=C", tail
         command = tail[2]
         if command == "systemctl":
@@ -160,6 +163,16 @@ class FakeGuest:
         if command == "docker":
             return self._docker(tail)
         raise AssertionError(f"unexpected guest command: {tail}")
+
+    # -- guest_operational -----------------------------------------------
+
+    def _guest_operational(self, tail):
+        assert tail == ("/bin/true",), tail
+        if self.timeout_on == "guest_operational":
+            return helper.CommandResult(0, b"", b"", timed_out=True)
+        return helper.CommandResult(
+            0 if self.guest_operational_ok else 1, b"", b""
+        )
 
     # -- systemd -------------------------------------------------------
 
@@ -751,6 +764,86 @@ def test_an_unusable_daemon_oracle_is_unknown_for_every_docker_probe() -> None:
     guest._docker = unusable_listing
     assert _evaluate(guest, (("docker_container_running", "web"),)) == [
         ("unknown", "malformed_output")
+    ]
+
+
+# ===========================================================================
+# 2.5. guest_operational (v20): a FALLBACK, not application health.
+# ===========================================================================
+
+
+def test_guest_operational_passes_with_the_exact_fixed_argv() -> None:
+    guest = FakeGuest()
+    assert _evaluate(guest, (("guest_operational", None),)) == [
+        ("passed", "guest_operational_confirmed")
+    ]
+    guest_command = next(
+        argv for argv in guest.commands if argv[:2] == ("pct", "exec")
+    )
+    assert guest_command == ("pct", "exec", str(VMID), "--", "/bin/true")
+    # No operator-supplied argument crosses this boundary at all.
+    assert "web" not in guest_command
+    assert "nginx.service" not in guest_command
+
+
+def test_guest_operational_never_carries_a_request_target() -> None:
+    """Structural: the request validator refuses a target on this kind
+    outright, before any guest command is even considered."""
+
+    payload = _request((("guest_operational", None),))
+    payload["health_contract"]["probes"][0]["target"] = "should-not-exist"
+    with pytest.raises(helper.RequestError, match="must not carry a target"):
+        helper.validate_request(payload)
+
+
+def test_a_failed_guest_operation_is_unknown_never_a_definitive_failure() -> None:
+    """No FAIL outcome exists for this kind at all: infrastructure
+    uncertainty about a guest this stage cannot positively prove down is
+    never turned into a failure of a workload this kind does not name."""
+
+    guest = FakeGuest()
+    guest.guest_operational_ok = False
+    assert _evaluate(guest, (("guest_operational", None),)) == [
+        ("unknown", "command_failed")
+    ]
+
+
+def test_a_guest_operation_timeout_is_unknown() -> None:
+    guest = FakeGuest()
+    guest.timeout_on = "guest_operational"
+    assert _evaluate(guest, (("guest_operational", None),)) == [
+        ("unknown", "command_timed_out")
+    ]
+
+
+def test_guest_operational_still_revalidates_the_live_target_first() -> None:
+    guest = FakeGuest()
+    guest.running = False
+    clock = FakeClock()
+    response = helper.handle_request(
+        _request((("guest_operational", None),)),
+        runner=guest,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "guest_unavailable"
+
+
+def test_guest_operational_alongside_a_docker_probe_in_the_same_round() -> None:
+    """A mixed contract is legal, and each family stays independently
+    batched: one guest_operational command, one Docker round, same round."""
+
+    guest = FakeGuest()
+    assert _evaluate(
+        guest,
+        (
+            ("guest_operational", None),
+            ("docker_container_running", "web"),
+        ),
+    ) == [
+        ("passed", "guest_operational_confirmed"),
+        ("passed", "container_running"),
     ]
 
 

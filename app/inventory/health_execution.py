@@ -74,6 +74,16 @@ def require_health_contract_execution_eligible(
                     "Docker health probe target is not an exact container name"
                 )
             continue
+        if probe.kind is HealthProbeKind.GUEST_OPERATIONAL:
+            # No target to validate -- the fixed guest operation names
+            # nothing the operator supplied. A target here would itself be
+            # the structural defect: `health_contract.py` already refuses
+            # to store one.
+            if probe.target is not None:
+                raise HealthContractExecutionError(
+                    "guest_operational health probe must not carry a target"
+                )
+            continue
         raise HealthContractExecutionError(
             "health probe kind is not supported by the package-update executor"
         )

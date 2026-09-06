@@ -316,6 +316,18 @@ class HealthProbeKind(StrEnum):
     #: therefore cannot satisfy this probe -- that is the point of choosing
     #: it over ``docker_container_running``.
     DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
+    #: A FALLBACK, not an application-health proof (v20, post-Human1 Stage
+    #: 3): the exact current guest/resource identity is revalidated AND the
+    #: dedicated health boundary can perform one fixed, code-owned,
+    #: read-only guest liveness operation inside it -- never an arbitrary
+    #: command, never an operator-supplied argument. Has NO workload target
+    #: (see ``ResourceHealthProbe.target``, which is ``None`` for this kind
+    #: and only this kind -- never a faked container/unit name). Only ever
+    #: RECOMMENDED by backend discovery when no supported Docker/systemd
+    #: workload candidate was found -- never a substitute for one that
+    #: exists, and never silently persisted without explicit operator
+    #: confirmation.
+    GUEST_OPERATIONAL = "guest_operational"
 
 
 class HealthProbeOutcome(StrEnum):
@@ -759,10 +771,18 @@ class PackagePlanApproval:
 
 @dataclass(frozen=True, slots=True)
 class ResourceHealthProbe:
-    """One required typed probe inside an operator-declared health contract."""
+    """One required typed probe inside an operator-declared health contract.
+
+    ``target`` is ``None`` for, and only for,
+    :attr:`HealthProbeKind.GUEST_OPERATIONAL` -- that kind names no
+    container or unit, and inventing a placeholder target for it would be
+    exactly the faked identity the frozen design forbids. Every other kind
+    requires a real bounded target string; `health_contract.py` enforces
+    which is which.
+    """
 
     kind: HealthProbeKind
-    target: str
+    target: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,7 +818,9 @@ class PackageUpdateJobHealthProbe:
 
     probe_index: int
     kind: HealthProbeKind
-    target: str
+    #: ``None`` for, and only for, ``HealthProbeKind.GUEST_OPERATIONAL`` --
+    #: see ``ResourceHealthProbe.target``.
+    target: str | None
 
 
 @dataclass(frozen=True, slots=True)

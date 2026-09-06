@@ -188,7 +188,13 @@ class SshPackageUpdateHealthHostControl:
             if probe["kind"] not in {kind.value for kind in HealthProbeKind}:
                 raise ValueError("health request carries an unsupported probe kind")
             target = probe["target"]
-            if (
+            if probe["kind"] == HealthProbeKind.GUEST_OPERATIONAL.value:
+                if target is not None:
+                    raise ValueError(
+                        "a guest_operational health request probe must not "
+                        "carry a target"
+                    )
+            elif (
                 not isinstance(target, str)
                 or not 1 <= len(target) <= MAX_HEALTH_PROBE_TARGET_LENGTH
             ):
@@ -451,7 +457,12 @@ class SshPackageUpdateHealthHostControl:
                 "host-control returned an unsupported probe kind"
             ) from exc
         target = raw["target"]
-        if (
+        if kind is HealthProbeKind.GUEST_OPERATIONAL:
+            if target is not None:
+                raise PackageUpdateHealthError(
+                    "host-control returned a target for a guest_operational probe"
+                )
+        elif (
             not isinstance(target, str)
             or not 1 <= len(target) <= MAX_HEALTH_PROBE_TARGET_LENGTH
         ):

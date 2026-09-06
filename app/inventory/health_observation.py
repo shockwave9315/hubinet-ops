@@ -34,6 +34,15 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "unit_deactivating",
         "unit_reloading",
         "unit_job_pending",
+        # v20 (post-Human1 Stage 3): the guest_operational FALLBACK kind.
+        # PASS only -- the exact resource context revalidated and the one
+        # fixed, code-owned, read-only guest liveness operation succeeded.
+        # There is deliberately no distinct FAIL token: infrastructure
+        # uncertainty about a guest that this stage cannot positively prove
+        # down is UNKNOWN, reusing the exact same generic UNKNOWN tokens
+        # every other kind already shares (guest_unavailable, command_
+        # failed, command_timed_out, malformed_output) -- never a guess.
+        "guest_operational_confirmed",
         "probe_target_not_exact",
         "probe_target_ambiguous",
         "guest_unavailable",
@@ -49,7 +58,12 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
 
 HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
     HealthProbeOutcome.PASSED: frozenset(
-        {"unit_active", "container_running", "container_healthy"}
+        {
+            "unit_active",
+            "container_running",
+            "container_healthy",
+            "guest_operational_confirmed",
+        }
     ),
     HealthProbeOutcome.FAILED: frozenset(
         {
@@ -150,6 +164,7 @@ HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
             HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
         }
     ),
+    "guest_operational_confirmed": frozenset({HealthProbeKind.GUEST_OPERATIONAL}),
 }
 
 

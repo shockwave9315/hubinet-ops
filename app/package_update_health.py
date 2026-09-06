@@ -172,6 +172,7 @@ HOST_PROBE_REASONS: frozenset[str] = frozenset(
         "unit_deactivating",
         "unit_reloading",
         "unit_job_pending",
+        "guest_operational_confirmed",
         "probe_target_not_exact",
         "probe_target_ambiguous",
         "guest_unavailable",
@@ -227,7 +228,8 @@ class HostProbeResult:
 
     probe_index: int
     kind: HealthProbeKind
-    target: str
+    #: ``None`` for, and only for, ``HealthProbeKind.GUEST_OPERATIONAL``.
+    target: str | None
     outcome: HealthProbeOutcome
     reason: str
 

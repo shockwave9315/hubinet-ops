@@ -2412,6 +2412,39 @@ def test_end_to_end_a_healthy_workload_succeeds(tmp_path: Path) -> None:
     ]
 
 
+def test_end_to_end_guest_operational_fallback_succeeds(tmp_path: Path) -> None:
+    """The full path: authority issuance -> job-frozen (kind, None) probe ->
+    the real SSH transport's JSON encoding (target serializes as `null`) ->
+    the real deployed helper -> the fixed `/bin/true` guest command -> a
+    durable PASSED verdict. No target ever crosses the wire for this probe."""
+
+    store, authority, guest, result = _end_to_end(
+        tmp_path,
+        probes=(ResourceHealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),),
+    )
+
+    assert result.status is HealthStageStatus.PASSED
+    assert result.job.status is PackageUpdateJobStatus.SUCCEEDED
+    assert [
+        (r.reason,) for r in result.job.health_probe_results
+    ] == [("guest_operational_confirmed",)]
+
+
+def test_end_to_end_a_failed_guest_operation_is_unknown(tmp_path: Path) -> None:
+    def break_it(guest):
+        guest.guest_operational_ok = False
+
+    store, authority, guest, result = _end_to_end(
+        tmp_path,
+        break_it,
+        probes=(ResourceHealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),),
+    )
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.health_outcome is None
+
+
 def test_end_to_end_a_stopped_unit_fails_and_keeps_rollback_authority(
     tmp_path: Path,
 ) -> None:

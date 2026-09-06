@@ -75,7 +75,7 @@ from fastapi import (
     Request,
 )
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.inventory import (
     AuthorityConflict,
@@ -162,6 +162,10 @@ class HealthProbeRequest(BaseModel):
     here, and ``extra="forbid"`` means a caller cannot smuggle one in: the
     future executor builds fixed argv from ``kind``, and ``target`` is data
     that only ever becomes one bounded argument.
+
+    ``target`` is optional ONLY for ``guest_operational`` (v20): that kind
+    names no container or unit, and a caller supplying one anyway is refused
+    here with a 422 rather than silently ignored -- never a faked target.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -171,7 +175,21 @@ class HealthProbeRequest(BaseModel):
     # enum member. The value set stays exactly `HealthProbeKind` -- anything
     # else is still a 422.
     kind: Annotated[HealthProbeKind, Field(strict=False)]
-    target: str = Field(min_length=1, max_length=MAX_HEALTH_PROBE_TARGET_LENGTH)
+    target: (
+        Annotated[str, Field(min_length=1, max_length=MAX_HEALTH_PROBE_TARGET_LENGTH)]
+        | None
+    ) = None
+
+    @model_validator(mode="after")
+    def _target_matches_kind(self) -> "HealthProbeRequest":
+        if self.kind is HealthProbeKind.GUEST_OPERATIONAL:
+            if self.target is not None:
+                raise ValueError(
+                    "a guest_operational health probe must not carry a target"
+                )
+        elif self.target is None:
+            raise ValueError("a target is required for this probe kind")
+        return self
 
 
 class HealthContractRequest(BaseModel):

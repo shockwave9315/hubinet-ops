@@ -159,7 +159,11 @@ PROBE_KINDS = (
     "systemd_unit_active",
     "docker_container_running",
     "docker_container_healthy",
+    "guest_operational",
 )
+
+#: The one kind whose probes carry no target at all -- never a faked one.
+_GUEST_OPERATIONAL_KIND = "guest_operational"
 
 # ---------------------------------------------------------------------------
 # Bounded health settling -- backend-owned TIMING POLICY, never HA-owned.
@@ -214,8 +218,9 @@ MIN_DECISIVE_ROUND = 2
 MAX_SETTLING_ROUNDS = 40
 #: At most this many guest commands (`pct exec` invocations) in ONE round,
 #: whatever the probe count: one batched `docker ps`, one batched
-#: `docker inspect`, one batched `systemctl show`.
-MAX_COMMANDS_PER_ROUND = 3
+#: `docker inspect`, one batched `systemctl show`, and (v20) one fixed
+#: `guest_operational` check -- one command per family, never one per probe.
+MAX_COMMANDS_PER_ROUND = 4
 #: A hard ceiling on guest commands across the WHOLE settling window.
 MAX_GUEST_COMMANDS = 160
 
@@ -582,7 +587,7 @@ def validate_request(payload: Any) -> dict[str, Any]:
     if not isinstance(raw_probes, list) or not 1 <= len(raw_probes) <= MAX_PROBES:
         raise RequestError("a health contract declares 1 to 32 probes")
     probes: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str | None]] = set()
     for index, raw in enumerate(raw_probes):
         if not isinstance(raw, Mapping) or set(raw) != {"index", "kind", "target"}:
             raise RequestError("a probe must have the exact shape")
@@ -592,7 +597,12 @@ def validate_request(payload: Any) -> dict[str, Any]:
         if kind not in PROBE_KINDS:
             raise RequestError("unsupported probe kind")
         probe_target = raw["target"]
-        if (
+        if kind == _GUEST_OPERATIONAL_KIND:
+            if probe_target is not None:
+                raise RequestError(
+                    "a guest_operational probe must not carry a target"
+                )
+        elif (
             not isinstance(probe_target, str)
             or not 1 <= len(probe_target) <= MAX_PROBE_TARGET_LENGTH
         ):
@@ -1214,6 +1224,63 @@ def _docker_round(
     return results
 
 
+#: The one fixed, code-owned, read-only guest liveness operation
+#: `guest_operational` performs. An absolute path (never resolved through a
+#: guest `PATH`), and never built from, or carrying, anything the operator
+#: supplied -- there is no argument at all. `/bin/true` is part of every
+#: supported Debian/Ubuntu LXC's base `coreutils` install.
+GUEST_OPERATIONAL_COMMAND: tuple[str, ...] = ("/bin/true",)
+
+
+def _guest_operational_round(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    probes: Sequence[dict[str, Any]],
+    budget: _RoundBudget,
+    *,
+    remaining_budget: float,
+) -> dict[int, tuple[str, str]]:
+    """The one `guest_operational` probe, if the contract declares one.
+
+    PASS requires the exact current resource context to have just
+    revalidated (already proven by `_run_guest_command`'s own invariant)
+    AND the fixed operation to exit successfully. Anything else this file
+    cannot positively prove otherwise is UNKNOWN -- there is deliberately no
+    FAIL outcome here: infrastructure uncertainty about a guest this stage
+    cannot positively prove down is never turned into a failure of the
+    workload the operator declared (there IS no workload declared; this
+    kind names none).
+    """
+
+    if not probes:
+        return {}
+    budget.spend()
+    try:
+        result = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            GUEST_OPERATIONAL_COMMAND,
+            max_output=1024,
+            timeout=_clamped_command_timeout(remaining_budget),
+        )
+    except (ProbeUnknown, HealthError) as exc:
+        reason = _guest_family_reason(exc)
+        return {int(probe["index"]): ("unknown", reason) for probe in probes}
+    if result.timed_out:
+        outcome = ("unknown", "command_timed_out")
+    elif result.output_exceeded:
+        outcome = ("unknown", "malformed_output")
+    elif result.returncode == 0:
+        outcome = ("passed", "guest_operational_confirmed")
+    else:
+        outcome = ("unknown", "command_failed")
+    return {int(probe["index"]): outcome for probe in probes}
+
+
 def _run_one_round(
     runner: Runner,
     vmid: int,
@@ -1227,7 +1294,12 @@ def _run_one_round(
     """Observe EVERY still-live frozen probe in one bounded batched round."""
 
     systemd_probes = [p for p in probes if p["kind"] == "systemd_unit_active"]
-    docker_probes = [p for p in probes if p["kind"] != "systemd_unit_active"]
+    guest_probes = [p for p in probes if p["kind"] == _GUEST_OPERATIONAL_KIND]
+    docker_probes = [
+        p
+        for p in probes
+        if p["kind"] not in ("systemd_unit_active", _GUEST_OPERATIONAL_KIND)
+    ]
 
     results: dict[int, tuple[str, str]] = {}
     if systemd_probes:
@@ -1251,6 +1323,18 @@ def _run_one_round(
                 expected_node,
                 local_node,
                 docker_probes,
+                budget,
+                remaining_budget=remaining_budget,
+            )
+        )
+    if guest_probes:
+        results.update(
+            _guest_operational_round(
+                runner,
+                vmid,
+                expected_node,
+                local_node,
+                guest_probes,
                 budget,
                 remaining_budget=remaining_budget,
             )

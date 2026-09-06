@@ -57,7 +57,20 @@ MAX_HEALTH_PROBE_TARGET_LENGTH = 200
 _FINGERPRINT_DOMAIN = "hubinet-ops/resource-health-contract/v1"
 
 
-def _require_probe_target(value: object) -> str:
+def _require_probe_target(kind: HealthProbeKind, value: object) -> str | None:
+    """A target is DATA for every kind except one.
+
+    ``GUEST_OPERATIONAL`` names no container or unit -- it MUST be ``None``,
+    never a faked placeholder (``"guest"``, ``"/bin/true"``, a VMID string).
+    Every other kind requires a real bounded opaque-argument string.
+    """
+
+    if kind is HealthProbeKind.GUEST_OPERATIONAL:
+        if value is not None:
+            raise HealthContractError(
+                "guest_operational health probes must not carry a target"
+            )
+        return None
     if not isinstance(value, str):
         raise HealthContractError("health probe target must be a string")
     if not value:
@@ -102,7 +115,7 @@ def canonical_health_probes(
     if isinstance(probes, (str, bytes)) or not isinstance(probes, Iterable):
         raise HealthContractError("health probes must be a sequence")
     normalized: list[ResourceHealthProbe] = []
-    identities: set[tuple[str, str]] = set()
+    identities: set[tuple[str, str | None]] = set()
     for probe in probes:
         if not isinstance(probe, ResourceHealthProbe):
             raise HealthContractError(
@@ -110,9 +123,12 @@ def canonical_health_probes(
             )
         if not isinstance(probe.kind, HealthProbeKind):
             raise HealthContractError("health probe kind is not supported")
-        target = _require_probe_target(probe.target)
+        target = _require_probe_target(probe.kind, probe.target)
         identity = (probe.kind.value, target)
         if identity in identities:
+            # For GUEST_OPERATIONAL specifically, this is also the "at most
+            # one" rule: every such probe has the identical (kind, None)
+            # identity, so a second one is always a duplicate.
             raise HealthContractError(
                 "health contract contains a duplicate (kind, target) probe"
             )
@@ -129,7 +145,9 @@ def canonical_health_probes(
         raise HealthContractError(
             f"a health contract may declare at most {MAX_HEALTH_PROBES} probes"
         )
-    return tuple(sorted(normalized, key=lambda probe: (probe.kind.value, probe.target)))
+    return tuple(
+        sorted(normalized, key=lambda probe: (probe.kind.value, probe.target or ""))
+    )
 
 
 def health_contract_fingerprint(probes: Iterable[ResourceHealthProbe]) -> str:

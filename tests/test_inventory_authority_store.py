@@ -24,7 +24,7 @@ def fixed_now() -> datetime:
     return FIXED_NOW
 
 
-def test_updater_static_schema_extraction_matches_final_v19_contract() -> None:
+def test_updater_static_schema_extraction_matches_final_v20_contract() -> None:
     """Exercise update-plan.sh's non-executing lexical extraction shape."""
 
     text = Path(store_module.__file__).read_text(encoding="utf-8")
@@ -34,7 +34,7 @@ def test_updater_static_schema_extraction_matches_final_v19_contract() -> None:
     start = text.find("_REQUIRED_TABLES")
     end = text.find("_LEGACY_TABLES")
     extracted = set(re.findall(r'"([A-Za-z0-9_]+)"', text[start:end]))
-    assert version is not None and int(version.group(1)) == 19
+    assert version is not None and int(version.group(1)) == 20
     assert start != -1 and end > start
     assert extracted == store_module._REQUIRED_SCHEMA_OBJECTS
     assert "package_update_post_scan_requests" in extracted
@@ -47,7 +47,7 @@ def test_fresh_authority_database_initializes_one_persistent_backend(
 ) -> None:
     path = tmp_path / "authority.db"
     store = InventoryAuthorityStore(path, now=fixed_now)
-    assert AUTHORITY_SCHEMA_VERSION == 19
+    assert AUTHORITY_SCHEMA_VERSION == 20
 
     backend = store.backend_instance()
     parsed = uuid.UUID(backend.backend_instance_id)

@@ -171,6 +171,108 @@ def _last_allocated_revision(store, resource_id: str) -> int | None:
     return None if row is None else int(row[0])
 
 
+GUEST_OPERATIONAL = HealthProbeKind.GUEST_OPERATIONAL
+
+
+# ===========================================================================
+# guest_operational (v20): a FALLBACK, never a faked target.
+# ===========================================================================
+
+
+def test_guest_operational_can_be_declared_with_no_target(tmp_path: Path) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+
+    contract = authority.replace_resource_health_contract(
+        rid, (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),)
+    )
+    assert contract.probes == (
+        ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),
+    )
+    assert authority.resource_health_contract(rid).probes[0].target is None
+
+    # Durable, and correctly nullable in the real schema, not merely in the
+    # Python model.
+    _, probe_rows = _raw_rows(store)
+    (row,) = [row for row in probe_rows if row["resource_id"] == rid]
+    assert row["target"] is None
+    assert row["kind"] == "guest_operational"
+
+
+def test_guest_operational_rejects_a_supplied_target(tmp_path: Path) -> None:
+    """No faked target -- `"guest"`, a VMID string, anything -- is accepted
+    for the one kind that names no container or unit."""
+
+    _, _, authority, resource = _system(tmp_path)
+    with pytest.raises(HealthContractError, match="must not carry a target"):
+        authority.replace_resource_health_contract(
+            resource.resource_id,
+            (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target="guest"),),
+        )
+
+
+def test_every_other_kind_still_requires_a_target(tmp_path: Path) -> None:
+    _, _, authority, resource = _system(tmp_path)
+    with pytest.raises(HealthContractError):
+        authority.replace_resource_health_contract(
+            resource.resource_id,
+            (ResourceHealthProbe(kind=RUNNING, target=None),),
+        )
+
+
+def test_at_most_one_guest_operational_probe_is_ever_accepted(
+    tmp_path: Path,
+) -> None:
+    """Two `guest_operational` probes have the IDENTICAL (kind, None)
+    identity, so the existing duplicate-probe rule is exactly the "at most
+    one" rule for this kind -- no separate mechanism was invented."""
+
+    _, _, authority, resource = _system(tmp_path)
+    with pytest.raises(HealthContractError, match="duplicate"):
+        authority.replace_resource_health_contract(
+            resource.resource_id,
+            (
+                ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),
+                ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),
+            ),
+        )
+
+
+def test_guest_operational_may_be_declared_alongside_workload_probes(
+    tmp_path: Path,
+) -> None:
+    """A mixed contract is structurally legal (recommendation policy is a
+    separate, backend-owned concern from what an operator may explicitly
+    declare)."""
+
+    _, _, authority, resource = _system(tmp_path)
+    contract = authority.replace_resource_health_contract(
+        resource.resource_id,
+        DEFAULT_PROBES + (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),),
+    )
+    assert len(contract.probes) == 3
+
+
+def test_sql_directly_refuses_inserting_a_non_null_target_for_guest_operational(
+    tmp_path: Path,
+) -> None:
+    """Defense in depth in the REAL deployed schema, not just the standalone
+    mirror this test file's SQL-level section already exercises for the
+    other kinds. Probe rows are insert-only (never updated in place), so
+    this proves the CHECK constraint at the one place a bad row could ever
+    be introduced."""
+
+    _, store, authority, resource = _system(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO resource_health_contract_probes "
+                "VALUES (?, 0, 'guest_operational', 'fake')",
+                (resource.resource_id,),
+            )
+
+
 # ===========================================================================
 # A. SCHEMA
 # ===========================================================================
@@ -181,7 +283,7 @@ def test_fresh_database_is_schema_v15_with_the_health_contract_tables(
 ) -> None:
     from app.inventory.store import AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION
 
-    assert AUTHORITY_SCHEMA_VERSION == 19
+    assert AUTHORITY_SCHEMA_VERSION == 20
     InventoryAuthorityStore(tmp_path / "authority.db")
     with sqlite3.connect(tmp_path / "authority.db") as connection:
         marker, version = connection.execute(
