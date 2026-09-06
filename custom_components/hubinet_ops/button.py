@@ -284,14 +284,29 @@ class HubinetOpsResourceButton(HubinetOpsResourceEntity, ButtonEntity):
     def available(self) -> bool:
         if not super().available:
             return False
-        if self.entity_description.key == "approve_reviewed_plan":
-            return self.coordinator.reviewed_update_plan(self.resource_id) is not None
-        return bool(
+        capability = bool(
             getattr(
                 self.coordinator.operator_capabilities(self.resource_id),
                 self.entity_description.capability,
             )
         )
+        if self.entity_description.key == "approve_reviewed_plan":
+            # APPROVE-CAP-GATE-01: presentation availability is the
+            # conjunction of the backend-published capability and the
+            # ephemeral HA-local proof that an operator actually reviewed
+            # this exact plan in this runtime. Neither fact alone is
+            # sufficient: the reviewed reference is UX memory, not backend
+            # authority (a compatibility all-false fallback, or a capability
+            # that lapsed since the review, must still hide the button), and
+            # the capability alone is not proof of an explicit local review.
+            # This grants no authority either way -- approval itself still
+            # independently fresh-reads and revalidates backend, resource,
+            # scan, and fingerprint before ever calling the backend.
+            return (
+                capability
+                and self.coordinator.reviewed_update_plan(self.resource_id) is not None
+            )
+        return capability
 
     @override
     async def async_press(self) -> None:

@@ -2616,6 +2616,96 @@ async def test_operator_availability_unsupported_route_falls_back_to_all_false(
 
 
 @pytest.mark.asyncio
+async def test_approve_button_stays_unavailable_after_compat_fallback_manual_review(
+    hass: HomeAssistant,
+) -> None:
+    """APPROVE-CAP-GATE-01, required witness A.
+
+    An old-backend compatibility fallback forces every capability false. A
+    manually invoked ``view_update_plan`` action (reachable through
+    Developer Tools regardless of button availability) still fresh-reads the
+    snapshot and, for an approvable plan, records an ephemeral reviewed
+    reference. That local UX fact alone must never make the approve button
+    available: the backend-published capability is still false.
+    """
+
+    planned = exact_plan_resource()
+    transport = FakeTransport(
+        [snapshot((planned,))],
+        operator_availability_views=(
+            HubinetOpsOperatorAvailabilityUnsupported("no such route"),
+        ),
+    )
+    entry = await setup_entry(hass, transport)
+    approve_id = resource_entity_id(hass, entry, RESOURCE_CT, "approve_reviewed_plan")
+    assert hass.states.get(approve_id).state == STATE_UNAVAILABLE
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+    assert response["approval_reference"] is not None
+    # The reviewed reference now exists...
+    assert entry.runtime_data.reviewed_update_plan(RESOURCE_CT) is not None
+    # ...but the backend-published capability is still false, so the button
+    # must remain unavailable.
+    assert not entry.runtime_data.operator_capabilities(
+        RESOURCE_CT
+    ).can_approve_update_plan
+    assert hass.states.get(approve_id).state == STATE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_approve_button_requires_current_capability_not_only_review(
+    hass: HomeAssistant,
+) -> None:
+    """APPROVE-CAP-GATE-01, required witness C.
+
+    A reviewed reference created while the backend allowed approval must not
+    outlive the capability itself: once the coordinator's own
+    backend-published availability says ``can_approve_update_plan`` is
+    false, the button must hide, whatever the ephemeral reviewed reference
+    still says.
+    """
+
+    planned = exact_plan_resource()
+    transport = FakeTransport(
+        [snapshot((planned,))],
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(can_approve_update_plan=True)
+        },
+    )
+    entry = await setup_entry(hass, transport)
+    coordinator = entry.runtime_data
+    approve_id = resource_entity_id(hass, entry, RESOURCE_CT, "approve_reviewed_plan")
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+    assert coordinator.reviewed_update_plan(RESOURCE_CT) is not None
+    assert hass.states.get(approve_id).state != STATE_UNAVAILABLE
+
+    # The backend capability alone now withdraws, independent of whatever
+    # invalidates the reviewed reference on an ordinary poll -- the button's
+    # own gate must not rely on that second mechanism to stay correct.
+    coordinator.operator_availability = operator_availability(
+        coordinator.data, {RESOURCE_CT: OperatorCapabilities()}
+    )
+    coordinator.async_update_listeners()
+    await hass.async_block_till_done()
+
+    assert coordinator.reviewed_update_plan(RESOURCE_CT) is not None
+    assert hass.states.get(approve_id).state == STATE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [
