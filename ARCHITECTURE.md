@@ -2231,9 +2231,15 @@ is backend-owned product policy: every current package-managed LXC is
 provisioned the built-in `guest_operational` contract during reconciliation
 (see "The built-in `guest_operational` default" below), so an approved update
 never waits on a health-onboarding step. An ADVANCED contract is
-operator-declared: an operator may explicitly replace that baseline with
-named Docker/systemd probes, and once they have, it is theirs until they
-explicitly reset it — reconciliation never sees it and never overwrites it.
+operator-declared: an operator may explicitly replace that baseline with one
+or more named `systemd_unit_active` probes, and once they have, it is theirs
+until they explicitly reset it — reconciliation never sees it and never
+overwrites it. The two never mix in one contract; see "Exactly two supported
+contract shapes" in `PRODUCT.md`. Docker-specific package-update health
+probes (`docker_container_running`, `docker_container_healthy`) existed
+through an earlier iteration of this stage and were removed end-to-end (v0.5
+health scope reduction) — not merely hidden from Home Assistant or excluded
+from provisioning.
 
 Neither half is inferred. See `PRODUCT.md`, "What healthy means", for why
 this product declares what healthy means rather than deducing it from what a
@@ -2244,11 +2250,19 @@ guest appears to run.
 `fingerprint`, `probe_count`, `created_at`, `updated_at` — with a foreign key
 to `resource_incarnations`. `resource_health_contract_probes` holds that
 contract's complete required set as `(resource_id, probe_index, kind, target)`,
-with `kind` constrained in SQL to the three kinds
+with `kind` constrained in SQL to the two kinds
 `app/inventory/models.py:HealthProbeKind` declares, and `target` constrained to
-one bounded, non-empty string with no NUL, whitespace, or newline. The
-constraint list is generated from the enum and the shared bounds in
-`app/inventory/health_contract.py`, so SQL and Python cannot drift.
+one bounded, non-empty string with no NUL, whitespace, or newline — nullable
+only for `guest_operational`. The constraint list is generated from the enum
+and the shared bounds in `app/inventory/health_contract.py`, so SQL and
+Python cannot drift; a kind the product no longer supports (a removed Docker
+member, say) simply stops being SQL-valid the moment it leaves the enum. A
+second pair of triggers (`resource_health_contract_no_mixed_baseline`,
+`package_update_job_health_probes_no_mixed_baseline`; schema v21) refuses a
+`guest_operational` row whose parent's own declared `probe_count` is not
+exactly 1 — the SQL-level half of "the two contract shapes never mix",
+independent of the Python `canonical_health_probes` check every ordinary
+write already goes through.
 
 **Absence is the schema's first rule.** There is no row for "unconfigured" —
 absence *is* unconfigured — and `probe_count` is constrained to at least one,
@@ -2357,7 +2371,7 @@ entity state on every Home Assistant poll.
 **The contract layer itself still never executes anything.** There is no probe
 executor, scheduler, worker, or host-control boundary *in this layer*, and no
 code in `app/inventory/health_contract.py` or the Home Assistant contract
-validation runs `systemctl`, `docker`, `pct`, or SSH. Declaring what healthy
+validation runs `systemctl`, `pct`, or SSH. Declaring what healthy
 means and checking it are two different jobs in two different files, and
 `tests/test_r0_architecture_regression.py` keeps them that way.
 
@@ -2406,12 +2420,13 @@ v15 intentionally stores bounded opaque targets and remains unchanged; being
 valid configuration is not proof that the stricter executor can represent it.
 The pure validator in `app/inventory/health_execution.py` therefore checks the
 exact contract inside the issuance transaction before any job row is written.
-It covers all three probe kinds, requires the executor's explicit systemd unit
-suffix and exact non-pattern grammar, and requires the exact Docker name
-grammar. It performs no host I/O. A non-executable contract remains readable
-configuration but produces no job, snapshot, or package mutation. Because the
-standalone host helper cannot import backend code, one regression compares its
-compiled patterns and suffix set byte-for-byte with this backend definition.
+It covers both remaining probe kinds and requires the executor's explicit
+systemd unit suffix and exact non-pattern grammar for `systemd_unit_active`;
+`guest_operational` carries no target to validate. It performs no host I/O. A
+non-executable contract remains readable configuration but produces no job,
+snapshot, or package mutation. Because the standalone host helper cannot
+import backend code, one regression compares its compiled pattern and suffix
+set byte-for-byte with this backend definition.
 
 The frozen rows are written before the parent job row through the same
 `DEFERRABLE INITIALLY DEFERRED` foreign key the frozen package rows use, and
@@ -2530,18 +2545,35 @@ percentage, or OR anywhere in it:
 | any probe `failed` | FAILED | completion, verdict, results; job stays ACTIVE |
 | otherwise | UNKNOWN | nothing but a bounded event |
 
-A proven failure beside an unevaluable probe is still FAILED: one false
-conjunct proves an ALL-OF false whatever the others did. PASSED, by contrast,
-requires every member positively proven — absence of an observed failure is not
-a pass.
+A proven failure beside an unevaluable probe is what the pure aggregator's
+table above describes in the abstract, but the phrase "one false conjunct
+proves an ALL-OF false whatever the others did" is dangerous read alone: it
+must never be read as license to durably finalize a FAILED verdict while a
+sibling probe is still UNKNOWN. Only a COMPLETE DECISIVE observation set may
+ever be finalized (see "PR #80 review remediation" below for what decisive
+means) — the aggregator is fed exclusively from such a set, never from a
+partial or non-decisive one. PASSED requires every member positively proven —
+absence of an observed failure is not a pass.
 
-UNKNOWN is refused by the definitive finalizer outright. It is not a verdict,
-it never becomes durable, and the job stays ACTIVE at `health_started` with its
-snapshot and rollback authority intact.
+**UNKNOWN is refused by the definitive finalizer outright, and so —
+independently, as defense in depth — is any observation set containing so
+much as ONE UNKNOWN probe, even beside a proven FAILED one.**
+`InventoryAuthority.complete_package_update_health` checks this before it
+ever calls `aggregate_health_outcome`: the production orchestrator already
+refuses to call the finalizer except after a DECISIVE round (which cannot
+contain an UNKNOWN probe by construction — see `validate_host_health_result`
+below), but the finalizer does not trust that upstream discipline. Neither an
+all-UNKNOWN set nor a FAILED-plus-UNKNOWN one is a verdict; neither ever
+becomes durable, and the job stays ACTIVE at `health_started` with its
+snapshot and rollback authority intact. Home Assistant's own
+`validate_package_update_job_view` mirrors the same rule independently: a
+payload naming `health_evidence == "verdict"` while any accompanying probe
+carries outcome `UNKNOWN` is refused rather than rendered.
 
 **Retrying is safe here, and is not safe for any other stage**, for one
-structural reason: health execution is READ-ONLY. It runs `systemctl show` and
-`docker inspect`. There is therefore deliberately no host operation journal, no
+structural reason: health execution is READ-ONLY. It runs `systemctl show`
+(or, for the built-in `guest_operational` baseline, the one fixed `/bin/true`
+liveness check). There is therefore deliberately no host operation journal, no
 `may_have_started` uncertainty checkpoint, no lease, and no at-most-once fence
 in this stage — inventing one would mimic the shape of the snapshot, mutation,
 and rollback boundaries without their reason for existing. What *is* kept is
@@ -2600,10 +2632,14 @@ job's workload is healthy. So the existing layered model applies:
 
 ### The exact commands, and why they are these
 
-Every argv is fixed, and every one was **verified against the real tools**
-(systemd 257, Docker 26.1.5), not assumed. A probe target is data: it becomes
-one argv element and never command text, never a format string, never a
-template, never a shell fragment.
+Every argv is fixed, and every one was **verified against the real tool**
+(systemd 257), not assumed. A probe target is data: it becomes one argv
+element and never command text, never a format string, never a template,
+never a shell fragment. Docker-specific package-update health probes existed
+through an earlier iteration of this stage and were removed end-to-end (v0.5
+health scope reduction); the remaining commands are `systemctl show` for the
+advanced `systemd_unit_active` contract and one fixed, argument-less
+`/bin/true` for the built-in `guest_operational` baseline.
 
 For a guest on the local node there is no shell at all — it is `pct exec`
 argv, straight through. The one place a command *line* exists is routing to
@@ -2617,10 +2653,10 @@ makes it safe.** The kind-specific validation below already restricts a target
 to characters a shell reads as nothing at all; the guest-command dispatcher
 names the request-derived element explicitly and refuses to route it if it
 would need a single quote adding, reporting the probe unevaluable instead. So
-the property is checked rather than claimed. The constants around it — notably
-the Docker `--format` template, whose braces this file owns — are quoted
-normally: their content is fixed and reviewed, the caller's is not, and only
-the caller's is subject to that rule.
+the property is checked rather than claimed. The constants around it — the
+fixed `systemctl`/`pct exec` argv this file owns — are quoted normally: their
+content is fixed and reviewed, the caller's is not, and only the caller's is
+subject to that rule.
 
 **`systemd_unit_active`**
 
@@ -2659,84 +2695,61 @@ success with `ActiveState=inactive`: a unit that is not there is definitively
 not active. An unreadable, empty, multi-block, or unrecognised answer is
 UNKNOWN. "The command ran" is never a PASS.
 
-**`docker_container_running` and `docker_container_healthy`**
+**`guest_operational`**
 
 ```text
-env LC_ALL=C docker ps --all --no-trunc --quiet              # daemon oracle
-env LC_ALL=C docker inspect --type container --format <CONST> -- <name>
-env LC_ALL=C docker ps --all --no-trunc --format '{{json .Names}}'
-                                                               # absence proof
+/bin/true
 ```
 
-No pipelines, no `docker ps | grep`, and no interpolated format string: the
-template is a constant owned by Hubinet
-(`{{.Name}}\t{{.State.Running}}\t{{if .State.Health}}{{.State.Health.Status}}{{else}}<none>{{end}}`).
-`--type container` stops an image of the same name matching, and `--` is
-honoured (verified: `-- --help` is treated as a container name).
+An absolute path (never resolved through a guest `PATH`), never built from,
+or carrying, anything the operator supplied — there is no argument at all.
+`/bin/true` is part of every supported Debian/Ubuntu LXC's base `coreutils`
+install. Exit `0` after the exact current resource context revalidated is
+DECISIVE PASS from a single execution; anything else this stage cannot
+positively prove otherwise is UNKNOWN. There is deliberately no FAIL outcome
+for this kind at all — infrastructure uncertainty about a guest this stage
+cannot positively prove down is never turned into a failure of a workload
+this kind does not name (there is no workload declared; this kind names
+none). See "The `guest_operational` baseline is independent of settling"
+below for why this command is never run more than once per evaluation
+attempt.
 
-`docker inspect` resolves a container by name **or by ID prefix** (verified),
-so the returned `.Name` must equal exactly `/<target>`: an ID-prefix resolution
-reports a different name and is refused rather than accepted as the named
-container.
-
-An inspect timeout or output overflow is classified before its normally
-non-zero killed-process return code. Any other non-zero inspect is not absence
-merely because the daemon answers. The fixed final command above was verified
-against Docker 26.1.5 on the development host: it is accepted by `docker ps`
-and emits each listed container's complete `.Names` value as one JSON string.
-The helper decodes every bounded line as JSON and compares the requested name
-exactly. Only a successful, well-formed listing in which that exact name is
-absent yields `container_absent`; an unavailable/timed-out/overflowing/
-malformed listing, or a generic inspect failure while the name remains listed,
-is UNKNOWN. No English stderr is parsed.
-
-`docker_container_healthy` is never downgraded to "running". It requires
-`.State.Running` true **and** `.State.Health.Status` exactly `healthy`. Not
-running, `unhealthy`, and *no HEALTHCHECK at all* are each a definitive FAIL,
-because the operator specifically demanded Docker health.
-
-**Bounded health settling closes the entire transient family, not only
-`starting` (post-Human1 Stage 1).** `starting` was Docker's first observed
-transient state (a real Human1 job that legitimately restarted
-Docker/containerd as part of its approved package plan observed every
-declared container `starting` at the instant this probe ran and `healthy`
-again seconds later, with no operator action in between), but it is one
-member of a general family: every ordinary package-triggered
-Docker/systemd restart puts the exact objects a health contract names
-through a state machine, and none of Docker's `starting`/`created`/
-`restarting`/`removing` or systemd's `activating`/`deactivating`/
+**Bounded health settling closes the entire transient family for the
+advanced `systemd_unit_active` contract, not only one state (post-Human1
+Stage 1).** A real Human1 job legitimately restarted Docker/containerd as
+part of its approved package plan (back when Docker-specific health probes
+still existed) and observed a declared object transiently unsettled at the
+instant a probe ran, then settled again seconds later with no operator
+action in between. That is one member of a general family: every ordinary
+package-triggered restart puts the exact objects a health contract names
+through a state machine, and none of systemd's `activating`/`deactivating`/
 `reloading`/pending-`Job` states is a workload verdict.
 
-`deploy/hubinet-package-health-helper.py` now owns a **bounded settling
-window** entirely inside its one `evaluate_health_contract` round trip
-(`PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS = 300` already gave this transport
-the headroom): up to `SETTLING_DEADLINE_SECONDS` (180s), observing the
-COMPLETE frozen probe set every `OBSERVATION_INTERVAL_SECONDS` (5s), in
-ROUNDS batched per family — at most one `docker ps` (daemon oracle and
-positively-proven absence set, mapped by name), one `docker inspect`
-(batched across every Docker target, mapped by returned `.Name`, never by
-position or ID prefix), and one `systemctl show --property=Job` (batched
-across every systemd target, mapped BY POSITION — verified
-`ssh.service`/`sshd.service` share the identical `Id`) per round, never one
-guest command per probe. A round is **decisive** only once it is at least
-the `MIN_DECISIVE_ROUND`-th (2), completed within `MAX_ROUND_SPAN_SECONDS`
-(15s), and left no probe transient; only a decisive round may terminate the
-contract PASSED or FAILED, and evidence from different rounds is never
-merged — an earlier PASS contributes no terminal authority once a later
-round proves a different probe FAILED. Structural target problems
-(glob-like, ambiguous) are computed once, spend no guest command, and never
-wait out the window. `exited`/`dead`/`paused`, `unhealthy`, no HEALTHCHECK,
-and empty-`Job` `inactive`/`failed`/`maintenance` remain definitive FAILs,
-exactly as before.
+`deploy/hubinet-package-health-helper.py` owns a **bounded settling window**,
+for the advanced `systemd_unit_active` contract ONLY, entirely inside its one
+`evaluate_health_contract` round trip (`PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS
+= 300` already gave this transport the headroom): up to
+`SETTLING_DEADLINE_SECONDS` (180s), observing the COMPLETE frozen probe set
+every `OBSERVATION_INTERVAL_SECONDS` (5s), in ROUNDS batched into one
+`systemctl show --property=Job` call per round — mapped BY POSITION, verified
+`ssh.service`/`sshd.service` share the identical `Id` — never one guest
+command per probe. A round is **decisive** only once it is at least the
+`MIN_DECISIVE_ROUND`-th (2), completed within `MAX_ROUND_SPAN_SECONDS` (15s),
+and left no probe transient; only a decisive round may terminate the contract
+PASSED or FAILED, and evidence from different rounds is never merged — an
+earlier PASS contributes no terminal authority once a later round proves a
+different probe FAILED. Structural target problems (glob-like, ambiguous) are
+computed once, spend no guest command, and never wait out the window.
+Empty-`Job` `inactive`/`failed`/`maintenance` remain definitive FAILs, exactly
+as before.
 
-An evaluation that never settles either way within the bounded window
-writes no durable verdict — like `docker_daemon_unavailable` always did —
-but (Stage 2) now persists the LAST complete round's bounded per-probe
-evidence (index, outcome, reason — `kind`/`target` joined from the frozen
-probe rows, never repeated) plus settling metadata (rounds, settled
-seconds, last round span) in the job's event history, so an operator can see
-exactly which probe is still unresolved and why without shell or SQLite
-access. The job stays ACTIVE at `health_started` with its snapshot and
+An evaluation that never settles either way within the bounded window writes
+no durable verdict, but (Stage 2) now persists the LAST complete round's
+bounded per-probe evidence (index, outcome, reason — `kind`/`target` joined
+from the frozen probe rows, never repeated) plus settling metadata (rounds,
+settled seconds, last round span) in the job's event history, so an operator
+can see exactly which probe is still unresolved and why without shell or
+SQLite access. The job stays ACTIVE at `health_started` with its snapshot and
 rollback authority intact, and a **distinct** `can_rerun_health_evaluation`
 capability — never the generic `can_resume_update`, which is narrowed to
 exclude this checkpoint precisely because "Resume" is not a truthful label
@@ -2745,6 +2758,37 @@ same `/resume` liveness entrypoint. No retry policy, timer, or grace period
 exists ABOVE this bounded window: one worker wake performs one bounded
 settling attempt, and reaching its deadline still ends the attempt, exactly
 as reaching any other UNKNOWN classification always did.
+
+### The `guest_operational` baseline is independent of settling
+
+**Major fix (v0.5 health scope reduction).** At the pre-reduction SHA,
+`evaluate_health_contract_settling` applied the ADVANCED settling rules above
+— `MAX_ROUND_SPAN_SECONDS`, `MIN_DECISIVE_ROUND`, the observation-interval
+sleep loop — to a `guest_operational`-only contract too, because the loop
+processed every declared probe generically regardless of kind. The concrete
+bad witness: the exact resource context succeeds, `/bin/true` exits `0` after
+16 seconds (slower than `MAX_ROUND_SPAN_SECONDS`, comfortably inside the
+settling deadline) — the successful observation was discarded as
+non-decisive, the command ran again, and repeated successful executions
+still exhausted the deadline as UNKNOWN, leaving the job stuck ACTIVE at
+`health_started` for a workload that never actually failed.
+
+The fix is structural independence, not a larger threshold: increasing
+`MAX_ROUND_SPAN_SECONDS` would only move the witness, not remove it. A
+`guest_operational`-only request never reaches
+`evaluate_health_contract_settling` at all. `handle_request` branches on the
+validated contract's kind and calls `_evaluate_guest_operational_once`
+directly for the baseline: ONE execution of `/bin/true`, no sleep, no second
+confirmation round, and no `MAX_ROUND_SPAN_SECONDS`/`MIN_DECISIVE_ROUND` gate
+of any kind. Exit `0` is `evaluation_status: decisive` immediately, from
+exactly one guest command. A stopped/unavailable guest, a command timeout, or
+any host/transport/context uncertainty is UNKNOWN after exactly that one
+attempt — no automatic retry, no settling window, no automatic rollback; an
+operator's explicit rerun remains available exactly as it does for the
+advanced contract's own UNKNOWN outcomes. This is also why the two contract
+shapes may never mix (`PRODUCT.md`, "Exactly two supported contract shapes"):
+mixing them would silently reintroduce the settling coupling this
+independence removes.
 
 ### PR #80 review remediation: typed decisiveness, a real deadline, and independent HA proof
 
@@ -2846,17 +2890,20 @@ or unit, carries no target (`target IS NULL`, `CHECK`-enforced, mirrored by
 `/bin/true` on the guest, an absolute path, no operator input, no shell -- so
 its only claim is "the exact current LXC remained reachable through the
 trusted PVE boundary and executed a command", never "a workload is up".
-`_guest_operational_round` can only ever produce PASS
-(`guest_operational_confirmed`) or UNKNOWN (`command_timed_out` /
-`malformed_output` / `command_failed`, and `guest_unavailable` when the
-live-target revalidation that precedes every guest command proves the guest
-went away, moved node, or is not running); it never FAILs, because a guest
-that cannot currently run a trivial command is a liveness question, not proof
-this contract was violated. A guest PVE positively reports STOPPED is refused
-by `handle_request`'s own prologue before any round, as a whole-request
-`guest_unavailable` — which the backend maps to UNKNOWN through
-`HOST_REFUSAL_REASONS` and now publishes as `health.reason` (see "Job-bound
-healthcheck execution" above). Explicit rollback stays available throughout:
+`_evaluate_guest_operational_once` -- called directly by `handle_request`,
+never through the advanced settling loop, exactly once per evaluation attempt
+(see "The `guest_operational` baseline is independent of settling" above) --
+can only ever produce PASS (`guest_operational_confirmed`) or UNKNOWN
+(`command_timed_out` / `malformed_output` / `command_failed`, and
+`guest_unavailable` when the live-target revalidation that precedes every
+guest command proves the guest went away, moved node, or is not running); it
+never FAILs, because a guest that cannot currently run a trivial command is a
+liveness question, not proof this contract was violated. A guest PVE
+positively reports STOPPED is refused by `handle_request`'s own prologue
+before any command, as a whole-request `guest_unavailable` — which the
+backend maps to UNKNOWN through `HOST_REFUSAL_REASONS` and now publishes as
+`health.reason` (see "Job-bound healthcheck execution" above). Explicit
+rollback stays available throughout:
 `health_started` is a rollback-eligible checkpoint and
 `_post_mutation_job_context_is_current` imposes no running-status
 requirement. A partial unique index
@@ -2867,13 +2914,13 @@ treats every `NULL` as distinct from every other `NULL`.
 **Why v0.5 does not discover workloads.** Absence of a workload observer is
 not proof of workload absence, so v0.5 does not infer workload health
 automatically. There is deliberately no candidate-discovery operation, no
-adapter-presence oracle, no `docker ps`/`docker inspect`/`systemctl
-list-unit-files`/`systemctl list-units` read for discovery purposes, no
-recommendation ranking, and no rule of the shape "Docker absent AND systemd
-absent -> guest_operational". Docker and systemd probes remain fully
-supported as **explicit advanced operator configuration**, executed by the
-job-bound helper exactly as described above; their absence or failure has no
-influence at all on the default path.
+adapter-presence oracle, no `systemctl list-unit-files`/`systemctl
+list-units` read for discovery purposes, no recommendation ranking, and no
+rule of the shape "systemd absent -> guest_operational". `systemd_unit_active`
+remains fully supported as **explicit advanced operator configuration**,
+executed by the job-bound helper exactly as described above; its absence or
+failure has no influence at all on the default path. Docker-specific
+package-update health probes are not part of v0.5 at all any more.
 
 **Where the default is created.** `InventoryAuthority.
 _provision_default_health_contracts` runs inside the successful-reconciliation
@@ -2893,8 +2940,8 @@ properties are load-bearing:
   command runs (`tests/test_resource_health_contract.py`,
   `test_default_provisioning_runs_no_guest_command_at_all`);
 - **an explicit contract always wins** -- the query only ever selects
-  resources with no contract row, so an operator's advanced Docker/systemd
-  contract is never seen, compared, or overwritten;
+  resources with no contract row, so an operator's advanced systemd contract
+  is never seen, compared, or overwritten;
 - **it is idempotent** -- a second reconciliation of the same inventory
   selects nothing, allocates no revision, and writes no row, so contract
   revisions do not churn with the discovery cadence.
@@ -2917,8 +2964,8 @@ reconciliation re-provisions the default for it.
 ### Native HA health maintenance
 
 Home Assistant is presentation plus explicit operator actions. It does not
-discover Docker, does not discover systemd, does not decide workload
-importance, and does not create the default from guest inspection -- the
+discover systemd, does not decide workload importance, and does not create
+the default from guest inspection -- the
 backend owns all of it. There is no health-onboarding step in the normal
 update flow at all: a managed LXC already carries the built-in contract before
 its first update, so **review -> approve -> Start** never detours through
@@ -2934,7 +2981,7 @@ the flow looked at it, is sent back as `expected_revision`; a concurrent
 change is `HubinetOpsConflict`, refused and reported rather than silently
 overwritten, and the flow re-reads current state so a retry is against
 reality. The `hubinet_ops.set_health_contract` action remains the supported
-way to declare an advanced Docker/systemd contract by hand, and
+way to declare an advanced `systemd_unit_active` contract by hand, and
 `hubinet_ops.reset_health_contract` is the same reset as an action.
 
 The `health_contract_unconfigured` Repair (see "Human1 defect A" in
@@ -2949,8 +2996,8 @@ on its own. There is no fix flow, no candidate rendering, and no
 `test_no_backend_or_integration_module_still_names_health_discovery`) proves
 the default/onboarding path contains no adapter, runtime, socket, process, or
 candidate-discovery vocabulary, while deliberately leaving the job-bound
-helper free to keep running the Docker and systemd commands explicit advanced
-probes need.
+helper free to keep running the `systemctl` command the explicit advanced
+contract needs.
 
 ### Restart, retry, and rollback
 
@@ -2985,7 +3032,7 @@ majority, or OR logic anywhere in this stage.
 
 Every host round trip happens strictly outside the authority store's writer
 transactions. Nothing holds `BEGIN IMMEDIATE` across SSH, `pct`, `systemctl`,
-`docker`, or the probe loop — affordable precisely because a read-only
+or the probe loop — affordable precisely because a read-only
 evaluation needs no critical section to prevent a second destructive
 submission, unlike the snapshot, mutation, and rollback boundaries. The
 authority transitions are short and local: start the evaluation, or atomically

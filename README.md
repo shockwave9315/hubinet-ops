@@ -40,20 +40,23 @@ a guest in Proxmox never requires touching this repository or its config.
   reference reviewed during the current runtime, fresh-reads it again before
   approval, and forgets it on reload. The backend independently revalidates
   the same reference. Approval never executes an update.
-- Per-resource health contracts: the list of typed probes
-  (`systemd_unit_active`, `docker_container_running`,
-  `docker_container_healthy`, and the targetless `guest_operational`) that
-  must **all** hold for that workload to count as up. **v0.5 gives every
+- Per-resource health contracts: either the targetless `guest_operational`
+  singleton (the built-in baseline) or one or more `systemd_unit_active`
+  probes (an explicit advanced contract) — never both in the same contract —
+  that must **all** hold for that workload to count as up. **v0.5 gives every
   package-managed LXC a built-in default: one `guest_operational` probe**, so
   an approved update can start with no separate health-onboarding step. It
   proves only that the exact container is still reachable and can still run a
-  process — never application health. Hubinet Ops does **not** automatically
-  discover or recommend Docker/systemd health probes: absence of a workload
+  process — never application health, and it is a single one-shot check with
+  no settling or retry. Hubinet Ops does **not** automatically discover or
+  recommend `systemd_unit_active` health probes: absence of a workload
   observer is not proof of workload absence, so v0.5 does not infer workload
-  health automatically. Docker and systemd probes remain fully supported as
+  health automatically. `systemd_unit_active` remains fully supported as
   explicit advanced operator configuration, declared with
-  `set_health_contract`; an explicitly declared contract is never silently
-  replaced by the default. Managed through the `view_health_contract` /
+  `set_health_contract`, and REPLACES the baseline rather than extending it;
+  an explicitly declared contract is never silently replaced by the default.
+  Docker-specific package-update health probes are not part of v0.5. Managed
+  through the `view_health_contract` /
   `set_health_contract` / `reset_health_contract` Home Assistant actions and
   the routes above, with a concise contract-status sensor, a per-resource
   **View health contract** button, and a **Configure** options flow
