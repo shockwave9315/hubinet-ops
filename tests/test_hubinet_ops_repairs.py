@@ -1,14 +1,16 @@
-"""Stage 4 (v20): the health-contract Repair as a fixable discovery flow.
+"""The health-contract Repair after the v0.5 simplification.
 
-Human1 defect A's issue (an approved plan stuck on an unconfigured health
-contract) is raised exactly as before -- see test_hubinet_ops_integration.py.
-These tests cover what changed: the issue is now `is_fixable=True`, and
-fixing it drives `discover -> render -> confirm -> declare` entirely through
-native Home Assistant Repairs, with zero YAML, zero Developer Tools, and zero
-manually-typed probe rows. Discovery is ephemeral throughout: nothing this
-flow does persists a candidate on Home Assistant's side, and nothing reaches
-the backend as a declared contract until the operator explicitly submits the
-confirm step.
+Human1 defect A was an approved plan stuck on an unconfigured health
+contract, with no discoverable continuation. v0.5 removes that dead end at
+its source: the backend gives every current package-managed LXC a built-in
+``guest_operational`` contract, so a normally managed resource never reaches
+the state this Repair describes.
+
+What is left is a narrow, NON-fixable safety net for the state that can still
+occur (an operator used the low-level clear API). These tests pin exactly
+that: the issue is still raised and still cleared correctly, it is NOT
+fixable, this module exposes no discovery/candidate flow at all, and the
+strings it renders point at the two explicit operator surfaces instead.
 """
 
 from __future__ import annotations
@@ -20,26 +22,13 @@ import pytest
 
 pytest.importorskip("homeassistant", reason="isolated HA test dependencies not installed")
 
-from homeassistant.components.repairs import repairs_flow_manager
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.setup import async_setup_component
 
+from custom_components.hubinet_ops import repairs as repairs_module
 from custom_components.hubinet_ops.api import (
     HealthContractStatus,
-    HealthDiscoveryAdapter,
-    HealthDiscoveryCandidate,
-    HealthDiscoveryRecommendationBasis,
-    HealthDiscoveryResult,
-    HealthDiscoveryRoleHint,
-    HealthDiscoveryStatus,
-    HealthProbeKind,
-    HubinetOpsCannotConnect,
-    HubinetOpsConflict,
     PackagePlanApprovalStatus,
 )
-from custom_components.hubinet_ops.const import DOMAIN
-from custom_components.hubinet_ops.repairs import _candidate_field
 
 from tests.test_hubinet_ops_integration import (
     FakeTransport,
@@ -58,55 +47,10 @@ def auto_enable_custom_integrations(enable_custom_integrations, socket_enabled):
     yield
 
 
-def _docker_candidate(**overrides) -> HealthDiscoveryCandidate:
-    fields = {
-        "adapter": HealthDiscoveryAdapter.DOCKER,
-        "kind": HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        "target": "weatherhub-redis-1",
-        "observed_state": "running",
-        "origin": None,
-        "role_hint": HealthDiscoveryRoleHint.WORKLOAD_CANDIDATE,
-        "recommended": True,
-        "rationale": "docker healthcheck reports healthy",
-    }
-    fields.update(overrides)
-    return HealthDiscoveryCandidate(**fields)
-
-
-def _systemd_candidate(**overrides) -> HealthDiscoveryCandidate:
-    fields = {
-        "adapter": HealthDiscoveryAdapter.SYSTEMD,
-        "kind": HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
-        "target": "weatherhub.service",
-        "observed_state": "active",
-        "origin": None,
-        "role_hint": HealthDiscoveryRoleHint.WORKLOAD_CANDIDATE,
-        "recommended": False,
-        "rationale": "the only enabled non-platform unit",
-    }
-    fields.update(overrides)
-    return HealthDiscoveryCandidate(**fields)
-
-
-def _guest_operational_candidate(**overrides) -> HealthDiscoveryCandidate:
-    fields = {
-        "adapter": HealthDiscoveryAdapter.GUEST,
-        "kind": HealthProbeKind.GUEST_OPERATIONAL,
-        "target": None,
-        "observed_state": "unknown",
-        "origin": None,
-        "role_hint": HealthDiscoveryRoleHint.WORKLOAD_CANDIDATE,
-        "recommended": True,
-        "rationale": "guest_fallback",
-    }
-    fields.update(overrides)
-    return HealthDiscoveryCandidate(**fields)
-
-
 async def _setup_blocked_resource(
     hass: HomeAssistant, **transport_kwargs
 ) -> tuple[FakeTransport, str]:
-    """Bring up one entry with the exact approved/unconfigured dead end.
+    """Bring up one entry with the approved/unconfigured state.
 
     Returns ``(transport, issue_id)``.
     """
@@ -118,358 +62,86 @@ async def _setup_blocked_resource(
 
     transport = FakeTransport([snapshot((planned,))], **transport_kwargs)
     await setup_entry(hass, transport)
-    issues = _health_contract_repair_ids(hass)
-    assert len(issues) == 1
-    return transport, next(iter(issues))
-
-
-async def _init_fix_flow(hass: HomeAssistant, issue_id: str):
-    assert await async_setup_component(hass, "repairs", {})
-    flow_manager = repairs_flow_manager(hass)
-    assert flow_manager is not None
-    return flow_manager, await flow_manager.async_init(
-        DOMAIN, data={"issue_id": issue_id}
-    )
+    (issue_id,) = _health_contract_repair_ids(hass)
+    return transport, issue_id
 
 
 @pytest.mark.asyncio
-async def test_fix_flow_declares_the_recommended_docker_candidate(
-    hass: HomeAssistant,
-) -> None:
-    candidate = _docker_candidate()
-    transport, issue_id = await _setup_blocked_resource(
-        hass,
-        health_discovery_results={
-            RESOURCE_CT: HealthDiscoveryResult(
-                resource_id=RESOURCE_CT,
-                status=HealthDiscoveryStatus.OK,
-                candidates=(candidate,),
-                recommendation_basis=HealthDiscoveryRecommendationBasis.DOCKER_HEALTHCHECK,
-            )
-        },
-    )
+async def test_the_repair_is_raised_but_is_not_fixable(hass: HomeAssistant) -> None:
+    """The remedy is a backend product default plus two explicit operator
+    surfaces -- never a Home-Assistant-side discovery flow."""
 
-    flow_manager, result = await _init_fix_flow(hass, issue_id)
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "confirm"
-    assert transport.health_discovery_reads == [RESOURCE_CT]
+    from homeassistant.helpers import issue_registry as ir
 
-    field = _candidate_field(candidate)
-    # The recommended candidate is pre-selected -- submitting the schema's
-    # own defaults unchanged must be enough to declare it.
-    result = await flow_manager.async_configure(result["flow_id"], {field: True})
+    _transport, issue_id = await _setup_blocked_resource(hass)
+    issue = ir.async_get(hass).async_get_issue("hubinet_ops", issue_id)
 
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    written_resource_id, written_probes, written_revision = transport.health_contract_writes[0]
-    assert written_resource_id == RESOURCE_CT
-    # Compare-and-set on the issue's own premise: `0` asserts "currently
-    # unconfigured", which is the only reason this Repair was raised. An
-    # unconditional (`None`) write would silently overwrite a contract
-    # declared while this flow was discovering (PR #80 final review).
-    assert written_revision == 0
-    assert len(written_probes) == 1
-    assert written_probes[0].kind is HealthProbeKind.DOCKER_CONTAINER_HEALTHY
-    assert written_probes[0].target == "weatherhub-redis-1"
-
-    # The issue clears itself: fixing it is exactly the same as an operator
-    # declaring the contract by hand.
-    assert _health_contract_repair_ids(hass) == set()
+    assert issue is not None
+    assert issue.is_fixable is False
+    assert issue.severity is ir.IssueSeverity.WARNING
+    assert issue.translation_key == "health_contract_unconfigured"
+    assert issue.translation_placeholders == {"name": "CT101 Cloudflared"}
 
 
-@pytest.mark.asyncio
-async def test_fix_flow_lets_the_operator_deselect_a_non_recommended_candidate(
-    hass: HomeAssistant,
-) -> None:
-    """Two containers are running; only one has a Docker healthcheck.
+def test_the_repairs_module_exposes_no_discovery_or_fix_flow() -> None:
+    """Load-bearing: the removed `discover -> render -> confirm -> declare`
+    surface must be gone, not merely unreachable.
 
-    Both are shown, only the healthchecked one is pre-selected -- and the
-    operator's own unchanged submission must leave the other one out.
+    Leaving it behind would advertise automatic workload discovery this
+    product deliberately does not do -- absence of a workload observer is not
+    proof of workload absence, so v0.5 infers no workload health at all.
     """
 
-    healthchecked = _docker_candidate()
-    running_only = _docker_candidate(
-        kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-        target="weatherhub-nginx-1",
-        recommended=False,
-        rationale="running, no healthcheck configured",
-    )
-    transport, issue_id = await _setup_blocked_resource(
-        hass,
-        health_discovery_results={
-            RESOURCE_CT: HealthDiscoveryResult(
-                resource_id=RESOURCE_CT,
-                status=HealthDiscoveryStatus.OK,
-                candidates=(healthchecked, running_only),
-                recommendation_basis=HealthDiscoveryRecommendationBasis.DOCKER_HEALTHCHECK,
-            )
-        },
-    )
+    assert not hasattr(repairs_module, "async_create_fix_flow")
+    assert not hasattr(repairs_module, "HealthContractDiscoveryFixFlow")
+    assert not hasattr(repairs_module, "_candidate_field")
 
-    flow_manager, result = await _init_fix_flow(hass, issue_id)
-    result = await flow_manager.async_configure(
-        result["flow_id"], {_candidate_field(healthchecked): True}
-    )
-
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    _, written_probes, _ = transport.health_contract_writes[0]
-    assert len(written_probes) == 1
-    assert written_probes[0].target == "weatherhub-redis-1"
+    source = Path(repairs_module.__file__).read_text(encoding="utf-8")
+    for marker in (
+        "async_fetch_health_candidates",
+        "HealthDiscovery",
+        "UNDECIDED_DISCOVERY_STATUSES",
+        "RepairsFlow",
+        "docker ps",
+        "systemctl",
+        "command -v",
+    ):
+        assert marker not in source, marker
 
 
-@pytest.mark.asyncio
-async def test_fix_flow_requires_at_least_one_selection(hass: HomeAssistant) -> None:
-    candidate = _docker_candidate()
-    transport, issue_id = await _setup_blocked_resource(
-        hass,
-        health_discovery_results={
-            RESOURCE_CT: HealthDiscoveryResult(
-                resource_id=RESOURCE_CT,
-                status=HealthDiscoveryStatus.OK,
-                candidates=(candidate,),
-                recommendation_basis=HealthDiscoveryRecommendationBasis.DOCKER_HEALTHCHECK,
-            )
-        },
-    )
-
-    flow_manager, result = await _init_fix_flow(hass, issue_id)
-    result = await flow_manager.async_configure(
-        result["flow_id"], {_candidate_field(candidate): False}
-    )
-
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "confirm"
-    assert result["errors"] == {"base": "no_candidates_selected"}
-    assert transport.health_contract_writes == []
-    # Nothing was declared -- the issue must still be open.
-    assert len(_health_contract_repair_ids(hass)) == 1
-
-
-@pytest.mark.asyncio
-async def test_fix_flow_writes_the_guest_fallback_with_a_null_target(
-    hass: HomeAssistant,
-) -> None:
-    """The one rule that must never slip, end to end: a targetless fallback
-    probe reaches the backend as `target: null`, never a faked target."""
-
-    candidate = _guest_operational_candidate()
-    transport, issue_id = await _setup_blocked_resource(
-        hass,
-        health_discovery_results={
-            RESOURCE_CT: HealthDiscoveryResult(
-                resource_id=RESOURCE_CT,
-                status=HealthDiscoveryStatus.NO_CANDIDATES,
-                candidates=(candidate,),
-                recommendation_basis=HealthDiscoveryRecommendationBasis.GUEST_FALLBACK,
-            )
-        },
-    )
-
-    flow_manager, result = await _init_fix_flow(hass, issue_id)
-    result = await flow_manager.async_configure(
-        result["flow_id"], {_candidate_field(candidate): True}
-    )
-
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    _, written_probes, _ = transport.health_contract_writes[0]
-    assert len(written_probes) == 1
-    assert written_probes[0].kind is HealthProbeKind.GUEST_OPERATIONAL
-    assert written_probes[0].target is None
-
-
-@pytest.mark.asyncio
-async def test_fix_flow_lets_the_operator_choose_among_ambiguous_candidates(
-    hass: HomeAssistant,
-) -> None:
-    first = _systemd_candidate(target="weatherhub-api.service")
-    second = _systemd_candidate(target="weatherhub-worker.service")
-    transport, issue_id = await _setup_blocked_resource(
-        hass,
-        health_discovery_results={
-            RESOURCE_CT: HealthDiscoveryResult(
-                resource_id=RESOURCE_CT,
-                status=HealthDiscoveryStatus.AMBIGUOUS_CANDIDATES,
-                candidates=(first, second),
-                recommendation_basis=None,
-            )
-        },
-    )
-
-    flow_manager, result = await _init_fix_flow(hass, issue_id)
-    # Neither is pre-selected -- the operator must pick.
-    result = await flow_manager.async_configure(
-        result["flow_id"],
-        {_candidate_field(first): True, _candidate_field(second): False},
-    )
-
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    _, written_probes, _ = transport.health_contract_writes[0]
-    assert len(written_probes) == 1
-    assert written_probes[0].target == "weatherhub-api.service"
-
-
-@pytest.mark.parametrize(
-    "status",
-    [
-        HealthDiscoveryStatus.GUEST_UNAVAILABLE,
-        HealthDiscoveryStatus.UNDECIDABLE,
-        HealthDiscoveryStatus.TOO_MANY_CANDIDATES,
-    ],
-)
-@pytest.mark.asyncio
-async def test_fix_flow_aborts_on_undecided_discovery(
-    hass: HomeAssistant, status: HealthDiscoveryStatus
-) -> None:
-    """Discovery uncertainty must never be rendered as if it were a choice --
-    the flow aborts and leaves the issue open, exactly as before Stage 4."""
-
-    transport, issue_id = await _setup_blocked_resource(
-        hass,
-        health_discovery_results={
-            RESOURCE_CT: HealthDiscoveryResult(
-                resource_id=RESOURCE_CT, status=status, candidates=(), recommendation_basis=None
-            )
-        },
-    )
-
-    _, result = await _init_fix_flow(hass, issue_id)
-
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == status.value
-    assert transport.health_contract_writes == []
-    assert len(_health_contract_repair_ids(hass)) == 1
-
-
-@pytest.mark.asyncio
-async def test_fix_flow_aborts_when_discovery_itself_fails(hass: HomeAssistant) -> None:
-    transport, issue_id = await _setup_blocked_resource(
-        hass, health_discovery_error=HubinetOpsCannotConnect("backend unreachable")
-    )
-
-    _, result = await _init_fix_flow(hass, issue_id)
-
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "discovery_failed"
-    assert len(_health_contract_repair_ids(hass)) == 1
-
-
-def test_fix_flow_translations_are_structural() -> None:
-    """Every abort reason and error the flow can return, and the confirm
-    step itself, must resolve in both English and Polish -- mirroring the
-    existing HUMAN1-ERROR-I18N-01 discipline for exceptions."""
+def test_the_issue_translations_are_structural_and_carry_no_fix_flow() -> None:
+    """Every string this issue renders must resolve in both English and
+    Polish -- mirroring the existing HUMAN1-ERROR-I18N-01 discipline."""
 
     integration_root = Path(__file__).parents[1] / "custom_components" / "hubinet_ops"
-    strings = json.loads((integration_root / "strings.json").read_text())
-    english = json.loads((integration_root / "translations" / "en.json").read_text())
-    polish = json.loads((integration_root / "translations" / "pl.json").read_text())
+    strings = json.loads((integration_root / "strings.json").read_text(encoding="utf-8"))
+    english = json.loads(
+        (integration_root / "translations" / "en.json").read_text(encoding="utf-8")
+    )
+    polish = json.loads(
+        (integration_root / "translations" / "pl.json").read_text(encoding="utf-8")
+    )
 
     assert strings["issues"] == english["issues"]
     assert set(strings["issues"]) == set(polish["issues"])
 
-    fix_flow = strings["issues"]["health_contract_unconfigured"]["fix_flow"]
-    polish_fix_flow = polish["issues"]["health_contract_unconfigured"]["fix_flow"]
-    assert set(fix_flow["abort"]) == set(polish_fix_flow["abort"])
-    assert set(fix_flow["error"]) == set(polish_fix_flow["error"])
-    assert set(fix_flow["step"]) == set(polish_fix_flow["step"])
-    for section in ("abort", "error"):
-        for key, message in polish_fix_flow[section].items():
-            assert isinstance(message, str) and message
-
-    # Every abort reason `async_step_init` can actually return must resolve.
-    expected_abort_reasons = {
-        "entry_not_loaded",
-        "resource_not_found",
-        "discovery_failed",
-        "guest_unavailable",
-        "undecidable",
-        "too_many_candidates",
-        "no_candidates_discovered",
-    }
-    assert expected_abort_reasons <= set(fix_flow["abort"])
-    assert {"no_candidates_selected", "declare_failed"} <= set(fix_flow["error"])
-
-
-# ===========================================================================
-# PR #80 FINAL REVIEW MINOR-3: the first declaration is a compare-and-set.
-#
-# This Repair exists only because current truth says the contract is
-# UNCONFIGURED, and `expected_revision=0` is exactly the backend's assertion
-# of that. An unconditional write silently replaced a contract another
-# operator declared between this flow's discovery read and its submit.
-# ===========================================================================
-
-
-@pytest.mark.asyncio
-async def test_fix_flow_declaration_is_refused_when_a_contract_appears_mid_flow(
-    hass: HomeAssistant,
-) -> None:
-    """A REAL race: a concurrent writer declares revision 1 while this fix
-    flow is open. The submit must be sent with `expected_revision=0`, be
-    refused, write nothing, and NOT retry blindly."""
-
-    candidate = _docker_candidate()
-    transport, issue_id = await _setup_blocked_resource(
-        hass,
-        health_discovery_results={
-            RESOURCE_CT: HealthDiscoveryResult(
-                resource_id=RESOURCE_CT,
-                status=HealthDiscoveryStatus.OK,
-                candidates=(candidate,),
-                recommendation_basis=HealthDiscoveryRecommendationBasis.DOCKER_HEALTHCHECK,
-            )
-        },
-    )
-
-    flow_manager, result = await _init_fix_flow(hass, issue_id)
-    assert result["step_id"] == "confirm"
-
-    attempted_revisions: list[int | None] = []
-    stored_before = dict(transport.health_contracts)
-
-    async def racing(resource_id, probes, expected_revision):
-        attempted_revisions.append(expected_revision)
-        # A concurrent writer got there first: the resource is no longer
-        # unconfigured, so the CAS this flow is holding cannot hold.
-        raise HubinetOpsConflict("resource health contract revision does not match")
-
-    transport.replace_health_contract = racing
-
-    result = await flow_manager.async_configure(
-        result["flow_id"], {_candidate_field(candidate): True}
-    )
-
-    # Aborted on the exact typed reason -- never a create-entry, and never a
-    # second attempt with a different (or the same) revision.
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "contract_already_declared"
-    assert attempted_revisions == [0]
-    # The stale flow wrote nothing at all.
-    assert transport.health_contract_writes == []
-    assert transport.health_contracts == stored_before
-
-
-@pytest.mark.asyncio
-async def test_positive_control_a_still_unconfigured_resource_declares_with_cas_zero(
-    hass: HomeAssistant,
-) -> None:
-    """Load-bearing: adding the CAS must not break the ordinary path. Still
-    unconfigured means `expected_revision=0` succeeds exactly as before."""
-
-    candidate = _docker_candidate()
-    transport, issue_id = await _setup_blocked_resource(
-        hass,
-        health_discovery_results={
-            RESOURCE_CT: HealthDiscoveryResult(
-                resource_id=RESOURCE_CT,
-                status=HealthDiscoveryStatus.OK,
-                candidates=(candidate,),
-                recommendation_basis=HealthDiscoveryRecommendationBasis.DOCKER_HEALTHCHECK,
-            )
-        },
-    )
-    flow_manager, result = await _init_fix_flow(hass, issue_id)
-    result = await flow_manager.async_configure(
-        result["flow_id"], {_candidate_field(candidate): True}
-    )
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert [write[2] for write in transport.health_contract_writes] == [0]
-    assert _health_contract_repair_ids(hass) == set()
+    for catalogue in (strings, polish):
+        issue = catalogue["issues"]["health_contract_unconfigured"]
+        # A non-fixable issue has no flow to translate, and leaving a dead
+        # `fix_flow` block behind would still advertise one in the UI.
+        assert "fix_flow" not in issue
+        assert set(issue) == {"title", "description"}
+        assert "{name}" in issue["title"]
+        assert "{name}" in issue["description"]
+        # It points at the two explicit surfaces, and never offers to find
+        # a workload for the operator. ("inventory discovery" is the PVE
+        # resource scan that restores the default -- a different thing.)
+        assert "reset_health_contract" in issue["description"]
+        assert "set_health_contract" in issue["description"]
+        for banned in (
+            "candidate",
+            "kandydat",
+            "discover candidates",
+            "Select **Fix**",
+        ):
+            assert banned not in issue["description"]

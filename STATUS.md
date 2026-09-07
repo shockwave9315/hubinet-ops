@@ -64,10 +64,9 @@
   `/operator-availability`;
   authority-metadata mutations
   (`PUT /r0/v1/resources/{resource_id}/package-plan-approval`,
-  `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`); the
-  ephemeral, read-only discovery route
-  (`GET /r0/v1/resources/{resource_id}/health-candidates`, v20 -- persists
-  nothing, grants no authority); and the explicit operator update controls
+  `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`,
+  `POST .../health-contract/reset` to restore the built-in default); and the
+  explicit operator update controls
   (`POST`/`GET /r0/v1/resources/{resource_id}/package-update`,
   `POST .../package-update/resume`, `POST .../package-update/rollback`,
   `GET /r0/v1/package-update/active`). Bearer authentication is required on
@@ -75,8 +74,9 @@
   `/r0/v1/health` liveness probe, which exposes no inventory or credential
   data.
 - **Home Assistant integration** — config flow, an options flow (v20;
-  Settings → Devices & Services → Hubinet Ops → Configure) for native
-  per-resource health-contract maintenance, coordinator, structural
+  Settings → Devices & Services → Hubinet Ops → Configure) for viewing a
+  resource's health contract and restoring the built-in default, coordinator,
+  structural
   contract validation, dynamic devices, sensors, a binary sensor, and buttons;
   package-scan summary and
   concise `none | approved | stale | consumed` approval-status sensors,
@@ -84,7 +84,7 @@
   concise per-resource package-update job status/checkpoint/package-count and
   health-outcome sensors, authoritative rollback availability, and native
   `view_update_plan` / `approve_update_plan` / `view_health_contract` /
-  `set_health_contract` / `clear_health_contract` / `start_update` /
+  `set_health_contract` / `reset_health_contract` / `start_update` /
   `view_update_job` / `resume_update` / `rollback_update` actions. Every
   response-capable action uses the native Hubinet resource-device selector and
   returns exact material — package rows, contract probes, job events — as
@@ -648,12 +648,13 @@ is how it is built. This stage shipped **configuration authority only**;
   positive revision can never become valid again, and `expected_revision=0`
   keeps meaning "currently unconfigured" rather than "never configured".
 - **Operator surface.** `GET`/`PUT`/`DELETE
-  /r0/v1/resources/{resource_id}/health-contract` with bearer auth. Failures
+  /r0/v1/resources/{resource_id}/health-contract`, plus
+  `POST .../health-contract/reset`, with bearer auth. Failures
   this API raises itself carry `{"detail": {"error", "message"}}`; a
   structurally invalid request is still rejected by FastAPI/Pydantic first,
   with its ordinary list-shaped validation body (see `ARCHITECTURE.md`). Plus
   the native Home Assistant
-  `view_health_contract` / `set_health_contract` / `clear_health_contract`
+  `view_health_contract` / `set_health_contract` / `reset_health_contract`
   actions on the existing resource-device selector. The published snapshot
   carries a concise `unsupported | unconfigured | configured` summary and its
   identity; the probe list is response data from an explicitly invoked action,
@@ -973,46 +974,39 @@ The operator-triggered update lifecycle is production reachable.
   ceilings rather than trusting Home Assistant to supply correct values —
   Home Assistant never states or overrides this policy.
 
-  **The authority schema is now v20** (bumped from v19, a normal pre-release
-  reset per `AGENTS.md`): a fourth probe kind, `guest_operational`, is a
-  fallback with no target at all (`CHECK`-enforced nullable `target`, a
-  partial unique index permitting at most one per contract) for a guest on
-  which backend discovery positively completed for both the Docker and
-  systemd families and found no workload candidate in either — it proves
-  guest liveness (`/bin/true`, fixed, no operator input), never application
-  health, and structurally can only ever PASS or UNKNOWN, never FAIL.
+  **The authority schema is v20** (bumped from v19, a normal pre-release
+  reset per `AGENTS.md`): a fourth probe kind, `guest_operational`, with no
+  target at all (`CHECK`-enforced nullable `target`, a partial unique index
+  permitting at most one per contract). It proves guest liveness
+  (`/bin/true`, fixed, no operator input), never application health, and
+  structurally can only ever PASS or UNKNOWN, never FAIL.
 
-  **Backend discovery** (`GET /r0/v1/resources/{resource_id}/health-candidates`,
-  a second ephemeral read-only operation sharing the existing forced-command
-  boundary, persisting nothing) inspects Docker (`docker ps` + batched
-  `docker inspect`, HEALTHCHECK detection) and systemd (unit-file/failed-unit
-  union, batched `systemctl show`, origin/role_hint classification by exact
-  small deny-lists) and recommends by one fixed backend-owned priority order
-  — Docker HEALTHCHECK, then Docker running, then a single unambiguous
-  systemd candidate, then (only once both families positively completed with
-  nothing found) `guest_operational`. Discovery uncertainty in either family
-  is never read as "nothing found" and can never fall through to recommending
-  the fallback.
+  **`guest_operational` is the v0.5 built-in default health criterion for a
+  package-managed LXC.** The backend provisions it inside the
+  successful-reconciliation transaction for every current managed LXC with no
+  contract of its own, so an approved update can start with no separate
+  health-onboarding step. It is a product decision, not an observation:
+  nothing reads the guest to create it, an operator's explicit contract is
+  never overwritten by it, and repeated reconciliation is idempotent.
+  `POST .../health-contract/reset` (and the `reset_health_contract` action, or
+  the Options flow) restores that baseline under the usual compare-and-set
+  discipline; `DELETE` remains the low-level clear.
 
-  **The `health_contract_unconfigured` Repair is now fixable**: its flow
-  calls discovery for the exact blocked resource, renders every candidate as
-  a checkbox (recommended ones pre-selected), and writes nothing until the
-  operator explicitly submits — through the same `async_replace_health_contract`
-  mutation `set_health_contract` already used. An undecided discovery status,
-  a transport failure, or zero candidates leaves the issue open; the manual
-  action remains a fully supported alternative.
+  **v0.5 does not automatically discover or recommend Docker/systemd
+  application health probes.** Absence of a workload observer is not proof of
+  workload absence, so v0.5 does not infer workload health automatically. The
+  candidate-discovery route, DTOs, adapter-presence oracle, recommendation
+  ranking, and the HA discovery flow were removed rather than left as a dead
+  architecture. Docker and systemd probes remain fully supported as explicit
+  advanced operator configuration, executed by the same job-bound helper as
+  before; their absence or failure has no influence on the default path.
 
-  **An already-configured resource now has a native maintenance path too**
-  (Settings → Devices & Services → Hubinet Ops → Configure, an options
-  flow): pick a resource, view its currently declared probes, re-discover
-  fresh candidates, edit the checkbox selection, and either replace the
-  contract or explicitly clear it — the CAS `expected_revision` read the
-  moment the flow looked at the contract is sent back on every write, and a
-  concurrent change is refused and reported rather than silently
-  overwritten. `set_health_contract` / `clear_health_contract` remain fully
-  supported as the manual/diagnostic path. See `ARCHITECTURE.md`, "PR #80
-  review remediation", "The guest_operational fallback and backend
-  discovery", and "Native HA onboarding".
+  **The `health_contract_unconfigured` Repair is a non-fixable safety net.**
+  The backend default normally makes its premise unreachable; when it does
+  occur it names the two explicit remedies (Options → reset, or
+  `set_health_contract`) and clears itself once a contract exists. See
+  `ARCHITECTURE.md`, "The built-in `guest_operational` default" and "Native HA
+  health maintenance".
 
 ### Next — Human1 follow-ons deliberately deferred
 

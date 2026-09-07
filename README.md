@@ -40,26 +40,31 @@ a guest in Proxmox never requires touching this repository or its config.
   reference reviewed during the current runtime, fresh-reads it again before
   approval, and forgets it on reload. The backend independently revalidates
   the same reference. Approval never executes an update.
-- Operator-declared per-resource health contracts: for each resource, the list
-  of typed probes (`systemd_unit_active`, `docker_container_running`,
-  `docker_container_healthy`, and — v20 — the targetless `guest_operational`
-  fallback) that must **all** hold for that workload to count as up. Managed
-  through the `view_health_contract` / `set_health_contract` /
-  `clear_health_contract` Home Assistant actions and the routes above, with a
-  concise contract-status sensor and a per-resource **View health contract**
-  button. A resource with no contract is
-  *unconfigured*, which is never "healthy" — and it can no longer be given an
-  update job at all, because a job whose success criterion does not exist
-  could never truthfully be called successful. A reviewed-and-approved
-  resource that is still unconfigured raises a native, fixable Home Assistant
-  Repair (Settings → Repairs) that discovers backend-recommended candidates
-  and declares a contract from an explicit checkbox confirmation — the
-  manual `set_health_contract` action remains a fully supported alternative.
-  An already-configured resource gets the same discover/render/confirm
-  treatment through the integration's own **Configure** options flow
-  (Settings → Devices & Services → Hubinet Ops), to view, re-discover, edit,
-  replace, or explicitly clear its contract, with the same revision-CAS
-  safety `set_health_contract`/`clear_health_contract` already use.
+- Per-resource health contracts: the list of typed probes
+  (`systemd_unit_active`, `docker_container_running`,
+  `docker_container_healthy`, and the targetless `guest_operational`) that
+  must **all** hold for that workload to count as up. **v0.5 gives every
+  package-managed LXC a built-in default: one `guest_operational` probe**, so
+  an approved update can start with no separate health-onboarding step. It
+  proves only that the exact container is still reachable and can still run a
+  process — never application health. Hubinet Ops does **not** automatically
+  discover or recommend Docker/systemd health probes: absence of a workload
+  observer is not proof of workload absence, so v0.5 does not infer workload
+  health automatically. Docker and systemd probes remain fully supported as
+  explicit advanced operator configuration, declared with
+  `set_health_contract`; an explicitly declared contract is never silently
+  replaced by the default. Managed through the `view_health_contract` /
+  `set_health_contract` / `reset_health_contract` Home Assistant actions and
+  the routes above, with a concise contract-status sensor, a per-resource
+  **View health contract** button, and a **Configure** options flow
+  (Settings → Devices & Services → Hubinet Ops) to review a contract or
+  restore the built-in default, with the same revision-CAS safety the actions
+  use. A resource with no contract at all is *unconfigured*, which is never
+  "healthy" — and it cannot be given an update job, because a job whose
+  success criterion does not exist could never truthfully be called
+  successful; that state is not the normal one, and a reviewed-and-approved
+  resource that reaches it raises a Home Assistant Repair naming the two
+  explicit remedies.
 - **Operator-triggered package updates.** One explicit action starts the
   currently approved update for one resource; the backend takes a fresh
   job-owned snapshot, re-proves the exact plan, performs one bounded package
@@ -204,7 +209,7 @@ For an update:
    backend publishes same-job rollback authority.
 
 The variable-length typed health probe list remains edited through the
-`set_health_contract` and `clear_health_contract` actions; forcing that list
+`set_health_contract` and `reset_health_contract` actions; forcing that list
 into a scalar text/select entity would weaken the typed contract. The native
 viewer and status sensor remove routine inspection from Developer Tools, while
 the actions remain available for initial or occasional contract editing and

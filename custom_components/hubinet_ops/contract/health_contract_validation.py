@@ -21,20 +21,13 @@ from typing import TYPE_CHECKING
 
 from .enums import (
     HealthContractStatus,
-    HealthDiscoveryAdapter,
-    HealthDiscoveryOrigin,
-    HealthDiscoveryRecommendationBasis,
-    HealthDiscoveryRoleHint,
-    HealthDiscoveryStatus,
     HealthProbeKind,
 )
-from .primitives import _require_enum_instance, _require_text, _require_uuid_identity
+from .primitives import _require_enum_instance, _require_text
 
 if TYPE_CHECKING:
     from .models import (
         HealthContractSummary,
-        HealthDiscoveryCandidate,
-        HealthDiscoveryResult,
         HealthProbe,
         ResourceHealthContract,
     )
@@ -143,107 +136,3 @@ def validate_resource_health_contract(contract: "ResourceHealthContract") -> Non
     identities = {(probe.kind, probe.target) for probe in probes}
     if len(identities) != len(probes):
         raise ValueError("health contract contains a duplicate probe")
-
-
-#: Bounds mirror the backend's own (deploy/hubinet-package-health-helper.py).
-MAX_DISCOVERY_CANDIDATES = 128
-_MAX_OBSERVED_STATE_LENGTH = 100
-_MAX_RATIONALE_LENGTH = 100
-
-
-#: The exact adapter -> probe-kind pairing. An adapter produces candidates of
-#: its OWN kinds and no others, so `(adapter=systemd, kind=guest_operational)`
-#: -- which would slip a targetless fallback in under a workload adapter, or
-#: a workload probe in under the fallback adapter -- is refused rather than
-#: rendered as if it described something real (PR #80 final review).
-_DISCOVERY_ADAPTER_KINDS: dict[HealthDiscoveryAdapter, frozenset[HealthProbeKind]] = {
-    HealthDiscoveryAdapter.DOCKER: frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    HealthDiscoveryAdapter.SYSTEMD: frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
-    HealthDiscoveryAdapter.GUEST: frozenset({HealthProbeKind.GUEST_OPERATIONAL}),
-}
-
-
-def validate_health_discovery_candidate(candidate: "HealthDiscoveryCandidate") -> None:
-    """Independent proof this is one coherent ephemeral candidate.
-
-    Mirrors the backend's own coherence rules: an adapter only ever produces
-    its own probe kinds, and ``target`` is ``None`` for, and only for, the
-    ``guest`` adapter's ``guest_operational`` candidate -- never a faked
-    target, and never a missing one for any other kind.
-    """
-
-    _require_enum_instance(
-        candidate.adapter, HealthDiscoveryAdapter, "discovery candidate adapter"
-    )
-    _require_enum_instance(
-        candidate.kind, HealthProbeKind, "discovery candidate kind"
-    )
-    if candidate.kind not in _DISCOVERY_ADAPTER_KINDS[candidate.adapter]:
-        raise ValueError(
-            "discovery candidate kind does not belong to its own adapter"
-        )
-    is_guest = candidate.kind is HealthProbeKind.GUEST_OPERATIONAL
-    if is_guest:
-        if candidate.target is not None:
-            raise ValueError(
-                "a guest_operational discovery candidate must not carry a target"
-            )
-    else:
-        if candidate.target is None:
-            raise ValueError("a discovery candidate target is required for this kind")
-        _require_text(candidate.target, "discovery candidate target")
-        if len(candidate.target) > MAX_HEALTH_PROBE_TARGET_LENGTH:
-            raise ValueError("discovery candidate target is too long")
-    _require_text(candidate.observed_state, "discovery candidate observed_state")
-    if len(candidate.observed_state) > _MAX_OBSERVED_STATE_LENGTH:
-        raise ValueError("discovery candidate observed_state is too long")
-    if candidate.origin is not None:
-        _require_enum_instance(
-            candidate.origin, HealthDiscoveryOrigin, "discovery candidate origin"
-        )
-    _require_enum_instance(
-        candidate.role_hint, HealthDiscoveryRoleHint, "discovery candidate role_hint"
-    )
-    if type(candidate.recommended) is not bool:
-        raise ValueError("discovery candidate recommended must be a boolean")
-    _require_text(candidate.rationale, "discovery candidate rationale")
-    if len(candidate.rationale) > _MAX_RATIONALE_LENGTH:
-        raise ValueError("discovery candidate rationale is too long")
-
-
-def validate_health_discovery_result(result: "HealthDiscoveryResult") -> None:
-    _require_uuid_identity(result.resource_id, "resource_id")
-    _require_enum_instance(result.status, HealthDiscoveryStatus, "discovery status")
-    if not isinstance(result.candidates, tuple):
-        raise ValueError("discovery candidates must be a tuple")
-    if len(result.candidates) > MAX_DISCOVERY_CANDIDATES:
-        raise ValueError("discovery candidate count is out of bounds")
-    from .models import HealthDiscoveryCandidate
-
-    if not all(
-        isinstance(candidate, HealthDiscoveryCandidate)
-        for candidate in result.candidates
-    ):
-        raise ValueError(
-            "discovery candidates must be a tuple of HealthDiscoveryCandidate"
-        )
-    if result.recommendation_basis is not None:
-        _require_enum_instance(
-            result.recommendation_basis,
-            HealthDiscoveryRecommendationBasis,
-            "discovery recommendation_basis",
-        )
-        if not any(candidate.recommended for candidate in result.candidates):
-            raise ValueError(
-                "a discovery recommendation_basis requires at least one "
-                "recommended candidate"
-            )
-    elif any(candidate.recommended for candidate in result.candidates):
-        raise ValueError(
-            "a recommended discovery candidate requires a recommendation_basis"
-        )

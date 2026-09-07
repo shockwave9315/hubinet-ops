@@ -19,7 +19,7 @@ SERVICE_VIEW_UPDATE_PLAN = "view_update_plan"
 SERVICE_APPROVE_UPDATE_PLAN = "approve_update_plan"
 SERVICE_VIEW_HEALTH_CONTRACT = "view_health_contract"
 SERVICE_SET_HEALTH_CONTRACT = "set_health_contract"
-SERVICE_CLEAR_HEALTH_CONTRACT = "clear_health_contract"
+SERVICE_RESET_HEALTH_CONTRACT = "reset_health_contract"
 # Explicit operator update controls. Each of these is invoked because a
 # person asked for it; none is reachable from coordinator polling.
 SERVICE_START_UPDATE = "start_update"

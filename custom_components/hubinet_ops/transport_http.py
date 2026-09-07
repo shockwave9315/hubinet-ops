@@ -28,13 +28,6 @@ from .api import (
     DetailStatus,
     HealthContractStatus,
     HealthContractSummary,
-    HealthDiscoveryAdapter,
-    HealthDiscoveryCandidate,
-    HealthDiscoveryOrigin,
-    HealthDiscoveryRecommendationBasis,
-    HealthDiscoveryResult,
-    HealthDiscoveryRoleHint,
-    HealthDiscoveryStatus,
     HealthProbe,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -189,7 +182,6 @@ _PACKAGE_PLAN_APPROVAL_ROUTE = (
     "/r0/v1/resources/{resource_id}/package-plan-approval"
 )
 _HEALTH_CONTRACT_ROUTE = "/r0/v1/resources/{resource_id}/health-contract"
-_HEALTH_CANDIDATES_ROUTE = "/r0/v1/resources/{resource_id}/health-candidates"
 _PACKAGE_UPDATE_ROUTE = "/r0/v1/resources/{resource_id}/package-update"
 _PACKAGE_UPDATE_RESUME_ROUTE = _PACKAGE_UPDATE_ROUTE + "/resume"
 _PACKAGE_UPDATE_ROLLBACK_ROUTE = _PACKAGE_UPDATE_ROUTE + "/rollback"
@@ -377,67 +369,6 @@ def _resource_health_contract(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubinetOpsInvalidResponse(f"malformed health contract: {exc}") from exc
-
-
-def _health_discovery_candidate(raw: Any) -> HealthDiscoveryCandidate:
-    if not isinstance(raw, Mapping):
-        raise HubinetOpsInvalidResponse("discovery candidate is not an object")
-    kind = HealthProbeKind(raw["kind"])
-    raw_target = raw["target"]
-    if kind is HealthProbeKind.GUEST_OPERATIONAL:
-        if raw_target is not None:
-            raise HubinetOpsInvalidResponse(
-                "discovery candidate target must be null for guest_operational"
-            )
-        target: str | None = None
-    else:
-        target = _strict_str(raw_target, "candidate.target")
-    raw_origin = raw["origin"]
-    return HealthDiscoveryCandidate(
-        adapter=HealthDiscoveryAdapter(raw["adapter"]),
-        kind=kind,
-        target=target,
-        observed_state=_strict_str(raw["observed_state"], "candidate.observed_state"),
-        origin=None if raw_origin is None else HealthDiscoveryOrigin(raw_origin),
-        role_hint=HealthDiscoveryRoleHint(raw["role_hint"]),
-        recommended=_strict_bool(raw["recommended"], "candidate.recommended"),
-        rationale=_strict_str(raw["rationale"], "candidate.rationale"),
-    )
-
-
-def _health_discovery_result(resource_id: str, payload: Any) -> HealthDiscoveryResult:
-    """Parse one ephemeral discovery answer. Never persisted on either side
-    of this boundary -- this is a plain response parse, not a contract."""
-
-    if not isinstance(payload, Mapping):
-        raise HubinetOpsInvalidResponse("discovery response is not an object")
-    try:
-        if payload["resource_id"] != resource_id:
-            raise HubinetOpsInvalidResponse(
-                "discovery response names a different resource"
-            )
-        raw_basis = payload.get("recommendation_basis")
-        candidates_raw = payload.get("candidates", [])
-        if not isinstance(candidates_raw, list):
-            raise HubinetOpsInvalidResponse("discovery candidates must be a list")
-        return HealthDiscoveryResult(
-            resource_id=resource_id,
-            status=HealthDiscoveryStatus(payload["discovery_status"]),
-            candidates=tuple(
-                _health_discovery_candidate(raw) for raw in candidates_raw
-            ),
-            recommendation_basis=(
-                None
-                if raw_basis is None
-                else HealthDiscoveryRecommendationBasis(raw_basis)
-            ),
-        )
-    except HubinetOpsInvalidResponse:
-        raise
-    except (KeyError, TypeError, ValueError) as exc:
-        raise HubinetOpsInvalidResponse(
-            f"malformed discovery response: {exc}"
-        ) from exc
 
 
 def _package_update_job_summary(payload: Any) -> PackageUpdateJobSummary:
@@ -848,9 +779,10 @@ class HttpHubinetOpsTransport:
             ) from exc
 
     async def _health_contract_request(
-        self, method: str, resource_id: str, **kwargs: Any
+        self, method: str, resource_id: str, *, path_suffix: str = "", **kwargs: Any
     ) -> Any:
-        url = f"{self._base_url}{_HEALTH_CONTRACT_ROUTE.format(resource_id=resource_id)}"
+        route = _HEALTH_CONTRACT_ROUTE.format(resource_id=resource_id)
+        url = f"{self._base_url}{route}{path_suffix}"
         headers = {"Authorization": f"Bearer {self._api_token}"}
         try:
             async with self._session.request(
@@ -1157,12 +1089,6 @@ class HttpHubinetOpsTransport:
         payload = await self._health_contract_request("GET", resource_id)
         return _resource_health_contract(resource_id, payload)
 
-    async def fetch_health_candidates(self, resource_id: str) -> HealthDiscoveryResult:
-        payload = await self._get(
-            _HEALTH_CANDIDATES_ROUTE.format(resource_id=resource_id)
-        )
-        return _health_discovery_result(resource_id, payload)
-
     async def replace_health_contract(
         self,
         resource_id: str,
@@ -1178,6 +1104,25 @@ class HttpHubinetOpsTransport:
         if expected_revision is not None:
             body["expected_revision"] = expected_revision
         payload = await self._health_contract_request("PUT", resource_id, json=body)
+        return _resource_health_contract(resource_id, payload)
+
+    async def reset_health_contract(
+        self, resource_id: str, expected_revision: int | None
+    ) -> ResourceHealthContract:
+        """Restore the backend's built-in default health contract.
+
+        No probe, kind, or target crosses this boundary: the operator
+        selects a RESOURCE and the backend installs its own baseline. Home
+        Assistant never computes what the default is, and never inspects a
+        guest to decide.
+        """
+
+        params: dict[str, Any] = {}
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        payload = await self._health_contract_request(
+            "POST", resource_id, path_suffix="/reset", params=params
+        )
         return _resource_health_contract(resource_id, payload)
 
     async def clear_health_contract(

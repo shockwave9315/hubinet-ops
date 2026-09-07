@@ -62,8 +62,8 @@ split by a crash or restart. Schema v20 adds `guest_operational`, a fourth
 health-probe kind whose `target` column is `NULL` (`CHECK`-enforced: exactly
 this kind may be `NULL`, and every other kind still requires a bounded
 target) with its own partial unique index permitting at most one such probe
-per resource contract or per frozen job copy (see "The guest_operational
-fallback and backend discovery" below). There is no migration from v9
+per resource contract or per frozen job copy (see "The built-in
+`guest_operational` default" below). There is no migration from v9
 through v19; pre-release installs use the
 product updater's explicit backed-up authority reset and require Home
 Assistant re-enrollment.
@@ -807,7 +807,7 @@ approval creates a new approval identity even when the current plan fingerprint
 is unchanged. Package rows do not become entity attributes or
 package-per-entity state.
 
-`view_health_contract`, `set_health_contract`, and `clear_health_contract` use
+`view_health_contract`, `set_health_contract`, and `reset_health_contract` use
 that same resource-device selector rather than a second selection model. All
 three return response data; contract material — the probe list — is response
 data only, never entity attributes. A native viewer button renders it on
@@ -2793,160 +2793,108 @@ validates and clamps whatever it receives against its own hard ceilings
 before using them, so a malformed or out-of-range request cannot make the
 helper run longer, or poll faster, than its own compiled bounds allow.
 
-### The guest_operational fallback and backend discovery (Stage 3, schema v20)
+### The built-in `guest_operational` default (schema v20)
 
-Some guests genuinely run nothing a health contract can currently name: no
-Docker container, no non-platform systemd unit — a bare guest, or one running
-only the base OS. Before schema v20 such a guest could not be given a health
-contract that means anything, which meant it could not be given a package
-update job at all ("no contract means unconfigured" above). `guest_operational`
-closes that gap **without inventing application-health proof**: it names no
-container or unit, carries no target (`target IS NULL`, `CHECK`-enforced,
-mirrored by `HealthProbe.target: str | None` on both sides), and its command is
-fixed — `/bin/true` on the guest, an absolute path, no operator input, no
-shell — so its only claim is "the guest executed a command", never "a
-workload is up". `_guest_operational_round` can only ever produce PASS
+For a package-managed LXC, `guest_operational` is the v0.5 **built-in
+post-update health criterion**, not a discovered one. It names no container
+or unit, carries no target (`target IS NULL`, `CHECK`-enforced, mirrored by
+`HealthProbe.target: str | None` on both sides), and its command is fixed --
+`/bin/true` on the guest, an absolute path, no operator input, no shell -- so
+its only claim is "the exact current LXC remained reachable through the
+trusted PVE boundary and executed a command", never "a workload is up".
+`_guest_operational_round` can only ever produce PASS
 (`guest_operational_confirmed`) or UNKNOWN (`command_timed_out` /
 `malformed_output` / `command_failed`); it never FAILs, because a guest that
 cannot currently run a trivial command is a liveness question, not proof this
-specific fallback contract was violated. A partial unique index
+contract was violated. A partial unique index
 (`... WHERE kind = 'guest_operational'`) permits at most one such probe per
-contract — a plain column-level `UNIQUE` cannot express this, because SQL
+contract -- a plain column-level `UNIQUE` cannot express this, because SQL
 treats every `NULL` as distinct from every other `NULL`.
 
-**Discovery is a second, ephemeral, read-only operation, never a durable
-one.** `discover_health_candidates` (helper) /
-`resource_health_discovery_request` + `HealthDiscoveryResult` (backend) /
-`GET /r0/v1/resources/{resource_id}/health-candidates` (API) share the same
-forced-command SSH boundary and pinned key `evaluate_health_contract`
-already uses, dispatched by an explicit `operation` field — but discovery
-persists nothing, carries no `job_id`, and mutates no authority row. It looks
-at a resource **positively**, never by absence of a health result: current
-unhealthiness must never suppress a candidate from being discoverable.
+**Why v0.5 does not discover workloads.** Absence of a workload observer is
+not proof of workload absence, so v0.5 does not infer workload health
+automatically. There is deliberately no candidate-discovery operation, no
+adapter-presence oracle, no `docker ps`/`docker inspect`/`systemctl
+list-unit-files`/`systemctl list-units` read for discovery purposes, no
+recommendation ranking, and no rule of the shape "Docker absent AND systemd
+absent -> guest_operational". Docker and systemd probes remain fully
+supported as **explicit advanced operator configuration**, executed by the
+job-bound helper exactly as described above; their absence or failure has no
+influence at all on the default path.
 
-Each family begins with a fixed **adapter-presence oracle**, because "this
-guest has no Docker at all" and "Docker is here but would not answer" are
-different facts and only the first is a complete answer. It is deliberately
-*not* a reading of the family command's own exit status — a bare `docker ps`
-returning 127 is too close to the execution/remote-command layer to carry
-positive-absence authority, since `env`, `pct exec`, and the inter-node `ssh`
-hop can each produce it for unrelated reasons. Instead one separate,
-code-owned `env LC_ALL=C sh -c 'command -v <program> …'` answers in an exit
-vocabulary this repository chooses: `0` present, `10` absent, **anything
-else undecidable** (no shell, a signal, a `pct`/`ssh` failure, a timeout, an
-output overflow, a failed live-target revalidation). It resolves the program
-through `env`/`PATH` exactly as the family command will, never an assumed
-`/usr/bin/docker`; verified on Debian 13 / systemd 257 that with `PATH` unset
-dash's built-in default is a strict superset of `execvp`'s `confstr` fallback,
-so the oracle can never report ABSENT for a program the family command could
-still have run. A positively absent adapter yields "family complete, zero
-candidates" — no new public discovery status; the distinction is proven
-internally and the combination rule below is unchanged.
+**Where the default is created.** `InventoryAuthority.
+_provision_default_health_contracts` runs inside the successful-reconciliation
+transaction of `complete_discovery_run_success`, which is the narrowest
+backend-owned point at which a resource actually becomes a CURRENT,
+package-managed LXC. It selects, through the exact same predicate package
+scanning uses (`_require_package_scan_target`: present, active, LXC, current
+locator binding, current node), every such resource with **no** contract row
+and writes `DEFAULT_HEALTH_PROBES` for it, allocating a revision from the same
+durable per-resource allocator every other contract generation uses. Three
+properties are load-bearing:
 
-- **Docker**: one `docker ps --all` (the complete name universe and the daemon
-  oracle in one call, exactly the settling engine's own absence-safety
-  pattern) followed by batched `docker inspect`, mapped back by returned
-  `.Name`, reading `.Config.Healthcheck` to distinguish a
-  `docker_container_healthy` candidate from a merely-`docker_container_running`
-  one.
-- **systemd**: the union of `systemctl list-unit-files --type=service`
-  (`enabled`/`enabled-runtime`/`disabled` states only) and
-  `systemctl list-units --all --type=service --state=failed`, batched
-  `systemctl show`, each unit classified into an `origin`
-  (`local_unit`/`package_unit`/`generated`/`alias`/`unknown_origin`) and a
-  `role_hint` (`workload_candidate`/`runtime`/`platform`/`ambiguous`) via
-  small, exact deny-lists (`docker.service`, `ssh.service`,
-  `systemd-*`/`getty@*` prefixes, and similarly) — a unit's packaging origin
-  never implies its platform role; the two are classified independently.
+- **it is not inference** -- no guest is read, no adapter is probed, and no
+  command runs (`tests/test_resource_health_contract.py`,
+  `test_default_provisioning_runs_no_guest_command_at_all`);
+- **an explicit contract always wins** -- the query only ever selects
+  resources with no contract row, so an operator's advanced Docker/systemd
+  contract is never seen, compared, or overwritten;
+- **it is idempotent** -- a second reconciliation of the same inventory
+  selects nothing, allocates no revision, and writes no row, so contract
+  revisions do not churn with the discovery cadence.
 
-**Recommendation is backend-owned, one fixed priority order, computed once:**
-Docker `HEALTHCHECK` candidates outrank a merely-running Docker candidate,
-which outranks a single unambiguous systemd `workload_candidate`, which
-outranks the `guest_operational` fallback. Multiple systemd workload
-candidates with none dominant return `ambiguous_candidates` with nothing
-recommended — an operator choice, never a guess. **The one rule that may
-never be violated**: discovery uncertainty in *either* family (a daemon that
-would not answer, an ambiguous local-node identity) returns that uncertain
-status immediately, with zero candidates and no recommendation — it can
-never fall through to recommending `guest_operational`, because "discovery
-could not tell" and "discovery positively found nothing" are different
-facts, and only the second may ever produce that recommendation. The
-presence oracle above is the *mirror* of that same rule: an adapter that is
-genuinely not installed is a positively found nothing, and reading it as
-uncertainty made the fallback — and every systemd recommendation —
-unreachable on exactly the bare and systemd-only guests it exists for.
+A VMID-reused replacement is a different `resource_id`, so it inherits nothing
+and is provisioned its own fresh default on its own counter. A QEMU guest is
+never provisioned one at all.
 
-One absolute monotonic deadline governs a whole discovery read, established
-in `handle_discover_request` **before** its prologue: the local-node
-identity read, the first live-target revalidation, both presence oracles,
-and both family reads all draw down the same `DISCOVERY_DEADLINE_SECONDS`,
-each subprocess taking its own timeout computed fresh immediately before it
-starts. The health evaluation is built identically around the backend's
-clamped settling deadline, so a bounded operation's real wall clock is
-"deadline + transport-return margin", never "prologue + deadline".
+**Reset, not clear.** `POST /r0/v1/resources/{resource_id}/health-contract/
+reset` (`InventoryAuthority.reset_resource_health_contract`) installs exactly
+`DEFAULT_HEALTH_PROBES` under the same compare-and-set discipline as every
+other contract mutation: no probe, kind, or target crosses the boundary, so
+the backend alone decides what the baseline is. This is what "reset health"
+means on the native operator path, because a current managed LXC that lost all
+health meaning would be blocked from starting an approved update.
+`DELETE .../health-contract` remains as the low-level clear primitive; a
+current managed LXC does not stay unconfigured, because the next successful
+reconciliation re-provisions the default for it.
 
-### Native HA onboarding (Stage 4)
+### Native HA health maintenance
+
+Home Assistant is presentation plus explicit operator actions. It does not
+discover Docker, does not discover systemd, does not decide workload
+importance, and does not create the default from guest inspection -- the
+backend owns all of it. There is no health-onboarding step in the normal
+update flow at all: a managed LXC already carries the built-in contract before
+its first update, so **review -> approve -> Start** never detours through
+health configuration.
+
+`HubinetOpsOptionsFlow` (Settings -> Devices & Services -> Hubinet Ops ->
+Configure) is the native maintenance surface: pick one of the entry's LXC
+resources, see what it currently declares (`async_fetch_health_contract`,
+treating "unconfigured" as no probes and revision `0` rather than an error),
+and optionally restore the built-in default through
+`async_reset_health_contract`. The contract's own `revision`, read the moment
+the flow looked at it, is sent back as `expected_revision`; a concurrent
+change is `HubinetOpsConflict`, refused and reported rather than silently
+overwritten, and the flow re-reads current state so a retry is against
+reality. The `hubinet_ops.set_health_contract` action remains the supported
+way to declare an advanced Docker/systemd contract by hand, and
+`hubinet_ops.reset_health_contract` is the same reset as an action.
 
 The `health_contract_unconfigured` Repair (see "Human1 defect A" in
-`STATUS.md`) is now `is_fixable=True`: its `RepairsFlow` calls the discovery
-route above for the exact blocked resource, renders every returned candidate
-as a checkbox (backend-recommended ones pre-selected, everything else
-unchecked), and writes nothing until the operator submits that form — the
-same `async_replace_health_contract` mutation the `set_health_contract`
-action already used. Discovery only narrows what is *shown*; the operator's
-explicit confirmation is still the only thing that ever creates authority,
-exactly as `PRODUCT.md`, "What healthy means", requires. Any undecided
-discovery status, a transport failure, or zero returned candidates aborts the
-flow with the issue left open rather than rendering an empty or misleading
-form; the manual `set_health_contract` action remains a fully supported
-alternative path, named in the issue text either way. The declaration itself
-is a **compare-and-set on the issue's own premise**: the Repair exists only
-because the contract is currently unconfigured, so the write is sent with
-`expected_revision=0`. A contract declared by anyone else between this
-flow's discovery read and its submit makes that CAS fail, and the flow
-aborts on `contract_already_declared` after refreshing — never a blind
-retry, and never an overwrite of what now exists. Classification itself
-— everything above about Docker/systemd inspection — has no HA-side
-counterpart at all: Home Assistant only ever renders an already-classified,
-already-bounded `HealthDiscoveryResult` it fetched over that one typed route
-(`tests/test_r0_architecture_regression.py`,
-`test_ha_integration_contains_no_docker_or_systemd_inspection_logic`, proves
-the absence).
-
-**A resource whose contract is already configured gets the same
-discover/render/confirm treatment, natively, without Developer Tools**
-(PR #80 review finding 3): `HubinetOpsOptionsFlow` (Settings -> Devices &
-Services -> Hubinet Ops -> Configure) picks one of the entry's LXC
-resources, reads its current contract (`async_fetch_health_contract`,
-treating "unconfigured" as no probes and no revision rather than an error),
-and offers a menu of *discover* (view/re-discover/edit/replace) or *clear*
--- skipped straight to *discover* when nothing is declared yet, exactly
-like the Repair's own first-declaration path. The discover step renders ONE
-merged checklist: every currently declared probe (always defaulting to
-checked -- removing one is an explicit uncheck, never implicit) unioned
-with every freshly discovered candidate (defaulting to the backend's own
-`recommended` flag), deduplicated by `(kind, target)` identity. The
-contract's own `revision`, read the moment the flow looked at it, is sent
-back as `expected_revision` on every write; a concurrent change is
-`HubinetOpsConflict`, refused and reported rather than silently
-overwritten, and the flow re-reads current state so a retry is against
-reality. Clearing is a separate, explicitly confirmed step, never a side
-effect of an empty discover submission.
-
-Both operator surfaces share ONE definition of the discovery statuses that
-carry no usable candidate set (`UNDECIDED_DISCOVERY_STATUSES` in
-`contract/enums.py`, beside the enum it comes from), so they cannot drift
-apart. An unconfigured resource whose discovery is undecided — or which
-completed truthfully with nothing to offer — aborts naming the exact typed
-reason rather than rendering a form with no checkboxes; a resource that
-already HAS a contract keeps its declared probes visible so they can still
-be edited, with the failure stated explicitly as a
-`rediscovery_<status>` error and **no candidate fabricated** to make a
-failed re-discovery look successful. The manual
-`set_health_contract`/`clear_health_contract` actions remain fully
-supported. This flow shares the exact same "no inspection logic on the HA
-side" guarantee as the Repair above -- the same regression test scans
-every file in the integration, this one included.
+`STATUS.md`) survives as a narrow, **non-fixable** safety net for a state that
+the backend default normally prevents entirely (an operator used the low-level
+clear API). It names the two explicit remedies and clears itself once a
+contract exists -- including when the next reconciliation restores the default
+on its own. There is no fix flow, no candidate rendering, and no
+`fetch_health_candidates` client method left anywhere in the integration;
+`tests/test_r0_architecture_regression.py`
+(`test_the_default_health_path_can_never_regress_into_workload_inference`,
+`test_no_backend_or_integration_module_still_names_health_discovery`) proves
+the default/onboarding path contains no adapter, runtime, socket, process, or
+candidate-discovery vocabulary, while deliberately leaving the job-bound
+helper free to keep running the Docker and systemd commands explicit advanced
+probes need.
 
 ### Restart, retry, and rollback
 

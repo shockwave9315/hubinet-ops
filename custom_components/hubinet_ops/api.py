@@ -9,13 +9,6 @@ from .contract import (
     DetailStatus,
     HealthContractStatus,
     HealthContractSummary,
-    HealthDiscoveryAdapter,
-    HealthDiscoveryCandidate,
-    HealthDiscoveryOrigin,
-    HealthDiscoveryRecommendationBasis,
-    HealthDiscoveryResult,
-    HealthDiscoveryRoleHint,
-    HealthDiscoveryStatus,
     HealthProbe,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -51,7 +44,6 @@ from .contract import (
     SourceFreshness,
     SourceHealth,
     SourceHealthOrigin,
-    UNDECIDED_DISCOVERY_STATUSES,
     validate_operator_availability,
 )
 
@@ -141,10 +133,6 @@ class HubinetOpsTransport(Protocol):
     async def fetch_health_contract(self, resource_id: str) -> ResourceHealthContract:
         """Read one exact resource's complete declared health contract."""
 
-    async def fetch_health_candidates(self, resource_id: str) -> HealthDiscoveryResult:
-        """Ephemeral health-candidate discovery (v20). Read-only; the
-        backend persists nothing from this call."""
-
     async def replace_health_contract(
         self,
         resource_id: str,
@@ -152,6 +140,11 @@ class HubinetOpsTransport(Protocol):
         expected_revision: int | None,
     ) -> ResourceHealthContract:
         """Install one complete health contract for one exact resource."""
+
+    async def reset_health_contract(
+        self, resource_id: str, expected_revision: int | None
+    ) -> ResourceHealthContract:
+        """Restore the backend's built-in default health contract."""
 
     async def clear_health_contract(
         self, resource_id: str, expected_revision: int | None
@@ -227,15 +220,6 @@ class HubinetOpsApi:
 
         return await self._transport.fetch_health_contract(resource_id)
 
-    async def async_fetch_health_candidates(
-        self, resource_id: str
-    ) -> HealthDiscoveryResult:
-        """Ephemeral discovery read: never persisted, revisioned, or
-        fingerprinted. An operator confirms what they want through the
-        existing health-contract mutation, never automatically."""
-
-        return await self._transport.fetch_health_candidates(resource_id)
-
     async def async_replace_health_contract(
         self,
         resource_id: str,
@@ -246,6 +230,20 @@ class HubinetOpsApi:
 
         return await self._transport.replace_health_contract(
             resource_id, probes, expected_revision
+        )
+
+    async def async_reset_health_contract(
+        self, resource_id: str, expected_revision: int | None = None
+    ) -> ResourceHealthContract:
+        """Restore the backend's own built-in default health contract.
+
+        The operator selects a RESOURCE; the backend decides what its
+        baseline is. This integration never computes the default, never
+        inspects a guest, and never sends a probe of its own here.
+        """
+
+        return await self._transport.reset_health_contract(
+            resource_id, expected_revision
         )
 
     async def async_clear_health_contract(
@@ -327,6 +325,11 @@ class _UnconfiguredPhaseZeroTransport:
         resource_id: str,
         probes: tuple[HealthProbe, ...],
         expected_revision: int | None,
+    ) -> ResourceHealthContract:
+        raise self._error()
+
+    async def reset_health_contract(
+        self, resource_id: str, expected_revision: int | None
     ) -> ResourceHealthContract:
         raise self._error()
 

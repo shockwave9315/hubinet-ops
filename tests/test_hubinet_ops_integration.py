@@ -42,12 +42,6 @@ from custom_components.hubinet_ops.api import (
     DetailStatus,
     HealthContractStatus,
     HealthContractSummary,
-    HealthDiscoveryAdapter,
-    HealthDiscoveryCandidate,
-    HealthDiscoveryRecommendationBasis,
-    HealthDiscoveryResult,
-    HealthDiscoveryRoleHint,
-    HealthDiscoveryStatus,
     HealthProbe,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -102,7 +96,7 @@ from custom_components.hubinet_ops.const import (
     DOMAIN,
     MODEL_LXC,
     SERVICE_APPROVE_UPDATE_PLAN,
-    SERVICE_CLEAR_HEALTH_CONTRACT,
+    SERVICE_RESET_HEALTH_CONTRACT,
     SERVICE_RESUME_UPDATE,
     SERVICE_ROLLBACK_UPDATE,
     SERVICE_SET_HEALTH_CONTRACT,
@@ -483,8 +477,6 @@ class FakeTransport:
         approval_error: Exception | None = None,
         health_contracts: dict[str, ResourceHealthContract] | None = None,
         health_contract_error: Exception | None = None,
-        health_discovery_results: dict[str, HealthDiscoveryResult] | None = None,
-        health_discovery_error: Exception | None = None,
         package_update_jobs: dict[str, PackageUpdateJobView] | None = None,
         package_update_error: Exception | None = None,
         operator_capabilities: dict[str, OperatorCapabilities] | None = None,
@@ -516,15 +508,7 @@ class FakeTransport:
         self.health_contract_reads: list[str] = []
         self.health_contract_writes: list[tuple[str, tuple, int | None]] = []
         self.health_contract_clears: list[tuple[str, int | None]] = []
-        # Ephemeral discovery (v20): a resource absent from this mapping has
-        # no fake answer configured at all, which raises rather than
-        # inventing a plausible-looking result -- exactly like an
-        # unconfigured health contract above.
-        self.health_discovery_results: dict[str, HealthDiscoveryResult] = dict(
-            health_discovery_results or {}
-        )
-        self.health_discovery_error = health_discovery_error
-        self.health_discovery_reads: list[str] = []
+        self.health_contract_resets: list[tuple[str, int | None]] = []
         # Stands in for the backend's durable job authority. Every operator
         # update control records what it was asked and returns the job it
         # acted on, so a test can assert exactly what crossed the boundary --
@@ -595,15 +579,6 @@ class FakeTransport:
             )
         return contract
 
-    async def fetch_health_candidates(self, resource_id: str) -> HealthDiscoveryResult:
-        self.health_discovery_reads.append(resource_id)
-        if self.health_discovery_error is not None:
-            raise self.health_discovery_error
-        result = self.health_discovery_results.get(resource_id)
-        if result is None:
-            raise HubinetOpsCannotConnect("no fake discovery result configured")
-        return result
-
     async def replace_health_contract(
         self,
         resource_id: str,
@@ -623,6 +598,33 @@ class FakeTransport:
             updated_at="2026-08-08T12:05:00+00:00",
             probes=tuple(
                 sorted(probes, key=lambda probe: (probe.kind.value, probe.target))
+            ),
+        )
+        self.health_contracts[resource_id] = contract
+        return contract
+
+    async def reset_health_contract(
+        self, resource_id: str, expected_revision: int | None
+    ) -> ResourceHealthContract:
+        """Stands in for the backend restoring its OWN built-in default.
+
+        The probe set is decided entirely here (i.e. backend-side); nothing
+        the caller passes can influence what the default is.
+        """
+
+        self.health_contract_resets.append((resource_id, expected_revision))
+        if self.health_contract_error is not None:
+            raise self.health_contract_error
+        previous = self.health_contracts.get(resource_id)
+        contract = ResourceHealthContract(
+            resource_id=resource_id,
+            status=HealthContractStatus.CONFIGURED,
+            revision=1 if previous is None else previous.revision + 1,
+            fingerprint="d" * 64,
+            created_at="2026-08-08T12:00:00+00:00",
+            updated_at="2026-08-08T12:06:00+00:00",
+            probes=(
+                HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
             ),
         )
         self.health_contracts[resource_id] = contract
@@ -2010,7 +2012,7 @@ def test_update_plan_action_metadata_and_polish_translations_are_structural() ->
         SERVICE_APPROVE_UPDATE_PLAN,
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
         SERVICE_START_UPDATE,
         SERVICE_VIEW_UPDATE_JOB,
         SERVICE_RESUME_UPDATE,
@@ -2132,7 +2134,7 @@ def test_operator_error_translations_are_structural() -> None:
         "control_unavailable",
         "health_contract_read_failed",
         "health_contract_set_refused",
-        "health_contract_clear_refused",
+        "health_contract_reset_refused",
         "device_not_found",
         "device_not_unique_resource",
     } <= raised_keys
@@ -5051,7 +5053,7 @@ async def test_health_contract_actions_are_registered_and_removed_with_the_domai
     for service in (
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
     ):
         assert hass.services.has_service(DOMAIN, service)
 
@@ -5060,7 +5062,7 @@ async def test_health_contract_actions_are_registered_and_removed_with_the_domai
     for service in (
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
     ):
         assert not hass.services.has_service(DOMAIN, service)
 
@@ -5166,10 +5168,11 @@ async def test_approved_but_unconfigured_resource_raises_a_repair_issue(
     issues = _health_contract_repair_ids(hass)
     assert len(issues) == 1
     issue = ir.async_get(hass).issues[(DOMAIN, next(iter(issues)))]
-    # Stage 4 (v20): fixable through the discover -> render -> confirm ->
-    # declare flow, but the manual `set_health_contract` action described in
-    # the issue text remains a supported alternative path.
-    assert issue.is_fixable is True
+    # v0.5: NOT fixable from here. The backend's built-in default is what
+    # normally prevents this state, and the remedies are the two explicit
+    # operator surfaces the issue text names -- never a Home-Assistant-side
+    # discovery flow.
+    assert issue.is_fixable is False
     assert issue.severity == ir.IssueSeverity.WARNING
     assert issue.translation_key == "health_contract_unconfigured"
     assert issue.translation_placeholders == {"name": "CT101 Cloudflared"}
@@ -5381,9 +5384,17 @@ async def test_set_health_contract_refuses_malformed_declarations(
 
 
 @pytest.mark.asyncio
-async def test_clear_health_contract_leaves_the_resource_unconfigured(
+async def test_reset_health_contract_restores_the_backend_built_in_default(
     hass: HomeAssistant,
 ) -> None:
+    """Reset is not clear: the resource ends CONFIGURED with the backend's
+    own baseline, so an approved update is never blocked by resetting.
+
+    Home Assistant sends a resource and a compare-and-set revision and
+    nothing else -- no probe, no kind, no target -- so what the default IS
+    remains entirely the backend's decision.
+    """
+
     transport = FakeTransport(
         [snapshot(INITIAL_RESOURCES)],
         health_contracts={RESOURCE_CT: configured_contract()},
@@ -5392,7 +5403,7 @@ async def test_clear_health_contract_leaves_the_resource_unconfigured(
 
     response = await hass.services.async_call(
         DOMAIN,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
         {
             "device_id": resource_device_id(hass, RESOURCE_CT),
             "expected_revision": 3,
@@ -5402,10 +5413,16 @@ async def test_clear_health_contract_leaves_the_resource_unconfigured(
     )
     await hass.async_block_till_done()
 
-    assert transport.health_contract_clears == [(RESOURCE_CT, 3)]
-    assert response["status"] == "unconfigured"
-    assert response["probes"] is None
-    assert transport.health_contracts == {}
+    assert transport.health_contract_resets == [(RESOURCE_CT, 3)]
+    assert transport.health_contract_clears == []
+    assert transport.health_contract_writes == []
+    assert response["status"] == "configured"
+    assert response["probes"] == [
+        {"kind": "guest_operational", "target": None}
+    ]
+    assert transport.health_contracts[RESOURCE_CT].probes == (
+        HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
+    )
 
 
 @pytest.mark.asyncio
@@ -5429,7 +5446,7 @@ async def test_health_contract_actions_use_the_dynamic_resource_device_selector(
         for service, payload in (
             (SERVICE_VIEW_HEALTH_CONTRACT, {}),
             (SERVICE_SET_HEALTH_CONTRACT, {"probes": HEALTH_PROBES}),
-            (SERVICE_CLEAR_HEALTH_CONTRACT, {}),
+            (SERVICE_RESET_HEALTH_CONTRACT, {}),
         ):
             with pytest.raises(HomeAssistantError):
                 await hass.services.async_call(
@@ -5460,7 +5477,7 @@ async def test_health_contract_actions_surface_a_backend_refusal_as_an_error(
     for service, payload in (
         (SERVICE_VIEW_HEALTH_CONTRACT, {}),
         (SERVICE_SET_HEALTH_CONTRACT, {"probes": HEALTH_PROBES}),
-        (SERVICE_CLEAR_HEALTH_CONTRACT, {}),
+        (SERVICE_RESET_HEALTH_CONTRACT, {}),
     ):
         with pytest.raises(HomeAssistantError):
             await hass.services.async_call(
@@ -5548,7 +5565,7 @@ async def test_health_contract_action_metadata_and_translations_are_structural(
         "probes",
         "expected_revision",
     }
-    assert set(descriptions[DOMAIN][SERVICE_CLEAR_HEALTH_CONTRACT]["fields"]) == {
+    assert set(descriptions[DOMAIN][SERVICE_RESET_HEALTH_CONTRACT]["fields"]) == {
         "device_id",
         "expected_revision",
     }
@@ -5559,7 +5576,7 @@ async def test_health_contract_action_metadata_and_translations_are_structural(
     for service in (
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
     ):
         assert polish[f"component.{DOMAIN}.services.{service}.name"]
 
@@ -5886,53 +5903,6 @@ def test_the_ha_reason_taxonomy_mirrors_the_backend_exactly() -> None:
         reason: sorted(kind.value for kind in kinds)
         for reason, kinds in backend.HEALTH_PROBE_REASON_KINDS.items()
     }
-
-
-def test_a_discovery_candidate_kind_must_belong_to_its_own_adapter() -> None:
-    """An adapter produces candidates of its OWN kinds and no others -- a
-    targetless fallback must not arrive under a workload adapter, nor a
-    workload probe under the fallback adapter."""
-
-    incoherent = (
-        (HealthDiscoveryAdapter.SYSTEMD, HealthProbeKind.GUEST_OPERATIONAL, None),
-        (HealthDiscoveryAdapter.GUEST, HealthProbeKind.SYSTEMD_UNIT_ACTIVE, "n.service"),
-        (HealthDiscoveryAdapter.DOCKER, HealthProbeKind.SYSTEMD_UNIT_ACTIVE, "n.service"),
-        (HealthDiscoveryAdapter.SYSTEMD, HealthProbeKind.DOCKER_CONTAINER_RUNNING, "web"),
-        (HealthDiscoveryAdapter.GUEST, HealthProbeKind.DOCKER_CONTAINER_HEALTHY, "web"),
-    )
-    for adapter, kind, target in incoherent:
-        with pytest.raises(ValueError, match="does not belong to its own adapter"):
-            HealthDiscoveryCandidate(
-                adapter=adapter,
-                kind=kind,
-                target=target,
-                observed_state="running",
-                origin=None,
-                role_hint=HealthDiscoveryRoleHint.WORKLOAD_CANDIDATE,
-                recommended=False,
-                rationale="x",
-            )
-
-
-def test_positive_control_every_coherent_adapter_kind_pair_is_accepted() -> None:
-    coherent = (
-        (HealthDiscoveryAdapter.DOCKER, HealthProbeKind.DOCKER_CONTAINER_RUNNING, "web"),
-        (HealthDiscoveryAdapter.DOCKER, HealthProbeKind.DOCKER_CONTAINER_HEALTHY, "web"),
-        (HealthDiscoveryAdapter.SYSTEMD, HealthProbeKind.SYSTEMD_UNIT_ACTIVE, "n.service"),
-        (HealthDiscoveryAdapter.GUEST, HealthProbeKind.GUEST_OPERATIONAL, None),
-    )
-    for adapter, kind, target in coherent:
-        candidate = HealthDiscoveryCandidate(
-            adapter=adapter,
-            kind=kind,
-            target=target,
-            observed_state="running",
-            origin=None,
-            role_hint=HealthDiscoveryRoleHint.WORKLOAD_CANDIDATE,
-            recommended=False,
-            rationale="x",
-        )
-        assert candidate.kind is kind
 
 
 def test_job_view_rejects_a_reason_outside_the_bounded_taxonomy() -> None:

@@ -404,6 +404,103 @@ def test_only_an_explicit_operator_request_can_issue_an_update_job() -> None:
         assert "issue_package_update_job" not in text, rel_path
 
 
+#: The default-health provisioning/onboarding surface. Every module here
+#: participates in deciding that a current managed LXC has a health contract,
+#: and none of them may ever decide it by looking at what the guest runs.
+_DEFAULT_HEALTH_PROVISIONING_MODULES = (
+    "app/inventory/authority.py",
+    "app/inventory/health_contract.py",
+    "app/inventory/reconciliation.py",
+    "app/inventory_runtime.py",
+    "custom_components/hubinet_ops/config_flow.py",
+    "custom_components/hubinet_ops/repairs.py",
+    "custom_components/hubinet_ops/coordinator.py",
+)
+
+#: Text that only workload DISCOVERY needs. Advanced explicit probes still
+#: legitimately run `docker inspect` and `systemctl show` -- but they run
+#: them in the job-bound health helper, never in any module above.
+_WORKLOAD_INFERENCE_MARKERS = (
+    "command -v",
+    "docker ps",
+    "docker inspect",
+    "dockerd",
+    "containerd",
+    "docker.sock",
+    "systemctl",
+    "list-unit-files",
+    "list-units",
+    "health-candidates",
+    "health_candidates",
+    "discover_health_candidates",
+    "HealthDiscovery",
+    "adapter_presence",
+)
+
+
+def test_the_default_health_path_can_never_regress_into_workload_inference() -> None:
+    """The v0.5 pivot's fence.
+
+    A managed LXC's default health criterion is `guest_operational`, and it
+    is a PRODUCT decision made in authority, not an observation of the guest:
+    absence of a workload observer is not proof of workload absence. So the
+    provisioning/onboarding path must contain no adapter probe, no runtime
+    probe, and no candidate-discovery vocabulary of any kind.
+
+    This is deliberately NOT a global ban. An operator who explicitly
+    declares `docker_container_healthy("web")` still gets a real Docker
+    check, executed by the job-bound health helper -- which is excluded here
+    precisely because that is its job.
+    """
+
+    for rel_path in _DEFAULT_HEALTH_PROVISIONING_MODULES:
+        path = REPO_ROOT / rel_path
+        if not path.exists():
+            continue
+        text = _code(path)
+        for marker in _WORKLOAD_INFERENCE_MARKERS:
+            assert marker not in text, (rel_path, marker)
+
+    # Positive control: the explicit-probe executor still legitimately owns
+    # the Docker and systemd commands, so the markers above are a statement
+    # about WHERE inference may not live, not a global prohibition.
+    helper = _code(REPO_ROOT / "deploy/hubinet-package-health-helper.py")
+    assert "docker" in helper and "systemctl" in helper
+    # ...but even it no longer carries the removed discovery surface.
+    for marker in (
+        "command -v",
+        "docker ps",
+        "list-unit-files",
+        "list-units",
+        "discover_health_candidates",
+        "adapter_presence",
+    ):
+        assert marker not in helper, marker
+
+
+def test_no_backend_or_integration_module_still_names_health_discovery() -> None:
+    """The removed Stage-3/3B surface is gone, not merely unreferenced.
+
+    Leaving the DTOs, the route, or the HA flow behind would advertise a
+    capability v0.5 deliberately does not have.
+    """
+
+    for base in ("app", "custom_components", "deploy", "scripts"):
+        for path in sorted((REPO_ROOT / base).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            text = path.read_text(encoding="utf-8")
+            rel = path.relative_to(REPO_ROOT)
+            for marker in (
+                "HealthDiscovery",
+                "discover_health_candidates",
+                "health-candidates",
+                "UNDECIDED_DISCOVERY_STATUSES",
+                "ResourceHealthDiscoveryRequest",
+            ):
+                assert marker not in text, (str(rel), marker)
+
+
 def test_the_maintenance_fence_is_read_inside_the_issuance_transaction() -> None:
     """The synchronization is the writer lock, not the file's existence.
 
@@ -985,8 +1082,8 @@ def test_r0_ha_transport_defines_an_exact_operator_method_allowlist() -> None:
         "fetch_operator_availability",
         "approve_package_plan",
         "fetch_health_contract",
-        "fetch_health_candidates",
         "replace_health_contract",
+        "reset_health_contract",
         "clear_health_contract",
         "start_package_update",
         "fetch_package_update",

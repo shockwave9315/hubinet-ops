@@ -28,11 +28,8 @@ from homeassistant.helpers.selector import (
 
 from . import create_api_client
 from .api import (
-    UNDECIDED_DISCOVERY_STATUSES,
     BackendInformation,
-    HealthDiscoveryCandidate,
     HealthProbe,
-    HealthProbeKind,
     HubinetOpsApiError,
     HubinetOpsCannotConnect,
     HubinetOpsConflict,
@@ -243,47 +240,44 @@ class HubinetOpsConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
-def _probe_field(kind: HealthProbeKind, target: str | None) -> str:
-    """One stable, readable form-field name per probe identity -- mirrors
-    the backend's own duplicate-identity rule, `(kind, target)`."""
-
-    if kind is HealthProbeKind.GUEST_OPERATIONAL:
-        return "probe__guest_operational"
-    return f"probe__{kind.value}__{target}"
-
-
-def _probe_line(
-    kind: HealthProbeKind, target: str | None, note: str, *, recommended: bool
-) -> str:
-    target_text = target if target is not None else "(no target -- guest-level fallback)"
-    flag = " (recommended)" if recommended else ""
-    return f"- **{kind.value}** `{target_text}`{flag} -- {note}"
+def _probe_line(probe: HealthProbe) -> str:
+    target = probe.target if probe.target is not None else (
+        "(no target -- guest liveness only)"
+    )
+    return f"- **{probe.kind.value}** `{target}`"
 
 
 class HubinetOpsOptionsFlow(OptionsFlow):
-    """Native per-resource health-contract maintenance: view the current
-    contract, re-discover backend candidates, edit the selection, replace
-    the contract, or explicitly clear it.
+    """Native per-resource health maintenance: view the current contract and
+    restore the backend's built-in default.
 
     Reached from Settings -> Devices & Services -> Hubinet Ops -> Configure,
-    never Developer Tools. Discovery classification -- Docker/systemd
-    inspection, origin/role_hint, the recommendation priority order, and the
-    `guest_operational` fallback decision -- has no counterpart here at all:
-    this flow only ever renders an already-classified, already-bounded
-    `HealthDiscoveryResult` fetched over the existing typed route, and
-    nothing becomes a declared contract until the operator explicitly
-    submits the confirm/clear step. The contract's own `revision`, read the
-    moment this flow looked at it, is sent back as `expected_revision` on
-    every write -- a concurrent change is refused (`HubinetOpsConflict`)
-    rather than silently overwritten, and this flow re-reads the current
-    state and lets the operator try again instead of retrying blindly.
+    never Developer Tools. It is deliberately NOT part of the normal update
+    flow: a managed LXC already carries the backend's built-in
+    ``guest_operational`` contract before its first update, so nothing here
+    has to be visited to reach **Start**.
+
+    There is no discovery step. Home Assistant does not inspect Docker or
+    systemd, does not rank workloads, and does not decide what "healthy"
+    means for a guest -- absence of a workload observer is not proof of
+    workload absence, so v0.5 does not infer workload health automatically.
+    An operator who wants an advanced Docker/systemd contract declares it
+    explicitly through the ``hubinet_ops.set_health_contract`` action, which
+    this flow's own description names.
+
+    The contract's `revision`, read the moment this flow looked at it, is
+    sent back as `expected_revision` on the reset -- a concurrent change is
+    refused (`HubinetOpsConflict`) rather than silently overwritten, and this
+    flow re-reads current state and lets the operator try again instead of
+    retrying blindly.
     """
 
     _resource_id: str = ""
     _resource_name: str = ""
     _current_probes: tuple[HealthProbe, ...] = ()
-    _current_revision: int | None = None
-    _candidates: tuple[HealthDiscoveryCandidate, ...] = ()
+    #: `0` means *currently unconfigured* -- the backend's own compare-and-set
+    #: assertion for "there is no contract yet", never "no opinion".
+    _current_revision: int = 0
 
     def _coordinator(self):
         coordinators = self.hass.data.get(DOMAIN, {}).get(DATA_COORDINATORS, {})
@@ -305,7 +299,7 @@ class HubinetOpsOptionsFlow(OptionsFlow):
         if user_input is not None:
             self._resource_id = user_input["resource_id"]
             self._resource_name = resources[self._resource_id]
-            return await self.async_step_menu()
+            return await self.async_step_reset_confirm()
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema({vol.Required("resource_id"): vol.In(resources)}),
@@ -326,175 +320,51 @@ class HubinetOpsOptionsFlow(OptionsFlow):
             self._current_revision = contract.revision
         except HubinetOpsHealthContractUnconfigured:
             self._current_probes = ()
-            self._current_revision = None
+            self._current_revision = 0
         except HubinetOpsApiError:
             return "health_contract_read_failed"
         return None
 
-    async def async_step_menu(
-        self, user_input: dict[str, str] | None = None
-    ) -> ConfigFlowResult:
-        abort_reason = await self._read_current_contract()
-        if abort_reason is not None:
-            return self.async_abort(reason=abort_reason)
-        if not self._current_probes:
-            # Nothing declared yet -- there is nothing to view or clear, so
-            # go straight to discovery, exactly like the onboarding Repair.
-            return await self.async_step_discover()
-        return self.async_show_menu(
-            step_id="menu", menu_options=["discover", "clear_confirm"]
-        )
-
-    def _line_items(self) -> list[dict[str, Any]]:
-        """Every current probe UNIONED with every discovered candidate,
-        deduplicated by `(kind, target)` identity. A current probe always
-        defaults to checked (removing one is an explicit uncheck, never
-        implicit); a newly-discovered candidate defaults to the backend's
-        own `recommended` flag."""
-
-        merged: dict[tuple[HealthProbeKind, str | None], dict[str, Any]] = {}
-        for probe in self._current_probes:
-            merged[(probe.kind, probe.target)] = {
-                "kind": probe.kind,
-                "target": probe.target,
-                "default": True,
-                "line": _probe_line(
-                    probe.kind, probe.target, "currently declared", recommended=False
-                ),
-            }
-        for candidate in self._candidates:
-            key = (candidate.kind, candidate.target)
-            if key in merged:
-                continue
-            merged[key] = {
-                "kind": candidate.kind,
-                "target": candidate.target,
-                "default": candidate.recommended,
-                "line": _probe_line(
-                    candidate.kind,
-                    candidate.target,
-                    candidate.rationale,
-                    recommended=candidate.recommended,
-                ),
-            }
-        return [
-            {**value, "field": _probe_field(value["kind"], value["target"])}
-            for value in merged.values()
-        ]
-
-    async def async_step_discover(
+    async def async_step_reset_confirm(
         self, user_input: dict[str, bool] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
-        coordinator = self._coordinator()
-        if coordinator is None:
-            return self.async_abort(reason="entry_not_loaded")
-
         if user_input is None:
-            try:
-                result = await coordinator.api.async_fetch_health_candidates(
-                    self._resource_id
-                )
-            except HubinetOpsApiError:
-                return self.async_abort(reason="discovery_failed")
-            # PR #80 final review: a status carrying no usable candidate set
-            # must never be rendered as though discovery had succeeded.
-            # Previously the status was ignored entirely, so an unconfigured
-            # resource got a form with no checkboxes and no explanation, and
-            # every submit failed "no probes selected" forever.
-            if result.status in UNDECIDED_DISCOVERY_STATUSES:
-                if not self._current_probes:
-                    # Nothing declared and nothing discoverable: there is no
-                    # honest form to show. Abort naming the exact typed
-                    # reason, exactly as the onboarding Repair does.
-                    return self.async_abort(reason=result.status.value)
-                # A configured resource keeps its DECLARED probes visible so
-                # the operator can still edit or keep them -- but this is
-                # explicitly NOT a successful discovery, and no candidate is
-                # fabricated to fill the gap.
-                self._candidates = ()
-                errors["base"] = f"rediscovery_{result.status.value}"
-            else:
-                self._candidates = result.candidates
-                if not self._current_probes and not result.candidates:
-                    # A truthful, positively-completed answer that simply has
-                    # nothing to offer. Still not a renderable form.
-                    return self.async_abort(reason="no_candidates_discovered")
+            abort_reason = await self._read_current_contract()
+            if abort_reason is not None:
+                return self.async_abort(reason=abort_reason)
         else:
-            line_items = self._line_items()
-            selected = tuple(
-                item for item in line_items if user_input.get(item["field"])
-            )
-            if not selected:
-                errors["base"] = "no_probes_selected"
-            else:
-                probes = tuple(
-                    HealthProbe(kind=item["kind"], target=item["target"])
-                    for item in selected
-                )
-                try:
-                    await coordinator.api.async_replace_health_contract(
-                        self._resource_id, probes, self._current_revision
-                    )
-                except HubinetOpsConflict:
-                    errors["base"] = "revision_changed"
-                    await self._read_current_contract()
-                except HubinetOpsApiError:
-                    errors["base"] = "declare_failed"
-                else:
-                    await coordinator.async_request_refresh()
-                    return self.async_create_entry(title="", data={})
-
-        line_items = self._line_items()
-        schema = vol.Schema(
-            {
-                vol.Optional(item["field"], default=item["default"]): bool
-                for item in line_items
-            }
-        )
-        return self.async_show_form(
-            step_id="discover",
-            data_schema=schema,
-            errors=errors,
-            description_placeholders={
-                "name": self._resource_name,
-                "candidates": "\n".join(item["line"] for item in line_items),
-            },
-        )
-
-    async def async_step_clear_confirm(
-        self, user_input: dict[str, bool] | None = None
-    ) -> ConfigFlowResult:
-        errors: dict[str, str] = {}
-        if user_input is not None:
             if not user_input.get("confirm"):
-                errors["base"] = "clear_not_confirmed"
+                errors["base"] = "reset_not_confirmed"
             else:
                 coordinator = self._coordinator()
                 if coordinator is None:
                     return self.async_abort(reason="entry_not_loaded")
                 try:
-                    await coordinator.api.async_clear_health_contract(
+                    # The backend owns the default; this sends no probe, kind,
+                    # or target of its own.
+                    await coordinator.api.async_reset_health_contract(
                         self._resource_id, self._current_revision
                     )
                 except HubinetOpsConflict:
                     errors["base"] = "revision_changed"
                     await self._read_current_contract()
                 except HubinetOpsApiError:
-                    errors["base"] = "clear_failed"
+                    errors["base"] = "reset_failed"
                 else:
                     await coordinator.async_request_refresh()
                     return self.async_create_entry(title="", data={})
 
+        current = (
+            "\n".join(_probe_line(probe) for probe in self._current_probes)
+            or "- (unconfigured -- no declared meaning of healthy)"
+        )
         return self.async_show_form(
-            step_id="clear_confirm",
+            step_id="reset_confirm",
             data_schema=vol.Schema({vol.Required("confirm", default=False): bool}),
             errors=errors,
             description_placeholders={
                 "name": self._resource_name,
-                "candidates": "\n".join(
-                    _probe_line(probe.kind, probe.target, "currently declared", recommended=False)
-                    for probe in self._current_probes
-                ),
+                "current": current,
             },
         )

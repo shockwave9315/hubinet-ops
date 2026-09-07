@@ -40,7 +40,7 @@ set_health_contract:
           min: 0
           mode: box
 
-clear_health_contract:
+reset_health_contract:
   fields:
     device_id:
       required: true

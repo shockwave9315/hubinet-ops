@@ -85,14 +85,36 @@ will not invent one. A guest that answers, an `apt` exit code, and the
 package-mutation completion proof are each already-meaningful facts, and none
 of them says anything about what the guest is *for*.
 
-**Health is operator-declared, per resource.** For each dynamic resource the
-operator declares a health contract: the list of things that must be true for
-that workload to be considered up. It attaches to the durable `resource_id`,
-never to a VMID, a hostname, a node, or a list in a repository or config file —
-adding or removing a guest in Proxmox still never requires a code change. A
-guest that replaces another at the same VMID is a different resource
-incarnation and inherits nothing; the same resource keeps its contract when it
-is renamed or moves node.
+**Default.** For a package-managed LXC, v0.5 uses `guest_operational` as the
+built-in post-update health criterion. The backend provisions it for every
+current managed LXC, so an approved update can start without a separate
+health-onboarding step.
+
+**Meaning.** `guest_operational` proves only guest liveness/process
+execution. It does not prove application health, Docker health, systemd
+workload health, HTTP reachability, network reachability, or that a database
+is accepting queries.
+
+**No automatic workload discovery.** v0.5 does not automatically discover or
+recommend Docker/systemd application health probes. Absence of a workload
+observer is not proof of workload absence, so v0.5 does not infer workload
+health automatically.
+
+**Advanced probes.** Docker and systemd probes remain explicit advanced
+operator configuration, declared through the health-contract mutation. A
+manually configured Docker contract still truthfully checks Docker; a
+manually configured systemd contract still truthfully checks systemd.
+
+**Health is per resource, and an operator's own contract always wins.** A
+health contract attaches to the durable `resource_id`, never to a VMID, a
+hostname, a node, or a list in a repository or config file — adding or
+removing a guest in Proxmox still never requires a code change. A guest that
+replaces another at the same VMID is a different resource incarnation and
+inherits nothing (it gets its own fresh built-in default, never the
+predecessor's contract); the same resource keeps its contract when it is
+renamed or moves node. An explicitly declared contract is never silently
+replaced by the default — only an explicit operator reset restores the
+baseline.
 
 **A contract is one or more typed probes, and all of them are required.**
 There are exactly four probe kinds:
@@ -101,34 +123,19 @@ There are exactly four probe kinds:
 - `docker_container_running` — the named Docker container must be running;
 - `docker_container_healthy` — the named Docker container must be running and
   report Docker `HEALTHCHECK` status healthy;
-- `guest_operational` (schema v20) — the guest itself must be reachable. It
-  carries no target at all, never even a faked one (a literal `"guest"`, a
-  VMID string) — it is the one probe kind this product will recommend when
-  backend discovery positively completes for both the Docker and systemd
-  families on a guest and finds no workload candidate in either. It is a
-  fallback proof of guest liveness, never a substitute for application-health
-  proof: an operator who later adds a real workload to that guest is expected
-  to replace it with a probe naming that workload.
+- `guest_operational` (schema v20) — the exact current LXC remained reachable
+  through the trusted PVE boundary and successfully executed one fixed,
+  code-owned command. It carries no target at all, never even a faked one (a
+  literal `"guest"`, a VMID string). This is the built-in default above: a
+  proof of guest liveness, never a substitute for application-health proof.
+  An operator who wants their workload checked declares one of the three
+  probe kinds above instead.
 
 Every declared probe must hold. There is no OR, no scoring, no percentage, and
 no boolean expression — a contract that needs those is a contract nobody can
 read at 3am. A probe names a target; it never carries a command, a script, or
 a shell fragment, and no caller-supplied text ever becomes command text (see
 "Arbitrary remote shell" under "Not the product").
-
-**Health is operator-declared even when the backend suggests candidates.**
-Home Assistant can ask the backend to look at a resource and report what it
-found — running Docker containers, containers with a `HEALTHCHECK`, systemd
-units it can enumerate — through one ephemeral, read-only discovery read that
-persists nothing and grants no authority. The backend's own priority order
-(a Docker `HEALTHCHECK` outranks a merely-running container, which outranks a
-single unambiguous systemd candidate, which outranks the `guest_operational`
-fallback, which is only ever recommended once discovery positively completed
-in both families with nothing to recommend) only ever narrows what is
-*shown* to an operator; nothing becomes a declared contract until the operator
-explicitly confirms it through the same contract mutation this section
-already describes. Discovery uncertainty in either family is never read as
-"nothing found" and never falls through to a recommendation.
 
 **Configuration and execution eligibility are separate.** The configuration
 layer keeps probe targets as bounded opaque data; it does not guess, append a
@@ -143,6 +150,9 @@ resource with no declared contract cannot be health-checked, so its update job
 cannot be called successful and no automatic health-triggered rollback can be
 justified for it. Unconfigured is not "healthy", "passed", or "nothing to
 check" — it is the absence of a statement, and Hubinet Ops reports it as such.
+This is not the normal state of a managed LXC: the built-in default above
+means a current managed LXC is configured from the moment it is reconciled,
+and resetting health restores that baseline rather than removing it.
 An empty contract is invalid for the same reason: a list of zero required
 things is not a definition of health. A resource that has declared nothing
 therefore cannot be given an update job at all: a job whose success criterion

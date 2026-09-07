@@ -161,82 +161,12 @@ class HealthProbeKind(StrEnum):
     SYSTEMD_UNIT_ACTIVE = "systemd_unit_active"
     DOCKER_CONTAINER_RUNNING = "docker_container_running"
     DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
-    #: A FALLBACK, not an application-health proof (v20): backend discovery
-    #: recommends this ONLY when no supported Docker/systemd workload
-    #: candidate was found. Carries no workload target -- see
+    #: The v0.5 BUILT-IN DEFAULT for a package-managed LXC: a guest
+    #: liveness proof, never an application-health proof. The backend
+    #: provisions it as a product decision; Home Assistant never infers it
+    #: from what a guest appears to run. Carries no workload target -- see
     #: `HealthProbe.target`.
     GUEST_OPERATIONAL = "guest_operational"
-
-
-class HealthDiscoveryAdapter(StrEnum):
-    """The supported v0.5 discovery adapters. Home Assistant never discovers
-    or classifies anything itself -- this only names which backend-owned
-    adapter produced a candidate."""
-
-    DOCKER = "docker"
-    SYSTEMD = "systemd"
-    GUEST = "guest"
-
-
-class HealthDiscoveryOrigin(StrEnum):
-    """Where a systemd candidate's unit file came from. Neutral: a
-    PACKAGE_UNIT is never thereby "platform"."""
-
-    LOCAL_UNIT = "local_unit"
-    PACKAGE_UNIT = "package_unit"
-    GENERATED = "generated"
-    ALIAS = "alias"
-    UNKNOWN_ORIGIN = "unknown_origin"
-
-
-class HealthDiscoveryRoleHint(StrEnum):
-    """A structural hint, never a health fact."""
-
-    WORKLOAD_CANDIDATE = "workload_candidate"
-    RUNTIME = "runtime"
-    PLATFORM = "platform"
-    AMBIGUOUS = "ambiguous"
-
-
-class HealthDiscoveryStatus(StrEnum):
-    """What discovery could truthfully determine. Home Assistant renders
-    this and never re-derives it -- in particular, it never treats an
-    inability to discover as proof that no workload exists."""
-
-    OK = "ok"
-    NO_CANDIDATES = "no_candidates"
-    AMBIGUOUS_CANDIDATES = "ambiguous_candidates"
-    GUEST_UNAVAILABLE = "guest_unavailable"
-    UNDECIDABLE = "undecidable"
-    TOO_MANY_CANDIDATES = "too_many_candidates"
-
-
-#: The statuses that carry NO usable candidate set, and therefore must never
-#: be rendered as though discovery had succeeded (PR #80 final review).
-#:
-#: Defined here, beside the enum whose semantics it comes from, so both
-#: operator surfaces that call the discovery route -- the fixable Repair and
-#: the Options flow -- share ONE definition rather than each keeping a
-#: private copy that could drift. `NO_CANDIDATES` and `AMBIGUOUS_CANDIDATES`
-#: are deliberately NOT here: both are truthful, positively-completed
-#: answers that do carry candidates for an operator to choose from.
-UNDECIDED_DISCOVERY_STATUSES: frozenset[HealthDiscoveryStatus] = frozenset(
-    {
-        HealthDiscoveryStatus.GUEST_UNAVAILABLE,
-        HealthDiscoveryStatus.UNDECIDABLE,
-        HealthDiscoveryStatus.TOO_MANY_CANDIDATES,
-    }
-)
-
-
-class HealthDiscoveryRecommendationBasis(StrEnum):
-    """The bounded, backend-owned rationale for what discovery recommended.
-    Home Assistant translates this token; it never computes one."""
-
-    DOCKER_HEALTHCHECK = "docker_healthcheck"
-    DOCKER_RUNNING = "docker_running"
-    SINGLE_SYSTEMD_CANDIDATE = "single_systemd_candidate"
-    GUEST_FALLBACK = "guest_fallback"
 
 
 class HealthProbeOutcome(StrEnum):

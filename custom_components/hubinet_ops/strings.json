@@ -50,40 +50,26 @@
     "abort": {
       "entry_not_loaded": "This Hubinet Ops entry is not currently loaded.",
       "no_lxc_resources": "No LXC resources are currently loaded by Hubinet Ops.",
-      "health_contract_read_failed": "Could not read the current health contract for this resource.",
-      "discovery_failed": "Could not reach the Hubinet Ops backend to discover health-check candidates.",
-      "undecidable": "The Hubinet Ops backend could not determine which health-check adapters this guest has. Nothing was changed; try again once the guest is readable, or use the `hubinet_ops.set_health_contract` action.",
-      "guest_unavailable": "The Hubinet Ops backend could not reach the guest to discover health-check candidates. Nothing was changed; try again once the guest is reachable.",
-      "too_many_candidates": "Discovery found more candidates than can be shown safely. Use the `hubinet_ops.set_health_contract` action to declare the exact probes you want.",
-      "no_candidates_discovered": "Discovery completed and found nothing to offer for this resource. Use the `hubinet_ops.set_health_contract` action to declare the exact probes you want."
+      "health_contract_read_failed": "Could not read the current health contract for this resource."
     },
     "error": {
-      "no_probes_selected": "Select at least one probe, or cancel.",
-      "declare_failed": "Hubinet Ops refused the declared health contract. Nothing was changed.",
-      "revision_changed": "The health contract changed since this flow read it. Review the refreshed current probes below and try again.",
-      "clear_not_confirmed": "Check the confirmation box to clear the health contract.",
-      "clear_failed": "Hubinet Ops refused to clear the health contract. Nothing was changed.",
-      "rediscovery_undecidable": "Fresh discovery could not determine which health-check adapters this guest has, so no new candidates are shown. The probes below are the ones currently declared; submit to keep or adjust them, or cancel.",
-      "rediscovery_guest_unavailable": "Fresh discovery could not reach the guest, so no new candidates are shown. The probes below are the ones currently declared; submit to keep or adjust them, or cancel.",
-      "rediscovery_too_many_candidates": "Fresh discovery found more candidates than can be shown safely, so none are shown. The probes below are the ones currently declared; submit to keep or adjust them, or cancel."
+      "reset_not_confirmed": "Check the confirmation box to restore the built-in health contract.",
+      "reset_failed": "Hubinet Ops refused to reset the health contract. Nothing was changed.",
+      "revision_changed": "The health contract changed since this flow read it. Review the refreshed contract below and try again."
     },
     "step": {
       "init": {
-        "title": "Maintain a health contract",
-        "description": "Select the resource whose health contract you want to view, edit, replace, or clear.",
+        "title": "Health contract maintenance",
+        "description": "Select the resource whose health contract you want to review, or reset to the Hubinet Ops built-in default.",
         "data": {
           "resource_id": "Resource"
         }
       },
-      "discover": {
-        "title": "Health contract for {name}",
-        "description": "Currently declared probes and freshly discovered candidates for {name}. Nothing is written until you select **Submit** -- adjust the selection to match what \"healthy\" means for this workload, then submit to replace the declared contract.\n\n{candidates}"
-      },
-      "clear_confirm": {
-        "title": "Clear the health contract for {name}",
-        "description": "This currently declares:\n\n{candidates}\n\nClearing makes {name} unconfigured, which is not healthy, and blocks any future package update until a contract is declared again. Check the box and select **Submit** to confirm.",
+      "reset_confirm": {
+        "title": "Reset the health contract for {name}",
+        "description": "This currently declares:\n\n{current}\n\nResetting replaces it with the Hubinet Ops built-in default for a package-managed LXC: a single `guest_operational` probe, which proves only that the exact container is still reachable and can still run a process. It does not prove application health.\n\nHubinet Ops does not discover Docker or systemd workloads for you — absence of a workload observer is not proof of workload absence — so an advanced Docker/systemd contract stays an explicit choice you make with the `hubinet_ops.set_health_contract` action.\n\nCheck the box and select **Submit** to confirm.",
         "data": {
-          "confirm": "I understand -- clear the health contract"
+          "confirm": "I understand — restore the built-in default"
         }
       }
     }
@@ -198,14 +184,30 @@
       }
     },
     "button": {
-      "review_update_plan": {"name": "Review update plan"},
-      "approve_reviewed_plan": {"name": "Approve reviewed plan"},
-      "start_update": {"name": "Start approved update"},
-      "view_update_job": {"name": "View update job"},
-      "resume_update": {"name": "Resume update job"},
-      "rerun_health_evaluation": {"name": "Re-run health evaluation"},
-      "rollback_update": {"name": "Roll back this update"},
-      "view_health_contract": {"name": "View health contract"}
+      "review_update_plan": {
+        "name": "Review update plan"
+      },
+      "approve_reviewed_plan": {
+        "name": "Approve reviewed plan"
+      },
+      "start_update": {
+        "name": "Start approved update"
+      },
+      "view_update_job": {
+        "name": "View update job"
+      },
+      "resume_update": {
+        "name": "Resume update job"
+      },
+      "rerun_health_evaluation": {
+        "name": "Re-run health evaluation"
+      },
+      "rollback_update": {
+        "name": "Roll back this update"
+      },
+      "view_health_contract": {
+        "name": "View health contract"
+      }
     }
   },
   "services": {
@@ -257,9 +259,9 @@
         }
       }
     },
-    "clear_health_contract": {
-      "name": "Clear health contract",
-      "description": "Remove the health contract for one selected Hubinet Ops resource. The resource becomes unconfigured, which is not healthy.",
+    "reset_health_contract": {
+      "name": "Reset health contract",
+      "description": "Restore the Hubinet Ops built-in default health contract for one selected resource: a single guest_operational probe that proves guest liveness only, never application health.",
       "fields": {
         "device_id": {
           "name": "Resource",
@@ -368,7 +370,7 @@
     },
     "health": {
       "title": "Hubinet Ops health contract — {name}",
-      "unconfigured": "No health contract is configured. This is **unconfigured**, not healthy, and a package update cannot start until a contract is declared. The quickest way to declare one is natively: **Settings → Devices & Services → Hubinet Ops → Configure**, which discovers candidates for this resource and lets you confirm them (a **Repair** offers the same discover-and-confirm flow while an approved plan is waiting on it). The **`hubinet_ops.set_health_contract`** action — reachable from this device's **Actions** tab, or from Developer Tools → Actions — remains fully supported for typing one by hand: name each required probe kind (`systemd_unit_active`, `docker_container_running`, `docker_container_healthy`, or the targetless `guest_operational` guest-liveness fallback) and its target.",
+      "unconfigured": "No health contract is configured. This is **unconfigured**, not healthy, and a package update cannot start until a contract is declared. This is not the normal state: Hubinet Ops gives every package-managed LXC a built-in `guest_operational` contract, and the next successful inventory discovery restores it automatically. To restore it now, use **Settings → Devices & Services → Hubinet Ops → Configure**, or the **`hubinet_ops.reset_health_contract`** action. To declare an advanced contract instead, use **`hubinet_ops.set_health_contract`** — reachable from this device's **Actions** tab, or from Developer Tools → Actions — naming each required probe kind (`systemd_unit_active`, `docker_container_running`, `docker_container_healthy`, or the targetless `guest_operational` guest-liveness probe) and its target.",
       "revision": "Revision",
       "all_required": "Every probe below is required:"
     }
@@ -376,29 +378,7 @@
   "issues": {
     "health_contract_unconfigured": {
       "title": "{name}: package update blocked on a missing health contract",
-      "description": "The reviewed package plan for **{name}** is approved, but no health contract is declared, so **Start approved update** stays disabled. That is deliberate: Hubinet Ops never invents what \"healthy\" means for your workload — you declare it.\n\nSelect **Fix** below to discover candidates for this resource and declare a contract from them, or use the `hubinet_ops.set_health_contract` action for this device (reachable from this device's **Actions** tab or from Developer Tools → Actions) to type one by hand. This issue clears itself automatically once a contract exists for this resource.",
-      "fix_flow": {
-        "abort": {
-          "entry_not_loaded": "This Hubinet Ops entry is not currently loaded.",
-          "resource_not_found": "This resource is no longer loaded by Hubinet Ops.",
-          "discovery_failed": "Could not reach the Hubinet Ops backend to discover health-check candidates. Use the `hubinet_ops.set_health_contract` action instead, or try again once the backend is reachable.",
-          "guest_unavailable": "The backend could not reach the guest to discover health-check candidates. Use the `hubinet_ops.set_health_contract` action instead, or try again once the guest is reachable.",
-          "undecidable": "The backend could not determine whether Docker or systemd is present on this guest. Use the `hubinet_ops.set_health_contract` action instead.",
-          "too_many_candidates": "Discovery found more candidates than can be shown safely. Use the `hubinet_ops.set_health_contract` action to declare the exact probes you want.",
-          "no_candidates_discovered": "Discovery found nothing to recommend for this resource. Use the `hubinet_ops.set_health_contract` action to declare the exact probes you want.",
-          "contract_already_declared": "A health contract was declared for this resource while this form was open, so nothing was written. Review the contract that now exists before changing it."
-        },
-        "error": {
-          "no_candidates_selected": "Select at least one probe, or cancel and use the `hubinet_ops.set_health_contract` action instead.",
-          "declare_failed": "Hubinet Ops refused the declared health contract. Nothing was changed."
-        },
-        "step": {
-          "confirm": {
-            "title": "Declare a health contract for {name}",
-            "description": "Hubinet Ops discovered the following on {name}. Nothing is written until you select **Submit** — recommended candidates are pre-selected; adjust the selection to match what \"healthy\" means for this workload, then submit to declare it.\n\n{candidates}"
-          }
-        }
-      }
+      "description": "The reviewed package plan for **{name}** is approved, but no health contract is declared, so **Start approved update** stays disabled.\n\nThis should not normally happen: Hubinet Ops gives every package-managed LXC a built-in `guest_operational` health contract, and the next successful inventory discovery restores it for this resource automatically. To restore it now, use **Settings → Devices & Services → Hubinet Ops → Configure**, or the `hubinet_ops.reset_health_contract` action for this device. To declare an advanced Docker/systemd contract instead, use the `hubinet_ops.set_health_contract` action (this device's **Actions** tab, or Developer Tools → Actions).\n\nThis issue clears itself automatically once a contract exists for this resource."
     }
   },
   "exceptions": {
@@ -435,8 +415,8 @@
     "health_contract_set_refused": {
       "message": "Hubinet Ops refused the declared health contract."
     },
-    "health_contract_clear_refused": {
-      "message": "Hubinet Ops refused to clear the health contract."
+    "health_contract_reset_refused": {
+      "message": "Hubinet Ops refused to reset the health contract."
     },
     "approve_without_review": {
       "message": "Review the current update plan before approving it."
