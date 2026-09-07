@@ -60,7 +60,12 @@ jobs:
           python -c "import importlib.metadata as m; assert m.version('homeassistant') == '2026.9.1'"
           python -c "import sys; assert sys.version_info >= (3, 14, 2)"
       - name: Test native Home Assistant integration
-        run: python -m pytest -q --tb=short -o asyncio_mode=auto tests/test_hubinet_ops_integration.py
+        run: |
+          python -m pytest -q --tb=short -o asyncio_mode=auto \
+            tests/test_hubinet_ops_integration.py \
+            tests/test_hubinet_ops_options_flow.py \
+            tests/test_hubinet_ops_repairs.py \
+            tests/test_hubinet_ops_transport_http.py
 
   bootstrap-smoke:
     runs-on: ubuntu-latest
