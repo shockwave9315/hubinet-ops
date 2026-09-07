@@ -45,12 +45,13 @@ from homeassistant.helpers import issue_registry as ir
 import voluptuous as vol
 
 from .api import (
+    UNDECIDED_DISCOVERY_STATUSES,
     HealthContractStatus,
     HealthDiscoveryCandidate,
-    HealthDiscoveryStatus,
     HealthProbe,
     HealthProbeKind,
     HubinetOpsApiError,
+    HubinetOpsConflict,
     HubinetOpsSnapshot,
     PackagePlanApprovalStatus,
     ResourceType,
@@ -66,13 +67,10 @@ _ISSUE_PREFIX = "health_contract_unconfigured"
 #: aborts rather than showing an empty or meaningless form. The operator's
 #: only path forward on any of these is the manual `set_health_contract`
 #: action, exactly as before Stage 4.
-_UNDECIDED_DISCOVERY_STATUSES = frozenset(
-    {
-        HealthDiscoveryStatus.GUEST_UNAVAILABLE,
-        HealthDiscoveryStatus.UNDECIDABLE,
-        HealthDiscoveryStatus.TOO_MANY_CANDIDATES,
-    }
-)
+#:
+#: Defined once in `contract/enums.py`, beside the enum it comes from, and
+#: shared with `HubinetOpsOptionsFlow` so the two operator surfaces that call
+#: the discovery route cannot drift apart (PR #80 final review).
 
 
 def _issue_id(entry_id: str, resource_id: str) -> str:
@@ -216,7 +214,7 @@ class HealthContractDiscoveryFixFlow(RepairsFlow):
         except HubinetOpsApiError:
             return self.async_abort(reason="discovery_failed")
 
-        if result.status in _UNDECIDED_DISCOVERY_STATUSES:
+        if result.status in UNDECIDED_DISCOVERY_STATUSES:
             return self.async_abort(reason=result.status.value)
         if not result.candidates:
             return self.async_abort(reason="no_candidates_discovered")
@@ -246,9 +244,23 @@ class HealthContractDiscoveryFixFlow(RepairsFlow):
                     for candidate in selected
                 )
                 try:
+                    # Compare-and-set on the issue's OWN premise: this
+                    # Repair exists only because the contract is currently
+                    # UNCONFIGURED, and `expected_revision=0` is exactly the
+                    # backend's assertion of that (PR #80 final review). An
+                    # unconditional write here would silently overwrite a
+                    # contract another operator declared while this flow was
+                    # discovering.
                     await coordinator.api.async_replace_health_contract(
-                        resource_id, probes, None
+                        resource_id, probes, 0
                     )
+                except HubinetOpsConflict:
+                    # The Repair's premise is no longer true: something now
+                    # IS declared. Never a blind retry, and never an
+                    # overwrite -- re-read current truth and stop, leaving
+                    # the operator to look at what actually exists.
+                    await coordinator.async_request_refresh()
+                    return self.async_abort(reason="contract_already_declared")
                 except HubinetOpsApiError:
                     errors["base"] = "declare_failed"
                 else:

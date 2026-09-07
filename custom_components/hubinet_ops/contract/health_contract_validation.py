@@ -151,12 +151,30 @@ _MAX_OBSERVED_STATE_LENGTH = 100
 _MAX_RATIONALE_LENGTH = 100
 
 
+#: The exact adapter -> probe-kind pairing. An adapter produces candidates of
+#: its OWN kinds and no others, so `(adapter=systemd, kind=guest_operational)`
+#: -- which would slip a targetless fallback in under a workload adapter, or
+#: a workload probe in under the fallback adapter -- is refused rather than
+#: rendered as if it described something real (PR #80 final review).
+_DISCOVERY_ADAPTER_KINDS: dict[HealthDiscoveryAdapter, frozenset[HealthProbeKind]] = {
+    HealthDiscoveryAdapter.DOCKER: frozenset(
+        {
+            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        }
+    ),
+    HealthDiscoveryAdapter.SYSTEMD: frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
+    HealthDiscoveryAdapter.GUEST: frozenset({HealthProbeKind.GUEST_OPERATIONAL}),
+}
+
+
 def validate_health_discovery_candidate(candidate: "HealthDiscoveryCandidate") -> None:
     """Independent proof this is one coherent ephemeral candidate.
 
-    Mirrors the backend's own coherence rule: ``target`` is ``None`` for,
-    and only for, a ``guest`` adapter candidate (``kind=guest_operational``)
-    -- never a faked target, and never a missing one for any other kind.
+    Mirrors the backend's own coherence rules: an adapter only ever produces
+    its own probe kinds, and ``target`` is ``None`` for, and only for, the
+    ``guest`` adapter's ``guest_operational`` candidate -- never a faked
+    target, and never a missing one for any other kind.
     """
 
     _require_enum_instance(
@@ -165,6 +183,10 @@ def validate_health_discovery_candidate(candidate: "HealthDiscoveryCandidate") -
     _require_enum_instance(
         candidate.kind, HealthProbeKind, "discovery candidate kind"
     )
+    if candidate.kind not in _DISCOVERY_ADAPTER_KINDS[candidate.adapter]:
+        raise ValueError(
+            "discovery candidate kind does not belong to its own adapter"
+        )
     is_guest = candidate.kind is HealthProbeKind.GUEST_OPERATIONAL
     if is_guest:
         if candidate.target is not None:

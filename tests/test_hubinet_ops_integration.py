@@ -5804,6 +5804,137 @@ def test_job_view_rejects_a_reason_impossible_for_its_probe_kind() -> None:
         )
 
 
+# ===========================================================================
+# PR #80 FINAL REVIEW, coherence cleanups.
+# ===========================================================================
+
+
+def test_job_view_rejects_a_target_shaped_reason_on_a_targetless_probe() -> None:
+    """`guest_operational` NAMES no target, so no target-shaped reason can
+    truthfully describe it. Both tokens are produced only where a
+    request-supplied target actually exists."""
+
+    for reason in ("probe_target_not_exact", "probe_target_ambiguous"):
+        with pytest.raises(ValueError, match="impossible for that probe kind"):
+            job_view(
+                checkpoint="health_completed",
+                health_outcome=PackageUpdateHealthOutcome.FAILED,
+                health_probes=(
+                    _probe_result(
+                        kind=HealthProbeKind.GUEST_OPERATIONAL,
+                        target=None,
+                        outcome=HealthProbeOutcome.UNKNOWN,
+                        reason=reason,
+                    ),
+                    _probe_result(
+                        probe_index=1,
+                        kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+                        target="web",
+                        outcome=HealthProbeOutcome.FAILED,
+                        reason="container_not_running",
+                    ),
+                ),
+            )
+
+
+def test_positive_control_a_targeted_probe_may_still_report_a_target_reason() -> None:
+    """Restricting those tokens must not remove them from the kinds that DO
+    have a target."""
+
+    view = job_view(
+        checkpoint="health_completed",
+        health_outcome=PackageUpdateHealthOutcome.FAILED,
+        health_probes=(
+            _probe_result(
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                target="nginx.service",
+                outcome=HealthProbeOutcome.UNKNOWN,
+                reason="probe_target_not_exact",
+            ),
+            _probe_result(
+                probe_index=1,
+                kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+                target="web",
+                outcome=HealthProbeOutcome.FAILED,
+                reason="container_not_running",
+            ),
+        ),
+    )
+    assert view.health_probes[0].reason == "probe_target_not_exact"
+
+
+def test_the_ha_reason_taxonomy_mirrors_the_backend_exactly() -> None:
+    """Two mirrored tables must not drift. HA validates independently, but
+    it must validate the SAME closed taxonomy the backend owns."""
+
+    from app.inventory import health_observation as backend
+
+    from custom_components.hubinet_ops.contract import package_update_validation as ha
+
+    assert ha.HEALTH_PROBE_REASONS == backend.HEALTH_PROBE_REASONS
+    assert {
+        outcome.value: sorted(reasons)
+        for outcome, reasons in ha.HEALTH_PROBE_REASONS_BY_OUTCOME.items()
+    } == {
+        outcome.value: sorted(reasons)
+        for outcome, reasons in backend.HEALTH_PROBE_REASONS_BY_OUTCOME.items()
+    }
+    assert {
+        reason: sorted(kind.value for kind in kinds)
+        for reason, kinds in ha.HEALTH_PROBE_REASON_KINDS.items()
+    } == {
+        reason: sorted(kind.value for kind in kinds)
+        for reason, kinds in backend.HEALTH_PROBE_REASON_KINDS.items()
+    }
+
+
+def test_a_discovery_candidate_kind_must_belong_to_its_own_adapter() -> None:
+    """An adapter produces candidates of its OWN kinds and no others -- a
+    targetless fallback must not arrive under a workload adapter, nor a
+    workload probe under the fallback adapter."""
+
+    incoherent = (
+        (HealthDiscoveryAdapter.SYSTEMD, HealthProbeKind.GUEST_OPERATIONAL, None),
+        (HealthDiscoveryAdapter.GUEST, HealthProbeKind.SYSTEMD_UNIT_ACTIVE, "n.service"),
+        (HealthDiscoveryAdapter.DOCKER, HealthProbeKind.SYSTEMD_UNIT_ACTIVE, "n.service"),
+        (HealthDiscoveryAdapter.SYSTEMD, HealthProbeKind.DOCKER_CONTAINER_RUNNING, "web"),
+        (HealthDiscoveryAdapter.GUEST, HealthProbeKind.DOCKER_CONTAINER_HEALTHY, "web"),
+    )
+    for adapter, kind, target in incoherent:
+        with pytest.raises(ValueError, match="does not belong to its own adapter"):
+            HealthDiscoveryCandidate(
+                adapter=adapter,
+                kind=kind,
+                target=target,
+                observed_state="running",
+                origin=None,
+                role_hint=HealthDiscoveryRoleHint.WORKLOAD_CANDIDATE,
+                recommended=False,
+                rationale="x",
+            )
+
+
+def test_positive_control_every_coherent_adapter_kind_pair_is_accepted() -> None:
+    coherent = (
+        (HealthDiscoveryAdapter.DOCKER, HealthProbeKind.DOCKER_CONTAINER_RUNNING, "web"),
+        (HealthDiscoveryAdapter.DOCKER, HealthProbeKind.DOCKER_CONTAINER_HEALTHY, "web"),
+        (HealthDiscoveryAdapter.SYSTEMD, HealthProbeKind.SYSTEMD_UNIT_ACTIVE, "n.service"),
+        (HealthDiscoveryAdapter.GUEST, HealthProbeKind.GUEST_OPERATIONAL, None),
+    )
+    for adapter, kind, target in coherent:
+        candidate = HealthDiscoveryCandidate(
+            adapter=adapter,
+            kind=kind,
+            target=target,
+            observed_state="running",
+            origin=None,
+            role_hint=HealthDiscoveryRoleHint.WORKLOAD_CANDIDATE,
+            recommended=False,
+            rationale="x",
+        )
+        assert candidate.kind is kind
+
+
 def test_job_view_rejects_a_reason_outside_the_bounded_taxonomy() -> None:
     """Never render raw guest output as if it were a classification token."""
 

@@ -35,6 +35,7 @@ from custom_components.hubinet_ops.api import (
     HealthDiscoveryStatus,
     HealthProbeKind,
     HubinetOpsCannotConnect,
+    HubinetOpsConflict,
     PackagePlanApprovalStatus,
 )
 from custom_components.hubinet_ops.const import DOMAIN
@@ -161,7 +162,11 @@ async def test_fix_flow_declares_the_recommended_docker_candidate(
     assert result["type"] is FlowResultType.CREATE_ENTRY
     written_resource_id, written_probes, written_revision = transport.health_contract_writes[0]
     assert written_resource_id == RESOURCE_CT
-    assert written_revision is None
+    # Compare-and-set on the issue's own premise: `0` asserts "currently
+    # unconfigured", which is the only reason this Repair was raised. An
+    # unconditional (`None`) write would silently overwrite a contract
+    # declared while this flow was discovering (PR #80 final review).
+    assert written_revision == 0
     assert len(written_probes) == 1
     assert written_probes[0].kind is HealthProbeKind.DOCKER_CONTAINER_HEALTHY
     assert written_probes[0].target == "weatherhub-redis-1"
@@ -381,3 +386,90 @@ def test_fix_flow_translations_are_structural() -> None:
     }
     assert expected_abort_reasons <= set(fix_flow["abort"])
     assert {"no_candidates_selected", "declare_failed"} <= set(fix_flow["error"])
+
+
+# ===========================================================================
+# PR #80 FINAL REVIEW MINOR-3: the first declaration is a compare-and-set.
+#
+# This Repair exists only because current truth says the contract is
+# UNCONFIGURED, and `expected_revision=0` is exactly the backend's assertion
+# of that. An unconditional write silently replaced a contract another
+# operator declared between this flow's discovery read and its submit.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_fix_flow_declaration_is_refused_when_a_contract_appears_mid_flow(
+    hass: HomeAssistant,
+) -> None:
+    """A REAL race: a concurrent writer declares revision 1 while this fix
+    flow is open. The submit must be sent with `expected_revision=0`, be
+    refused, write nothing, and NOT retry blindly."""
+
+    candidate = _docker_candidate()
+    transport, issue_id = await _setup_blocked_resource(
+        hass,
+        health_discovery_results={
+            RESOURCE_CT: HealthDiscoveryResult(
+                resource_id=RESOURCE_CT,
+                status=HealthDiscoveryStatus.OK,
+                candidates=(candidate,),
+                recommendation_basis=HealthDiscoveryRecommendationBasis.DOCKER_HEALTHCHECK,
+            )
+        },
+    )
+
+    flow_manager, result = await _init_fix_flow(hass, issue_id)
+    assert result["step_id"] == "confirm"
+
+    attempted_revisions: list[int | None] = []
+    stored_before = dict(transport.health_contracts)
+
+    async def racing(resource_id, probes, expected_revision):
+        attempted_revisions.append(expected_revision)
+        # A concurrent writer got there first: the resource is no longer
+        # unconfigured, so the CAS this flow is holding cannot hold.
+        raise HubinetOpsConflict("resource health contract revision does not match")
+
+    transport.replace_health_contract = racing
+
+    result = await flow_manager.async_configure(
+        result["flow_id"], {_candidate_field(candidate): True}
+    )
+
+    # Aborted on the exact typed reason -- never a create-entry, and never a
+    # second attempt with a different (or the same) revision.
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "contract_already_declared"
+    assert attempted_revisions == [0]
+    # The stale flow wrote nothing at all.
+    assert transport.health_contract_writes == []
+    assert transport.health_contracts == stored_before
+
+
+@pytest.mark.asyncio
+async def test_positive_control_a_still_unconfigured_resource_declares_with_cas_zero(
+    hass: HomeAssistant,
+) -> None:
+    """Load-bearing: adding the CAS must not break the ordinary path. Still
+    unconfigured means `expected_revision=0` succeeds exactly as before."""
+
+    candidate = _docker_candidate()
+    transport, issue_id = await _setup_blocked_resource(
+        hass,
+        health_discovery_results={
+            RESOURCE_CT: HealthDiscoveryResult(
+                resource_id=RESOURCE_CT,
+                status=HealthDiscoveryStatus.OK,
+                candidates=(candidate,),
+                recommendation_basis=HealthDiscoveryRecommendationBasis.DOCKER_HEALTHCHECK,
+            )
+        },
+    )
+    flow_manager, result = await _init_fix_flow(hass, issue_id)
+    result = await flow_manager.async_configure(
+        result["flow_id"], {_candidate_field(candidate): True}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert [write[2] for write in transport.health_contract_writes] == [0]
+    assert _health_contract_repair_ids(hass) == set()

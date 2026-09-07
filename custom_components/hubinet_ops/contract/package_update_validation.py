@@ -166,6 +166,17 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
 #: any probe kind; one present here is legal ONLY for the kind(s) listed --
 #: e.g. `container_healthy` can never accompany a `systemd_unit_active`
 #: probe, and `unit_not_active` can never accompany a Docker one.
+#: Mirrors `app/inventory/health_observation.py::_TARGETED_HEALTH_PROBE_
+#: KINDS`: every probe kind that NAMES a target. `GUEST_OPERATIONAL` names
+#: none, and is deliberately absent.
+_TARGETED_HEALTH_PROBE_KINDS: frozenset[HealthProbeKind] = frozenset(
+    {
+        HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+        HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+        HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+    }
+)
+
 HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
     "unit_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
     "unit_not_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
@@ -217,6 +228,11 @@ HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
         }
     ),
     "guest_operational_confirmed": frozenset({HealthProbeKind.GUEST_OPERATIONAL}),
+    # PR #80 final review: a targetless probe kind can never truthfully
+    # report a target-SHAPED reason. Mirrors the backend's own
+    # `_TARGETED_HEALTH_PROBE_KINDS`.
+    "probe_target_not_exact": _TARGETED_HEALTH_PROBE_KINDS,
+    "probe_target_ambiguous": _TARGETED_HEALTH_PROBE_KINDS,
 }
 
 #: The two states in which no job material may be present at all.

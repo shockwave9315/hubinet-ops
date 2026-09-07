@@ -10,6 +10,7 @@ from .enums import (
     HealthDiscoveryStatus,
     HealthProbeKind,
     HealthProbeOutcome,
+    UNDECIDED_DISCOVERY_STATUSES,
     LifecycleState,
     NodeAvailability,
     ObservationalContinuity,
@@ -99,5 +100,6 @@ __all__ = (
     "SourceFreshness",
     "SourceHealth",
     "SourceHealthOrigin",
+    "UNDECIDED_DISCOVERY_STATUSES",
     "validate_operator_availability",
 )

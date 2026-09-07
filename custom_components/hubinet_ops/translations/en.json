@@ -49,14 +49,21 @@
       "entry_not_loaded": "This Hubinet Ops entry is not currently loaded.",
       "no_lxc_resources": "No LXC resources are currently loaded by Hubinet Ops.",
       "health_contract_read_failed": "Could not read the current health contract for this resource.",
-      "discovery_failed": "Could not reach the Hubinet Ops backend to discover health-check candidates."
+      "discovery_failed": "Could not reach the Hubinet Ops backend to discover health-check candidates.",
+      "undecidable": "The Hubinet Ops backend could not determine which health-check adapters this guest has. Nothing was changed; try again once the guest is readable, or use the `hubinet_ops.set_health_contract` action.",
+      "guest_unavailable": "The Hubinet Ops backend could not reach the guest to discover health-check candidates. Nothing was changed; try again once the guest is reachable.",
+      "too_many_candidates": "Discovery found more candidates than can be shown safely. Use the `hubinet_ops.set_health_contract` action to declare the exact probes you want.",
+      "no_candidates_discovered": "Discovery completed and found nothing to offer for this resource. Use the `hubinet_ops.set_health_contract` action to declare the exact probes you want."
     },
     "error": {
       "no_probes_selected": "Select at least one probe, or cancel.",
       "declare_failed": "Hubinet Ops refused the declared health contract. Nothing was changed.",
       "revision_changed": "The health contract changed since this flow read it. Review the refreshed current probes below and try again.",
       "clear_not_confirmed": "Check the confirmation box to clear the health contract.",
-      "clear_failed": "Hubinet Ops refused to clear the health contract. Nothing was changed."
+      "clear_failed": "Hubinet Ops refused to clear the health contract. Nothing was changed.",
+      "rediscovery_undecidable": "Fresh discovery could not determine which health-check adapters this guest has, so no new candidates are shown. The probes below are the ones currently declared; submit to keep or adjust them, or cancel.",
+      "rediscovery_guest_unavailable": "Fresh discovery could not reach the guest, so no new candidates are shown. The probes below are the ones currently declared; submit to keep or adjust them, or cancel.",
+      "rediscovery_too_many_candidates": "Fresh discovery found more candidates than can be shown safely, so none are shown. The probes below are the ones currently declared; submit to keep or adjust them, or cancel."
     },
     "step": {
       "init": {
@@ -317,7 +324,7 @@
     },
     "health": {
       "title": "Hubinet Ops health contract — {name}",
-      "unconfigured": "No health contract is configured. This is **unconfigured**, not healthy, and a package update cannot start until a contract is declared. Declare one with the **`hubinet_ops.set_health_contract`** action for this device — reachable from this device's **Actions** tab, or from Developer Tools → Actions — naming each required probe kind (`systemd_unit_active`, `docker_container_running`, or `docker_container_healthy`) and its target.",
+      "unconfigured": "No health contract is configured. This is **unconfigured**, not healthy, and a package update cannot start until a contract is declared. The quickest way to declare one is natively: **Settings → Devices & Services → Hubinet Ops → Configure**, which discovers candidates for this resource and lets you confirm them (a **Repair** offers the same discover-and-confirm flow while an approved plan is waiting on it). The **`hubinet_ops.set_health_contract`** action — reachable from this device's **Actions** tab, or from Developer Tools → Actions — remains fully supported for typing one by hand: name each required probe kind (`systemd_unit_active`, `docker_container_running`, `docker_container_healthy`, or the targetless `guest_operational` guest-liveness fallback) and its target.",
       "revision": "Revision",
       "all_required": "Every probe below is required:"
     }
@@ -334,7 +341,8 @@
           "guest_unavailable": "The backend could not reach the guest to discover health-check candidates. Use the `hubinet_ops.set_health_contract` action instead, or try again once the guest is reachable.",
           "undecidable": "The backend could not determine whether Docker or systemd is present on this guest. Use the `hubinet_ops.set_health_contract` action instead.",
           "too_many_candidates": "Discovery found more candidates than can be shown safely. Use the `hubinet_ops.set_health_contract` action to declare the exact probes you want.",
-          "no_candidates_discovered": "Discovery found nothing to recommend for this resource. Use the `hubinet_ops.set_health_contract` action to declare the exact probes you want."
+          "no_candidates_discovered": "Discovery found nothing to recommend for this resource. Use the `hubinet_ops.set_health_contract` action to declare the exact probes you want.",
+          "contract_already_declared": "A health contract was declared for this resource while this form was open, so nothing was written. Review the contract that now exists before changing it."
         },
         "error": {
           "no_candidates_selected": "Select at least one probe, or cancel and use the `hubinet_ops.set_health_contract` action instead.",

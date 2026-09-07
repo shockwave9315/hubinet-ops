@@ -49,14 +49,21 @@
       "entry_not_loaded": "Ten wpis Hubinet Ops nie jest obecnie załadowany.",
       "no_lxc_resources": "Żadne zasoby LXC nie są obecnie załadowane przez Hubinet Ops.",
       "health_contract_read_failed": "Nie udało się odczytać bieżącego kontraktu kondycji dla tego zasobu.",
-      "discovery_failed": "Nie udało się połączyć z backendem Hubinet Ops w celu wykrycia kandydatów."
+      "discovery_failed": "Nie udało się połączyć z backendem Hubinet Ops w celu wykrycia kandydatów.",
+      "undecidable": "Backend Hubinet Ops nie mógł ustalić, które adaptery kontroli kondycji ma ten gość. Nic nie zostało zmienione; spróbuj ponownie, gdy gość będzie odczytywalny, albo użyj akcji `hubinet_ops.set_health_contract`.",
+      "guest_unavailable": "Backend Hubinet Ops nie mógł połączyć się z gościem, aby wykryć kandydatów. Nic nie zostało zmienione; spróbuj ponownie, gdy gość będzie osiągalny.",
+      "too_many_candidates": "Wykrywanie znalazło więcej kandydatów, niż można bezpiecznie pokazać. Użyj akcji `hubinet_ops.set_health_contract`, aby zadeklarować dokładnie wybrane sondy.",
+      "no_candidates_discovered": "Wykrywanie zakończyło się i nie znalazło nic do zaproponowania dla tego zasobu. Użyj akcji `hubinet_ops.set_health_contract`, aby zadeklarować dokładnie wybrane sondy."
     },
     "error": {
       "no_probes_selected": "Wybierz co najmniej jedną sondę albo anuluj.",
       "declare_failed": "Hubinet Ops odrzucił zadeklarowany kontrakt kondycji. Nic nie zostało zmienione.",
       "revision_changed": "Kontrakt kondycji zmienił się od momentu jego odczytu przez ten formularz. Przejrzyj odświeżone bieżące sondy poniżej i spróbuj ponownie.",
       "clear_not_confirmed": "Zaznacz pole potwierdzenia, aby wyczyścić kontrakt kondycji.",
-      "clear_failed": "Hubinet Ops odrzucił wyczyszczenie kontraktu kondycji. Nic nie zostało zmienione."
+      "clear_failed": "Hubinet Ops odrzucił wyczyszczenie kontraktu kondycji. Nic nie zostało zmienione.",
+      "rediscovery_undecidable": "Świeże wykrywanie nie ustaliło, które adaptery kontroli kondycji ma ten gość, więc nie pokazano nowych kandydatów. Poniższe sondy to te obecnie zadeklarowane; zatwierdź, aby je zachować lub zmienić, albo anuluj.",
+      "rediscovery_guest_unavailable": "Świeże wykrywanie nie mogło połączyć się z gościem, więc nie pokazano nowych kandydatów. Poniższe sondy to te obecnie zadeklarowane; zatwierdź, aby je zachować lub zmienić, albo anuluj.",
+      "rediscovery_too_many_candidates": "Świeże wykrywanie znalazło więcej kandydatów, niż można bezpiecznie pokazać, więc nie pokazano żadnego. Poniższe sondy to te obecnie zadeklarowane; zatwierdź, aby je zachować lub zmienić, albo anuluj."
     },
     "step": {
       "init": {
@@ -317,7 +324,7 @@
     },
     "health": {
       "title": "Kontrakt kondycji Hubinet Ops — {name}",
-      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany. Zadeklaruj go za pomocą akcji **`hubinet_ops.set_health_contract`** dla tego urządzenia — dostępnej z zakładki **Akcje** tego urządzenia lub z Narzędzi deweloperskich → Akcje — podając każdy wymagany rodzaj sondy (`systemd_unit_active`, `docker_container_running` lub `docker_container_healthy`) i jej cel.",
+      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany. Najszybciej zadeklarujesz go natywnie: **Ustawienia → Urządzenia i usługi → Hubinet Ops → Konfiguruj**, gdzie wykryjesz kandydatów dla tego zasobu i potwierdzisz wybór (zgłoszenie **Naprawa** oferuje ten sam przepływ, gdy czeka zatwierdzony plan). Akcja **`hubinet_ops.set_health_contract`** — dostępna z zakładki **Akcje** tego urządzenia lub z Narzędzi deweloperskich → Akcje — pozostaje w pełni wspierana do wpisania kontraktu ręcznie: podaj każdy wymagany rodzaj sondy (`systemd_unit_active`, `docker_container_running`, `docker_container_healthy` albo bezcelowy `guest_operational`, czyli awaryjną sondę żywotności gościa) i jej cel.",
       "revision": "Rewizja",
       "all_required": "Wszystkie poniższe sondy są wymagane:"
     }
@@ -334,7 +341,8 @@
           "guest_unavailable": "Backend nie mógł połączyć się z gościem, aby wykryć kandydatów. Użyj zamiast tego akcji `hubinet_ops.set_health_contract` albo spróbuj ponownie, gdy gość będzie dostępny.",
           "undecidable": "Backend nie mógł ustalić, czy na tym gościu jest obecny Docker czy systemd. Użyj zamiast tego akcji `hubinet_ops.set_health_contract`.",
           "too_many_candidates": "Wykrywanie znalazło więcej kandydatów, niż można bezpiecznie wyświetlić. Użyj akcji `hubinet_ops.set_health_contract`, aby zadeklarować dokładne sondy.",
-          "no_candidates_discovered": "Wykrywanie nie znalazło niczego do zarekomendowania dla tego zasobu. Użyj akcji `hubinet_ops.set_health_contract`, aby zadeklarować dokładne sondy."
+          "no_candidates_discovered": "Wykrywanie nie znalazło niczego do zarekomendowania dla tego zasobu. Użyj akcji `hubinet_ops.set_health_contract`, aby zadeklarować dokładne sondy.",
+          "contract_already_declared": "Kontrakt kondycji dla tego zasobu został zadeklarowany, gdy ten formularz był otwarty, więc nic nie zostało zapisane. Przejrzyj istniejący kontrakt, zanim go zmienisz."
         },
         "error": {
           "no_candidates_selected": "Wybierz co najmniej jedną sondę albo anuluj i użyj zamiast tego akcji `hubinet_ops.set_health_contract`.",

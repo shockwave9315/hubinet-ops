@@ -2824,6 +2824,25 @@ persists nothing, carries no `job_id`, and mutates no authority row. It looks
 at a resource **positively**, never by absence of a health result: current
 unhealthiness must never suppress a candidate from being discoverable.
 
+Each family begins with a fixed **adapter-presence oracle**, because "this
+guest has no Docker at all" and "Docker is here but would not answer" are
+different facts and only the first is a complete answer. It is deliberately
+*not* a reading of the family command's own exit status — a bare `docker ps`
+returning 127 is too close to the execution/remote-command layer to carry
+positive-absence authority, since `env`, `pct exec`, and the inter-node `ssh`
+hop can each produce it for unrelated reasons. Instead one separate,
+code-owned `env LC_ALL=C sh -c 'command -v <program> …'` answers in an exit
+vocabulary this repository chooses: `0` present, `10` absent, **anything
+else undecidable** (no shell, a signal, a `pct`/`ssh` failure, a timeout, an
+output overflow, a failed live-target revalidation). It resolves the program
+through `env`/`PATH` exactly as the family command will, never an assumed
+`/usr/bin/docker`; verified on Debian 13 / systemd 257 that with `PATH` unset
+dash's built-in default is a strict superset of `execvp`'s `confstr` fallback,
+so the oracle can never report ABSENT for a program the family command could
+still have run. A positively absent adapter yields "family complete, zero
+candidates" — no new public discovery status; the distinction is proven
+internally and the combination rule below is unchanged.
+
 - **Docker**: one `docker ps --all` (the complete name universe and the daemon
   oracle in one call, exactly the settling engine's own absence-safety
   pattern) followed by batched `docker inspect`, mapped back by returned
@@ -2851,7 +2870,20 @@ would not answer, an ambiguous local-node identity) returns that uncertain
 status immediately, with zero candidates and no recommendation — it can
 never fall through to recommending `guest_operational`, because "discovery
 could not tell" and "discovery positively found nothing" are different
-facts, and only the second may ever produce that recommendation.
+facts, and only the second may ever produce that recommendation. The
+presence oracle above is the *mirror* of that same rule: an adapter that is
+genuinely not installed is a positively found nothing, and reading it as
+uncertainty made the fallback — and every systemd recommendation —
+unreachable on exactly the bare and systemd-only guests it exists for.
+
+One absolute monotonic deadline governs a whole discovery read, established
+in `handle_discover_request` **before** its prologue: the local-node
+identity read, the first live-target revalidation, both presence oracles,
+and both family reads all draw down the same `DISCOVERY_DEADLINE_SECONDS`,
+each subprocess taking its own timeout computed fresh immediately before it
+starts. The health evaluation is built identically around the backend's
+clamped settling deadline, so a bounded operation's real wall clock is
+"deadline + transport-return margin", never "prologue + deadline".
 
 ### Native HA onboarding (Stage 4)
 
@@ -2867,7 +2899,13 @@ exactly as `PRODUCT.md`, "What healthy means", requires. Any undecided
 discovery status, a transport failure, or zero returned candidates aborts the
 flow with the issue left open rather than rendering an empty or misleading
 form; the manual `set_health_contract` action remains a fully supported
-alternative path, named in the issue text either way. Classification itself
+alternative path, named in the issue text either way. The declaration itself
+is a **compare-and-set on the issue's own premise**: the Repair exists only
+because the contract is currently unconfigured, so the write is sent with
+`expected_revision=0`. A contract declared by anyone else between this
+flow's discovery read and its submit makes that CAS fail, and the flow
+aborts on `contract_already_declared` after refreshing — never a blind
+retry, and never an overwrite of what now exists. Classification itself
 — everything above about Docker/systemd inspection — has no HA-side
 counterpart at all: Home Assistant only ever renders an already-classified,
 already-bounded `HealthDiscoveryResult` it fetched over that one typed route
@@ -2893,7 +2931,18 @@ back as `expected_revision` on every write; a concurrent change is
 `HubinetOpsConflict`, refused and reported rather than silently
 overwritten, and the flow re-reads current state so a retry is against
 reality. Clearing is a separate, explicitly confirmed step, never a side
-effect of an empty discover submission. The manual
+effect of an empty discover submission.
+
+Both operator surfaces share ONE definition of the discovery statuses that
+carry no usable candidate set (`UNDECIDED_DISCOVERY_STATUSES` in
+`contract/enums.py`, beside the enum it comes from), so they cannot drift
+apart. An unconfigured resource whose discovery is undecided — or which
+completed truthfully with nothing to offer — aborts naming the exact typed
+reason rather than rendering a form with no checkboxes; a resource that
+already HAS a contract keeps its declared probes visible so they can still
+be edited, with the failure stated explicitly as a
+`rediscovery_<status>` error and **no candidate fabricated** to make a
+failed re-discovery look successful. The manual
 `set_health_contract`/`clear_health_contract` actions remain fully
 supported. This flow shares the exact same "no inspection logic on the HA
 side" guarantee as the Repair above -- the same regression test scans

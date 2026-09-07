@@ -348,3 +348,196 @@ async def test_options_flow_explicit_clear_succeeds(hass: HomeAssistant) -> None
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert transport.health_contract_clears == [(RESOURCE_CT, 5)]
+
+
+# ===========================================================================
+# PR #80 FINAL REVIEW MAJOR: the Options flow must HONOR the discovery
+# status, not ignore it.
+#
+# Before this fix `async_step_discover` assigned `result.candidates` without
+# ever inspecting `result.status`. For an unconfigured resource every
+# undecided status (which carries zero candidates) therefore produced a form
+# with no checkboxes and no explanation, and every submit failed
+# "no_probes_selected" forever -- an unescapable dead end reached by any
+# guest the backend could not read.
+# ===========================================================================
+
+
+def _undecided_transport(status: HealthDiscoveryStatus, *, configured: bool):
+    resources = INITIAL_RESOURCES
+    contracts = {}
+    if configured:
+        resources = (INITIAL_RESOURCES[0], _configured_ct_resource(), INITIAL_RESOURCES[2])
+        contracts = {RESOURCE_CT: _configured_contract()}
+    return FakeTransport(
+        [snapshot(resources)],
+        health_contracts=contracts,
+        health_discovery_results={
+            RESOURCE_CT: HealthDiscoveryResult(
+                resource_id=RESOURCE_CT,
+                status=status,
+                candidates=(),
+                recommendation_basis=None,
+            )
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        HealthDiscoveryStatus.UNDECIDABLE,
+        HealthDiscoveryStatus.GUEST_UNAVAILABLE,
+        HealthDiscoveryStatus.TOO_MANY_CANDIDATES,
+    ],
+)
+@pytest.mark.asyncio
+async def test_options_flow_unconfigured_aborts_truthfully_on_undecided_discovery(
+    hass: HomeAssistant, status: HealthDiscoveryStatus
+) -> None:
+    """The exact typed reason, never an empty form the operator cannot use."""
+
+    transport = _undecided_transport(status, configured=False)
+    entry = await setup_entry(hass, transport)
+    result = await _init_options_flow(hass, entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"resource_id": RESOURCE_CT}
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == status.value
+    # Nothing was written, and nothing was fabricated to fill the gap.
+    assert transport.health_contract_writes == []
+    assert transport.health_contract_clears == []
+
+
+@pytest.mark.asyncio
+async def test_options_flow_unconfigured_aborts_when_discovery_offers_nothing(
+    hass: HomeAssistant,
+) -> None:
+    """A truthful, positively-completed answer that simply has nothing to
+    offer is still not a renderable form."""
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        health_discovery_results={
+            RESOURCE_CT: HealthDiscoveryResult(
+                resource_id=RESOURCE_CT,
+                status=HealthDiscoveryStatus.NO_CANDIDATES,
+                candidates=(),
+                recommendation_basis=None,
+            )
+        },
+    )
+    entry = await setup_entry(hass, transport)
+    result = await _init_options_flow(hass, entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"resource_id": RESOURCE_CT}
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_candidates_discovered"
+    assert transport.health_contract_writes == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        HealthDiscoveryStatus.UNDECIDABLE,
+        HealthDiscoveryStatus.GUEST_UNAVAILABLE,
+        HealthDiscoveryStatus.TOO_MANY_CANDIDATES,
+    ],
+)
+@pytest.mark.asyncio
+async def test_options_flow_configured_keeps_current_probes_and_says_rediscovery_failed(
+    hass: HomeAssistant, status: HealthDiscoveryStatus
+) -> None:
+    """A resource that already HAS a contract keeps its declared probes
+    visible so they can still be edited -- but the failure is stated
+    explicitly, and no candidate is fabricated to look like a successful
+    discovery."""
+
+    transport = _undecided_transport(status, configured=True)
+    entry = await setup_entry(hass, transport)
+    result = await _init_options_flow(hass, entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"resource_id": RESOURCE_CT}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "discover"}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "discover"
+    # The failure is NAMED, not swallowed.
+    assert result["errors"] == {"base": f"rediscovery_{status.value}"}
+    # Exactly the currently declared probe -- nothing invented.
+    schema_fields = {str(key) for key in result["data_schema"].schema}
+    assert schema_fields == {
+        _probe_field(HealthProbeKind.SYSTEMD_UNIT_ACTIVE, "nginx.service")
+    }
+    assert transport.health_contract_writes == []
+    assert transport.health_contract_clears == []
+
+
+@pytest.mark.asyncio
+async def test_positive_control_an_ok_discovery_still_renders_the_checklist(
+    hass: HomeAssistant,
+) -> None:
+    """Load-bearing: honoring undecided statuses must not disable the normal
+    path. An OK discovery still renders every candidate as before."""
+
+    candidate = _docker_candidate()
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        health_discovery_results={
+            RESOURCE_CT: HealthDiscoveryResult(
+                resource_id=RESOURCE_CT,
+                status=HealthDiscoveryStatus.OK,
+                candidates=(candidate,),
+                recommendation_basis=HealthDiscoveryRecommendationBasis.DOCKER_HEALTHCHECK,
+            )
+        },
+    )
+    entry = await setup_entry(hass, transport)
+    result = await _init_options_flow(hass, entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"resource_id": RESOURCE_CT}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "discover"
+    assert not result["errors"]
+    schema_fields = {str(key) for key in result["data_schema"].schema}
+    assert schema_fields == {_probe_field(candidate.kind, candidate.target)}
+
+
+@pytest.mark.asyncio
+async def test_positive_control_ambiguous_candidates_are_still_rendered(
+    hass: HomeAssistant,
+) -> None:
+    """`ambiguous_candidates` is a truthful, completed answer that DOES carry
+    candidates -- it is an operator choice, not an undecided status, and must
+    keep rendering."""
+
+    first = _docker_candidate(target="app-a", recommended=False)
+    second = _docker_candidate(target="app-b", recommended=False)
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        health_discovery_results={
+            RESOURCE_CT: HealthDiscoveryResult(
+                resource_id=RESOURCE_CT,
+                status=HealthDiscoveryStatus.AMBIGUOUS_CANDIDATES,
+                candidates=(first, second),
+                recommendation_basis=None,
+            )
+        },
+    )
+    entry = await setup_entry(hass, transport)
+    result = await _init_options_flow(hass, entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"resource_id": RESOURCE_CT}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "discover"
+    schema_fields = {str(key) for key in result["data_schema"].schema}
+    assert schema_fields == {
+        _probe_field(first.kind, first.target),
+        _probe_field(second.kind, second.target),
+    }

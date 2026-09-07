@@ -211,6 +211,24 @@ class HealthDiscoveryStatus(StrEnum):
     TOO_MANY_CANDIDATES = "too_many_candidates"
 
 
+#: The statuses that carry NO usable candidate set, and therefore must never
+#: be rendered as though discovery had succeeded (PR #80 final review).
+#:
+#: Defined here, beside the enum whose semantics it comes from, so both
+#: operator surfaces that call the discovery route -- the fixable Repair and
+#: the Options flow -- share ONE definition rather than each keeping a
+#: private copy that could drift. `NO_CANDIDATES` and `AMBIGUOUS_CANDIDATES`
+#: are deliberately NOT here: both are truthful, positively-completed
+#: answers that do carry candidates for an operator to choose from.
+UNDECIDED_DISCOVERY_STATUSES: frozenset[HealthDiscoveryStatus] = frozenset(
+    {
+        HealthDiscoveryStatus.GUEST_UNAVAILABLE,
+        HealthDiscoveryStatus.UNDECIDABLE,
+        HealthDiscoveryStatus.TOO_MANY_CANDIDATES,
+    }
+)
+
+
 class HealthDiscoveryRecommendationBasis(StrEnum):
     """The bounded, backend-owned rationale for what discovery recommended.
     Home Assistant translates this token; it never computes one."""

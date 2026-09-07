@@ -28,6 +28,7 @@ from homeassistant.helpers.selector import (
 
 from . import create_api_client
 from .api import (
+    UNDECIDED_DISCOVERY_STATUSES,
     BackendInformation,
     HealthDiscoveryCandidate,
     HealthProbe,
@@ -396,7 +397,29 @@ class HubinetOpsOptionsFlow(OptionsFlow):
                 )
             except HubinetOpsApiError:
                 return self.async_abort(reason="discovery_failed")
-            self._candidates = result.candidates
+            # PR #80 final review: a status carrying no usable candidate set
+            # must never be rendered as though discovery had succeeded.
+            # Previously the status was ignored entirely, so an unconfigured
+            # resource got a form with no checkboxes and no explanation, and
+            # every submit failed "no probes selected" forever.
+            if result.status in UNDECIDED_DISCOVERY_STATUSES:
+                if not self._current_probes:
+                    # Nothing declared and nothing discoverable: there is no
+                    # honest form to show. Abort naming the exact typed
+                    # reason, exactly as the onboarding Repair does.
+                    return self.async_abort(reason=result.status.value)
+                # A configured resource keeps its DECLARED probes visible so
+                # the operator can still edit or keep them -- but this is
+                # explicitly NOT a successful discovery, and no candidate is
+                # fabricated to fill the gap.
+                self._candidates = ()
+                errors["base"] = f"rediscovery_{result.status.value}"
+            else:
+                self._candidates = result.candidates
+                if not self._current_probes and not result.candidates:
+                    # A truthful, positively-completed answer that simply has
+                    # nothing to offer. Still not a renderable form.
+                    return self.async_abort(reason="no_candidates_discovered")
         else:
             line_items = self._line_items()
             selected = tuple(
