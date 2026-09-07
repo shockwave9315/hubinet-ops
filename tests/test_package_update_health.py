@@ -1799,6 +1799,18 @@ def test_a_stale_resource_context_is_refused_before_any_host_call(
 # ===========================================================================
 
 
+def _passed_reason_for_kind(kind: HealthProbeKind) -> str:
+    """The PASSED reason token for one frozen probe kind -- explicit kind
+    branching, never a Docker-shaped catch-all, so a future kind addition
+    fails loudly here instead of silently inheriting the wrong reason."""
+
+    if kind is HealthProbeKind.SYSTEMD_UNIT_ACTIVE:
+        return "unit_active"
+    if kind is HealthProbeKind.GUEST_OPERATIONAL:
+        return "guest_operational_confirmed"
+    raise AssertionError(f"unreachable: unsupported probe kind {kind!r}")
+
+
 def _host_result(job, **overrides):
     base = {
         "contract_revision": job.health_contract_revision,
@@ -1809,11 +1821,7 @@ def _host_result(job, **overrides):
                 kind=probe.kind,
                 target=probe.target,
                 outcome=HealthProbeOutcome.PASSED,
-                reason=(
-                    "unit_active"
-                    if probe.kind is HealthProbeKind.SYSTEMD_UNIT_ACTIVE
-                    else "container_running"
-                ),
+                reason=_passed_reason_for_kind(probe.kind),
             )
             for probe in job.health_probes
         ),
@@ -2269,11 +2277,7 @@ def test_a_decisive_claim_with_an_unknown_probe_is_a_contradiction(
                         reason=(
                             "command_timed_out"
                             if probe.probe_index == 0
-                            else (
-                                "unit_active"
-                                if probe.kind is HealthProbeKind.SYSTEMD_UNIT_ACTIVE
-                                else "container_running"
-                            )
+                            else _passed_reason_for_kind(probe.kind)
                         ),
                     )
                     for probe in job.health_probes

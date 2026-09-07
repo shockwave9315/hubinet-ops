@@ -834,11 +834,19 @@ class PackageUpdateJobHealthProbe:
 class PackageUpdateJobHealthProbeResult:
     """The durable, definitive result recorded for ONE frozen probe.
 
-    Only ever written by the one definitive finalization boundary, and only
-    as a complete set covering every frozen probe. ``outcome`` may be
-    ``UNKNOWN`` for an individual probe inside a FAILED contract verdict --
-    an unevaluable member alongside a proven failure is truthful history --
-    but a PASSED contract requires every one of these to be ``PASSED``.
+    Only ever written by the one definitive finalization boundary
+    (``InventoryAuthority.complete_package_update_health``), and only as a
+    complete set covering every frozen probe. ``outcome`` is never
+    ``UNKNOWN`` here: only a COMPLETE DECISIVE observation set may ever be
+    finalized, and the finalizer independently refuses to write this row set
+    at all if any reported observation is ``UNKNOWN`` -- even one UNKNOWN
+    probe beside an otherwise proven FAILED contract is refused outright, not
+    recorded. So every row is ``PASSED`` or ``FAILED``; a PASSED contract
+    requires every one of these to be ``PASSED``, and a FAILED contract
+    requires at least one. An unresolved evaluation's bounded per-probe
+    evidence is a different, non-durable thing entirely (a bounded event via
+    ``record_package_update_health_outcome_unknown``), never a row of this
+    type.
 
     ``reason`` is a bounded token from a closed taxonomy, never raw command
     output: nothing a guest printed reaches durable state.

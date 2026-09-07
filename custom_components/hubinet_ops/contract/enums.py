@@ -179,14 +179,19 @@ class HealthProbeKind(StrEnum):
 
 
 class HealthProbeOutcome(StrEnum):
-    """What ONE frozen probe was durably observed to be, once evaluated.
+    """What ONE frozen probe was observed to be, in either evidence kind a
+    job's ``health_probes`` can carry (``HealthProbe.definitive``).
 
-    Unlike ``PackageUpdateHealthOutcome`` (the job's own ALL-OF verdict, which
-    has no ``unknown`` member because an unevaluable job writes nothing
-    durable), an individual probe's result row genuinely can be ``UNKNOWN``
-    inside an otherwise FAILED job: one proven failure is enough to fail the
-    whole ALL-OF, and a sibling probe that could not be evaluated is still
-    truthful history the operator needs, not something to hide.
+    ``UNKNOWN`` can appear ONLY in non-definitive OBSERVATION evidence
+    (``definitive: False``) -- the bounded per-probe evidence of an
+    unresolved attempt, while the job still sits at ``health_started`` with
+    no durable verdict at all. It can never appear in definitive VERDICT
+    evidence (``definitive: True``): only a COMPLETE DECISIVE observation set
+    may ever be finalized, so a durable verdict's probes are each PASSED or
+    FAILED, never UNKNOWN -- not even one UNKNOWN probe beside an otherwise
+    proven FAILED job. `validate_package_update_job_view` independently
+    refuses a ``"verdict"`` payload carrying an UNKNOWN probe rather than
+    rendering it.
     """
 
     PASSED = "passed"

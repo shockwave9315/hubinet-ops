@@ -130,9 +130,9 @@ UNRESOLVED_HEALTH_REASONS: frozenset[str] = frozenset(
 #: Mirrors `app/inventory/health_observation.py::HEALTH_PROBE_REASONS_BY_
 #: OUTCOME`. A reason token that is syntactically bounded (in
 #: `HEALTH_PROBE_REASONS`) but semantically impossible for the outcome it
-#: accompanies -- e.g. `container_health_starting` (an UNKNOWN-only token)
-#: paired with `outcome=passed` -- is exactly the kind of self-contradictory
-#: payload PR #80 review found HA was not independently proving impossible.
+#: accompanies -- e.g. `unit_activating` (an UNKNOWN-only token) paired with
+#: `outcome=passed` -- is exactly the kind of self-contradictory payload
+#: PR #80 review found HA was not independently proving impossible.
 HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
     HealthProbeOutcome.PASSED: frozenset(
         {

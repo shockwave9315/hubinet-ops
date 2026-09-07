@@ -23,7 +23,7 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v20). Schema v10 added
+database (marker `hubinet_ops_0_5_authority`, schema v21). Schema v10 added
 the job-owned snapshot operation identity, its write-ahead uncertainty
 checkpoint, the observed PVE task identity, and SQL-level state-machine
 invariants over all of them. Schema v11 added the explicit, material
@@ -63,10 +63,21 @@ health-probe kind whose `target` column is `NULL` (`CHECK`-enforced: exactly
 this kind may be `NULL`, and every other kind still requires a bounded
 target) with its own partial unique index permitting at most one such probe
 per resource contract or per frozen job copy (see "The built-in
-`guest_operational` default" below). There is no migration from v9
-through v19; pre-release installs use the
-product updater's explicit backed-up authority reset and require Home
-Assistant re-enrollment.
+`guest_operational` default" below). **Schema v21 (v0.5 health scope
+reduction, current)** removes the two Docker-specific health-probe kinds
+(`docker_container_running`, `docker_container_healthy`) from the generated
+`HealthProbeKind` `CHECK` entirely, so the SQL-valid set is now exactly
+`guest_operational` and `systemd_unit_active`, and adds the contract-shape
+invariant that the two may never mix in one contract: EITHER the singleton
+`guest_operational` baseline OR one-or-more `systemd_unit_active` probes,
+enforced by two new triggers
+(`resource_health_contract_no_mixed_baseline`,
+`package_update_job_health_probes_no_mixed_baseline`) beside the existing
+domain-level check (see "Job-bound healthcheck execution" below). There is no
+migration from v9 through v20; pre-release installs use the product
+updater's explicit backed-up authority reset (verified coherent backup ->
+explicit reset -> fresh v21 database -> new backend identity) and require
+Home Assistant re-enrollment.
 
 - `store.py` — schema, transactions, CAS/fencing for discovery-run ownership,
   backend/source/global-revision bookkeeping.
