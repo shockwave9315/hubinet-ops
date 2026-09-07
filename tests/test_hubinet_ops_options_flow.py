@@ -247,6 +247,14 @@ async def test_options_flow_explicit_replace_succeeds_with_the_read_revision(
 async def test_options_flow_revision_race_fails_closed_and_never_overwrites(
     hass: HomeAssistant,
 ) -> None:
+    """A REAL race: a concurrent writer (another operator, the manual
+    `set_health_contract` action, anything) bumps the backend's stored
+    revision to 6 between this flow reading it and submitting. The first
+    attempt must be sent with the STALE revision it actually read (5), must
+    be refused, and the flow's own re-read must pick up the NEW truth (6)
+    so the operator's explicit retry is sent with `expected_revision=6` --
+    never a blind resend of the same stale value."""
+
     configured = _configured_ct_resource(revision=5)
     candidate = _docker_candidate()
     transport = FakeTransport(
@@ -264,15 +272,20 @@ async def test_options_flow_revision_race_fails_closed_and_never_overwrites(
     entry = await setup_entry(hass, transport)
 
     original_replace = transport.replace_health_contract
-    calls = {"n": 0}
+    attempted_revisions: list[int | None] = []
 
-    async def conflicting_once(resource_id, probes, expected_revision):
-        calls["n"] += 1
-        if calls["n"] == 1:
+    async def racing(resource_id, probes, expected_revision):
+        attempted_revisions.append(expected_revision)
+        if len(attempted_revisions) == 1:
+            # Simulate a concurrent writer that already moved the backend's
+            # stored contract to revision 6 -- a REAL divergence from what
+            # this flow read, not merely a scripted one-shot failure.
+            current = transport.health_contracts[resource_id]
+            transport.health_contracts[resource_id] = replace(current, revision=6)
             raise HubinetOpsConflict("stale revision")
         return await original_replace(resource_id, probes, expected_revision)
 
-    transport.replace_health_contract = conflicting_once
+    transport.replace_health_contract = racing
 
     result = await _init_options_flow(hass, entry.entry_id)
     result = await hass.config_entries.options.async_configure(
@@ -290,13 +303,18 @@ async def test_options_flow_revision_race_fails_closed_and_never_overwrites(
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "revision_changed"}
     assert transport.health_contract_writes == []
+    assert attempted_revisions == [5]
 
-    # Trying again (same selection) now succeeds against the current data.
+    # Trying again (same selection) now sends the FRESHLY RE-READ revision,
+    # never a blind resend of the same stale 5.
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {candidate_field: True, current_field: False}
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert attempted_revisions == [5, 6]
     assert len(transport.health_contract_writes) == 1
+    _, _, written_revision = transport.health_contract_writes[0]
+    assert written_revision == 6
 
 
 @pytest.mark.asyncio

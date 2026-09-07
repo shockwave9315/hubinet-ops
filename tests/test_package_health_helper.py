@@ -1898,6 +1898,14 @@ class DiscoveryGuest:
         #: instead of synthesizing a clean row per `docker_info` entry.
         self.docker_inspect_returncode = 0
         self.docker_inspect_raw_stdout: bytes | None = None
+        #: systemd completeness-proof overrides (PR #80 review, systemd
+        #: discovery completeness). When set, the corresponding command
+        #: answers verbatim with this instead of synthesizing clean rows
+        #: from `unit_files`/`unit_props` -- for shapes those structured
+        #: fields cannot themselves produce (too few columns, a duplicate
+        #: property key, a non-`key=value` line).
+        self.unit_files_raw_stdout: bytes | None = None
+        self.show_raw_stdout: bytes | None = None
         #: Same virtual-clock consumption support as `FakeGuest`, for the
         #: discovery deadline's own fresh-per-command timeout regression.
         self.clock: FakeClock | None = None
@@ -1970,6 +1978,8 @@ class DiscoveryGuest:
     def _systemctl(self, tail):
         if tail[3] == "list-unit-files":
             assert "--plain" in tail, tail
+            if self.unit_files_raw_stdout is not None:
+                return self._ok(self.unit_files_raw_stdout)
             lines = [f"{unit}    {state}    -" for unit, state in self.unit_files]
             return self._ok(("\n".join(lines) + "\n").encode())
         if tail[3] == "list-units":
@@ -1980,6 +1990,8 @@ class DiscoveryGuest:
                 else b""
             )
         assert tail[3] == "show", tail
+        if self.show_raw_stdout is not None:
+            return self._ok(self.show_raw_stdout)
         requested = tail[tail.index("--") + 1 :]
         blocks = []
         for unit in requested:
@@ -2321,6 +2333,213 @@ def test_systemd_discovery_requests_plain_output_on_every_invocation() -> None:
     ]
     assert list_unit_files_calls and all("--plain" in c for c in list_unit_files_calls)
     assert list_units_calls and all("--plain" in c for c in list_units_calls)
+
+
+# ===========================================================================
+# PR #80 review (follow-up): systemd discovery still lacked the SAME positive
+# completeness proof the Docker half already has. Uncertain/malformed/raced
+# observations were silently "continue"d rather than making the family
+# undecidable -- exactly the "uncertainty read as absence" the frozen
+# architecture forbids, and it could still let a false guest_operational
+# fallback through.
+# ===========================================================================
+
+
+def test_a_malformed_list_unit_files_row_is_undecidable() -> None:
+    """Witness A: a non-empty row this file cannot parse into a unit AND a
+    state is never silently treated as 'no relevant unit here'."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files_raw_stdout = b"mariadb.service\n"  # no state column
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["candidates"] == []
+    assert result["recommendation_basis"] is None
+
+
+def test_an_unrecognised_list_unit_files_state_token_is_undecidable() -> None:
+    """A state token outside the full known systemd vocabulary is never a
+    legitimate exclusion this file can vouch for."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files_raw_stdout = b"mariadb.service    some-bogus-state    -\n"
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_a_malformed_failed_unit_row_is_undecidable() -> None:
+    """Witness B: `--plain` is retained (asserted by the fake dispatch
+    itself); a truthful failed-unit row still needs at least UNIT LOAD
+    ACTIVE SUB -- fewer columns is never silently absence."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = []
+    guest.failed_units = ["mosquitto.service"]  # no load/active/sub columns
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["candidates"] == []
+    assert result["recommendation_basis"] is None
+
+
+def test_a_failed_unit_row_not_actually_reporting_failed_is_undecidable() -> None:
+    """`--state=failed` was requested; a row this file cannot even confirm
+    as ACTIVE=failed cannot be trusted at all."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = []
+    guest.failed_units = ["mosquitto.service loaded active running MQTT broker"]
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_an_enumerated_unit_that_disappears_before_show_is_undecidable() -> None:
+    """Witness C. `mariadb.service` was positively enumerated as `enabled`
+    a moment ago; `systemctl show` now reporting `LoadState=not-found` is a
+    read-race, never proof the unit does not exist -- the whole family goes
+    undecidable, not a silently shrunk (empty) candidate set."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = [("mariadb.service", "enabled")]
+    guest.unit_props = {
+        "mariadb.service": {
+            "Id": "mariadb.service",
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+            "UnitFileState": "",
+            "FragmentPath": "",
+        },
+    }
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["candidates"] == []
+    assert result["recommendation_basis"] is None
+
+
+def test_a_show_block_missing_a_required_property_is_undecidable() -> None:
+    """Witness D."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = [("mariadb.service", "enabled")]
+    guest.show_raw_stdout = (
+        b"Id=mariadb.service\nLoadState=loaded\nActiveState=active\n"
+        # UnitFileState and FragmentPath omitted entirely.
+    )
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_a_show_block_with_a_duplicate_property_is_undecidable() -> None:
+    """Witness E. Never "first value wins" for a duplicate key."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = [("mariadb.service", "enabled")]
+    guest.show_raw_stdout = (
+        b"Id=mariadb.service\nLoadState=loaded\nLoadState=not-found\n"
+        b"ActiveState=active\nUnitFileState=enabled\n"
+        b"FragmentPath=/usr/lib/systemd/system/mariadb.service\n"
+    )
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_a_show_block_with_a_malformed_line_is_undecidable() -> None:
+    """Witness F."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = [("mariadb.service", "enabled")]
+    guest.show_raw_stdout = (
+        b"Id=mariadb.service\nthis line has no equals sign\n"
+        b"LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n"
+        b"FragmentPath=/usr/lib/systemd/system/mariadb.service\n"
+    )
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_docker_complete_empty_plus_systemd_uncertain_never_reaches_guest_fallback() -> None:
+    """Witness G, the overall fallback witness: Docker positively completes
+    with nothing found, but systemd's own observation is malformed --
+    combined, the answer must be undecidable, never a fabricated
+    guest_operational recommendation."""
+
+    guest = DiscoveryGuest()
+    guest.docker_info = {}  # Docker positively complete, zero candidates
+    guest.unit_files = [("mariadb.service", "enabled")]
+    guest.unit_props = {
+        "mariadb.service": {
+            "Id": "mariadb.service",
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+            "UnitFileState": "",
+            "FragmentPath": "",
+        },
+    }
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+    assert not any(c["adapter"] == "guest" for c in result["candidates"])
+
+
+# ---------------------------------------------------------------------------
+# Positive controls: the completeness proof must not make ordinary, valid
+# discovery stricter than it needs to be.
+# ---------------------------------------------------------------------------
+
+
+def test_positive_control_normal_package_service_discovery_still_succeeds() -> None:
+    guest = DiscoveryGuest()
+    guest.unit_files = [("mariadb.service", "enabled")]
+    result = _discover(guest)
+    assert result["status"] == "ok"
+    assert result["candidates"][0]["target"] == "mariadb.service"
+    assert result["candidates"][0]["role_hint"] == "workload_candidate"
+
+
+def test_positive_control_a_valid_failed_unit_is_still_discovered() -> None:
+    guest = DiscoveryGuest()
+    guest.unit_files = []
+    guest.failed_units = ["mosquitto.service loaded failed failed MQTT broker"]
+    guest.unit_props = {
+        "mosquitto.service": {
+            "Id": "mosquitto.service",
+            "LoadState": "loaded",
+            "ActiveState": "failed",
+            "UnitFileState": "enabled",
+            "FragmentPath": "/usr/lib/systemd/system/mosquitto.service",
+        },
+    }
+    result = _discover(guest)
+    assert result["status"] == "ok"
+    assert result["candidates"][0]["target"] == "mosquitto.service"
+
+
+def test_positive_control_platform_only_units_never_become_recommendations() -> None:
+    guest = DiscoveryGuest()
+    guest.unit_files = [("ssh.service", "enabled"), ("cron.service", "enabled")]
+    result = _discover(guest)
+    assert result["status"] == "no_candidates"
+    assert result["recommendation_basis"] == "guest_fallback"
+    assert all(
+        not c["recommended"] for c in result["candidates"] if c["adapter"] == "systemd"
+    )
+
+
+def test_positive_control_a_genuinely_bare_guest_still_gets_the_guest_fallback() -> None:
+    """Load-bearing: fixing uncertainty-as-absence must not disable the
+    fallback globally. Positively complete Docker (nothing) and positively
+    complete systemd (nothing but platform units) together still recommend
+    `guest_operational`."""
+
+    guest = DiscoveryGuest()
+    guest.docker_info = {}
+    guest.unit_files = [("ssh.service", "enabled")]
+    result = _discover(guest)
+    assert result["status"] == "no_candidates"
+    assert result["recommendation_basis"] == "guest_fallback"
+    guest_candidates = [c for c in result["candidates"] if c["adapter"] == "guest"]
+    assert len(guest_candidates) == 1
+    assert guest_candidates[0]["kind"] == "guest_operational"
+    assert guest_candidates[0]["recommended"] is True
 
 
 # ===========================================================================

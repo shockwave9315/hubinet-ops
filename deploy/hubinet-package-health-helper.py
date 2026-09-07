@@ -1605,6 +1605,35 @@ _SYSTEMD_DISCOVERY_UNIT_FILE_STATES = frozenset(
     {"enabled", "enabled-runtime", "disabled"}
 )
 
+#: PR #80 review finding (systemd discovery completeness): EVERY state token
+#: `systemctl list-unit-files` can report (verified against systemd 257's own
+#: `UnitFileState` vocabulary; confirmed on this host: enabled, enabled-
+#: runtime, disabled, static, masked, generated, indirect, transient,
+#: alias -- linked/linked-runtime/masked-runtime/bad are the remaining
+#: documented values not currently observed here). A state token OUTSIDE
+#: this closed set is never "policy-excluded" -- it is unrecognised, and
+#: this file cannot safely tell a legitimate exclusion from a malformed row,
+#: so it must make the whole family undecidable rather than guess.
+#: `_SYSTEMD_DISCOVERY_UNIT_FILE_STATES` above is the narrower CANDIDATE-
+#: worthy subset of this vocabulary, never the other way around.
+_SYSTEMD_DISCOVERY_ALL_KNOWN_UNIT_FILE_STATES = frozenset(
+    {
+        "enabled",
+        "enabled-runtime",
+        "linked",
+        "linked-runtime",
+        "masked",
+        "masked-runtime",
+        "static",
+        "disabled",
+        "indirect",
+        "generated",
+        "transient",
+        "bad",
+        "alias",
+    }
+)
+
 
 def _systemd_discovery_role_hint(unit: str) -> str:
     if unit in _SYSTEMD_RUNTIME_UNITS:
@@ -1841,22 +1870,34 @@ def _discover_systemd_candidates(
     seen: set[str] = set()
     try:
         for line in listed.stdout.decode("utf-8").splitlines():
-            parts = line.split()
-            if len(parts) < 2:
+            if not line.strip():
                 continue
-            unit, state = parts[0], parts[1]
-            if (
-                state in _SYSTEMD_DISCOVERY_UNIT_FILE_STATES
-                and SYSTEMD_UNIT_RE.fullmatch(unit)
-                and unit.endswith(SYSTEMD_UNIT_SUFFIXES)
-                and "@" not in unit
-                and unit not in seen
-            ):
-                units.append(unit)
-                seen.add(unit)
-        for line in failed.stdout.decode("utf-8").splitlines():
             parts = line.split()
-            if not parts:
+            # PR #80 review, systemd discovery completeness: a non-empty row
+            # this file cannot parse into at least a unit and a state is
+            # never silently treated as "no relevant unit here" -- that
+            # would be exactly the uncertainty-as-absence the frozen
+            # architecture forbids. It makes the whole family undecidable.
+            if len(parts) < 2:
+                return [], "undecidable"
+            unit, state = parts[0], parts[1]
+            if not (SYSTEMD_UNIT_RE.fullmatch(unit) and unit.endswith(SYSTEMD_UNIT_SUFFIXES)):
+                return [], "undecidable"
+            if state not in _SYSTEMD_DISCOVERY_ALL_KNOWN_UNIT_FILE_STATES:
+                # An unrecognised state token is not a legitimate exclusion
+                # this file can vouch for -- never distinguishable here from
+                # a malformed row, so it is treated as one.
+                return [], "undecidable"
+            if "@" in unit:
+                continue  # valid, known state -- policy-excluded template unit
+            if state not in _SYSTEMD_DISCOVERY_UNIT_FILE_STATES:
+                continue  # valid, known state -- legitimately not a candidate source
+            if unit in seen:
+                continue
+            units.append(unit)
+            seen.add(unit)
+        for line in failed.stdout.decode("utf-8").splitlines():
+            if not line.strip():
                 continue
             # PR #80 review finding 3B: `systemctl list-units --state=failed`
             # prefixes a FAILED unit's row with a bullet glyph ("● unit.name
@@ -1867,17 +1908,26 @@ def _discover_systemd_candidates(
             # stripping of that one glyph was never the fix: `--plain`
             # (requested above, verified to remove it) is a machine-stable
             # command CONTRACT, so this parses `parts[0]` directly and
-            # trusts it -- a token that still fails the unit-name shape
-            # below is treated as a malformed line, not specially unwrapped.
-            unit = parts[0]
-            if (
-                SYSTEMD_UNIT_RE.fullmatch(unit)
-                and unit.endswith(SYSTEMD_UNIT_SUFFIXES)
-                and "@" not in unit
-                and unit not in seen
-            ):
-                units.append(unit)
-                seen.add(unit)
+            # trusts it.
+            parts = line.split()
+            # `--type=service --state=failed` -- UNIT LOAD ACTIVE SUB
+            # DESCRIPTION... -- so a truthful row has at least 4 columns.
+            # Fewer is never silently "no relevant unit here".
+            if len(parts) < 4:
+                return [], "undecidable"
+            unit, active_state = parts[0], parts[2]
+            if not (SYSTEMD_UNIT_RE.fullmatch(unit) and unit.endswith(SYSTEMD_UNIT_SUFFIXES)):
+                return [], "undecidable"
+            if active_state != "failed":
+                # `--state=failed` was requested; a row this file cannot
+                # even confirm as failed cannot be trusted at all.
+                return [], "undecidable"
+            if "@" in unit:
+                continue  # policy-excluded template unit, same as above
+            if unit in seen:
+                continue
+            units.append(unit)
+            seen.add(unit)
     except UnicodeDecodeError:
         return [], "undecidable"
 
@@ -1923,29 +1973,52 @@ def _discover_systemd_candidates(
     if len(blocks) != len(units):
         return [], "undecidable"
 
+    # PR #80 review, systemd discovery completeness (witness C): a unit was
+    # already POSITIVELY enumerated a moment ago -- by `list-unit-files` or
+    # the failed-unit union above. Its `show` block must now prove a
+    # complete, coherent observation of that exact unit, or this file cannot
+    # trust its own enumeration: never silently reinterpret a malformed
+    # block, a missing/duplicate property, or a raced-away unit
+    # (`LoadState` no longer `loaded`) as "this unit does not exist" --
+    # that is exactly the uncertainty-as-absence the frozen architecture
+    # forbids. Any of these makes the WHOLE family undecidable, never a
+    # silently shrunk candidate set.
+    _REQUIRED_SHOW_PROPERTIES = frozenset(
+        {"Id", "LoadState", "ActiveState", "UnitFileState", "FragmentPath"}
+    )
     candidates: list[dict[str, Any]] = []
     for unit, block in zip(units, blocks, strict=True):
         properties: dict[str, str] = {}
+        malformed = False
         for line in block.splitlines():
             if "=" not in line:
-                continue
+                malformed = True
+                break
             key, value = line.split("=", 1)
-            properties.setdefault(key, value)
-        if properties.get("LoadState") != "loaded":
-            continue
-        fragment_path = properties.get("FragmentPath", "")
+            if key in properties:
+                malformed = True
+                break
+            properties[key] = value
+        if malformed or set(properties) != _REQUIRED_SHOW_PROPERTIES:
+            return [], "undecidable"
+        if properties["LoadState"] != "loaded":
+            # This exact unit was positively enumerated moments ago; a
+            # LoadState other than "loaded" now is a read-race or an
+            # inconsistency, never proof it does not exist.
+            return [], "undecidable"
+        fragment_path = properties["FragmentPath"]
         origin = _systemd_discovery_origin(fragment_path)
         # The requested unit and the answer's own Id can differ for an
         # alias (verified: ssh.service/sshd.service share one Id) -- report
         # it under the name actually requested, but flag the origin.
-        if properties.get("Id") and properties["Id"] != unit:
+        if properties["Id"] != unit:
             origin = "alias"
         candidates.append(
             {
                 "adapter": "systemd",
                 "kind": "systemd_unit_active",
                 "target": unit,
-                "observed_state": properties.get("ActiveState", "unknown"),
+                "observed_state": properties["ActiveState"],
                 "origin": origin,
                 "role_hint": _systemd_discovery_role_hint(unit),
                 "recommended": False,
