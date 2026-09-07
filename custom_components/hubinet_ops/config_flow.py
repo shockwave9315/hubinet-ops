@@ -290,10 +290,22 @@ class HubinetOpsOptionsFlow(OptionsFlow):
         coordinator = self._coordinator()
         if coordinator is None:
             return self.async_abort(reason="entry_not_loaded")
+        # GitHub review P2 #2: `resource_type is LXC` alone is not enough --
+        # a failed/partial discovery can retain a historical/missing/
+        # uncertain LXC in the published snapshot, and this flow's terminal
+        # action (`async_reset_health_contract`) is a WRITE, not a read. Gate
+        # on the backend-owned `can_configure_health_contract` capability
+        # (not `can_view_health_contract`, which exists for the separate
+        # read-only "view_health_contract" button) so HA never offers a
+        # resource the backend would refuse this exact mutation for -- HA
+        # must not re-derive presence/binding/node currency itself.
         resources = {
             resource.resource_id: resource_device_name(resource)
             for resource in coordinator.data.resources
             if resource.resource_type is ResourceType.LXC
+            and coordinator.operator_capabilities(
+                resource.resource_id
+            ).can_configure_health_contract
         }
         if not resources:
             return self.async_abort(reason="no_lxc_resources")

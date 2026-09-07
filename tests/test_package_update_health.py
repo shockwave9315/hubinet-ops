@@ -2123,6 +2123,69 @@ def test_the_unknown_event_names_the_probe_that_could_not_be_evaluated(
     event = store.list_package_update_job_events(job.job_id)[-1]
     assert event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN
     assert event.details["reason"] == "command_timed_out"
+    # Positive control for the P2 fix below: context stayed current, so the
+    # validated probe evidence from this real UNRESOLVED round IS published.
+    assert event.details["probes"] == [
+        {"index": 0, "outcome": "unknown", "reason": "command_timed_out"},
+        {"index": 1, "outcome": "passed", "reason": "unit_active"},
+    ]
+
+
+def test_an_unresolved_round_with_context_changed_in_flight_publishes_no_probe_evidence(
+    tmp_path: Path,
+) -> None:
+    """P2 #1 regression: post-host context revalidation was skipped on the
+    non-DECISIVE (UNRESOLVED) path, so validated-but-stale probe evidence
+    about a replacement/moved resource could be published as UNKNOWN
+    evidence. Every host answer -- decisive or not -- must be checked against
+    the SAME post-host context proof before its observations are used for
+    anything, exactly as `_unknown`'s own contract already requires for an
+    in-flight resource-context change.
+
+    Witness:
+    1. context is current before the host call (`_mutated_job` sets this up
+       and step B re-proves it);
+    2. the host returns a valid UNRESOLVED result carrying real observations
+       (one UNKNOWN probe, one PASSED probe);
+    3. context changes while that host call is considered in-flight -- the
+       fake host's ``side_effect`` breaks incarnation continuity before
+       returning its answer, exactly like the sibling decisive-path test
+       `test_a_resource_replaced_during_the_host_call_is_never_accepted`;
+    4. the result is UNKNOWN with reason ``resource_context_changed``, not
+       the probe's own ``command_timed_out`` blocking reason;
+    5. no probe evidence from that stale host answer is persisted/published.
+    """
+
+    from tests.test_package_update_snapshot_safety import (
+        _break_incarnation_continuity_at_the_same_locator,
+    )
+
+    _, store, authority, _, _, _, job = _mutated_job(tmp_path)
+
+    def replace_guest(request):
+        _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    host = FakeHealthHostControl(
+        outcomes=(HealthProbeOutcome.UNKNOWN, HealthProbeOutcome.PASSED),
+        side_effect=replace_guest,
+    )
+    orchestrator = PackageUpdateHealthOrchestrator(authority, host)
+
+    result = orchestrator.evaluate_job_health(job.job_id)
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert result.job.health_completed_at is None
+    assert result.job.health_outcome is None
+    assert result.job.health_probe_results == ()
+
+    event = store.list_package_update_job_events(job.job_id)[-1]
+    assert event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN
+    assert event.details["reason"] == "resource_context_changed"
+    # The load-bearing assertion: no stale probe evidence about the
+    # replaced/moved resource is ever recorded.
+    assert "probes" not in event.details
 
 
 def test_a_job_that_moved_on_mid_attempt_still_reports_no_verdict(

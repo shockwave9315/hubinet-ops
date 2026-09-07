@@ -373,6 +373,22 @@ class PackageUpdateHealthOrchestrator:
         except PackageUpdateHealthError as exc:
             return self._unknown(job.job_id, exc.reason, str(exc))
 
+        # E. Re-prove the backend resource context immediately after the host
+        # answered, and BEFORE these validated observations are used for
+        # ANYTHING -- decisive or not. A guest replaced while the round trip
+        # was in flight means every observation above describes a
+        # replacement/moved resource rather than the exact incarnation frozen
+        # into this job, so it must carry no probe evidence at all: this is
+        # exactly `_unknown`'s own documented contract for an in-flight
+        # context change, and it applies whether the round below turns out
+        # decisive or not. Reuses the SAME authority proof the pre-host
+        # re-proof (step B) used, rather than inventing an approximate
+        # context predicate here.
+        try:
+            self._authority.package_update_health_request(job.job_id)
+        except AuthorityConflict as exc:
+            return self._unknown(job.job_id, "resource_context_changed", str(exc))
+
         # F. The explicit, typed decisiveness carrier is checked BEFORE any
         # aggregation -- never re-derived from the probe outcomes alone. A
         # non-decisive round (the settling deadline/round-cap was reached
@@ -436,15 +452,16 @@ class PackageUpdateHealthOrchestrator:
                 last_round_span_ms=host_result.last_round_span_ms,
             )
 
-        # E. Re-prove the backend resource context AFTER the host answered.
-        # A guest replaced while the round trip was in flight means the
-        # answer describes a different workload, and neither a PASS nor a
-        # FAIL about it may be accepted.
-        try:
-            self._authority.package_update_health_request(job.job_id)
-        except AuthorityConflict as exc:
-            return self._unknown(job.job_id, "resource_context_changed", str(exc))
-
+        # The post-host context re-proof already happened once, at step E
+        # above, for this exact validated observation set -- covering both
+        # the decisive and non-decisive rounds alike. `complete_package_
+        # update_health` still re-proves it a SECOND time, atomically, inside
+        # the very transaction that would commit the verdict (see its
+        # docstring: "the load-bearing post-host proof"), which is what
+        # closes the true check/commit race for a decisive PASS/FAIL. That
+        # atomic proof is the one that must never be skipped; the proof above
+        # only decides, earlier and more cheaply, whether probe evidence may
+        # be reported at all for a non-decisive round.
         try:
             decided = self._authority.complete_package_update_health(
                 job.job_id, observations

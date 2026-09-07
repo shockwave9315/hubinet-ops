@@ -35,6 +35,7 @@ from custom_components.hubinet_ops.api import (
     HealthProbeKind,
     HubinetOpsCannotConnect,
     HubinetOpsConflict,
+    OperatorCapabilities,
     ResourceHealthContract,
 )
 
@@ -88,6 +89,18 @@ def _advanced_contract(*, revision: int = 3) -> ResourceHealthContract:
 
 
 async def _open_for_ct(hass: HomeAssistant, transport) -> tuple:
+    """Open the flow for RESOURCE_CT.
+
+    GitHub review P2 #2: the init selector now only offers an LXC the
+    backend currently says `can_configure_health_contract` for, so every
+    fixture routed through here needs that capability published for
+    RESOURCE_CT -- `setdefault` so a test that deliberately sets its own
+    capabilities map is never overridden.
+    """
+
+    transport.operator_capabilities.setdefault(
+        RESOURCE_CT, OperatorCapabilities(can_configure_health_contract=True)
+    )
     entry = await setup_entry(hass, transport)
     result = await hass.config_entries.options.async_init(entry.entry_id)
     result = await hass.config_entries.options.async_configure(
@@ -98,16 +111,73 @@ async def _open_for_ct(hass: HomeAssistant, transport) -> tuple:
 
 @pytest.mark.asyncio
 async def test_options_flow_lists_lxc_resources_only(hass: HomeAssistant) -> None:
-    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    """Both current, configurable LXCs are offered; the QEMU is excluded."""
+
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [snapshot(INITIAL_RESOURCES)],
+            operator_capabilities={
+                RESOURCE_CT: OperatorCapabilities(can_configure_health_contract=True),
+                RESOURCE_TEST: OperatorCapabilities(can_configure_health_contract=True),
+            },
+        ),
+    )
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
     selectable = result["data_schema"].schema["resource_id"].container
-    # RESOURCE_VM is QEMU, excluded; both LXC resources are offered.
+    # RESOURCE_VM is QEMU, excluded; both current, configurable LXCs are
+    # offered.
     assert RESOURCE_VM not in selectable
     assert RESOURCE_CT in selectable
     assert RESOURCE_TEST in selectable
+
+
+@pytest.mark.asyncio
+async def test_a_retained_non_current_lxc_is_not_offered(hass: HomeAssistant) -> None:
+    """GitHub review P2 #2's exact witness: a failed/partial discovery can
+    retain a historical/missing/uncertain LXC in the published snapshot, and
+    the backend correctly refuses `can_configure_health_contract` for it. HA
+    must not offer a resource the backend would then refuse
+    `async_fetch_health_contract`/`async_reset_health_contract` for --
+    RESOURCE_TEST is a real LXC in the snapshot, but the backend publishes no
+    configure capability for it, so it must not appear in the selector."""
+
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [snapshot(INITIAL_RESOURCES)],
+            operator_capabilities={
+                RESOURCE_CT: OperatorCapabilities(can_configure_health_contract=True),
+                # RESOURCE_TEST deliberately omitted: defaults to
+                # OperatorCapabilities(), i.e. every capability False,
+                # exactly like a retained/non-current resource.
+            },
+        ),
+    )
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    selectable = result["data_schema"].schema["resource_id"].container
+    assert RESOURCE_CT in selectable
+    assert RESOURCE_TEST not in selectable
+    assert RESOURCE_VM not in selectable
+
+
+@pytest.mark.asyncio
+async def test_no_eligible_lxc_produces_a_truthful_abort(hass: HomeAssistant) -> None:
+    """Every LXC present is currently non-configurable (e.g. all retained/
+    non-current) -- the flow must abort truthfully rather than offer a
+    selector the backend would refuse every option of."""
+
+    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_lxc_resources"
 
 
 @pytest.mark.asyncio
