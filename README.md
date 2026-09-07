@@ -42,17 +42,24 @@ a guest in Proxmox never requires touching this repository or its config.
   the same reference. Approval never executes an update.
 - Operator-declared per-resource health contracts: for each resource, the list
   of typed probes (`systemd_unit_active`, `docker_container_running`,
-  `docker_container_healthy`) that must **all** hold for that workload to count
-  as up. Managed through the `view_health_contract` / `set_health_contract` /
+  `docker_container_healthy`, and — v20 — the targetless `guest_operational`
+  fallback) that must **all** hold for that workload to count as up. Managed
+  through the `view_health_contract` / `set_health_contract` /
   `clear_health_contract` Home Assistant actions and the routes above, with a
   concise contract-status sensor and a per-resource **View health contract**
   button. A resource with no contract is
   *unconfigured*, which is never "healthy" — and it can no longer be given an
   update job at all, because a job whose success criterion does not exist
   could never truthfully be called successful. A reviewed-and-approved
-  resource that is still unconfigured raises a native Home Assistant Repair
-  (Settings → Repairs), naming the `set_health_contract` action so the
-  discoverable next step never requires reading source code.
+  resource that is still unconfigured raises a native, fixable Home Assistant
+  Repair (Settings → Repairs) that discovers backend-recommended candidates
+  and declares a contract from an explicit checkbox confirmation — the
+  manual `set_health_contract` action remains a fully supported alternative.
+  An already-configured resource gets the same discover/render/confirm
+  treatment through the integration's own **Configure** options flow
+  (Settings → Devices & Services → Hubinet Ops), to view, re-discover, edit,
+  replace, or explicitly clear its contract, with the same revision-CAS
+  safety `set_health_contract`/`clear_health_contract` already use.
 - **Operator-triggered package updates.** One explicit action starts the
   currently approved update for one resource; the backend takes a fresh
   job-owned snapshot, re-proves the exact plan, performs one bounded package

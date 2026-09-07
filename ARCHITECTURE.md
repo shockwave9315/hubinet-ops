@@ -2875,6 +2875,30 @@ already-bounded `HealthDiscoveryResult` it fetched over that one typed route
 `test_ha_integration_contains_no_docker_or_systemd_inspection_logic`, proves
 the absence).
 
+**A resource whose contract is already configured gets the same
+discover/render/confirm treatment, natively, without Developer Tools**
+(PR #80 review finding 3): `HubinetOpsOptionsFlow` (Settings -> Devices &
+Services -> Hubinet Ops -> Configure) picks one of the entry's LXC
+resources, reads its current contract (`async_fetch_health_contract`,
+treating "unconfigured" as no probes and no revision rather than an error),
+and offers a menu of *discover* (view/re-discover/edit/replace) or *clear*
+-- skipped straight to *discover* when nothing is declared yet, exactly
+like the Repair's own first-declaration path. The discover step renders ONE
+merged checklist: every currently declared probe (always defaulting to
+checked -- removing one is an explicit uncheck, never implicit) unioned
+with every freshly discovered candidate (defaulting to the backend's own
+`recommended` flag), deduplicated by `(kind, target)` identity. The
+contract's own `revision`, read the moment the flow looked at it, is sent
+back as `expected_revision` on every write; a concurrent change is
+`HubinetOpsConflict`, refused and reported rather than silently
+overwritten, and the flow re-reads current state so a retry is against
+reality. Clearing is a separate, explicitly confirmed step, never a side
+effect of an empty discover submission. The manual
+`set_health_contract`/`clear_health_contract` actions remain fully
+supported. This flow shares the exact same "no inspection logic on the HA
+side" guarantee as the Repair above -- the same regression test scans
+every file in the integration, this one included.
+
 ### Restart, retry, and rollback
 
 Startup recovery is unchanged and deliberately so: `health_started` and

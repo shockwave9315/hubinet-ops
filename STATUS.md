@@ -54,20 +54,29 @@
   accepts only a RUNNING scan for the same resource. Schema v19 makes the
   successful job row the atomic durable consumption fact for its exact
   approval and adds a unique fence permitting at most one successful job per
-  approval.
+  approval. Schema v20 adds `guest_operational`, a fourth health-probe kind
+  whose `target` column is the one nullable exception to the otherwise
+  `NOT NULL` bounded-target `CHECK` (enforced positionally: exactly this kind
+  may be `NULL`, every other kind still requires one), with its own partial
+  unique index permitting at most one such probe per contract or per frozen
+  job copy.
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`,
   `/operator-availability`;
   authority-metadata mutations
   (`PUT /r0/v1/resources/{resource_id}/package-plan-approval`,
-  `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`); and the
-  explicit operator update controls
+  `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`); the
+  ephemeral, read-only discovery route
+  (`GET /r0/v1/resources/{resource_id}/health-candidates`, v20 -- persists
+  nothing, grants no authority); and the explicit operator update controls
   (`POST`/`GET /r0/v1/resources/{resource_id}/package-update`,
   `POST .../package-update/resume`, `POST .../package-update/rollback`,
   `GET /r0/v1/package-update/active`). Bearer authentication is required on
   every endpoint except the deliberately unauthenticated minimal
   `/r0/v1/health` liveness probe, which exposes no inventory or credential
   data.
-- **Home Assistant integration** — config flow, coordinator, structural
+- **Home Assistant integration** — config flow, an options flow (v20;
+  Settings → Devices & Services → Hubinet Ops → Configure) for native
+  per-resource health-contract maintenance, coordinator, structural
   contract validation, dynamic devices, sensors, a binary sensor, and buttons;
   package-scan summary and
   concise `none | approved | stale | consumed` approval-status sensors,
@@ -991,24 +1000,27 @@ The operator-triggered update lifecycle is production reachable.
   operator explicitly submits — through the same `async_replace_health_contract`
   mutation `set_health_contract` already used. An undecided discovery status,
   a transport failure, or zero candidates leaves the issue open; the manual
-  action remains a fully supported alternative. See `ARCHITECTURE.md`, "PR
-  #80 review remediation", "The guest_operational fallback and backend
+  action remains a fully supported alternative.
+
+  **An already-configured resource now has a native maintenance path too**
+  (Settings → Devices & Services → Hubinet Ops → Configure, an options
+  flow): pick a resource, view its currently declared probes, re-discover
+  fresh candidates, edit the checkbox selection, and either replace the
+  contract or explicitly clear it — the CAS `expected_revision` read the
+  moment the flow looked at the contract is sent back on every write, and a
+  concurrent change is refused and reported rather than silently
+  overwritten. `set_health_contract` / `clear_health_contract` remain fully
+  supported as the manual/diagnostic path. See `ARCHITECTURE.md`, "PR #80
+  review remediation", "The guest_operational fallback and backend
   discovery", and "Native HA onboarding".
 
 ### Next — Human1 follow-ons deliberately deferred
 
-- An edit/re-discover/clear maintenance flow for a resource that **already**
-  has a declared contract was not built alongside the initial-declaration fix
-  flow above; `set_health_contract`/`clear_health_contract` remain the
-  supported path for editing an existing contract.
 - Typed CT start/stop/restart and manual-snapshot operations were not added in
   this slice. They require new dedicated backend operations and privileged
   forced-command boundaries; combining that deployment/host-control work with
   the package operator surface would make the boundary harder to review.
   Manual snapshots must remain distinct from job-owned rollback authority.
-- Health-contract inspection is native, but editing the variable-length typed
-  probe list remains in `set_health_contract` / `clear_health_contract` actions.
-  A scalar Text/Select entity would be a misleading editor for this contract.
 - A dedicated operator-facing bearer-token handoff/retrieval path remains to
   be designed. The token must not enter ordinary logs, diagnostics, or the
   published snapshot.
