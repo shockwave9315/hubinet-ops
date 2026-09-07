@@ -1963,7 +1963,14 @@ def _discover_systemd_candidates(
         )
     except (ProbeUnknown, HealthError):
         return [], "undecidable"
-    if result.timed_out or result.output_exceeded:
+    if result.timed_out or result.output_exceeded or result.returncode != 0:
+        # PR #80 review (follow-up): a non-zero `systemctl show` is never
+        # positive completeness, whatever its stdout happens to contain --
+        # never parse a failed command's output and try to salvage
+        # candidates from it. This mirrors the settling-side `_systemd_
+        # round`'s own rule (`systemctl show succeeds even for a unit that
+        # does not exist, so a non-zero exit means the command itself could
+        # not run`), applied here to discovery's own batched call.
         return [], "undecidable"
     try:
         stdout = result.stdout.decode("utf-8")

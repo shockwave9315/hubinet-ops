@@ -1906,6 +1906,11 @@ class DiscoveryGuest:
         #: property key, a non-`key=value` line).
         self.unit_files_raw_stdout: bytes | None = None
         self.show_raw_stdout: bytes | None = None
+        #: A non-zero `systemctl show` return code, with otherwise
+        #: perfectly-shaped stdout (from `unit_props`/`show_raw_stdout`) --
+        #: proves the completeness check rejects the exit code BEFORE
+        #: parsing, never salvaging candidates from a failed command.
+        self.show_returncode = 0
         #: Same virtual-clock consumption support as `FakeGuest`, for the
         #: discovery deadline's own fresh-per-command timeout regression.
         self.clock: FakeClock | None = None
@@ -1991,7 +1996,9 @@ class DiscoveryGuest:
             )
         assert tail[3] == "show", tail
         if self.show_raw_stdout is not None:
-            return self._ok(self.show_raw_stdout)
+            return helper.CommandResult(
+                self.show_returncode, self.show_raw_stdout, b""
+            )
         requested = tail[tail.index("--") + 1 :]
         blocks = []
         for unit in requested:
@@ -2006,7 +2013,9 @@ class DiscoveryGuest:
                 },
             )
             blocks.append("\n".join(f"{key}={value}" for key, value in props.items()))
-        return self._ok(("\n\n".join(blocks) + "\n").encode())
+        return helper.CommandResult(
+            self.show_returncode, ("\n\n".join(blocks) + "\n").encode(), b""
+        )
 
     @staticmethod
     def _ok(stdout: bytes):
@@ -2454,6 +2463,65 @@ def test_a_show_block_with_a_malformed_line_is_undecidable() -> None:
     )
     result = _discover(guest)
     assert result["status"] == "undecidable"
+
+
+def test_a_nonzero_systemctl_show_return_code_is_undecidable_even_with_valid_stdout() -> None:
+    """Witness (follow-up review): a non-zero `systemctl show` is never
+    positive completeness, whatever its stdout looks like -- never parse a
+    failed command's output and try to salvage candidates from it."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = [("ssh.service", "enabled")]
+    guest.show_returncode = 1  # stdout is otherwise perfectly well-formed
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+    assert result["candidates"] == []
+
+
+def test_docker_complete_empty_plus_failed_systemctl_show_never_reaches_guest_fallback() -> None:
+    """The concrete end-to-end witness: Docker positively completes with
+    nothing found; systemd positively enumerates `ssh.service` (which would
+    only ever be a non-recommended platform unit anyway), but its batched
+    `systemctl show` fails (rc=1) with otherwise perfectly valid,
+    structurally complete stdout. Before this fix, the non-zero exit code
+    was never checked, so this exact stdout would have been parsed,
+    `ssh.service` classified `platform`, `systemd_status` reported `None`
+    (positively complete, zero workload candidates), and combined with
+    Docker's own positive-empty result this would have produced a false
+    `guest_operational` recommendation for a guest whose systemd state was
+    never actually proven."""
+
+    guest = DiscoveryGuest()
+    guest.docker_info = {}  # Docker positively complete, zero candidates
+    guest.unit_files = [("ssh.service", "enabled")]
+    guest.show_returncode = 1
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+    assert not any(c["adapter"] == "guest" for c in result["candidates"])
+
+
+def test_positive_control_the_same_observation_with_a_successful_show_still_completes() -> None:
+    """The equivalent rc=0 path remains valid, and a genuinely complete,
+    genuinely bare guest still legitimately reaches the guest_operational
+    fallback -- this fix narrows uncertainty handling, it does not disable
+    the fallback. (The same load-bearing shape as
+    `test_positive_control_a_genuinely_bare_guest_still_gets_the_guest_
+    fallback` above; kept as its own explicit rc=0 counterpart to the
+    witness immediately above it.)"""
+
+    guest = DiscoveryGuest()
+    guest.docker_info = {}
+    guest.unit_files = [("ssh.service", "enabled")]
+    assert guest.show_returncode == 0
+    result = _discover(guest)
+    assert result["status"] == "no_candidates"
+    assert result["recommendation_basis"] == "guest_fallback"
+    guest_candidates = [c for c in result["candidates"] if c["adapter"] == "guest"]
+    assert len(guest_candidates) == 1
+    assert guest_candidates[0]["kind"] == "guest_operational"
+    assert guest_candidates[0]["recommended"] is True
 
 
 def test_docker_complete_empty_plus_systemd_uncertain_never_reaches_guest_fallback() -> None:
