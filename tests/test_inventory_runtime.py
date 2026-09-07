@@ -221,7 +221,7 @@ def test_2_only_reads_and_exact_authority_metadata_writes_exist(tmp_path: Path) 
         "/r0/v1/operator-availability": {"GET"},
         "/r0/v1/resources/{resource_id}/package-plan-approval": {"PUT"},
         "/r0/v1/resources/{resource_id}/health-contract": {"GET", "PUT", "DELETE"},
-        "/r0/v1/resources/{resource_id}/health-candidates": {"GET"},
+        "/r0/v1/resources/{resource_id}/health-contract/reset": {"POST"},
         "/r0/v1/resources/{resource_id}/package-update": {"GET", "POST"},
         "/r0/v1/resources/{resource_id}/package-update/resume": {"POST"},
         "/r0/v1/resources/{resource_id}/package-update/rollback": {"POST"},
@@ -715,17 +715,32 @@ def _discover_lxc_resource(app, config, monkeypatch):
     return app.state.store.list_resources(source_id)[0]
 
 
+def _unconfigured_lxc_resource(app, config, monkeypatch):
+    """A discovered LXC taken back to genuinely *unconfigured*.
+
+    Reconciliation provisions the built-in `guest_operational` default for
+    every current managed LXC (v0.5), so the routes' unconfigured behaviour
+    -- which still exists and still has to fail closed -- is only reachable
+    through the low-level clear.
+    """
+
+    resource = _discover_lxc_resource(app, config, monkeypatch)
+    app.state.authority.clear_resource_health_contract(resource.resource_id)
+    return resource
+
+
 def test_health_contract_routes_require_bearer_authentication(
     tmp_path: Path, monkeypatch
 ) -> None:
     app, config = _build_app(tmp_path)
-    resource = _discover_lxc_resource(app, config, monkeypatch)
+    resource = _unconfigured_lxc_resource(app, config, monkeypatch)
     path = _health_contract_path(resource.resource_id)
     client = TestClient(app)
 
     assert client.get(path).status_code == 401
     assert client.put(path, json={"probes": _HEALTH_PROBES}).status_code == 401
     assert client.delete(path).status_code == 401
+    assert client.post(f"{path}/reset").status_code == 401
     assert client.get(path, headers={"Authorization": "Bearer wrong"}).status_code == 401
     # Nothing was written by any unauthenticated attempt.
     assert app.state.store.resource_health_contract(resource.resource_id) is None
@@ -737,7 +752,7 @@ def test_health_contract_get_distinguishes_unconfigured_from_unknown_resource(
     """An absent contract is never a 200 with an empty probe list."""
 
     app, config = _build_app(tmp_path)
-    resource = _discover_lxc_resource(app, config, monkeypatch)
+    resource = _unconfigured_lxc_resource(app, config, monkeypatch)
     headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
     client = TestClient(app)
 
@@ -759,7 +774,7 @@ def test_health_contract_put_then_get_returns_the_exact_canonical_contract(
     tmp_path: Path, monkeypatch, caplog
 ) -> None:
     app, config = _build_app(tmp_path)
-    resource = _discover_lxc_resource(app, config, monkeypatch)
+    resource = _unconfigured_lxc_resource(app, config, monkeypatch)
     path = _health_contract_path(resource.resource_id)
     headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
     client = TestClient(app)
@@ -778,7 +793,8 @@ def test_health_contract_put_then_get_returns_the_exact_canonical_contract(
     body = created.json()
     assert body["resource_id"] == resource.resource_id
     assert body["status"] == "configured"
-    assert body["revision"] == 1
+    # Revision 2: revision 1 was the built-in default the helper cleared.
+    assert body["revision"] == 2
     # Canonical order, independent of how the operator listed them.
     assert body["probes"] == [
         {"kind": "docker_container_healthy", "target": "immich_server"},
@@ -793,7 +809,7 @@ def test_health_contract_put_then_get_returns_the_exact_canonical_contract(
         headers=headers,
         json={"probes": [{"kind": "docker_container_running", "target": "redis"}]},
     ).json()
-    assert replaced["revision"] == 2
+    assert replaced["revision"] == 3
     assert replaced["fingerprint"] != body["fingerprint"]
     assert replaced["created_at"] == body["created_at"]
 
@@ -801,7 +817,7 @@ def test_health_contract_put_then_get_returns_the_exact_canonical_contract(
     published = client.get("/r0/v1/snapshot", headers=headers).json()["resources"][0]
     assert published["health_contract"] == {
         "status": "configured",
-        "revision": 2,
+        "revision": 3,
         "fingerprint": replaced["fingerprint"],
         "probe_count": 1,
         "updated_at": replaced["updated_at"],
@@ -869,7 +885,7 @@ def test_health_contract_put_refuses_malformed_or_unbounded_declarations(
     tmp_path: Path, monkeypatch, expected_layer: str, body
 ) -> None:
     app, config = _build_app(tmp_path)
-    resource = _discover_lxc_resource(app, config, monkeypatch)
+    resource = _unconfigured_lxc_resource(app, config, monkeypatch)
     path = _health_contract_path(resource.resource_id)
     headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
     client = TestClient(app)
@@ -889,7 +905,7 @@ def test_health_contract_delete_is_idempotent_and_means_unconfigured(
     tmp_path: Path, monkeypatch
 ) -> None:
     app, config = _build_app(tmp_path)
-    resource = _discover_lxc_resource(app, config, monkeypatch)
+    resource = _unconfigured_lxc_resource(app, config, monkeypatch)
     path = _health_contract_path(resource.resource_id)
     headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
     client = TestClient(app)
@@ -915,7 +931,7 @@ def test_health_contract_compare_and_set_refuses_a_stale_editor(
     tmp_path: Path, monkeypatch
 ) -> None:
     app, config = _build_app(tmp_path)
-    resource = _discover_lxc_resource(app, config, monkeypatch)
+    resource = _unconfigured_lxc_resource(app, config, monkeypatch)
     path = _health_contract_path(resource.resource_id)
     headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
     client = TestClient(app)
@@ -941,7 +957,15 @@ def test_health_contract_compare_and_set_refuses_a_stale_editor(
     assert conflicted_clear.json()["detail"]["error"] == "revision_conflict"
     # The refused writes left the original contract exactly as it was.
     assert client.get(path, headers=headers).json() == first.json()
-    assert client.delete(f"{path}?expected_revision=1", headers=headers).status_code == 200
+    # Reset carries the same compare-and-set discipline as every other
+    # contract mutation.
+    stale_reset = client.post(f"{path}/reset?expected_revision=7", headers=headers)
+    assert stale_reset.status_code == 409
+    assert stale_reset.json()["detail"]["error"] == "revision_conflict"
+    reset = client.post(f"{path}/reset?expected_revision=2", headers=headers)
+    assert reset.status_code == 200
+    assert reset.json()["probes"] == [{"kind": "guest_operational", "target": None}]
+    assert client.delete(f"{path}?expected_revision=3", headers=headers).status_code == 200
 
 
 def test_health_contract_revision_is_never_reused_over_http(
@@ -950,16 +974,17 @@ def test_health_contract_revision_is_never_reused_over_http(
     """Clearing must not rewind the revision an operator compares against."""
 
     app, config = _build_app(tmp_path)
-    resource = _discover_lxc_resource(app, config, monkeypatch)
+    resource = _unconfigured_lxc_resource(app, config, monkeypatch)
     path = _health_contract_path(resource.resource_id)
     headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
     client = TestClient(app)
 
     first = client.put(path, headers=headers, json={"probes": _HEALTH_PROBES}).json()
-    assert first["revision"] == 1
-    # An operator opens the editor here, holding revision 1.
+    # Revision 2: revision 1 was the built-in default the helper cleared.
+    assert first["revision"] == 2
+    # An operator opens the editor here, holding revision 2.
 
-    assert client.delete(f"{path}?expected_revision=1", headers=headers).status_code == 200
+    assert client.delete(f"{path}?expected_revision=2", headers=headers).status_code == 200
     second = client.put(
         path,
         headers=headers,
@@ -969,7 +994,7 @@ def test_health_contract_revision_is_never_reused_over_http(
         },
     )
     assert second.status_code == 200
-    assert second.json()["revision"] == 2
+    assert second.json()["revision"] == 3
 
     # The stale editor's revision named a generation that no longer exists.
     stale = client.put(
@@ -977,7 +1002,7 @@ def test_health_contract_revision_is_never_reused_over_http(
         headers=headers,
         json={
             "probes": [{"kind": "systemd_unit_active", "target": "hostile.service"}],
-            "expected_revision": 1,
+            "expected_revision": 2,
         },
     )
     assert stale.status_code == 409
@@ -989,7 +1014,7 @@ def test_health_contract_revision_is_never_reused_over_http(
     client.delete(path, headers=headers)
     recreated = client.put(path, headers=headers, json={"probes": _HEALTH_PROBES}).json()
     assert recreated["fingerprint"] == first["fingerprint"]
-    assert recreated["revision"] == 3
+    assert recreated["revision"] == 4
     assert (recreated["revision"], recreated["fingerprint"]) != (
         first["revision"],
         first["fingerprint"],
@@ -1030,18 +1055,22 @@ def test_health_contract_routes_fail_closed_on_a_non_current_resource(
         if item.resource_id != resource.resource_id
     )
 
-    for method in ("get", "put", "delete"):
+    for method in ("get", "put", "delete", "reset"):
         for target in (resource.resource_id, successor.resource_id):
-            call = getattr(client, method)
-            kwargs = {"headers": headers}
-            if method == "put":
-                kwargs["json"] = {"probes": _HEALTH_PROBES}
-            response = call(_health_contract_path(target), **kwargs)
+            path_for = _health_contract_path(target)
+            if method == "reset":
+                response = client.post(f"{path_for}/reset", headers=headers)
+            else:
+                kwargs = {"headers": headers}
+                if method == "put":
+                    kwargs["json"] = {"probes": _HEALTH_PROBES}
+                response = getattr(client, method)(path_for, **kwargs)
             assert response.status_code == 409, (method, target, response.text)
             assert response.json()["detail"]["error"] == "resource_not_current"
 
-    # The successor never inherited anything, and the predecessor's own
-    # historical row was not edited by any of those refusals.
+    # A QEMU successor gets no built-in default and inherits nothing, and the
+    # predecessor's own historical row was not edited by any of those
+    # refusals -- revision 2, over the built-in default it replaced.
     assert app.state.store.resource_health_contract(successor.resource_id) is None
     predecessor = app.state.store.resource_health_contract(resource.resource_id)
-    assert predecessor is not None and predecessor.revision == 1
+    assert predecessor is not None and predecessor.revision == 2

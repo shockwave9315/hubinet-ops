@@ -43,8 +43,6 @@ import pytest
 
 from app.inventory import (
     AuthorityConflict,
-    HealthDiscoveryResult,
-    HealthDiscoveryStatus,
     HealthOutcome,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -278,13 +276,6 @@ class ScriptedHealthHostControl:
             contract_fingerprint=request.health_contract_fingerprint,
             probes=probes,
             evaluation_status=HealthEvaluationStatus.DECISIVE,
-        )
-
-    def discover_health_candidates(self, request):
-        return HealthDiscoveryResult(
-            status=HealthDiscoveryStatus.NO_CANDIDATES,
-            candidates=(),
-            recommendation_basis=None,
         )
 
 
@@ -1631,7 +1622,6 @@ class ApiSystem:
             return PackageUpdateRuntime(
                 worker=_DeferredWorker(seed),
                 snapshot_host_control=_DeferredSnapshotHost(seed),
-                health_host_control=_DeferredHealthHost(seed),
             )
 
         # The same fake clock the seeded authority used. Without it the
@@ -1663,6 +1653,11 @@ class ApiSystem:
 
     def get(self, path: str, **kwargs):
         return self.client.get(
+            path, headers={"Authorization": f"Bearer {BEARER}"}, **kwargs
+        )
+
+    def put(self, path: str, **kwargs):
+        return self.client.put(
             path, headers={"Authorization": f"Bearer {BEARER}"}, **kwargs
         )
 
@@ -1703,16 +1698,6 @@ class _DeferredWorker:
 
     def stop(self, *, grace_seconds: float = 30.0) -> None:
         pass
-
-
-class _DeferredHealthHost:
-    """Forwards ephemeral discovery to the fixture's scripted boundary."""
-
-    def __init__(self, system: ProductionSystem) -> None:
-        self._system = system
-
-    def discover_health_candidates(self, request):
-        return self._system.health_host.discover_health_candidates(request)
 
 
 class _DeferredSnapshotHost:
@@ -2019,70 +2004,107 @@ def test_readback_includes_bounded_observation_evidence_when_unresolved(
 
 
 # ===========================================================================
-# Health-candidate discovery (v20, post-Human1 Stage 3B): ephemeral, and
-# reachable only through the real route -> real authority -> the health
-# host control's SECOND typed operation.
+# The built-in v0.5 default health contract, through the real routes.
+#
+# There is no candidate-discovery route any more: v0.5 does not automatically
+# discover or recommend Docker/systemd application health probes, because
+# absence of a workload observer is not proof of workload absence.
 # ===========================================================================
 
 
-def test_discover_health_candidates_route_persists_nothing(tmp_path: Path) -> None:
+def test_a_managed_lxc_needs_no_health_onboarding_before_start(
+    tmp_path: Path,
+) -> None:
+    """The whole point of the v0.5 default: an operator who approves a real
+    plan reaches **Start**, not a health-configuration dead end.
+
+    The fixture declares an advanced contract of its own, so this first takes
+    the resource back to genuinely unconfigured through the low-level clear,
+    then runs one ordinary inventory reconciliation -- the same backend-owned
+    point production uses -- and proves that alone is enough to start.
+    """
+
     system = ApiSystem(tmp_path)
     try:
-        before = system.store.record_counts()
+        assert system.authority.clear_resource_health_contract(system.resource_id)
+        blocked = system.start()
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["error"] == "health_contract_unconfigured"
 
+        _reconcile(system.authority, system.seed.resource.inventory_source_id)
+
+        contract = system.get(
+            f"/r0/v1/resources/{system.resource_id}/health-contract"
+        )
+        assert contract.status_code == 200
+        assert contract.json()["probes"] == [
+            {"kind": "guest_operational", "target": None}
+        ]
+        assert system.start().status_code == 202
+    finally:
+        system.close()
+
+
+def test_there_is_no_health_candidate_discovery_route(tmp_path: Path) -> None:
+    """The removed Stage-3B surface must be gone, not merely unused."""
+
+    system = ApiSystem(tmp_path)
+    try:
         response = system.get(
             f"/r0/v1/resources/{system.resource_id}/health-candidates"
         )
-
-        assert response.status_code == 200
-        body = response.json()
-        assert body["resource_id"] == system.resource_id
-        assert body["discovery_status"] == "no_candidates"
-        assert body["candidates"] == []
-        assert body["recommendation_basis"] is None
-
-        after = system.store.record_counts()
-        assert after == before
+        assert response.status_code == 404
+        paths = {route.path for route in system.app.routes}
+        assert not any("health-candidates" in path for path in paths)
     finally:
         system.close()
 
 
-def test_discover_health_candidates_requires_activation(tmp_path: Path) -> None:
-    system = ApiSystem(tmp_path, activated=False)
-    try:
-        response = system.get(
-            f"/r0/v1/resources/{system.resource_id}/health-candidates"
-        )
-        assert response.status_code == 503
-        assert response.json()["detail"]["error"] == "package_update_not_activated"
-    finally:
-        system.close()
-
-
-def test_discover_health_candidates_requires_authentication(tmp_path: Path) -> None:
-    system = ApiSystem(tmp_path)
-    try:
-        response = system.client.get(
-            f"/r0/v1/resources/{system.resource_id}/health-candidates"
-        )
-        assert response.status_code in (401, 403)
-    finally:
-        system.close()
-
-
-def test_resource_health_discovery_request_assembles_current_context(
+def test_reset_route_restores_the_default_over_an_advanced_contract(
     tmp_path: Path,
 ) -> None:
     system = ApiSystem(tmp_path)
     try:
-        request = system.authority.resource_health_discovery_request(
-            system.resource_id
+        declared = system.put(
+            f"/r0/v1/resources/{system.resource_id}/health-contract",
+            json={
+                "probes": [
+                    {"kind": "docker_container_healthy", "target": "web"}
+                ]
+            },
         )
-        assert request.resource_id == system.resource_id
-        assert request.vmid > 0
-        assert request.expected_node
-        assert request.locator_generation > 0
-        assert request.resource_continuity_revision > 0
+        assert declared.status_code == 200
+        advanced_revision = declared.json()["revision"]
+
+        # A stale expected_revision cannot silently discard the newer
+        # advanced contract.
+        stale = system.post(
+            f"/r0/v1/resources/{system.resource_id}/health-contract/reset",
+            params={"expected_revision": advanced_revision - 1},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["error"] == "revision_conflict"
+
+        reset = system.post(
+            f"/r0/v1/resources/{system.resource_id}/health-contract/reset",
+            params={"expected_revision": advanced_revision},
+        )
+        assert reset.status_code == 200
+        assert reset.json()["probes"] == [
+            {"kind": "guest_operational", "target": None}
+        ]
+        assert reset.json()["revision"] == advanced_revision + 1
+    finally:
+        system.close()
+
+
+def test_reset_route_requires_authentication(tmp_path: Path) -> None:
+    system = ApiSystem(tmp_path)
+    try:
+        response = system.client.post(
+            f"/r0/v1/resources/{system.resource_id}/health-contract/reset"
+        )
+        assert response.status_code in (401, 403)
     finally:
         system.close()
 

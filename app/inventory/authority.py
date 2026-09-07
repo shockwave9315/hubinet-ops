@@ -43,7 +43,6 @@ from .models import (
     PackageUpdateEventType,
     PackageUpdateExecutionOutcome,
     PackageUpdateHealthRequest,
-    ResourceHealthDiscoveryRequest,
     PackageUpdateJob,
     PackageUpdateJobHealthProbe,
     PackageUpdateJobStatus,
@@ -66,6 +65,8 @@ from .models import (
     checkpoint_rank as _checkpoint_rank,
 )
 from .health_contract import (
+    DEFAULT_HEALTH_CONTRACT_FINGERPRINT,
+    DEFAULT_HEALTH_PROBES,
     canonical_health_probes,
     health_contract_fingerprint,
 )
@@ -548,6 +549,15 @@ class InventoryAuthority:
                     connection, snapshot, committed_at=committed_at
                 )
                 self._after_reconciliation(connection, snapshot)
+                # The narrowest backend-owned point at which a resource is a
+                # CURRENT, package-managed LXC. Provisioning the built-in
+                # `guest_operational` default here -- inside this same
+                # transaction, with no guest read of any kind -- is what
+                # removes the "approved plan, unconfigured health" dead end
+                # without inferring anything about the workload.
+                self._provision_default_health_contracts(
+                    connection, now=committed_at
+                )
                 freshness_reference = _freshness_reference_at(snapshot)
                 deadline = freshness_reference + timedelta(
                     seconds=int(source["freshness_duration_seconds"])
@@ -1504,6 +1514,16 @@ class InventoryAuthority:
         Clearing removes the contract material but never the record of which
         revisions have already been allocated, so the next contract cannot
         reuse one.
+
+        This is the LOW-LEVEL primitive, not the native operator path. A
+        current package-managed LXC does not stay unconfigured: the next
+        successful reconciliation re-provisions the built-in
+        ``guest_operational`` default for it (see
+        :meth:`_provision_default_health_contracts`). An operator who wants
+        to discard an advanced contract should use
+        :meth:`reset_resource_health_contract`, which restores that baseline
+        immediately instead of leaving the resource update-blocked until the
+        next discovery run.
         """
 
         canonical_resource_id = _require_uuid(resource_id, "resource_id")
@@ -1540,6 +1560,105 @@ class InventoryAuthority:
                 connection, inventory_changed=False, published_changed=True
             )
         return True
+
+    def reset_resource_health_contract(
+        self, resource_id: str, *, expected_revision: int | None = None
+    ) -> ResourceHealthContract:
+        """Restore the built-in v0.5 default contract for one resource.
+
+        This is what "reset health" means on the native operator path, and
+        it is deliberately NOT :meth:`clear_resource_health_contract`: a
+        current package-managed LXC that lost all health meaning would be
+        blocked from starting an approved update, which is exactly the dead
+        end this product decision removes. Resetting returns the resource to
+        the backend-owned baseline -- one ``guest_operational`` probe -- not
+        to *unconfigured*.
+
+        It is an explicit operator action, so it carries the same
+        compare-and-set discipline as any other contract mutation: an
+        advanced contract is replaced only when ``expected_revision``
+        matches the generation the operator was looking at (or is omitted).
+        Nothing here reads the guest, and nothing here chooses probes from
+        what a guest appears to run.
+        """
+
+        return self.replace_resource_health_contract(
+            resource_id, DEFAULT_HEALTH_PROBES, expected_revision=expected_revision
+        )
+
+    def _provision_default_health_contracts(
+        self, connection: sqlite3.Connection, *, now: str
+    ) -> int:
+        """Give every currently-unconfigured managed LXC the built-in default.
+
+        Called inside the successful-reconciliation transaction, which is the
+        narrowest backend-owned point at which a resource actually becomes a
+        CURRENT, package-managed LXC. Running it there is what makes the
+        default a PRODUCT default rather than an onboarding chore: an
+        operator never has to declare a contract before the first approved
+        update can start.
+
+        Three properties hold, and all three are load-bearing:
+
+        - **It is not workload inference.** No guest is read, no adapter is
+          probed, and no command runs. The probe set is the fixed code-owned
+          `DEFAULT_HEALTH_PROBES`, chosen because absence of a workload
+          observer is not proof of workload absence.
+        - **An explicit contract always wins.** The query only ever selects
+          resources with NO contract row, so an operator's advanced Docker or
+          systemd contract is never seen, never compared, and never
+          overwritten.
+        - **It is idempotent.** The second reconciliation of the same
+          inventory selects nothing, allocates no revision, and writes no
+          row, so a resource's contract revision does not churn with the
+          discovery cadence.
+
+        Selection mirrors `_require_package_scan_target` exactly -- present,
+        active, LXC, with a current locator binding and a current node -- so
+        a resource that is not a legal package-update target never
+        accumulates a contract, and a VMID-reused replacement is a different
+        ``resource_id`` that gets its own fresh default rather than
+        inheriting one.
+        """
+
+        rows = connection.execute(
+            "SELECT r.resource_id FROM resource_incarnations r "
+            "JOIN resource_locator_bindings b ON b.resource_id=r.resource_id "
+            "AND b.valid_to_run_sequence IS NULL "
+            "LEFT JOIN resource_health_contracts c "
+            "ON c.resource_id=r.resource_id "
+            "WHERE r.resource_type='lxc' AND r.presence='present' "
+            "AND r.lifecycle='active' AND r.current_node_id IS NOT NULL "
+            "AND c.resource_id IS NULL "
+            "ORDER BY r.resource_id"
+        ).fetchall()
+        for row in rows:
+            resource_id = str(row["resource_id"])
+            revision = self._allocate_health_contract_revision(
+                connection, resource_id, now=now
+            )
+            connection.execute(
+                "INSERT INTO resource_health_contracts("
+                "resource_id, revision, fingerprint, probe_count, created_at, "
+                "updated_at) VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    resource_id,
+                    revision,
+                    DEFAULT_HEALTH_CONTRACT_FINGERPRINT,
+                    len(DEFAULT_HEALTH_PROBES),
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO resource_health_contract_probes("
+                "resource_id, probe_index, kind, target) VALUES(?, ?, ?, ?)",
+                [
+                    (resource_id, index, probe.kind.value, probe.target)
+                    for index, probe in enumerate(DEFAULT_HEALTH_PROBES)
+                ],
+            )
+        return len(rows)
 
     @staticmethod
     def _allocate_health_contract_revision(
@@ -4296,48 +4415,6 @@ class InventoryAuthority:
         """
 
         return self.package_update_job(job_id).health_probes
-
-    def resource_health_discovery_request(
-        self, resource_id: str
-    ) -> ResourceHealthDiscoveryRequest:
-        """Assemble the typed request for the dark boundary's SECOND
-        operation: ephemeral health-candidate discovery (v20, post-Human1
-        Stage 3B).
-
-        Unlike :meth:`package_update_health_request`, this is not bound to
-        any job -- it reads the resource's CURRENT executable binding
-        directly, through the exact same narrow predicate package scanning
-        uses (`_require_package_scan_target`): present, active, LXC, with a
-        current binding and an available current node. Discovery is
-        read-only and creates no authority of its own, so there is no
-        "frozen generation" to re-prove afterwards the way a health
-        evaluation's verdict must be -- the caller re-derives this same
-        request fresh for its own next call if it needs to.
-        """
-
-        canonical_resource_id = _require_uuid(resource_id, "resource_id")
-        with self._store._read_transaction() as connection:
-            row = self._require_package_scan_target(connection, canonical_resource_id)
-            if str(row["resource_type"]) != "lxc":
-                raise AuthorityConflict(
-                    "health candidate discovery supports LXC resources only"
-                )
-            backend_instance_id = str(
-                connection.execute(
-                    "SELECT backend_instance_id FROM backend_instance"
-                ).fetchone()["backend_instance_id"]
-            )
-            return ResourceHealthDiscoveryRequest(
-                backend_instance_id=backend_instance_id,
-                resource_id=canonical_resource_id,
-                binding_id=str(row["binding_id"]),
-                locator_generation=int(row["locator_generation"]),
-                resource_continuity_revision=int(
-                    row["resource_continuity_revision"]
-                ),
-                vmid=int(row["vmid"]),
-                expected_node=str(row["external_node_name"]),
-            )
 
     def package_update_health_request(
         self, job_id: str

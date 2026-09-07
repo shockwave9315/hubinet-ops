@@ -17,6 +17,13 @@ The three rules that shape everything below:
 - **Absence is not health.** No contract means *unconfigured*, never "passing".
   An empty probe set is therefore not a contract, it is a malformed one, and
   is rejected here rather than stored.
+- **A managed LXC gets a built-in default rather than staying unconfigured.**
+  `DEFAULT_HEALTH_PROBES` below is the v0.5 baseline the backend provisions
+  for every current package-managed LXC. It is a product decision, not an
+  observation of the guest: nothing here or anywhere else inspects a guest to
+  choose it, because absence of a workload observer is not proof of workload
+  absence. An operator's own explicit contract always wins and is never
+  overwritten by it.
 
 A probe target is DATA. The executor uses fixed argv operations, so a target is
 never command text and this configuration module deliberately does not
@@ -150,6 +157,20 @@ def canonical_health_probes(
     )
 
 
+#: The v0.5 BUILT-IN DEFAULT contract for a package-managed LXC.
+#:
+#: One probe, no target: "the exact current LXC remained reachable through
+#: the trusted PVE boundary and successfully executed the fixed code-owned
+#: command". It is a PRODUCT DEFAULT owned by the backend, not an inference
+#: about what the guest runs -- absence of a workload observer is not proof
+#: of workload absence, so v0.5 does not infer workload health
+#: automatically. Docker and systemd probes remain available, but only as an
+#: explicit operator-declared advanced contract.
+DEFAULT_HEALTH_PROBES: tuple[ResourceHealthProbe, ...] = (
+    ResourceHealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
+)
+
+
 def health_contract_fingerprint(probes: Iterable[ResourceHealthProbe]) -> str:
     """SHA-256 over the canonical contract material only.
 
@@ -174,3 +195,11 @@ def health_contract_fingerprint(probes: Iterable[ResourceHealthProbe]) -> str:
         payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+#: Precomputed once from `DEFAULT_HEALTH_PROBES`, so the default-provisioning
+#: path never has to re-derive it per resource and a test can assert against
+#: the exact same material the provisioner writes.
+DEFAULT_HEALTH_CONTRACT_FINGERPRINT: str = health_contract_fingerprint(
+    DEFAULT_HEALTH_PROBES
+)

@@ -263,22 +263,23 @@ def test_r0_production_modules_define_only_authority_metadata_mutations() -> Non
 
     Two `@app.put` (the exact-plan approval and the health-contract
     replacement), one `@app.delete` (the health-contract clear), and exactly
-    four `@app.post` -- start, resume, and roll back one update, plus the
-    product updater's own exclusive maintenance fence. The first three are
-    explicit operator controls over the update lifecycle; the fourth performs
-    no workload action at all and exists only to make a product update and a
-    workload update mutually exclusive. None is a generic dispatcher, and
-    `@app.patch` stays absent entirely.
+    five `@app.post` -- start, resume, and roll back one update, restore the
+    built-in health default, plus the product updater's own exclusive
+    maintenance fence. The first three are explicit operator controls over
+    the update lifecycle; the health reset writes authority metadata only and
+    reaches no guest; the last performs no workload action at all and exists
+    only to make a product update and a workload update mutually exclusive.
+    None is a generic dispatcher, and `@app.patch` stays absent entirely.
 
     Production activation is what made a destructive verb possible at all, so
-    this list is now the thing that stops a fifth one appearing quietly.
+    this list is now the thing that stops a sixth one appearing quietly.
     """
 
     text = (REPO_ROOT / "app/inventory_runtime.py").read_text(encoding="utf-8")
     assert "@app.patch(" not in text
     assert text.count("@app.put(") == 2
     assert text.count("@app.delete(") == 1
-    assert text.count("@app.post(") == 4
+    assert text.count("@app.post(") == 5
     assert (
         'f"{API_PREFIX}/resources/{{resource_id}}/package-plan-approval"'
         in text
