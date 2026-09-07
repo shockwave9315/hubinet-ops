@@ -2,7 +2,7 @@
 
 Two families live here. The review/configuration actions
 (``view_update_plan``, ``approve_update_plan``, ``view_health_contract``,
-``set_health_contract``, ``clear_health_contract``) read or change authority
+``set_health_contract``, ``reset_health_contract``) read or change authority
 *metadata* and change no workload. The execution actions (``start_update``,
 ``view_update_job``, ``resume_update``, ``rollback_update``) are explicit
 operator controls over the production update lifecycle.
@@ -46,7 +46,7 @@ from .const import (
     DATA_SERVICES_REGISTERED,
     DOMAIN,
     SERVICE_APPROVE_UPDATE_PLAN,
-    SERVICE_CLEAR_HEALTH_CONTRACT,
+    SERVICE_RESET_HEALTH_CONTRACT,
     SERVICE_RESUME_UPDATE,
     SERVICE_ROLLBACK_UPDATE,
     SERVICE_SET_HEALTH_CONTRACT,
@@ -101,11 +101,35 @@ def _probe_target(value: Any) -> str:
     return value
 
 
-_PROBE_SCHEMA = vol.Schema(
-    {
-        vol.Required(ATTR_KIND): vol.In([kind.value for kind in HealthProbeKind]),
-        vol.Required(ATTR_TARGET): _probe_target,
-    }
+def _require_probe_target_matches_kind(probe: dict[str, Any]) -> dict[str, Any]:
+    """``target`` is required for every kind except one.
+
+    ``guest_operational`` (v20) names no container or unit -- it must not
+    carry a target at all, never a faked one (``"guest"``, a VMID string).
+    """
+
+    kind = probe[ATTR_KIND]
+    target = probe.get(ATTR_TARGET)
+    if kind == HealthProbeKind.GUEST_OPERATIONAL.value:
+        if target is not None:
+            raise vol.Invalid(
+                "a guest_operational health probe must not carry a target"
+            )
+    elif target is None:
+        raise vol.Invalid("a target is required for this probe kind")
+    return probe
+
+
+_PROBE_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Required(ATTR_KIND): vol.In(
+                [kind.value for kind in HealthProbeKind]
+            ),
+            vol.Optional(ATTR_TARGET, default=None): vol.Any(None, _probe_target),
+        }
+    ),
+    _require_probe_target_matches_kind,
 )
 _VIEW_HEALTH_CONTRACT_SCHEMA = vol.Schema({vol.Required(ATTR_DEVICE_ID): str})
 _SET_HEALTH_CONTRACT_SCHEMA = vol.Schema(
@@ -120,7 +144,7 @@ _SET_HEALTH_CONTRACT_SCHEMA = vol.Schema(
         vol.Optional(ATTR_EXPECTED_REVISION): vol.All(int, vol.Range(min=0)),
     }
 )
-_CLEAR_HEALTH_CONTRACT_SCHEMA = vol.Schema(
+_RESET_HEALTH_CONTRACT_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_DEVICE_ID): str,
         vol.Optional(ATTR_EXPECTED_REVISION): vol.All(int, vol.Range(min=0)),
@@ -374,25 +398,33 @@ async def _set_health_contract(
     return _health_contract_response(resource_id, name, contract)
 
 
-async def _clear_health_contract(
+async def _reset_health_contract(
     hass: HomeAssistant, call: ServiceCall
 ) -> ServiceResponse:
+    """Restore the backend's built-in default health contract.
+
+    Deliberately not "clear": a current package-managed LXC that lost all
+    health meaning would be blocked from starting an approved update. The
+    backend owns what the default is; nothing here computes it, and nothing
+    here inspects a guest to choose it.
+    """
+
     coordinator, resource_id = _coordinator_and_resource_for_device(
         hass, call.data[ATTR_DEVICE_ID]
     )
     name = _resource_display_name(coordinator, resource_id)
     try:
-        await coordinator.api.async_clear_health_contract(
+        contract = await coordinator.api.async_reset_health_contract(
             resource_id, call.data.get(ATTR_EXPECTED_REVISION)
         )
     except HubinetOpsApiError as exc:
         raise HomeAssistantError(
-            "Hubinet Ops refused to clear the health contract",
+            "Hubinet Ops refused to reset the health contract",
             translation_domain=DOMAIN,
-            translation_key="health_contract_clear_refused",
+            translation_key="health_contract_reset_refused",
         ) from exc
     await coordinator.async_request_refresh()
-    return _health_contract_response(resource_id, name, None)
+    return _health_contract_response(resource_id, name, contract)
 
 
 def _resource_display_name(
@@ -478,10 +510,17 @@ def _job_response(
 ) -> dict[str, Any]:
     """Render one job as an action response.
 
-    Response data, never entity state. Bounded to durable authority facts:
-    no helper output, no PVE task log, no command text, no package rows, and
-    no per-probe results. ``health_outcome`` is ``None`` when no definitive
-    verdict has been recorded, and ``None`` is emphatically not a pass.
+    Response data, never entity state. Bounded to durable authority facts: no
+    helper output, no PVE task log, no command text, and no package rows.
+    ``health_outcome`` is ``None`` when no definitive verdict has been
+    recorded, and ``None`` is emphatically not a pass. ``health_probes`` IS
+    included (post-Human1 correction): each frozen probe's kind, target,
+    outcome, checked-at, and bounded reason token, so a FAILED or UNKNOWN
+    health result is actionable from Home Assistant without shell/SQLite
+    access. ``health_reason`` is the companion fact for the case that
+    evidence cannot cover: a whole-request refusal that happened before any
+    probe round ran leaves no verdict and no probes, and this bounded token
+    is the only thing that says why.
     """
 
     return {
@@ -504,6 +543,8 @@ def _job_response(
         "health_outcome": (
             None if job.health_outcome is None else job.health_outcome.value
         ),
+        "health_evidence": job.health_evidence,
+        "health_reason": job.health_reason,
         "rollback_may_have_started_at": job.rollback_may_have_started_at,
         "rollback_completed_at": job.rollback_completed_at,
         "rollback_available": job.rollback_available,
@@ -519,6 +560,18 @@ def _job_response(
                 "message": event.message,
             }
             for event in job.events
+        ],
+        "health_probes": [
+            {
+                "index": probe.probe_index,
+                "kind": probe.kind.value,
+                "target": probe.target,
+                "outcome": probe.outcome.value,
+                "checked_at": probe.checked_at,
+                "reason": probe.reason,
+                "definitive": probe.definitive,
+            }
+            for probe in job.health_probes
         ],
     }
 
@@ -681,8 +734,8 @@ def async_setup_services(hass: HomeAssistant) -> None:
     async def set_health_contract_handler(call: ServiceCall) -> ServiceResponse:
         return await _set_health_contract(hass, call)
 
-    async def clear_health_contract_handler(call: ServiceCall) -> ServiceResponse:
-        return await _clear_health_contract(hass, call)
+    async def reset_health_contract_handler(call: ServiceCall) -> ServiceResponse:
+        return await _reset_health_contract(hass, call)
 
     for service, handler, schema in (
         (
@@ -696,9 +749,9 @@ def async_setup_services(hass: HomeAssistant) -> None:
             _SET_HEALTH_CONTRACT_SCHEMA,
         ),
         (
-            SERVICE_CLEAR_HEALTH_CONTRACT,
-            clear_health_contract_handler,
-            _CLEAR_HEALTH_CONTRACT_SCHEMA,
+            SERVICE_RESET_HEALTH_CONTRACT,
+            reset_health_contract_handler,
+            _RESET_HEALTH_CONTRACT_SCHEMA,
         ),
     ):
         hass.services.async_register(
@@ -751,7 +804,7 @@ def async_unload_services(hass: HomeAssistant) -> None:
         SERVICE_APPROVE_UPDATE_PLAN,
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
         SERVICE_START_UPDATE,
         SERVICE_VIEW_UPDATE_JOB,
         SERVICE_RESUME_UPDATE,

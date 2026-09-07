@@ -40,16 +40,34 @@ a guest in Proxmox never requires touching this repository or its config.
   reference reviewed during the current runtime, fresh-reads it again before
   approval, and forgets it on reload. The backend independently revalidates
   the same reference. Approval never executes an update.
-- Operator-declared per-resource health contracts: for each resource, the list
-  of typed probes (`systemd_unit_active`, `docker_container_running`,
-  `docker_container_healthy`) that must **all** hold for that workload to count
-  as up. Managed through the `view_health_contract` / `set_health_contract` /
-  `clear_health_contract` Home Assistant actions and the routes above, with a
-  concise contract-status sensor and a per-resource **View health contract**
-  button. A resource with no contract is
-  *unconfigured*, which is never "healthy" — and it can no longer be given an
-  update job at all, because a job whose success criterion does not exist
-  could never truthfully be called successful.
+- Per-resource health contracts: either the targetless `guest_operational`
+  singleton (the built-in baseline) or one or more `systemd_unit_active`
+  probes (an explicit advanced contract) — never both in the same contract —
+  that must **all** hold for that workload to count as up. **v0.5 gives every
+  package-managed LXC a built-in default: one `guest_operational` probe**, so
+  an approved update can start with no separate health-onboarding step. It
+  proves only that the exact container is still reachable and can still run a
+  process — never application health, and it is a single one-shot check with
+  no settling or retry. Hubinet Ops does **not** automatically discover or
+  recommend `systemd_unit_active` health probes: absence of a workload
+  observer is not proof of workload absence, so v0.5 does not infer workload
+  health automatically. `systemd_unit_active` remains fully supported as
+  explicit advanced operator configuration, declared with
+  `set_health_contract`, and REPLACES the baseline rather than extending it;
+  an explicitly declared contract is never silently replaced by the default.
+  Docker-specific package-update health probes are not part of v0.5. Managed
+  through the `view_health_contract` /
+  `set_health_contract` / `reset_health_contract` Home Assistant actions and
+  the routes above, with a concise contract-status sensor, a per-resource
+  **View health contract** button, and a **Configure** options flow
+  (Settings → Devices & Services → Hubinet Ops) to review a contract or
+  restore the built-in default, with the same revision-CAS safety the actions
+  use. A resource with no contract at all is *unconfigured*, which is never
+  "healthy" — and it cannot be given an update job, because a job whose
+  success criterion does not exist could never truthfully be called
+  successful; that state is not the normal one, and a reviewed-and-approved
+  resource that reaches it raises a Home Assistant Repair naming the two
+  explicit remedies.
 - **Operator-triggered package updates.** One explicit action starts the
   currently approved update for one resource; the backend takes a fresh
   job-owned snapshot, re-proves the exact plan, performs one bounded package
@@ -59,8 +77,12 @@ a guest in Proxmox never requires touching this repository or its config.
   above, with per-resource **Start**, **View job**, **Resume**, and **Roll
   back** buttons. Concise sensors show the latest job status, checkpoint,
   package count, health outcome, and authoritative rollback availability;
-  exact bounded job details and recent durable events appear in a persistent
-  notification only when requested.
+  exact bounded job details, recent durable events, every frozen probe's
+  kind, target, outcome, and bounded reason token, and — when an evaluation
+  reached no result at all, which is what a guest that did not come back
+  looks like — a fixed localized explanation of the bounded reason there is
+  still no verdict, all appear in a persistent notification only when
+  requested.
 - An automated Proxmox bootstrap that provisions the whole backend.
 - An in-place updater for an existing installation: install once, update
   many times, preserving identity/config/credentials.
@@ -86,13 +108,18 @@ a deterministic health failure, did not auto-rollback, and reached
 snapshot. See `STATUS.md` for the completed evidence and current product stage.
 
 Pre-release authority schema versions are not migrated in place: the current
-schema is v19. Schema v17 added the per-resource durable `issuance_sequence`
+schema is v20. Schema v17 added the per-resource durable `issuance_sequence`
 that orders "latest job" readback by issuance rather than wall-clock
 `issued_at`. Schema v18 adds the durable job-keyed post-success package-scan
 request and its write-once same-resource RUNNING scan link. Schema v19 makes a
 successful job the durable consumption fact for its exact approval and permits
-at most one successful job per approval. An existing schema-v18 (or earlier)
-pre-release deployment is therefore incompatible in
+at most one successful job per approval. Schema v20 adds `guest_operational`,
+a health-probe kind with no target — the built-in default contract the
+backend provisions for every current package-managed LXC, chosen as a product
+decision and never inferred from what a guest appears to run; its `target`
+column is nullable only for this kind (`CHECK`-enforced), and a partial unique
+index still permits at most one such probe per contract. An existing
+schema-v19 (or earlier) pre-release deployment is therefore incompatible in
 place. `deploy/update-proxmox-0.5.sh` reports
 `reset_required`, makes and validates a coherent authority backup, and resets
 only the authority database after explicit operator authorization. The LXC,
@@ -187,7 +214,7 @@ For an update:
    backend publishes same-job rollback authority.
 
 The variable-length typed health probe list remains edited through the
-`set_health_contract` and `clear_health_contract` actions; forcing that list
+`set_health_contract` and `reset_health_contract` actions; forcing that list
 into a scalar text/select entity would weaken the typed contract. The native
 viewer and status sensor remove routine inspection from Developer Tools, while
 the actions remain available for initial or occasional contract editing and

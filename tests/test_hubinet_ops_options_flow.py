@@ -1,0 +1,307 @@
+"""Native health maintenance after the v0.5 simplification.
+
+Settings -> Devices & Services -> Hubinet Ops -> Configure is now a narrow,
+two-step flow: pick an LXC, see what it currently declares, and optionally
+restore the Hubinet Ops built-in default. It is deliberately NOT part of the
+normal update flow -- a managed LXC already carries the backend's built-in
+``guest_operational`` contract before its first update, so nothing here has
+to be visited to reach **Start**.
+
+The load-bearing part of these tests is what the flow can no longer do: there
+is no discovery step, no candidate rendering, no adapter/role/recommendation
+vocabulary, and no path through which Home Assistant decides what "healthy"
+means for a guest. Absence of a workload observer is not proof of workload
+absence, so v0.5 infers no workload health at all; an advanced Docker/systemd
+contract stays an explicit `set_health_contract` decision.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("homeassistant", reason="isolated HA test dependencies not installed")
+
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+
+from custom_components.hubinet_ops import config_flow as config_flow_module
+from custom_components.hubinet_ops.api import (
+    HealthContractStatus,
+    HealthContractSummary,
+    HealthProbe,
+    HealthProbeKind,
+    HubinetOpsCannotConnect,
+    HubinetOpsConflict,
+    ResourceHealthContract,
+)
+
+from tests.test_hubinet_ops_integration import (
+    INITIAL_RESOURCES,
+    FakeTransport,
+    RESOURCE_CT,
+    RESOURCE_TEST,
+    RESOURCE_VM,
+    setup_entry,
+    snapshot,
+)
+
+
+@pytest.fixture(autouse=True)
+def auto_enable_custom_integrations(enable_custom_integrations, socket_enabled):
+    """Load custom integrations; fake transports never perform network I/O."""
+
+    yield
+
+
+def _configured_ct_resource(*, revision: int = 3):
+    return replace(
+        INITIAL_RESOURCES[1],
+        health_contract=HealthContractSummary(
+            status=HealthContractStatus.CONFIGURED,
+            revision=revision,
+            fingerprint="a" * 64,
+            probe_count=1,
+            updated_at="2026-08-08T11:30:00+00:00",
+        ),
+    )
+
+
+def _advanced_contract(*, revision: int = 3) -> ResourceHealthContract:
+    """An explicitly declared advanced systemd contract."""
+
+    return ResourceHealthContract(
+        resource_id=RESOURCE_CT,
+        status=HealthContractStatus.CONFIGURED,
+        revision=revision,
+        fingerprint="a" * 64,
+        created_at="2026-08-08T11:00:00+00:00",
+        updated_at="2026-08-08T11:30:00+00:00",
+        probes=(
+            HealthProbe(
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="mariadb.service"
+            ),
+        ),
+    )
+
+
+async def _open_for_ct(hass: HomeAssistant, transport) -> tuple:
+    entry = await setup_entry(hass, transport)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"resource_id": RESOURCE_CT}
+    )
+    return entry, result
+
+
+@pytest.mark.asyncio
+async def test_options_flow_lists_lxc_resources_only(hass: HomeAssistant) -> None:
+    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    selectable = result["data_schema"].schema["resource_id"].container
+    # RESOURCE_VM is QEMU, excluded; both LXC resources are offered.
+    assert RESOURCE_VM not in selectable
+    assert RESOURCE_CT in selectable
+    assert RESOURCE_TEST in selectable
+
+
+@pytest.mark.asyncio
+async def test_the_flow_shows_the_current_contract_and_writes_nothing(
+    hass: HomeAssistant,
+) -> None:
+    """Reading is never a mutation, and the form is reached in ONE step --
+    no discover/render/confirm detour."""
+
+    transport = FakeTransport(
+        [snapshot((INITIAL_RESOURCES[0], _configured_ct_resource(), INITIAL_RESOURCES[2]))],
+        health_contracts={RESOURCE_CT: _advanced_contract()},
+    )
+    _entry, result = await _open_for_ct(hass, transport)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reset_confirm"
+    assert "mariadb.service" in result["description_placeholders"]["current"]
+    assert transport.health_contract_writes == []
+    assert transport.health_contract_resets == []
+    assert transport.health_contract_clears == []
+
+
+@pytest.mark.asyncio
+async def test_an_unconfigured_resource_reaches_the_same_single_form(
+    hass: HomeAssistant,
+) -> None:
+    """Even the state the old flow treated as an onboarding dead end is just
+    "nothing declared yet" now -- one form, one confirm, done."""
+
+    transport = FakeTransport([snapshot(INITIAL_RESOURCES)])
+    _entry, result = await _open_for_ct(hass, transport)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reset_confirm"
+    assert "unconfigured" in result["description_placeholders"]["current"]
+
+
+@pytest.mark.asyncio
+async def test_reset_restores_the_default_with_the_read_revision(
+    hass: HomeAssistant,
+) -> None:
+    """The backend owns the default: this flow sends the resource and its
+    compare-and-set revision, and no probe of its own."""
+
+    transport = FakeTransport(
+        [
+            snapshot(
+                (INITIAL_RESOURCES[0], _configured_ct_resource(), INITIAL_RESOURCES[2])
+            ),
+            snapshot(
+                (INITIAL_RESOURCES[0], _configured_ct_resource(revision=4), INITIAL_RESOURCES[2]),
+                inventory_revision=11,
+                published_state_revision=21,
+            ),
+        ],
+        health_contracts={RESOURCE_CT: _advanced_contract()},
+    )
+    _entry, result = await _open_for_ct(hass, transport)
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"confirm": True}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert transport.health_contract_resets == [(RESOURCE_CT, 3)]
+    assert transport.health_contract_writes == []
+    assert transport.health_contract_clears == []
+    assert transport.health_contracts[RESOURCE_CT].probes == (
+        HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
+    )
+
+
+@pytest.mark.asyncio
+async def test_reset_from_unconfigured_asserts_revision_zero(
+    hass: HomeAssistant,
+) -> None:
+    """`0` is the backend's own "there is no contract yet" assertion, never
+    "no opinion" -- so an unconfigured reset is still a compare-and-set."""
+
+    transport = FakeTransport([snapshot(INITIAL_RESOURCES), snapshot(INITIAL_RESOURCES)])
+    _entry, result = await _open_for_ct(hass, transport)
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"confirm": True}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert transport.health_contract_resets == [(RESOURCE_CT, 0)]
+
+
+@pytest.mark.asyncio
+async def test_an_unconfirmed_reset_writes_nothing(hass: HomeAssistant) -> None:
+    transport = FakeTransport(
+        [snapshot((INITIAL_RESOURCES[0], _configured_ct_resource(), INITIAL_RESOURCES[2]))],
+        health_contracts={RESOURCE_CT: _advanced_contract()},
+    )
+    _entry, result = await _open_for_ct(hass, transport)
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"confirm": False}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "reset_not_confirmed"}
+    assert transport.health_contract_resets == []
+    # The advanced contract an operator declared is still exactly there.
+    assert transport.health_contracts[RESOURCE_CT] == _advanced_contract()
+
+
+@pytest.mark.asyncio
+async def test_a_revision_race_fails_closed_and_never_overwrites(
+    hass: HomeAssistant,
+) -> None:
+    """A concurrent change is refused and re-read, never retried blindly."""
+
+    transport = FakeTransport(
+        [snapshot((INITIAL_RESOURCES[0], _configured_ct_resource(), INITIAL_RESOURCES[2]))],
+        health_contracts={RESOURCE_CT: _advanced_contract()},
+    )
+    _entry, result = await _open_for_ct(hass, transport)
+    # Another writer changes the contract while this form is open.
+    transport.health_contract_error = HubinetOpsConflict("revision conflict")
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"confirm": True}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "revision_changed"}
+    assert transport.health_contract_resets == [(RESOURCE_CT, 3)]
+    assert transport.health_contracts[RESOURCE_CT] == _advanced_contract()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reset_is_reported_and_changes_nothing(
+    hass: HomeAssistant,
+) -> None:
+    transport = FakeTransport(
+        [snapshot((INITIAL_RESOURCES[0], _configured_ct_resource(), INITIAL_RESOURCES[2]))],
+        health_contracts={RESOURCE_CT: _advanced_contract()},
+    )
+    _entry, result = await _open_for_ct(hass, transport)
+    transport.health_contract_error = HubinetOpsCannotConnect("backend down")
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"confirm": True}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "reset_failed"}
+    assert transport.health_contracts[RESOURCE_CT] == _advanced_contract()
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_contract_aborts_rather_than_guessing(
+    hass: HomeAssistant,
+) -> None:
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        health_contract_error=HubinetOpsCannotConnect("backend down"),
+    )
+    _entry, result = await _open_for_ct(hass, transport)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "health_contract_read_failed"
+    assert transport.health_contract_resets == []
+
+
+def test_the_options_flow_carries_no_workload_discovery_surface() -> None:
+    """Load-bearing: this operator surface must never grow back into guest
+    inspection.
+
+    It also may not name Docker or systemd COMMANDS. Advanced explicit probes
+    still run those -- in the job-bound backend health helper, which is the
+    only place they belong.
+    """
+
+    flow = config_flow_module.HubinetOpsOptionsFlow
+    assert not hasattr(flow, "async_step_discover")
+    assert not hasattr(flow, "async_step_clear_confirm")
+    assert not hasattr(flow, "_candidates")
+    assert not hasattr(config_flow_module, "_probe_field")
+
+    source = Path(config_flow_module.__file__).read_text(encoding="utf-8")
+    for marker in (
+        "async_fetch_health_candidates",
+        "HealthDiscovery",
+        "UNDECIDED_DISCOVERY_STATUSES",
+        "recommended",
+        "docker ps",
+        "systemctl",
+        "command -v",
+    ):
+        assert marker not in source, marker

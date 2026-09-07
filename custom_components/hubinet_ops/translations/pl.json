@@ -15,7 +15,9 @@
     },
     "step": {
       "reauth_confirm": {
-        "data": {"api_token": "Token API"},
+        "data": {
+          "api_token": "Token API"
+        },
         "description": "Podaj nowy bearer token dla tego backendu Hubinet Ops.",
         "title": "Ponownie uwierzytelnij Hubinet Ops"
       },
@@ -44,19 +46,69 @@
       }
     }
   },
+  "options": {
+    "abort": {
+      "entry_not_loaded": "Ten wpis Hubinet Ops nie jest obecnie załadowany.",
+      "no_lxc_resources": "Hubinet Ops nie ma obecnie załadowanych zasobów LXC.",
+      "health_contract_read_failed": "Nie udało się odczytać bieżącego kontraktu kondycji dla tego zasobu."
+    },
+    "error": {
+      "reset_not_confirmed": "Zaznacz pole potwierdzenia, aby przywrócić wbudowany kontrakt kondycji.",
+      "reset_failed": "Hubinet Ops odmówił zresetowania kontraktu kondycji. Nic nie zostało zmienione.",
+      "revision_changed": "Kontrakt kondycji zmienił się od czasu odczytu przez ten formularz. Sprawdź odświeżony kontrakt poniżej i spróbuj ponownie."
+    },
+    "step": {
+      "init": {
+        "title": "Utrzymanie kontraktu kondycji",
+        "description": "Wybierz zasób, którego kontrakt kondycji chcesz przejrzeć lub zresetować do wbudowanego domyślnego kontraktu Hubinet Ops.",
+        "data": {
+          "resource_id": "Zasób"
+        }
+      },
+      "reset_confirm": {
+        "title": "Zresetuj kontrakt kondycji dla {name}",
+        "description": "Obecnie zadeklarowano:\n\n{current}\n\nReset zastąpi go wbudowanym domyślnym kontraktem Hubinet Ops dla kontenera LXC zarządzanego pakietowo: pojedynczą sondą `guest_operational`, która dowodzi wyłącznie, że dokładnie ten kontener jest nadal osiągalny i nadal potrafi uruchomić proces. Nie dowodzi kondycji aplikacji.\n\nHubinet Ops nie wykrywa za Ciebie ładunków systemd — brak obserwatora ładunku nie jest dowodem braku ładunku — więc zaawansowany kontrakt `systemd_unit_active` pozostaje jawnym wyborem dokonywanym akcją `hubinet_ops.set_health_contract`. Kondycja obciążeń Docker nie jest częścią kondycji aktualizacji pakietów Hubinet Ops w wersji 0.5.\n\nZaznacz pole i wybierz **Zatwierdź**, aby potwierdzić.",
+        "data": {
+          "confirm": "Rozumiem — przywróć wbudowany domyślny kontrakt"
+        }
+      }
+    }
+  },
   "entity": {
     "sensor": {
-      "node_status": {"name": "Stan"},
-      "source_health": {"name": "Stan źródła"},
-      "source_freshness": {"name": "Świeżość"},
-      "source_last_successful_observation": {"name": "Ostatnia udana obserwacja"},
-      "source_freshness_valid_until": {"name": "Świeżość ważna do"},
-      "resource_node": {"name": "Node"},
-      "resource_status": {"name": "Stan"},
-      "resource_presence": {"name": "Obecność"},
-      "resource_detail_status": {"name": "Stan szczegółów"},
-      "resource_lifecycle": {"name": "Cykl życia"},
-      "resource_observational_continuity": {"name": "Ciągłość obserwacyjna"},
+      "node_status": {
+        "name": "Stan"
+      },
+      "source_health": {
+        "name": "Stan źródła"
+      },
+      "source_freshness": {
+        "name": "Świeżość"
+      },
+      "source_last_successful_observation": {
+        "name": "Ostatnia udana obserwacja"
+      },
+      "source_freshness_valid_until": {
+        "name": "Świeżość ważna do"
+      },
+      "resource_node": {
+        "name": "Node"
+      },
+      "resource_status": {
+        "name": "Stan"
+      },
+      "resource_presence": {
+        "name": "Obecność"
+      },
+      "resource_detail_status": {
+        "name": "Stan szczegółów"
+      },
+      "resource_lifecycle": {
+        "name": "Cykl życia"
+      },
+      "resource_observational_continuity": {
+        "name": "Ciągłość obserwacyjna"
+      },
       "resource_security_continuity": {
         "name": "Starsza obserwacja ciągłości",
         "state": {
@@ -65,8 +117,12 @@
           "revoked": "Odwołana"
         }
       },
-      "resource_type": {"name": "Typ"},
-      "resource_package_scan_status": {"name": "Stan skanowania pakietów"},
+      "resource_type": {
+        "name": "Typ"
+      },
+      "resource_package_scan_status": {
+        "name": "Stan skanowania pakietów"
+      },
       "resource_package_plan_approval": {
         "name": "Zatwierdzenie planu pakietów",
         "state": {
@@ -84,9 +140,15 @@
           "configured": "Skonfigurowany"
         }
       },
-      "resource_pending_updates": {"name": "Oczekujące aktualizacje"},
-      "resource_last_package_scan": {"name": "Ostatnie skanowanie pakietów"},
-      "resource_reboot_required": {"name": "Wymagany restart (nieznany, gdy niedostępny)"},
+      "resource_pending_updates": {
+        "name": "Oczekujące aktualizacje"
+      },
+      "resource_last_package_scan": {
+        "name": "Ostatnie skanowanie pakietów"
+      },
+      "resource_reboot_required": {
+        "name": "Wymagany restart (nieznany, gdy niedostępny)"
+      },
       "resource_package_update_job": {
         "name": "Ostatnie zadanie aktualizacji pakietów",
         "state": {
@@ -101,8 +163,12 @@
           "manual_intervention": "Wymaga interwencji"
         }
       },
-      "resource_package_update_checkpoint": {"name": "Punkt kontrolny aktualizacji"},
-      "resource_package_update_package_count": {"name": "Liczba pakietów aktualizacji"},
+      "resource_package_update_checkpoint": {
+        "name": "Punkt kontrolny aktualizacji"
+      },
+      "resource_package_update_package_count": {
+        "name": "Liczba pakietów aktualizacji"
+      },
       "resource_package_update_health_outcome": {
         "name": "Ostatni wynik kontroli zdrowia po aktualizacji",
         "state": {
@@ -113,16 +179,35 @@
       }
     },
     "binary_sensor": {
-      "rollback_available": {"name": "Wycofanie dostępne"}
+      "rollback_available": {
+        "name": "Wycofanie dostępne"
+      }
     },
     "button": {
-      "review_update_plan": {"name": "Przejrzyj plan aktualizacji"},
-      "approve_reviewed_plan": {"name": "Zatwierdź przejrzany plan"},
-      "start_update": {"name": "Rozpocznij zatwierdzoną aktualizację"},
-      "view_update_job": {"name": "Wyświetl zadanie aktualizacji"},
-      "resume_update": {"name": "Wznów zadanie aktualizacji"},
-      "rollback_update": {"name": "Wycofaj tę aktualizację"},
-      "view_health_contract": {"name": "Wyświetl kontrakt zdrowia"}
+      "review_update_plan": {
+        "name": "Przejrzyj plan aktualizacji"
+      },
+      "approve_reviewed_plan": {
+        "name": "Zatwierdź przejrzany plan"
+      },
+      "start_update": {
+        "name": "Rozpocznij zatwierdzoną aktualizację"
+      },
+      "view_update_job": {
+        "name": "Wyświetl zadanie aktualizacji"
+      },
+      "resume_update": {
+        "name": "Wznów zadanie aktualizacji"
+      },
+      "rerun_health_evaluation": {
+        "name": "Ponów ocenę stanu zdrowia"
+      },
+      "rollback_update": {
+        "name": "Wycofaj tę aktualizację"
+      },
+      "view_health_contract": {
+        "name": "Wyświetl kontrakt zdrowia"
+      }
     }
   },
   "services": {
@@ -166,7 +251,7 @@
         },
         "probes": {
           "name": "Sondy",
-          "description": "Pełna lista wymaganych sond, każda z rodzajem (systemd_unit_active, docker_container_running lub docker_container_healthy) i nazwą celu."
+          "description": "Pełna lista wymaganych sond: albo pojedyncza bezcelowa sonda guest_operational, albo jedna lub więcej sond systemd_unit_active, z których każda wskazuje dokładną jednostkę — nigdy oba rodzaje w tym samym kontrakcie."
         },
         "expected_revision": {
           "name": "Oczekiwana rewizja",
@@ -174,17 +259,17 @@
         }
       }
     },
-    "clear_health_contract": {
-      "name": "Wyczyść kontrakt zdrowia",
-      "description": "Usuwa kontrakt zdrowia dla wybranego zasobu Hubinet Ops. Zasób staje się nieskonfigurowany, co nie oznacza zdrowia.",
+    "reset_health_contract": {
+      "name": "Zresetuj kontrakt kondycji",
+      "description": "Przywróć wbudowany domyślny kontrakt kondycji Hubinet Ops dla wybranego zasobu: pojedynczą sondę guest_operational, która dowodzi wyłącznie żywotności gościa, nigdy kondycji aplikacji.",
       "fields": {
         "device_id": {
           "name": "Zasób",
-          "description": "Wybierz zasób roboczy zarządzany przez Hubinet Ops."
+          "description": "Wybierz zasób ładunku zarządzany przez Hubinet Ops."
         },
         "expected_revision": {
           "name": "Oczekiwana rewizja",
-          "description": "Opcjonalne. Odrzuca zmianę, jeśli zapisany kontrakt nie jest już w tej rewizji."
+          "description": "Opcjonalne. Odrzuć zmianę, chyba że zapisany kontrakt nadal ma tę rewizję."
         }
       }
     },
@@ -270,14 +355,47 @@
         "mutation_completed": "Zmiana pakietów ukończona",
         "health_result": "Wynik kontroli kondycji",
         "rollback_available": "Wycofanie dostępne",
-        "terminal_reason": "Powód zakończenia"
+        "terminal_reason": "Powód zakończenia",
+        "health_reason": "Powód"
+      },
+      "health_probes": {
+        "heading": "Szczegółowe wyniki sond kondycji",
+        "observation_heading": "Szczegółowe wyniki sond kondycji (nierozstrzygnięte)",
+        "observation_note": "To ograniczone dowody obserwacyjne z ostatniej ukończonej rundy stabilizacji, a nie ostateczny werdykt. Zadanie pozostaje aktywne; naciśnij **Ponów ocenę stanu zdrowia**, aby ocenić ponownie.",
+        "outcome": {
+          "passed": "POZYTYWNY",
+          "failed": "NEGATYWNY",
+          "unknown": "NIEZNANY"
+        }
+      },
+      "health_reason": {
+        "command_failed": "Wymagane polecenie tylko do odczytu w kontenerze nie powiodło się.",
+        "command_timed_out": "Wymagane polecenie tylko do odczytu w kontenerze nie zakończyło się na czas.",
+        "guest_unavailable": "Kontener nie jest uruchomiony albo PVE nie mogło go osiągnąć przez zaufaną granicę.",
+        "host_response_rejected": "Odpowiedzi granicy sprawdzania kondycji nie można było uznać za wiarygodną, więc nie zapisano żadnego werdyktu.",
+        "host_unreachable": "Granica sprawdzania kondycji nie zwróciła odpowiedzi.",
+        "malformed_output": "Wymagane polecenie tylko do odczytu w kontenerze zwróciło dane, których nie dało się odczytać.",
+        "probe_target_ambiguous": "Zadeklarowany cel sondy pasował do więcej niż jednego obiektu.",
+        "probe_target_not_exact": "Zadeklarowanego celu sondy nie dało się rozwiązać do dokładnie jednego obiektu.",
+        "resource_context_changed": "Dokładny zasób, lokalizator lub węzeł wskazywany przez to zadanie nie jest już aktualny.",
+        "settling_budget_exhausted": "Ograniczone okno stabilizacji skończyło się, zanim tę sondę dało się ocenić.",
+        "unit_activating": "Zadeklarowana jednostka systemd wciąż się aktywuje.",
+        "unit_deactivating": "Zadeklarowana jednostka systemd jest dezaktywowana.",
+        "unit_job_pending": "Zadeklarowana jednostka systemd ma wciąż oczekujące zadanie systemd.",
+        "unit_reloading": "Zadeklarowana jednostka systemd jest przeładowywana."
       }
     },
     "health": {
       "title": "Kontrakt kondycji Hubinet Ops — {name}",
-      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany.",
+      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany. Nie jest to stan normalny: Hubinet Ops nadaje każdemu zarządzanemu pakietowo kontenerowi LXC wbudowany kontrakt `guest_operational`, a następne udane wykrywanie inwentarza przywraca go automatycznie. Aby przywrócić go teraz, użyj **Ustawienia → Urządzenia i usługi → Hubinet Ops → Konfiguruj** albo akcji **`hubinet_ops.reset_health_contract`**. Aby zamiast tego zadeklarować zaawansowany kontrakt, użyj **`hubinet_ops.set_health_contract`** — dostępnej z zakładki **Akcje** tego urządzenia lub z Narzędzi deweloperskich → Akcje — podając albo samą bezcelową sondę żywotności gościa `guest_operational`, albo jedną lub więcej sond `systemd_unit_active` wraz z ich celami.",
       "revision": "Rewizja",
       "all_required": "Wszystkie poniższe sondy są wymagane:"
+    }
+  },
+  "issues": {
+    "health_contract_unconfigured": {
+      "title": "{name}: aktualizacja pakietów zablokowana brakiem kontraktu kondycji",
+      "description": "Sprawdzony plan pakietów dla **{name}** jest zatwierdzony, ale nie zadeklarowano kontraktu kondycji, więc **Uruchom zatwierdzoną aktualizację** pozostaje nieaktywne.\n\nNormalnie nie powinno się to zdarzyć: Hubinet Ops nadaje każdemu zarządzanemu pakietowo kontenerowi LXC wbudowany kontrakt kondycji `guest_operational`, a następne udane wykrywanie inwentarza przywróci go dla tego zasobu automatycznie. Aby przywrócić go teraz, użyj **Ustawienia → Urządzenia i usługi → Hubinet Ops → Konfiguruj** albo akcji `hubinet_ops.reset_health_contract` dla tego urządzenia. Aby zamiast tego zadeklarować zaawansowany kontrakt `systemd_unit_active`, użyj akcji `hubinet_ops.set_health_contract` (zakładka **Akcje** tego urządzenia lub Narzędzia deweloperskie → Akcje).\n\nTo zgłoszenie znika samo, gdy kontrakt dla tego zasobu już istnieje."
     }
   },
   "exceptions": {
@@ -314,8 +432,8 @@
     "health_contract_set_refused": {
       "message": "Hubinet Ops odrzucił zadeklarowany kontrakt zdrowia."
     },
-    "health_contract_clear_refused": {
-      "message": "Hubinet Ops odmówił wyczyszczenia kontraktu zdrowia."
+    "health_contract_reset_refused": {
+      "message": "Hubinet Ops odmówił zresetowania kontraktu kondycji."
     },
     "approve_without_review": {
       "message": "Przejrzyj bieżący plan aktualizacji przed jego zatwierdzeniem."

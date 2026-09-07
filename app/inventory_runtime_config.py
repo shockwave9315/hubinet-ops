@@ -146,6 +146,16 @@ PACKAGE_UPDATE_ROLLBACK_SUBMISSION_TIMEOUT_SECONDS = 60
 PACKAGE_UPDATE_ROLLBACK_INSPECTION_TIMEOUT_SECONDS = 120
 #: One read-only health evaluation of a complete frozen probe set.
 PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS = 300
+#: Backend-owned bounded-settling TIMING POLICY (frozen architecture: the
+#: backend owns timing policy, the privileged health helper enforces hard
+#: ceilings -- `deploy/hubinet-package-health-helper.py`,
+#: `_validate_settling_policy`). Home Assistant never supplies or chooses
+#: either value; it has no path to this boundary at all. These are the
+#: product defaults this backend actually sends on the wire today, well
+#: inside the helper's own hard min/max ceilings, and well inside
+#: `PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS` above.
+PACKAGE_UPDATE_HEALTH_SETTLING_DEADLINE_SECONDS = 180
+PACKAGE_UPDATE_HEALTH_OBSERVATION_INTERVAL_SECONDS = 5
 #: Shared bounded response ceiling for every production update host control.
 PACKAGE_UPDATE_MAX_RESULT_BYTES = 8 * 1024 * 1024
 

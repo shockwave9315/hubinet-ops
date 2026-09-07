@@ -65,6 +65,8 @@ from .models import (
     checkpoint_rank as _checkpoint_rank,
 )
 from .health_contract import (
+    DEFAULT_HEALTH_CONTRACT_FINGERPRINT,
+    DEFAULT_HEALTH_PROBES,
     canonical_health_probes,
     health_contract_fingerprint,
 )
@@ -81,6 +83,7 @@ from .product_update_fence import (
 )
 from .health_observation import (
     HEALTH_PROBE_REASONS,
+    HEALTH_PROBE_REASONS_BY_OUTCOME,
     require_health_probe_semantics,
 )
 from .mutation_completion import (
@@ -136,7 +139,8 @@ class HealthProbeObservation:
 
     probe_index: int
     kind: HealthProbeKind
-    target: str
+    #: ``None`` for, and only for, ``HealthProbeKind.GUEST_OPERATIONAL``.
+    target: str | None
     outcome: HealthProbeOutcome
     reason: str
 
@@ -159,6 +163,25 @@ def _require_health_probe_reason(value: object) -> str:
     if not isinstance(value, str) or value not in HEALTH_PROBE_REASONS:
         raise AuthorityConflict("health probe reason is not a known bounded token")
     return value
+
+
+def _require_unresolved_health_reason(value: object) -> str:
+    """The classification an UNKNOWN health evaluation may be recorded under.
+
+    Strictly the UNKNOWN family of the closed taxonomy, never the whole of
+    it. An attempt that reached no verdict cannot truthfully be summarized
+    by a token that only ever describes a POSITIVE proof (`unit_active`) or
+    a proven-false conjunct (`container_absent`), and this field is read
+    back to an operator as the current reason there is still no result -- so
+    a self-contradictory pairing is refused here rather than published.
+    """
+
+    reason = _require_health_probe_reason(value)
+    if reason not in HEALTH_PROBE_REASONS_BY_OUTCOME[HealthProbeOutcome.UNKNOWN]:
+        raise AuthorityConflict(
+            "an unresolved health evaluation reason must be an UNKNOWN-family token"
+        )
+    return reason
 
 
 def _match_health_observations_to_frozen_probes(
@@ -546,6 +569,15 @@ class InventoryAuthority:
                     connection, snapshot, committed_at=committed_at
                 )
                 self._after_reconciliation(connection, snapshot)
+                # The narrowest backend-owned point at which a resource is a
+                # CURRENT, package-managed LXC. Provisioning the built-in
+                # `guest_operational` default here -- inside this same
+                # transaction, with no guest read of any kind -- is what
+                # removes the "approved plan, unconfigured health" dead end
+                # without inferring anything about the workload.
+                self._provision_default_health_contracts(
+                    connection, now=committed_at
+                )
                 freshness_reference = _freshness_reference_at(snapshot)
                 deadline = freshness_reference + timedelta(
                     seconds=int(source["freshness_duration_seconds"])
@@ -1502,6 +1534,16 @@ class InventoryAuthority:
         Clearing removes the contract material but never the record of which
         revisions have already been allocated, so the next contract cannot
         reuse one.
+
+        This is the LOW-LEVEL primitive, not the native operator path. A
+        current package-managed LXC does not stay unconfigured: the next
+        successful reconciliation re-provisions the built-in
+        ``guest_operational`` default for it (see
+        :meth:`_provision_default_health_contracts`). An operator who wants
+        to discard an advanced contract should use
+        :meth:`reset_resource_health_contract`, which restores that baseline
+        immediately instead of leaving the resource update-blocked until the
+        next discovery run.
         """
 
         canonical_resource_id = _require_uuid(resource_id, "resource_id")
@@ -1538,6 +1580,105 @@ class InventoryAuthority:
                 connection, inventory_changed=False, published_changed=True
             )
         return True
+
+    def reset_resource_health_contract(
+        self, resource_id: str, *, expected_revision: int | None = None
+    ) -> ResourceHealthContract:
+        """Restore the built-in v0.5 default contract for one resource.
+
+        This is what "reset health" means on the native operator path, and
+        it is deliberately NOT :meth:`clear_resource_health_contract`: a
+        current package-managed LXC that lost all health meaning would be
+        blocked from starting an approved update, which is exactly the dead
+        end this product decision removes. Resetting returns the resource to
+        the backend-owned baseline -- one ``guest_operational`` probe -- not
+        to *unconfigured*.
+
+        It is an explicit operator action, so it carries the same
+        compare-and-set discipline as any other contract mutation: an
+        advanced contract is replaced only when ``expected_revision``
+        matches the generation the operator was looking at (or is omitted).
+        Nothing here reads the guest, and nothing here chooses probes from
+        what a guest appears to run.
+        """
+
+        return self.replace_resource_health_contract(
+            resource_id, DEFAULT_HEALTH_PROBES, expected_revision=expected_revision
+        )
+
+    def _provision_default_health_contracts(
+        self, connection: sqlite3.Connection, *, now: str
+    ) -> int:
+        """Give every currently-unconfigured managed LXC the built-in default.
+
+        Called inside the successful-reconciliation transaction, which is the
+        narrowest backend-owned point at which a resource actually becomes a
+        CURRENT, package-managed LXC. Running it there is what makes the
+        default a PRODUCT default rather than an onboarding chore: an
+        operator never has to declare a contract before the first approved
+        update can start.
+
+        Three properties hold, and all three are load-bearing:
+
+        - **It is not workload inference.** No guest is read, no adapter is
+          probed, and no command runs. The probe set is the fixed code-owned
+          `DEFAULT_HEALTH_PROBES`, chosen because absence of a workload
+          observer is not proof of workload absence.
+        - **An explicit contract always wins.** The query only ever selects
+          resources with NO contract row, so an operator's advanced systemd
+          contract is never seen, never compared, and never
+          overwritten.
+        - **It is idempotent.** The second reconciliation of the same
+          inventory selects nothing, allocates no revision, and writes no
+          row, so a resource's contract revision does not churn with the
+          discovery cadence.
+
+        Selection mirrors `_require_package_scan_target` exactly -- present,
+        active, LXC, with a current locator binding and a current node -- so
+        a resource that is not a legal package-update target never
+        accumulates a contract, and a VMID-reused replacement is a different
+        ``resource_id`` that gets its own fresh default rather than
+        inheriting one.
+        """
+
+        rows = connection.execute(
+            "SELECT r.resource_id FROM resource_incarnations r "
+            "JOIN resource_locator_bindings b ON b.resource_id=r.resource_id "
+            "AND b.valid_to_run_sequence IS NULL "
+            "LEFT JOIN resource_health_contracts c "
+            "ON c.resource_id=r.resource_id "
+            "WHERE r.resource_type='lxc' AND r.presence='present' "
+            "AND r.lifecycle='active' AND r.current_node_id IS NOT NULL "
+            "AND c.resource_id IS NULL "
+            "ORDER BY r.resource_id"
+        ).fetchall()
+        for row in rows:
+            resource_id = str(row["resource_id"])
+            revision = self._allocate_health_contract_revision(
+                connection, resource_id, now=now
+            )
+            connection.execute(
+                "INSERT INTO resource_health_contracts("
+                "resource_id, revision, fingerprint, probe_count, created_at, "
+                "updated_at) VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    resource_id,
+                    revision,
+                    DEFAULT_HEALTH_CONTRACT_FINGERPRINT,
+                    len(DEFAULT_HEALTH_PROBES),
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO resource_health_contract_probes("
+                "resource_id, probe_index, kind, target) VALUES(?, ?, ?, ?)",
+                [
+                    (resource_id, index, probe.kind.value, probe.target)
+                    for index, probe in enumerate(DEFAULT_HEALTH_PROBES)
+                ],
+            )
+        return len(rows)
 
     @staticmethod
     def _allocate_health_contract_revision(
@@ -1835,8 +1976,8 @@ class InventoryAuthority:
                     # targets.  A package-update job is narrower: every
                     # frozen probe must be structurally representable by the
                     # exact executor before this transaction may issue it.
-                    # This is pure validation -- no systemctl, Docker, pct,
-                    # SSH, or PVE call occurs here.
+                    # This is pure validation -- no systemctl, pct, SSH, or
+                    # PVE call occurs here.
                     try:
                         require_health_contract_execution_eligible(contract.probes)
                     except HealthContractExecutionError as exc:
@@ -2276,7 +2417,14 @@ class InventoryAuthority:
             (str(job["job_id"]),),
         ).fetchall()
         frozen_material = [
-            (int(row["probe_index"]), str(row["kind"]), str(row["target"]))
+            (
+                int(row["probe_index"]),
+                str(row["kind"]),
+                # NULL only for guest_operational (v20); `str(None)` would
+                # silently become the string "None" and could never compare
+                # equal to the dataclass's real `None`.
+                None if row["target"] is None else str(row["target"]),
+            )
             for row in frozen
         ]
         current_material = [
@@ -4478,11 +4626,15 @@ class InventoryAuthority:
           Nothing here triggers a rollback: this stage ships no automatic
           compensation policy at all (`PRODUCT.md`, `STATUS.md`).
 
-        An UNKNOWN aggregate is refused. It is not a verdict, it must never
-        become durable, and health execution is a read-only evaluation that
-        is safe to repeat -- see
-        :meth:`record_package_update_health_outcome_unknown`, which records
-        it as bounded history while keeping the job at ``health_started``.
+        An UNKNOWN aggregate is refused, and so -- independently, as defense
+        in depth -- is any observation set containing so much as ONE UNKNOWN
+        probe, even beside a proven FAILED one: only a COMPLETE DECISIVE
+        observation set may ever be finalized (PRODUCT.md, "What healthy
+        means"). Neither is a verdict, neither may become durable, and
+        health execution is a read-only evaluation that is safe to repeat --
+        see :meth:`record_package_update_health_outcome_unknown`, which
+        records it as bounded history while keeping the job at
+        ``health_started``.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
@@ -4517,6 +4669,24 @@ class InventoryAuthority:
                     "package update job resource or locator context is stale"
                 )
             ordered = _match_health_observations_to_frozen_probes(probes, reported)
+            # Independent defense in depth (PR #80 second review finding):
+            # the production orchestrator already refuses to call this method
+            # at all unless the host's own bounded settling window reported a
+            # DECISIVE round, and a decisive round cannot contain an UNKNOWN
+            # probe (`validate_host_health_result` rejects that combination
+            # outright). This method does not trust that upstream discipline
+            # -- a purported "definitive" observation set containing ANY
+            # UNKNOWN probe is refused HERE too, before aggregation, so a
+            # FAILED probe can never combine with a still-UNKNOWN sibling to
+            # manufacture a durable FAILED verdict from a non-decisive round.
+            if any(
+                observation.outcome is HealthProbeOutcome.UNKNOWN
+                for observation in ordered
+            ):
+                raise AuthorityConflict(
+                    "a health completion may not carry any unresolved "
+                    "(UNKNOWN) probe observation"
+                )
             outcome = aggregate_health_outcome(
                 observation.outcome for observation in ordered
             )
@@ -4651,7 +4821,14 @@ class InventoryAuthority:
         return self._store.package_update_job(canonical_job_id)
 
     def record_package_update_health_outcome_unknown(
-        self, job_id: str, reason: str
+        self,
+        job_id: str,
+        reason: str,
+        *,
+        probe_evidence: Sequence[HealthProbeObservation] = (),
+        settling_rounds: int | None = None,
+        settling_seconds: float | None = None,
+        last_round_span_ms: int | None = None,
     ) -> PackageUpdateJob:
         """Record that a health evaluation could not reach a verdict.
 
@@ -4665,11 +4842,41 @@ class InventoryAuthority:
         cause a second destructive action, so an unresolved evaluation needs
         no uncertainty fence and no host journal -- it simply may be run
         again.
+
+        ``probe_evidence`` is bounded, typed, per-probe OBSERVATION evidence
+        from the LAST COMPLETE settling round the caller observed -- never a
+        verdict, and never merged from more than one round. Only ``index``,
+        ``outcome``, and ``reason`` are persisted: immutable ``kind``/
+        ``target`` are already durable on the job's frozen probe rows and are
+        joined from there at read time, never repeated into event JSON. This
+        is what lets an operator see an UNKNOWN result's exact blocking
+        probe(s) without shell or SQLite access (`app/inventory_runtime.py`,
+        ``_package_update_health_probes_body``).
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        bounded_reason = _require_health_probe_reason(reason)
+        bounded_reason = _require_unresolved_health_reason(reason)
         recorded_at = _timestamp(self._now())
+        details: dict[str, object] = {"reason": bounded_reason}
+        if probe_evidence:
+            details["probes"] = [
+                {
+                    "index": int(observation.probe_index),
+                    "outcome": HealthProbeOutcome(observation.outcome).value,
+                    "reason": _require_health_probe_reason(observation.reason),
+                }
+                for observation in probe_evidence
+            ]
+        if type(settling_rounds) is int and 0 <= settling_rounds <= 1000:
+            details["rounds"] = settling_rounds
+        if (
+            isinstance(settling_seconds, (int, float))
+            and not isinstance(settling_seconds, bool)
+            and 0 <= settling_seconds <= 3600
+        ):
+            details["settled_seconds"] = round(float(settling_seconds), 3)
+        if type(last_round_span_ms) is int and 0 <= last_round_span_ms <= 3_600_000:
+            details["last_round_span_ms"] = last_round_span_ms
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
@@ -4692,7 +4899,7 @@ class InventoryAuthority:
                     "this job's frozen health contract could not be "
                     "evaluated truthfully; no verdict was recorded"
                 ),
-                details={"reason": bounded_reason},
+                details=details,
             )
         return self._store.package_update_job(canonical_job_id)
 

@@ -2,9 +2,8 @@
 
 Resource health contracts deliberately store bounded opaque targets.  The dark
 package-update executor is narrower: it can only evaluate exact systemd unit
-names and exact Docker container names.  This module is that execution-only
-boundary.  It performs no host I/O and does not change what the configuration
-layer may store.
+names.  This module is that execution-only boundary.  It performs no host I/O
+and does not change what the configuration layer may store.
 """
 
 from __future__ import annotations
@@ -19,9 +18,9 @@ class HealthContractExecutionError(ValueError):
     """A stored contract cannot be represented by the exact executor."""
 
 
-# These patterns are mirrored by the standalone PVE-host helper, which cannot
+# This pattern is mirrored by the standalone PVE-host helper, which cannot
 # import backend application code.  A regression test compares the helper's
-# compiled patterns and suffix set byte-for-byte with these definitions.
+# compiled pattern and suffix set byte-for-byte with these definitions.
 SYSTEMD_UNIT_PATTERN = r"[A-Za-z0-9][A-Za-z0-9:_.@-]{0,199}"
 SYSTEMD_UNIT_SUFFIXES = (
     ".service",
@@ -36,10 +35,8 @@ SYSTEMD_UNIT_SUFFIXES = (
     ".device",
     ".swap",
 )
-DOCKER_NAME_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}"
 
 _SYSTEMD_UNIT_RE = re.compile(SYSTEMD_UNIT_PATTERN)
-_DOCKER_NAME_RE = re.compile(DOCKER_NAME_PATTERN)
 
 
 def require_health_contract_execution_eligible(
@@ -47,8 +44,8 @@ def require_health_contract_execution_eligible(
 ) -> None:
     """Require every probe to be exactly representable by the executor.
 
-    This is structural validation only.  It never asks whether a unit or
-    container currently exists, is running, or is healthy.
+    This is structural validation only.  It never asks whether a unit
+    currently exists or is active.
     """
 
     for probe in probes:
@@ -62,16 +59,14 @@ def require_health_contract_execution_eligible(
                     "systemd health probe target is not an exact explicit unit name"
                 )
             continue
-        if probe.kind in (
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        ):
-            if (
-                not _DOCKER_NAME_RE.fullmatch(probe.target)
-                or probe.target.startswith("-")
-            ):
+        if probe.kind is HealthProbeKind.GUEST_OPERATIONAL:
+            # No target to validate -- the fixed guest operation names
+            # nothing the operator supplied. A target here would itself be
+            # the structural defect: `health_contract.py` already refuses
+            # to store one.
+            if probe.target is not None:
                 raise HealthContractExecutionError(
-                    "Docker health probe target is not an exact container name"
+                    "guest_operational health probe must not carry a target"
                 )
             continue
         raise HealthContractExecutionError(

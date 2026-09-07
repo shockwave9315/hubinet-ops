@@ -1,11 +1,14 @@
-"""Dark job-bound healthcheck execution for package update jobs.
+"""Job-bound healthcheck execution for package update jobs.
 
-**Not production-reachable.** Nothing in `app/inventory_runtime.py`, the HTTP
-API, the Home Assistant integration, the discovery scheduler, or the package
-scan scheduler constructs or calls anything in this module, and
-`tests/test_r0_architecture_regression.py` proves it stays that way. It exists
-so the last missing half of the update lifecycle can be built and adversarially
-tested before it is ever activated.
+**Production reachable, through the one worker.** `app/inventory_runtime.py`
+constructs this orchestrator and composes it into the one
+`PackageUpdateWorker` when `package_update.enabled` is configured true (see
+"Production activation" in `ARCHITECTURE.md`). No route, scheduler, or the
+Home Assistant integration calls into it directly -- the worker is the only
+caller, entering this stage at `mutation_completed` or `health_started`. This
+module still contains no host I/O, no write-ahead uncertainty checkpoint, and
+no policy of its own: it composes authority and one read-only dark host
+boundary, exactly as documented below.
 
 ## What this stage answers, and what it refuses to answer
 
@@ -53,9 +56,14 @@ A contract is an ALL-OF over its declared probes, so:
 - **PASS** requires every frozen probe to be POSITIVELY proven. Absence of an
   observed failure is not a pass, and neither is a probe that could not be
   evaluated.
-- **FAIL** needs one probe positively proven false. One false conjunct proves
-  an ALL-OF false whatever the others did, so a deterministic failure beside
-  an unevaluable probe is still a failure.
+- **FAIL** needs one probe positively proven false, inside a COMPLETE DECISIVE
+  observation set. One false conjunct proves an ALL-OF false whatever the
+  others did -- but UNKNOWN is impossible in material accepted for durable
+  finalization: a decisive round admits no unevaluated probe at all (a host
+  claiming both at once is rejected outright by `validate_host_health_result`
+  below), and `InventoryAuthority.complete_package_update_health` refuses any
+  observation set carrying an UNKNOWN outcome independently of that, as
+  defense in depth.
 - **UNKNOWN** is the remainder, and it is never success. It writes no verdict
   and no durable result rows: the job stays ACTIVE at `health_started`, keeps
   its snapshot and its rollback authority, and the evaluation may simply be
@@ -63,31 +71,29 @@ A contract is an ALL-OF over its declared probes, so:
 
 Retrying is safe here in a way it is emphatically NOT for the snapshot,
 mutation, and rollback stages, and for one structural reason: **health
-execution is read-only.** It runs `systemctl show` and `docker inspect`, and
-neither of those changes anything. There is therefore deliberately no host
-operation journal, no `may_have_started` uncertainty checkpoint, and no
-at-most-once fence in this stage -- inventing one would be mimicking the shape
-of the destructive stages without their reason for existing.
+execution is read-only.** It runs `systemctl show` (or, for the built-in
+`guest_operational` baseline, one fixed `/bin/true` liveness check), and
+neither changes anything. There is therefore deliberately no host operation
+journal, no `may_have_started` uncertainty checkpoint, and no at-most-once
+fence in this stage -- inventing one would be mimicking the shape of the
+destructive stages without their reason for existing.
 
 ## Verified CLI semantics
 
 Every fixed argv here was verified against the real tools rather than assumed;
 `ARCHITECTURE.md`, "Job-bound healthcheck execution", records what was
-observed and why each command is the one that cannot false-PASS. The two facts
-that shaped the design:
+observed and why the systemd command is the one that cannot false-PASS:
+`systemctl is-active <pattern>` expands globs and exits 0 if ANY matching unit
+is active, and `--` does NOT stop that expansion, so it is unusable for a
+probe that must name one exact unit. The executor uses `systemctl show`
+instead, requires exactly one property block, and validates the target
+charset so it cannot be a glob.
 
-- `systemctl is-active <pattern>` expands globs and exits 0 if ANY matching
-  unit is active, and `--` does NOT stop that expansion. It is unusable for a
-  probe that must name one exact unit.
-- `docker inspect` resolves a container by name OR by ID prefix, and the
-  daemon-unavailable and no-such-container failures share an exit code.
-
-So the executor uses `systemctl show`, requires exactly one property block,
-and validates the target charset so it cannot be a glob; and it uses
-`docker inspect` with a code-owned constant template, requires the returned
-`.Name` to be exactly the requested container, and treats an inspect failure
-as definitive absence ONLY when a separate fixed command proves the daemon
-answered.
+The `guest_operational` baseline runs no discovery command at all: it is one
+fixed, code-owned, argument-less liveness check (`/bin/true`) against the
+exact current resource context, executed exactly once per evaluation attempt
+-- never settled, never retried within one attempt. Docker workload health is
+not part of v0.5 Hubinet Ops package-update health.
 """
 
 from __future__ import annotations
@@ -154,21 +160,24 @@ HOST_REFUSAL_REASONS: dict[str, str] = {
 HOST_PROBE_REASONS: frozenset[str] = frozenset(
     {
         "unit_active",
-        "container_running",
-        "container_healthy",
         "unit_not_active",
-        "container_not_running",
-        "container_absent",
-        "container_unhealthy",
-        "container_health_starting",
-        "container_has_no_healthcheck",
+        "unit_activating",
+        "unit_deactivating",
+        "unit_reloading",
+        "unit_job_pending",
+        "guest_operational_confirmed",
         "probe_target_not_exact",
         "probe_target_ambiguous",
         "guest_unavailable",
         "command_failed",
         "command_timed_out",
         "malformed_output",
-        "docker_daemon_unavailable",
+        # PR #80 review finding 1: the host's own absolute settling deadline
+        # ran out before this probe's family could safely start (or finish)
+        # another subprocess. Meaningful only for the advanced systemd
+        # settling window -- the guest_operational baseline is a single
+        # one-shot execution and never settles.
+        "settling_budget_exhausted",
     }
 )
 
@@ -185,13 +194,40 @@ class HealthStageStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class HealthEvaluationStatus(StrEnum):
+    """Whether the HOST's own bounded settling window reached a round that
+    may be aggregated into a durable verdict at all.
+
+    This is the explicit, typed carrier of "decisiveness" the frozen
+    architecture requires: a durable PASS or FAIL may come ONLY from one
+    complete DECISIVE round (every probe resolved, the round itself
+    completed within its bound, and it was not the first round). Inferring
+    decisiveness a second time from the probe outcomes alone -- "every probe
+    happens to be PASSED or FAILED, so it must have been decisive" -- would
+    silently accept a round that only LOOKS complete because the settling
+    deadline or round cap cut it off mid-transition. This orchestrator checks
+    this field BEFORE ever calling `aggregate_health_outcome`; neither the
+    backend elsewhere nor Home Assistant may re-derive it.
+    """
+
+    #: Every probe in this round resolved (none transient); PASSED/FAILED is
+    #: this round's proven complete ALL-OF verdict, and may be persisted.
+    DECISIVE = "decisive"
+    #: The settling deadline, round cap, or guest-command ceiling was
+    #: reached with at least one probe still transient, OR a structurally
+    #: broken target makes a decisive round unreachable by construction.
+    #: Never aggregated into a verdict, whatever the individual probes say.
+    UNRESOLVED = "unresolved"
+
+
 @dataclass(frozen=True, slots=True)
 class HostProbeResult:
     """What the dark host reported about ONE frozen probe."""
 
     probe_index: int
     kind: HealthProbeKind
-    target: str
+    #: ``None`` for, and only for, ``HealthProbeKind.GUEST_OPERATIONAL``.
+    target: str | None
     outcome: HealthProbeOutcome
     reason: str
 
@@ -209,9 +245,22 @@ class HostHealthResult:
     contract_revision: int
     contract_fingerprint: str
     probes: tuple[HostProbeResult, ...]
+    #: Explicit, typed decisiveness -- see `HealthEvaluationStatus`. Required
+    #: (no default): a caller that has not decided whether a round was
+    #: decisive must not be able to silently default into either answer.
+    evaluation_status: HealthEvaluationStatus
     #: Bounded classification text for a whole-request failure. Never raw
     #: stdout, stderr, or command text.
     reason: str | None = None
+    #: Bounded settling metadata from the host's own bounded settling window
+    #: (ARCHITECTURE.md, "Job-bound healthcheck execution"): how many full
+    #: rounds it ran, the total wall time it spent settling, and the span of
+    #: the LAST round. Three small integers, never guest output. ``None``
+    #: only for an answer that predates this metadata (defence in depth; the
+    #: deployed helper always sends it).
+    settling_rounds: int | None = None
+    settling_seconds: float | None = None
+    last_round_span_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,19 +290,22 @@ class PackageUpdateHealthHostControl(Protocol):
 class PackageUpdateHealthOrchestrator:
     """Coordinate authority and one dark host boundary for one evaluation.
 
-    Instantiated only by hermetic tests in this stage. It performs no package
-    mutation, no snapshot operation, and no rollback -- and, critically, it
-    never CALLS the rollback stage either. A failing health verdict is
-    reported and nothing else happens; see `PRODUCT.md` on why automatic
-    compensation is a separate, unmade decision.
+    PRODUCTION-REACHABLE, and built by the composition root: see the module
+    docstring above -- `app/inventory_runtime.py`'s
+    `_build_package_update_runtime` constructs it and composes it into the
+    one `PackageUpdateWorker`, which is its only caller. It performs no
+    package mutation, no snapshot operation, and no rollback -- and,
+    critically, it never CALLS the rollback stage either. A failing health
+    verdict is reported and nothing else happens; see `PRODUCT.md` on why
+    automatic compensation is a separate, unmade decision.
 
     Every host round trip happens strictly OUTSIDE this store's writer
     transactions. The authority transitions here are short and local: start
     the evaluation, or atomically re-prove live context and accept its exact
     result. Nothing holds the writer lock
-    across SSH, `pct`, `systemctl`, `docker`, or a probe loop -- which is
-    affordable precisely because a read-only evaluation needs no critical
-    section to stop a second destructive submission.
+    across SSH, `pct`, `systemctl`, or a probe loop -- which is affordable
+    precisely because a read-only evaluation needs no critical section to
+    stop a second destructive submission.
     """
 
     def __init__(
@@ -321,14 +373,53 @@ class PackageUpdateHealthOrchestrator:
         except PackageUpdateHealthError as exc:
             return self._unknown(job.job_id, exc.reason, str(exc))
 
+        # F. The explicit, typed decisiveness carrier is checked BEFORE any
+        # aggregation -- never re-derived from the probe outcomes alone. A
+        # non-decisive round (the settling deadline/round-cap was reached
+        # with a probe still transient, or a structurally broken target
+        # makes decisiveness unreachable by construction) may look
+        # all-PASSED or contain exactly one FAILED probe, but that is NOT
+        # proof of anything: only a decisive round's complete observation
+        # set may ever become a durable verdict.
+        if host_result.evaluation_status is not HealthEvaluationStatus.DECISIVE:
+            unresolved_probe = next(
+                (
+                    observation
+                    for observation in observations
+                    if observation.outcome is HealthProbeOutcome.UNKNOWN
+                ),
+                None,
+            )
+            # A non-decisive round need not contain any UNKNOWN probe at all
+            # (e.g. every probe read PASSED, but the round itself ran too
+            # long to trust, or this was the first round) -- there is no
+            # single "blocking probe" reason to report in that case, so the
+            # generic, honest classification for an answer that cannot be
+            # believed as a verdict is used instead.
+            blocking_reason = (
+                unresolved_probe.reason
+                if unresolved_probe is not None
+                else "host_response_rejected"
+            )
+            return self._unknown(
+                job.job_id,
+                blocking_reason,
+                "the host's bounded settling window did not reach a "
+                f"decisive round ({blocking_reason})",
+                probe_evidence=observations,
+                settling_rounds=host_result.settling_rounds,
+                settling_seconds=host_result.settling_seconds,
+                last_round_span_ms=host_result.last_round_span_ms,
+            )
+
         outcome = aggregate_health_outcome(
             observation.outcome for observation in observations
         )
-        if outcome is HealthOutcome.UNKNOWN:
-            # Report the FIRST unevaluable probe's own reason rather than a
-            # generic one: "the Docker daemon did not answer" is what the
-            # operator needs, and it is already a bounded token from the
-            # closed taxonomy.
+        if outcome is HealthOutcome.UNKNOWN:  # pragma: no cover - defense in
+            # depth only: `validate_host_health_result` already refuses a
+            # DECISIVE payload carrying any UNKNOWN probe, so this is
+            # structurally unreachable, and it stays here in case that
+            # invariant is ever loosened by mistake.
             blocking = next(
                 observation
                 for observation in observations
@@ -339,6 +430,10 @@ class PackageUpdateHealthOrchestrator:
                 blocking.reason,
                 "at least one frozen probe could not be evaluated truthfully "
                 f"({blocking.reason})",
+                probe_evidence=observations,
+                settling_rounds=host_result.settling_rounds,
+                settling_seconds=host_result.settling_seconds,
+                last_round_span_ms=host_result.last_round_span_ms,
             )
 
         # E. Re-prove the backend resource context AFTER the host answered.
@@ -368,7 +463,15 @@ class PackageUpdateHealthOrchestrator:
         )
 
     def _unknown(
-        self, job_id: str, reason_token: str, detail: str
+        self,
+        job_id: str,
+        reason_token: str,
+        detail: str,
+        *,
+        probe_evidence: Sequence[HealthProbeObservation] = (),
+        settling_rounds: int | None = None,
+        settling_seconds: float | None = None,
+        last_round_span_ms: int | None = None,
     ) -> HealthStageResult:
         """Record a truthful non-answer and leave the job exactly as it was.
 
@@ -376,11 +479,23 @@ class PackageUpdateHealthOrchestrator:
         rollback, say -- the event can no longer be appended, and that is not
         an error worth raising: the outcome of THIS attempt is still "no
         verdict", and the job's real state is read back and returned.
+
+        ``probe_evidence`` is populated only when the host actually answered
+        and its per-probe observations were validated against the frozen
+        contract (an in-flight resource-context change or a whole-request
+        host refusal carries no such evidence to report). Bounded, typed,
+        never guest output -- see `InventoryAuthority.
+        record_package_update_health_outcome_unknown`.
         """
 
         try:
             job = self._authority.record_package_update_health_outcome_unknown(
-                job_id, reason_token
+                job_id,
+                reason_token,
+                probe_evidence=probe_evidence,
+                settling_rounds=settling_rounds,
+                settling_seconds=settling_seconds,
+                last_round_span_ms=last_round_span_ms,
             )
         except AuthorityConflict:
             job = self._authority.package_update_job(job_id)
@@ -408,11 +523,20 @@ def validate_host_health_result(
     - each outcome is one of the three known values;
     - each reason is a bounded token the HOST is allowed to report, is
       consistent with the outcome it accompanies, and is possible for the
-      kind of probe it claims to describe.
+      kind of probe it claims to describe;
+    - ``evaluation_status`` is a known value, and is never DECISIVE while any
+      probe is UNKNOWN -- a decisive round is, by the frozen definition,
+      exactly one where every probe resolved with no transient state, so a
+      host claiming both at once is contradicting itself and is rejected
+      outright rather than believed either way.
     """
 
     if not isinstance(result, HostHealthResult):
         raise PackageUpdateHealthError("a typed host health result is required")
+    if not isinstance(result.evaluation_status, HealthEvaluationStatus):
+        raise PackageUpdateHealthError(
+            "host returned an unknown evaluation status"
+        )
     if result.contract_revision != job.health_contract_revision:
         raise PackageUpdateHealthError(
             "host answered about a different health contract revision"
@@ -476,6 +600,13 @@ def validate_host_health_result(
                 outcome=outcome,
                 reason=reason,
             )
+        )
+    if result.evaluation_status is HealthEvaluationStatus.DECISIVE and any(
+        observation.outcome is HealthProbeOutcome.UNKNOWN
+        for observation in observations
+    ):
+        raise PackageUpdateHealthError(
+            "host claimed a decisive round while a probe remained unknown"
         )
     return tuple(observations)
 

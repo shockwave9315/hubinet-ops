@@ -1,10 +1,14 @@
 """Dark bounded SSH transport for job-bound healthcheck evaluation.
 
-**Not production-reachable and not deployed.** No production configuration,
-key, or `authorized_keys` entry exists for this channel:
-`app/inventory_runtime.py` never constructs it, and neither bootstrap nor the
-product updater installs its helper or key. It is instantiated only by
-hermetic tests in this stage.
+**Production reachable, through the one worker.** `app/inventory_runtime.py`
+constructs this transport and composes it into the one
+`PackageUpdateHealthOrchestrator` when `package_update.enabled` is configured
+with a health private key (see "Production activation" in
+`ARCHITECTURE.md`). `deploy/lib/bootstrap-update-boundaries.sh` and
+`deploy/update-proxmox-0.5.sh` provision its dedicated key and forced-command
+`authorized_keys` entry as one of the five package-update host-control
+boundaries; `deploy/hubinet-package-health-helper.py` is the deployed helper
+on the other end.
 
 It is a separate, purpose-specific client from the scan, snapshot, execution,
 mutation, and rollback transports, and deliberately does not resurrect the
@@ -40,6 +44,10 @@ from app.inventory import (
     MAX_HEALTH_PROBE_TARGET_LENGTH,
     PackageUpdateHealthRequest,
 )
+from app.inventory_runtime_config import (
+    PACKAGE_UPDATE_HEALTH_OBSERVATION_INTERVAL_SECONDS,
+    PACKAGE_UPDATE_HEALTH_SETTLING_DEADLINE_SECONDS,
+)
 from app.package_scan_host_control import (
     BoundedProcessResult,
     ProcessRunner,
@@ -48,6 +56,7 @@ from app.package_scan_host_control import (
 from app.package_update_health import (
     HOST_REFUSAL_REASONS,
     HOST_PROBE_REASONS,
+    HealthEvaluationStatus,
     HostHealthResult,
     HostProbeResult,
     PackageUpdateHealthError,
@@ -179,7 +188,13 @@ class SshPackageUpdateHealthHostControl:
             if probe["kind"] not in {kind.value for kind in HealthProbeKind}:
                 raise ValueError("health request carries an unsupported probe kind")
             target = probe["target"]
-            if (
+            if probe["kind"] == HealthProbeKind.GUEST_OPERATIONAL.value:
+                if target is not None:
+                    raise ValueError(
+                        "a guest_operational health request probe must not "
+                        "carry a target"
+                    )
+            elif (
                 not isinstance(target, str)
                 or not 1 <= len(target) <= MAX_HEALTH_PROBE_TARGET_LENGTH
             ):
@@ -213,6 +228,18 @@ class SshPackageUpdateHealthHostControl:
                 "revision": request.health_contract_revision,
                 "fingerprint": request.health_contract_fingerprint,
                 "probes": list(probes),
+            },
+            # Backend-owned timing POLICY, stated on the wire rather than
+            # living only inside the helper (PR #80 review 2.5): the helper
+            # independently clamps this against its own hard ceilings before
+            # using it, so a compromised or buggy backend cannot request an
+            # arbitrarily large settling window. Home Assistant has no path
+            # to this boundary and never supplies or chooses either value.
+            "settling_policy": {
+                "deadline_seconds": PACKAGE_UPDATE_HEALTH_SETTLING_DEADLINE_SECONDS,
+                "observation_interval_seconds": (
+                    PACKAGE_UPDATE_HEALTH_OBSERVATION_INTERVAL_SECONDS
+                ),
             },
         }
         encoded = json.dumps(
@@ -343,16 +370,68 @@ class SshPackageUpdateHealthHostControl:
         probes: list[HostProbeResult] = []
         for raw in raw_probes:
             probes.append(self._parse_probe(raw))
+        raw_status = payload.get("evaluation_status")
+        # Exact membership, never a coerced/normalized comparison: a
+        # malformed or missing evaluation_status is refused outright rather
+        # than defaulted to either DECISIVE or UNRESOLVED.
+        if raw_status not in ("decisive", "unresolved"):
+            raise PackageUpdateHealthError(
+                "host-control returned an unknown evaluation status"
+            )
+        evaluation_status = HealthEvaluationStatus(raw_status)
+        (
+            settling_rounds,
+            settling_seconds,
+            last_round_span_ms,
+        ) = self._parse_settling(payload.get("settling"))
         return HostHealthResult(
             contract_revision=revision,
             contract_fingerprint=fingerprint,
             probes=tuple(probes),
+            evaluation_status=evaluation_status,
             reason=(
                 str(payload["reason"])[:100]
                 if isinstance(payload.get("reason"), str)
                 else None
             ),
+            settling_rounds=settling_rounds,
+            settling_seconds=settling_seconds,
+            last_round_span_ms=last_round_span_ms,
         )
+
+    @staticmethod
+    def _parse_settling(
+        raw: Any,
+    ) -> tuple[int | None, float | None, int | None]:
+        """Parse the host's bounded settling metadata, defensively.
+
+        Absent or malformed metadata never rejects an otherwise-valid answer
+        -- it is observability, not proof -- so a missing or malformed
+        ``settling`` block simply yields ``None`` for every field rather than
+        raising. Bounds mirror the helper's own: at most
+        ``SETTLING_DEADLINE_SECONDS`` plus a small margin of settled seconds,
+        and a small bounded round/span count.
+        """
+
+        if not isinstance(raw, Mapping):
+            return None, None, None
+        rounds = raw.get("rounds")
+        seconds = raw.get("settled_seconds")
+        span_ms = raw.get("last_round_span_ms")
+        bounded_rounds = (
+            rounds if type(rounds) is int and 0 <= rounds <= 1000 else None
+        )
+        bounded_seconds = (
+            float(seconds)
+            if isinstance(seconds, (int, float))
+            and not isinstance(seconds, bool)
+            and 0 <= seconds <= 3600
+            else None
+        )
+        bounded_span_ms = (
+            span_ms if type(span_ms) is int and 0 <= span_ms <= 3_600_000 else None
+        )
+        return bounded_rounds, bounded_seconds, bounded_span_ms
 
     @staticmethod
     def _parse_probe(raw: Any) -> HostProbeResult:
@@ -378,7 +457,12 @@ class SshPackageUpdateHealthHostControl:
                 "host-control returned an unsupported probe kind"
             ) from exc
         target = raw["target"]
-        if (
+        if kind is HealthProbeKind.GUEST_OPERATIONAL:
+            if target is not None:
+                raise PackageUpdateHealthError(
+                    "host-control returned a target for a guest_operational probe"
+                )
+        elif (
             not isinstance(target, str)
             or not 1 <= len(target) <= MAX_HEALTH_PROBE_TARGET_LENGTH
         ):

@@ -8,6 +8,13 @@ atomicity that keeps a half-written contract out of any committed state, or
 the read-time verification that catches an inconsistent row set a direct-SQL
 repair could still have reconstructed.
 
+A current package-managed LXC is nevertheless never *left* unconfigured: the
+backend provisions the built-in `guest_operational` default for it during
+reconciliation, so revision 1 of any LXC here is that default and an
+explicit operator contract starts at revision 2. The primitives above still
+have to distinguish "no contract" from "a contract", so the tests that are
+about that distinction use `_unconfigured` to get back there deliberately.
+
 No health EXECUTION exists in this stage, so nothing here runs, schedules, or
 interprets a probe.
 """
@@ -22,6 +29,7 @@ import pytest
 
 from app.inventory import (
     AuthorityConflict,
+    DEFAULT_HEALTH_PROBES,
     AuthorityInvariantError,
     AuthorityNotFound,
     HealthContractError,
@@ -127,8 +135,15 @@ def _rediscover(
 
 
 SYSTEMD = HealthProbeKind.SYSTEMD_UNIT_ACTIVE
-RUNNING = HealthProbeKind.DOCKER_CONTAINER_RUNNING
-HEALTHY = HealthProbeKind.DOCKER_CONTAINER_HEALTHY
+# v0.5 dropped Docker-specific health probes entirely (see
+# tests/test_health_scope_reduction.py for the explicit-refusal coverage).
+# `systemd_unit_active` is now the only targeted advanced kind, and these two
+# names stay distinct aliases for it -- purely so the many generic
+# revision/versioning/race tests below that only need "two probes with
+# different (kind, target) identities" read the way they always did, never
+# because the two names still mean two different KINDS.
+RUNNING = HealthProbeKind.SYSTEMD_UNIT_ACTIVE
+HEALTHY = HealthProbeKind.SYSTEMD_UNIT_ACTIVE
 
 
 def _probes(*pairs: tuple[HealthProbeKind, str]) -> tuple[ResourceHealthProbe, ...]:
@@ -171,6 +186,172 @@ def _last_allocated_revision(store, resource_id: str) -> int | None:
     return None if row is None else int(row[0])
 
 
+GUEST_OPERATIONAL = HealthProbeKind.GUEST_OPERATIONAL
+
+
+def _unconfigured(authority, resource_id: str) -> None:
+    """Take a current managed LXC back to genuinely *unconfigured*.
+
+    The low-level clear is the only route there, because reconciliation
+    provisions the built-in default for every current managed LXC. It does
+    not rewind the revision allocator, so the first explicit contract after
+    it is revision 2 -- exactly the anti-ABA property `clear` has always had.
+    """
+
+    authority.clear_resource_health_contract(resource_id)
+
+
+# ===========================================================================
+# guest_operational: the v0.5 built-in DEFAULT, never a faked target.
+# ===========================================================================
+
+
+def test_guest_operational_can_be_declared_with_no_target(tmp_path: Path) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+
+    contract = authority.replace_resource_health_contract(
+        rid, (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),)
+    )
+    assert contract.probes == (
+        ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),
+    )
+    assert authority.resource_health_contract(rid).probes[0].target is None
+
+    # Durable, and correctly nullable in the real schema, not merely in the
+    # Python model.
+    _, probe_rows = _raw_rows(store)
+    (row,) = [row for row in probe_rows if row["resource_id"] == rid]
+    assert row["target"] is None
+    assert row["kind"] == "guest_operational"
+
+
+def test_guest_operational_rejects_a_supplied_target(tmp_path: Path) -> None:
+    """No faked target -- `"guest"`, a VMID string, anything -- is accepted
+    for the one kind that names no container or unit."""
+
+    _, _, authority, resource = _system(tmp_path)
+    with pytest.raises(HealthContractError, match="must not carry a target"):
+        authority.replace_resource_health_contract(
+            resource.resource_id,
+            (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target="guest"),),
+        )
+
+
+def test_every_other_kind_still_requires_a_target(tmp_path: Path) -> None:
+    _, _, authority, resource = _system(tmp_path)
+    with pytest.raises(HealthContractError):
+        authority.replace_resource_health_contract(
+            resource.resource_id,
+            (ResourceHealthProbe(kind=RUNNING, target=None),),
+        )
+
+
+def test_at_most_one_guest_operational_probe_is_ever_accepted(
+    tmp_path: Path,
+) -> None:
+    """Two `guest_operational` probes have the IDENTICAL (kind, None)
+    identity, so the existing duplicate-probe rule is exactly the "at most
+    one" rule for this kind -- no separate mechanism was invented."""
+
+    _, _, authority, resource = _system(tmp_path)
+    with pytest.raises(HealthContractError, match="duplicate"):
+        authority.replace_resource_health_contract(
+            resource.resource_id,
+            (
+                ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),
+                ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),
+            ),
+        )
+
+
+def test_guest_operational_and_systemd_mixed_contract_refused(
+    tmp_path: Path,
+) -> None:
+    """v0.5 health scope reduction: the baseline and an advanced contract
+    never mix. `guest_operational` is the backend-owned baseline; an explicit
+    `systemd_unit_active` contract REPLACES it entirely, it does not extend
+    it -- mixing them would silently reintroduce the settling coupling the
+    baseline is deliberately free of (PRODUCT.md, "What healthy means")."""
+
+    _, _, authority, resource = _system(tmp_path)
+    with pytest.raises(HealthContractError, match="guest_operational"):
+        authority.replace_resource_health_contract(
+            resource.resource_id,
+            DEFAULT_PROBES + (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),),
+        )
+
+
+def test_sql_directly_refuses_inserting_a_non_null_target_for_guest_operational(
+    tmp_path: Path,
+) -> None:
+    """Defense in depth in the REAL deployed schema, not just the standalone
+    mirror this test file's SQL-level section already exercises for the
+    other kinds. Probe rows are insert-only (never updated in place), so
+    this proves the CHECK constraint at the one place a bad row could ever
+    be introduced."""
+
+    _, store, authority, resource = _system(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO resource_health_contract_probes "
+                "VALUES (?, 0, 'guest_operational', 'fake')",
+                (resource.resource_id,),
+            )
+
+
+def test_sql_directly_refuses_a_guest_operational_row_beside_another_probe(
+    tmp_path: Path,
+) -> None:
+    """v21 defense in depth: `resource_health_contract_no_mixed_baseline`
+    refuses a `guest_operational` row the moment its parent contract's own
+    declared `probe_count` is not exactly 1 -- independently of the Python
+    `canonical_health_probes` check every ordinary write already goes
+    through, and independently of `_ONE_GUEST_OPERATIONAL_PROBE_SQL`'s
+    partial unique index (which only stops a SECOND `guest_operational`
+    row, not a DIFFERENT kind alongside the first)."""
+
+    _, store, authority, resource = _system(tmp_path)
+    existing = authority.resource_health_contract(resource.resource_id)
+    assert existing.probes == (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        # Replace the real singleton contract row with one that CLAIMS two
+        # probes but has none yet -- the exact pre-state a legitimate
+        # two-probe contract has for one instant during its own atomic
+        # replacement (contract row inserted, probe rows not yet filled).
+        connection.execute(
+            "DELETE FROM resource_health_contracts WHERE resource_id=?",
+            (resource.resource_id,),
+        )
+        connection.execute(
+            "DELETE FROM resource_health_contract_probes WHERE resource_id=?",
+            (resource.resource_id,),
+        )
+        connection.execute(
+            "INSERT INTO resource_health_contracts("
+            "resource_id, revision, fingerprint, probe_count, created_at, "
+            "updated_at) VALUES (?, ?, ?, 2, ?, ?)",
+            (
+                resource.resource_id,
+                existing.revision,
+                existing.fingerprint,
+                existing.created_at,
+                existing.updated_at,
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO resource_health_contract_probes"
+                "(resource_id, probe_index, kind, target) "
+                "VALUES (?, 0, 'guest_operational', NULL)",
+                (resource.resource_id,),
+            )
+
+
 # ===========================================================================
 # A. SCHEMA
 # ===========================================================================
@@ -181,7 +362,7 @@ def test_fresh_database_is_schema_v15_with_the_health_contract_tables(
 ) -> None:
     from app.inventory.store import AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION
 
-    assert AUTHORITY_SCHEMA_VERSION == 19
+    assert AUTHORITY_SCHEMA_VERSION == 21
     InventoryAuthorityStore(tmp_path / "authority.db")
     with sqlite3.connect(tmp_path / "authority.db") as connection:
         marker, version = connection.execute(
@@ -286,7 +467,7 @@ def test_sql_refuses_a_duplicate_probe_and_a_probe_beyond_the_declared_set(
             connection.execute(
                 "INSERT INTO resource_health_contract_probes("
                 "resource_id, probe_index, kind, target) "
-                "VALUES(?, 1, 'docker_container_running', 'redis')",
+                "VALUES(?, 1, 'systemd_unit_active', 'redis.service')",
                 (resource.resource_id,),
             )
         # And a duplicate identity is refused even at a legal-looking index.
@@ -326,9 +507,10 @@ def test_sql_refuses_editing_a_contract_or_shrinking_a_live_probe_set(
                 (resource.resource_id,),
             )
     # The complete original contract is untouched by all three refusals.
+    # Revision 2: revision 1 is the built-in default this replaced.
     stored = store.resource_health_contract(resource.resource_id)
     assert stored is not None
-    assert stored.revision == 1
+    assert stored.revision == 2
     assert stored.probes == tuple(
         sorted(DEFAULT_PROBES, key=lambda probe: (probe.kind.value, probe.target))
     )
@@ -420,18 +602,26 @@ def test_the_fingerprint_is_independent_of_declaration_order(tmp_path: Path) -> 
     assert repeated == first
     assert [probe.target for probe in first.probes] == [
         "immich_server",
-        "redis",
         "nginx.service",
+        "redis",
     ]
 
 
-def test_the_fingerprint_separates_kind_from_target(tmp_path: Path) -> None:
-    """Same target, different required condition, is a different contract."""
+def test_the_fingerprint_separates_target_within_one_kind(tmp_path: Path) -> None:
+    """Same kind, different target, is a different contract.
 
-    running = health_contract_fingerprint(_probes((RUNNING, "immich_server")))
-    healthy = health_contract_fingerprint(_probes((HEALTHY, "immich_server")))
-    assert running != healthy
-    assert healthy != health_contract_fingerprint(_probes((HEALTHY, "immich_web")))
+    Pre-v0.5-reduction this also proved the fingerprint separates KIND from
+    target using two different targeted Docker kinds; `systemd_unit_active`
+    is now the only targeted kind that can share a contract shape with
+    itself (an advanced contract can hold several), so that half of the
+    property is proven the only way still constructible. Kind is still part
+    of the fingerprint payload by construction (`health_contract_fingerprint`
+    hashes `{kind, target}` pairs), not merely by absence of a counterexample.
+    """
+
+    web = health_contract_fingerprint(_probes((SYSTEMD, "immich_web.service")))
+    server = health_contract_fingerprint(_probes((SYSTEMD, "immich_server.service")))
+    assert web != server
 
 
 @pytest.mark.parametrize(
@@ -458,6 +648,7 @@ def test_malformed_contract_material_is_refused_before_it_is_stored(
     tmp_path: Path, probes, message: str
 ) -> None:
     _, store, authority, resource = _system(tmp_path)
+    _unconfigured(authority, resource.resource_id)
     with pytest.raises(HealthContractError, match=message):
         authority.replace_resource_health_contract(resource.resource_id, probes)
     assert store.resource_health_contract(resource.resource_id) is None
@@ -508,6 +699,14 @@ def test_set_read_replace_and_clear_on_one_current_resource(tmp_path: Path) -> N
     clock, store, authority, resource = _system(tmp_path)
     rid = resource.resource_id
 
+    # A current managed LXC arrives already carrying the built-in default.
+    builtin = authority.resource_health_contract(rid)
+    assert builtin is not None
+    assert (builtin.revision, builtin.probes) == (1, DEFAULT_HEALTH_PROBES)
+
+    # The rest of this test is about the *unconfigured* state itself, which
+    # only the low-level clear still produces.
+    _unconfigured(authority, rid)
     assert authority.resource_health_contract(rid) is None
     assert _health_contract_view(store, authority, rid) == {
         "status": "unconfigured",
@@ -518,19 +717,19 @@ def test_set_read_replace_and_clear_on_one_current_resource(tmp_path: Path) -> N
     }
 
     first = authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
-    assert (first.revision, len(first.probes)) == (1, 2)
+    assert (first.revision, len(first.probes)) == (2, 2)
     assert authority.resource_health_contract(rid) == first
 
     replaced = authority.replace_resource_health_contract(
         rid, DEFAULT_PROBES + _probes((RUNNING, "redis"))
     )
-    assert replaced.revision == 2
+    assert replaced.revision == 3
     assert replaced.created_at == first.created_at
     assert replaced.fingerprint != first.fingerprint
     published = _health_contract_view(store, authority, rid)
     assert published == {
         "status": "configured",
-        "revision": 2,
+        "revision": 3,
         "fingerprint": replaced.fingerprint,
         "probe_count": 3,
         "updated_at": replaced.updated_at,
@@ -573,7 +772,7 @@ def test_replacement_never_leaves_a_mixed_revision_probe_set(tmp_path: Path) -> 
     contracts, probes = _raw_rows(store)
     assert len(contracts) == 1
     assert [(str(row["kind"]), str(row["target"])) for row in probes] == [
-        ("docker_container_running", "redis")
+        ("systemd_unit_active", "redis")
     ]
     assert int(contracts[0]["probe_count"]) == 1
     assert store.resource_health_contract(resource.resource_id) == replaced
@@ -658,17 +857,23 @@ def test_a_qemu_resource_cannot_hold_a_contract_no_executor_could_honour(
     }
 
 
-def test_a_vmid_reuse_replacement_inherits_no_contract(tmp_path: Path) -> None:
-    """A new incarnation at the same VMID starts unconfigured.
+def test_a_vmid_reuse_replacement_inherits_nothing_and_gets_the_builtin_default(
+    tmp_path: Path,
+) -> None:
+    """A new incarnation at the same VMID inherits no operator contract.
 
     This is the whole reason the contract is keyed by `resource_id`: the
     replacement is a different workload that happens to occupy the same
     locator, and silently handing it the previous workload's definition of
     healthy would be a false claim about a machine nobody has configured.
+    What it gets instead is the backend's own built-in default -- a guest
+    liveness baseline that claims nothing about a workload at all.
     """
 
     _, store, authority, original = _system(tmp_path)
-    authority.replace_resource_health_contract(original.resource_id, DEFAULT_PROBES)
+    declared = authority.replace_resource_health_contract(
+        original.resource_id, DEFAULT_PROBES
+    )
 
     # Two replacements at the same VMID, ending back at an LXC: the final
     # incarnation is an ordinary contract-eligible guest that simply has no
@@ -684,11 +889,17 @@ def test_a_vmid_reuse_replacement_inherits_no_contract(tmp_path: Path) -> None:
     )
     assert successor.vmid == original.vmid
 
-    assert store.resource_health_contract(successor.resource_id) is None
-    assert authority.resource_health_contract(successor.resource_id) is None
+    inherited = authority.resource_health_contract(successor.resource_id)
+    assert inherited == store.resource_health_contract(successor.resource_id)
+    assert inherited is not None
+    # The built-in default on its OWN fresh counter, never the predecessor's
+    # Docker/systemd contract and never the predecessor's revision.
+    assert inherited.probes == DEFAULT_HEALTH_PROBES
+    assert inherited.revision == 1
+    assert inherited.fingerprint != declared.fingerprint
     view = InventoryPublication(store, authority).read()
     by_id = {item["resource_id"]: item for item in view.resources}
-    assert by_id[successor.resource_id]["health_contract"]["status"] == "unconfigured"
+    assert by_id[successor.resource_id]["health_contract"]["status"] == "configured"
     # The predecessor keeps its own historical row -- ordinary FK provenance,
     # not a contract any replacement can use.
     assert by_id[original.resource_id]["health_contract"]["status"] == "configured"
@@ -707,9 +918,13 @@ def test_a_replaced_incarnation_can_no_longer_be_edited(tmp_path: Path) -> None:
     ):
         with pytest.raises(AuthorityConflict):
             call()
-    # And nothing was written by the refusals.
+    # And nothing was written by the refusals: the retired incarnation still
+    # carries exactly the revision-2 contract it had (revision 1 was the
+    # built-in default this replaced), and the QEMU successor gets none.
     contracts, _probe_rows = _raw_rows(store)
-    assert int(contracts[0]["revision"]) == 1
+    assert [
+        (str(row["resource_id"]), int(row["revision"])) for row in contracts
+    ] == [(original.resource_id, 2)]
 
 
 def test_the_same_resource_keeps_its_contract_across_a_node_move_and_rename(
@@ -756,24 +971,25 @@ def test_a_revision_is_never_reused_after_a_clear(tmp_path: Path) -> None:
     first = authority.replace_resource_health_contract(
         rid, _probes((SYSTEMD, "a.service"))
     )
-    assert first.revision == 1
-    # An ordinary operator opens the editor here and holds revision 1.
+    # Revision 2: revision 1 is the built-in default this replaced.
+    assert first.revision == 2
+    # An ordinary operator opens the editor here and holds revision 2.
 
-    assert authority.clear_resource_health_contract(rid, expected_revision=1) is True
-    assert _last_allocated_revision(store, rid) == 1
+    assert authority.clear_resource_health_contract(rid, expected_revision=2) is True
+    assert _last_allocated_revision(store, rid) == 2
 
     second = authority.replace_resource_health_contract(
         rid, _probes((RUNNING, "redis")), expected_revision=0
     )
-    assert second.revision == 2
+    assert second.revision == 3
 
     # The stale editor's revision names a generation that is gone, and must
     # never match again -- not now, and not after any number of later cycles.
     for call in (
         lambda: authority.replace_resource_health_contract(
-            rid, _probes((SYSTEMD, "hostile.service")), expected_revision=1
+            rid, _probes((SYSTEMD, "hostile.service")), expected_revision=2
         ),
-        lambda: authority.clear_resource_health_contract(rid, expected_revision=1),
+        lambda: authority.clear_resource_health_contract(rid, expected_revision=2),
     ):
         with pytest.raises(HealthContractRevisionConflict):
             call()
@@ -827,8 +1043,10 @@ def test_revisions_stay_strictly_increasing_across_many_clear_cycles(
             ).revision
         )
         authority.clear_resource_health_contract(rid)
-    assert seen == sorted(set(seen)) == [1, 2, 3, 4, 5, 6, 7, 8]
-    assert _last_allocated_revision(store, rid) == 8
+    # Starting at 2: revision 1 is the built-in default the first cycle
+    # replaced.
+    assert seen == sorted(set(seen)) == [2, 3, 4, 5, 6, 7, 8, 9]
+    assert _last_allocated_revision(store, rid) == 9
     # And every stale revision from every cycle stays stale forever.
     authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
     for stale in seen:
@@ -843,19 +1061,20 @@ def test_clearing_consumes_no_revision_and_keeps_the_counter(tmp_path: Path) -> 
     rid = resource.resource_id
     authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
     authority.replace_resource_health_contract(rid, _probes((RUNNING, "redis")))
-    assert _last_allocated_revision(store, rid) == 2
+    # 1 is the built-in default; 2 and 3 are the two explicit contracts.
+    assert _last_allocated_revision(store, rid) == 3
 
     authority.clear_resource_health_contract(rid)
     # No contract row and no probe rows -- absence is still what
     # "unconfigured" means -- but the allocation history survives.
     assert _raw_rows(store) == ([], [])
     assert store.resource_health_contract(rid) is None
-    assert _last_allocated_revision(store, rid) == 2
+    assert _last_allocated_revision(store, rid) == 3
 
     # A second clear is still a no-op and still consumes nothing.
     assert authority.clear_resource_health_contract(rid) is False
-    assert _last_allocated_revision(store, rid) == 2
-    assert authority.replace_resource_health_contract(rid, DEFAULT_PROBES).revision == 3
+    assert _last_allocated_revision(store, rid) == 3
+    assert authority.replace_resource_health_contract(rid, DEFAULT_PROBES).revision == 4
 
 
 def test_a_rolled_back_replacement_consumes_no_revision(
@@ -866,7 +1085,7 @@ def test_a_rolled_back_replacement_consumes_no_revision(
     _, store, authority, resource = _system(tmp_path)
     rid = resource.resource_id
     authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
-    assert _last_allocated_revision(store, rid) == 1
+    assert _last_allocated_revision(store, rid) == 2
 
     def explode(self, connection, *, resource_id):
         raise RuntimeError("simulated failure after the revision allocation")
@@ -879,14 +1098,14 @@ def test_a_rolled_back_replacement_consumes_no_revision(
             authority.replace_resource_health_contract(
                 rid, _probes((RUNNING, "redis"))
             )
-    assert _last_allocated_revision(store, rid) == 1
+    assert _last_allocated_revision(store, rid) == 2
 
     monkeypatch.undo()
     assert (
         authority.replace_resource_health_contract(
             rid, _probes((RUNNING, "redis"))
         ).revision
-        == 2
+        == 3
     )
 
 
@@ -935,7 +1154,10 @@ def test_sql_refuses_a_contract_row_that_bypasses_the_revision_allocator(
 
     with sqlite3.connect(store.path) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
-        for skipped_ahead in (2, 3, 99):
+        # 2 is the current allocator value (1 was the built-in default), and
+        # re-inserting at exactly that value is deliberately indistinguishable
+        # at the SQL level -- see the docstring. Everything ABOVE it is not.
+        for skipped_ahead in (3, 4, 99):
             with pytest.raises(sqlite3.IntegrityError):
                 connection.execute(
                     "INSERT INTO resource_health_contracts("
@@ -945,8 +1167,12 @@ def test_sql_refuses_a_contract_row_that_bypasses_the_revision_allocator(
                 )
 
     # A resource that has never had a contract has no allocator row at all,
-    # so a hand-written contract row cannot precede one.
-    _, other_store, _other_authority, other = _system(tmp_path / "other")
+    # so a hand-written contract row cannot precede one. A QEMU guest is the
+    # one that genuinely never gets one: the built-in default is provisioned
+    # for managed LXC resources only.
+    _, other_store, _other_authority, other = _system(
+        tmp_path / "other", resource_type="qemu"
+    )
     assert _last_allocated_revision(other_store, other.resource_id) is None
     with sqlite3.connect(other_store.path) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
@@ -967,7 +1193,8 @@ def test_a_replacement_resource_does_not_inherit_the_revision_counter(
     authority.replace_resource_health_contract(
         original.resource_id, _probes((RUNNING, "redis"))
     )
-    assert _last_allocated_revision(store, original.resource_id) == 2
+    # 1 built-in default + 2 explicit contracts.
+    assert _last_allocated_revision(store, original.resource_id) == 3
 
     _rediscover(authority, original.inventory_source_id, resource_type="qemu")
     _rediscover(authority, original.inventory_source_id, resource_type="lxc")
@@ -977,16 +1204,17 @@ def test_a_replacement_resource_does_not_inherit_the_revision_counter(
         if item.resource_type == "lxc" and item.resource_id != original.resource_id
     )
 
-    # A different workload at the same VMID starts with no counter and no
-    # contract; the predecessor keeps its own history.
-    assert _last_allocated_revision(store, successor.resource_id) is None
+    # A different workload at the same VMID starts on its OWN counter: the
+    # only revision it has ever been handed is 1, for the built-in default it
+    # was just provisioned. The predecessor keeps its own history.
+    assert _last_allocated_revision(store, successor.resource_id) == 1
     assert (
         authority.replace_resource_health_contract(
             successor.resource_id, DEFAULT_PROBES
         ).revision
-        == 1
+        == 2
     )
-    assert _last_allocated_revision(store, original.resource_id) == 2
+    assert _last_allocated_revision(store, original.resource_id) == 3
 
 
 def test_the_revision_counter_survives_a_rename_and_node_move(tmp_path: Path) -> None:
@@ -994,6 +1222,7 @@ def test_the_revision_counter_survives_a_rename_and_node_move(tmp_path: Path) ->
     rid = resource.resource_id
     authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
     authority.clear_resource_health_contract(rid)
+    assert _last_allocated_revision(store, rid) == 2
 
     _rediscover(
         authority,
@@ -1004,10 +1233,16 @@ def test_the_revision_counter_survives_a_rename_and_node_move(tmp_path: Path) ->
         observed_at="2026-08-28T13:00:00+00:00",
     )
     assert store.list_resources()[0].resource_id == rid
-    assert _last_allocated_revision(store, rid) == 1
-    assert authority.replace_resource_health_contract(rid, DEFAULT_PROBES).revision == 2
+    # Same durable resource, so the same counter -- and reconciliation
+    # re-provisioned the built-in default on top of it (revision 3) rather
+    # than leaving a current managed LXC update-blocked.
+    restored = authority.resource_health_contract(rid)
+    assert restored is not None
+    assert (restored.revision, restored.probes) == (3, DEFAULT_HEALTH_PROBES)
+    assert _last_allocated_revision(store, rid) == 3
+    assert authority.replace_resource_health_contract(rid, DEFAULT_PROBES).revision == 4
     with pytest.raises(HealthContractRevisionConflict):
-        authority.clear_resource_health_contract(rid, expected_revision=1)
+        authority.clear_resource_health_contract(rid, expected_revision=2)
 
 
 def test_concurrent_clear_and_replace_never_duplicate_a_revision(
@@ -1043,6 +1278,7 @@ def test_concurrent_clear_and_replace_never_duplicate_a_revision(
 def test_compare_and_set_refuses_a_stale_editor(tmp_path: Path) -> None:
     _, store, authority, resource = _system(tmp_path)
     rid = resource.resource_id
+    _unconfigured(authority, rid)
 
     # `expected_revision=0` asserts "there is no contract yet".
     first = authority.replace_resource_health_contract(
@@ -1056,20 +1292,20 @@ def test_compare_and_set_refuses_a_stale_editor(tmp_path: Path) -> None:
     second = authority.replace_resource_health_contract(
         rid, _probes((RUNNING, "redis")), expected_revision=first.revision
     )
-    assert second.revision == 2
-    # An editor still holding revision 1 may not discard revision 2.
+    assert (first.revision, second.revision) == (2, 3)
+    # An editor still holding revision 2 may not discard revision 3.
     with pytest.raises(HealthContractRevisionConflict, match="expected revision"):
         authority.replace_resource_health_contract(
-            rid, _probes((SYSTEMD, "other.service")), expected_revision=1
+            rid, _probes((SYSTEMD, "other.service")), expected_revision=2
         )
     with pytest.raises(HealthContractRevisionConflict, match="expected revision"):
-        authority.clear_resource_health_contract(rid, expected_revision=1)
+        authority.clear_resource_health_contract(rid, expected_revision=2)
     # It is still an AuthorityConflict, so an ordinary caller that only
     # distinguishes "refused" keeps working.
     assert issubclass(HealthContractRevisionConflict, AuthorityConflict)
     assert store.resource_health_contract(rid) == second
 
-    assert authority.clear_resource_health_contract(rid, expected_revision=2) is True
+    assert authority.clear_resource_health_contract(rid, expected_revision=3) is True
 
 
 def test_an_unconditional_write_still_advances_exactly_one_revision(
@@ -1084,7 +1320,8 @@ def test_an_unconditional_write_still_advances_exactly_one_revision(
                 rid, _probes((SYSTEMD, f"unit-{index}.service"))
             ).revision
         )
-    assert revisions == [1, 2, 3, 4]
+    # Starting at 2: revision 1 is the built-in default.
+    assert revisions == [2, 3, 4, 5]
 
 
 def test_concurrent_replacements_serialize_without_a_visible_partial_contract(
@@ -1105,10 +1342,10 @@ def test_concurrent_replacements_serialize_without_a_visible_partial_contract(
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [future.result() for future in (pool.submit(write, left), pool.submit(write, right))]
 
-    assert {result.revision for result in results} == {2, 3}
+    assert {result.revision for result in results} == {3, 4}
     final = store.resource_health_contract(rid)
     assert final is not None
-    assert final.revision == 3
+    assert final.revision == 4
     assert final.fingerprint == health_contract_fingerprint(final.probes)
     assert len(final.probes) in {5, 8}
     contracts, probe_rows = _raw_rows(store)
@@ -1146,6 +1383,232 @@ def test_a_concurrent_clear_and_replace_never_produce_orphan_probes(
 
 
 # ===========================================================================
+# E2. THE BUILT-IN v0.5 DEFAULT
+#
+# A package-managed LXC gets `guest_operational` from the backend as a PRODUCT
+# decision. It is not inferred from the guest: absence of a workload observer
+# is not proof of workload absence, so nothing here inspects Docker, systemd,
+# a socket, or a process to choose it.
+# ===========================================================================
+
+
+def test_a_newly_current_managed_lxc_gets_the_builtin_default(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+
+    contract = authority.resource_health_contract(rid)
+    assert contract is not None
+    assert contract.revision == 1
+    assert contract.probes == (
+        ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),
+    )
+    assert contract.probes[0].target is None
+    assert contract.fingerprint == health_contract_fingerprint(DEFAULT_HEALTH_PROBES)
+    assert _health_contract_view(store, authority, rid)["status"] == "configured"
+
+    # Durable, and correctly targetless in the real schema.
+    contracts, probe_rows = _raw_rows(store)
+    assert [(str(row["kind"]), row["target"]) for row in probe_rows] == [
+        ("guest_operational", None)
+    ]
+    assert int(contracts[0]["probe_count"]) == 1
+
+
+def test_repeated_reconciliation_of_the_default_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """No revision churn, no republish churn, no second contract."""
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    first = authority.resource_health_contract(rid)
+    published_before = store.backend_instance().published_state_revision
+
+    for index in range(3):
+        _rediscover(
+            authority,
+            resource.inventory_source_id,
+            observed_at=f"2026-08-28T1{index}:00:00+00:00",
+        )
+
+    assert authority.resource_health_contract(rid) == first
+    assert _last_allocated_revision(store, rid) == 1
+    contracts, probe_rows = _raw_rows(store)
+    assert (len(contracts), len(probe_rows)) == (1, 1)
+    # Reconciliation republishes on its own; what must not happen is a
+    # SECOND contract generation per discovery run.
+    assert store.backend_instance().published_state_revision > published_before
+
+
+def test_a_qemu_guest_never_gets_a_default_contract(tmp_path: Path) -> None:
+    """The default is a package-managed-LXC product decision, nothing wider."""
+
+    _, store, authority, resource = _system(tmp_path, resource_type="qemu")
+    assert _raw_rows(store) == ([], [])
+    assert _last_allocated_revision(store, resource.resource_id) is None
+    assert (
+        _health_contract_view(store, authority, resource.resource_id)["status"]
+        == "unsupported"
+    )
+
+
+@pytest.mark.parametrize(
+    "probes",
+    (
+        _probes((HEALTHY, "web")),
+        _probes((SYSTEMD, "mariadb.service")),
+        _probes((SYSTEMD, "mariadb.service"), (RUNNING, "web")),
+    ),
+)
+def test_an_explicit_advanced_contract_is_never_replaced_by_the_default(
+    tmp_path: Path, probes
+) -> None:
+    """B: the operator's own contract wins, forever, across any number of
+    discovery runs."""
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    declared = authority.replace_resource_health_contract(rid, probes)
+
+    for index in range(3):
+        _rediscover(
+            authority,
+            resource.inventory_source_id,
+            observed_at=f"2026-08-28T1{index}:00:00+00:00",
+        )
+
+    assert authority.resource_health_contract(rid) == declared
+    assert _last_allocated_revision(store, rid) == declared.revision
+
+
+def test_reset_restores_the_default_with_compare_and_set(tmp_path: Path) -> None:
+    """C: advanced contract -> explicit reset -> the built-in default."""
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    advanced = authority.replace_resource_health_contract(
+        rid, _probes((HEALTHY, "web"))
+    )
+
+    # A stale editor cannot discard the advanced contract by resetting.
+    with pytest.raises(HealthContractRevisionConflict):
+        authority.reset_resource_health_contract(rid, expected_revision=1)
+    assert authority.resource_health_contract(rid) == advanced
+
+    reset = authority.reset_resource_health_contract(
+        rid, expected_revision=advanced.revision
+    )
+    assert reset.probes == DEFAULT_HEALTH_PROBES
+    assert reset.revision == advanced.revision + 1
+    assert authority.resource_health_contract(rid) == reset
+
+    # Resetting an already-default contract is idempotent: identical material
+    # is not a change, so it consumes no revision.
+    again = authority.reset_resource_health_contract(rid)
+    assert again == reset
+    assert _last_allocated_revision(store, rid) == reset.revision
+
+    # And it never leaves the resource unconfigured/update-blocked.
+    assert _health_contract_view(store, authority, rid)["status"] == "configured"
+
+
+def test_reset_reaches_the_default_from_unconfigured_too(tmp_path: Path) -> None:
+    _, _store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    _unconfigured(authority, rid)
+
+    restored = authority.reset_resource_health_contract(rid, expected_revision=0)
+    assert restored.probes == DEFAULT_HEALTH_PROBES
+
+
+def test_reset_refuses_a_resource_that_is_not_a_current_managed_lxc(
+    tmp_path: Path,
+) -> None:
+    _, _store, authority, original = _system(tmp_path)
+    _rediscover(authority, original.inventory_source_id, resource_type="qemu")
+    with pytest.raises(AuthorityConflict):
+        authority.reset_resource_health_contract(original.resource_id)
+    with pytest.raises(AuthorityNotFound):
+        authority.reset_resource_health_contract(
+            "11111111-1111-1111-1111-111111111111"
+        )
+
+
+def test_default_provisioning_runs_no_guest_command_at_all(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """F/G, and the architecture fence for this whole simplification.
+
+    Provisioning the default must never grow back into workload inference.
+    The witness is deliberately blunt: the authority is not allowed to spawn
+    ANY process while a managed LXC is being reconciled and defaulted, so a
+    reintroduced `docker ps`, `systemctl list-unit-files`, `command -v
+    docker`, socket probe, or process scan fails this test immediately --
+    whatever guest the resource happens to be.
+
+    It says nothing about advanced probes, which still legitimately run
+    Docker and systemd commands through the job-bound health boundary.
+    """
+
+    import subprocess
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "default health provisioning executed a subprocess: "
+            f"{args!r} {kwargs!r}"
+        )
+
+    for name in ("run", "Popen", "check_output", "call", "check_call"):
+        monkeypatch.setattr(subprocess, name, forbidden)
+    monkeypatch.setattr("os.system", forbidden)
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    assert authority.resource_health_contract(rid).probes == DEFAULT_HEALTH_PROBES
+
+    # And again on the re-provisioning path, from unconfigured.
+    _unconfigured(authority, rid)
+    _rediscover(authority, resource.inventory_source_id)
+    assert authority.resource_health_contract(rid).probes == DEFAULT_HEALTH_PROBES
+    assert store.resource_health_contract(rid) is not None
+
+
+def test_the_default_makes_no_claim_about_docker_being_absent(
+    tmp_path: Path,
+) -> None:
+    """G: the Docker counterexample is simply not a special case any more.
+
+    A guest that really does run Docker but whose `docker` CLI cannot be
+    observed is indistinguishable, to this path, from any other LXC -- and
+    that is the point. The default asserts guest liveness, never "there is
+    no Docker here", so there is nothing for a hidden runtime to falsify.
+    """
+
+    _, store, authority, resource = _system(tmp_path)
+    contract = authority.resource_health_contract(resource.resource_id)
+    assert contract.probes == DEFAULT_HEALTH_PROBES
+    # The stored material carries exactly one kind and no adapter, workload,
+    # runtime, absence, or recommendation field of any sort.
+    contracts, probe_rows = _raw_rows(store)
+    assert set(probe_rows[0].keys()) == {
+        "resource_id",
+        "probe_index",
+        "kind",
+        "target",
+    }
+    assert set(contracts[0].keys()) == {
+        "resource_id",
+        "revision",
+        "fingerprint",
+        "probe_count",
+        "created_at",
+        "updated_at",
+    }
+
+
+# ===========================================================================
 # F. THE CONTRACT LAYER TOUCHES NOTHING ELSE
 # ===========================================================================
 
@@ -1174,3 +1637,50 @@ def test_contract_writes_republish_without_touching_the_inventory_revision(
     after = store.backend_instance()
     assert after.inventory_revision == before.inventory_revision
     assert after.published_state_revision > before.published_state_revision
+
+
+def test_a_stopped_managed_lxc_still_receives_the_builtin_default(
+    tmp_path: Path,
+) -> None:
+    """The default contract is CONFIGURATION, never a runtime observation.
+
+    The eligibility predicate is exactly "current, package-managed LXC":
+    present, active, `lxc`, with a current locator binding and a current
+    node. `status` is deliberately NOT part of it. A stopped guest is still
+    the resource whose health this contract describes, and gating the
+    baseline on a temporary runtime condition would recreate the very dead
+    end this pivot removed -- a managed LXC that is UNCONFIGURED, and
+    therefore cannot be given an approved update, purely because it happened
+    to be down during the reconciliation that would have configured it.
+
+    Running remains a requirement only for scan/update/health EXECUTION
+    (`_package_scan_context_is_current`, and the helper's own
+    `revalidate_live_target`), never for contract creation.
+    """
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    source_id = resource.inventory_source_id
+    _unconfigured(authority, rid)
+    assert authority.resource_health_contract(rid) is None
+
+    _reconcile(
+        authority,
+        source_id,
+        status="stopped",
+        observed_at="2026-08-28T10:00:00+00:00",
+    )
+
+    assert store.list_resources()[0].status == "stopped"
+    contract = authority.resource_health_contract(rid)
+    assert contract is not None
+    assert contract.probes == DEFAULT_HEALTH_PROBES
+    assert contract.fingerprint == health_contract_fingerprint(DEFAULT_HEALTH_PROBES)
+    assert _health_contract_view(store, authority, rid)["status"] == "configured"
+
+    # The predicate provisioning shares with the package-scan target proof
+    # accepts the stopped resource too: neither is gated on `status`.
+    with sqlite3.connect(store.path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = authority._require_package_scan_target(connection, rid)
+    assert str(row["status"]) == "stopped"

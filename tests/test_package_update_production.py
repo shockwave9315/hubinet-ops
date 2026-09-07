@@ -43,6 +43,7 @@ import pytest
 
 from app.inventory import (
     AuthorityConflict,
+    DEFAULT_HEALTH_PROBES,
     HealthOutcome,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -53,9 +54,11 @@ from app.inventory import (
     ObservedSnapshot,
     PackageScanFailure,
     PackageUpdateCheckpoint,
+    PackageUpdateEventType,
     PackageUpdateIssuanceRefused,
     PackageUpdateJobStatus,
     ProductUpdateFenceError,
+    UNRESOLVED_HEALTH_REASONS,
     product_update_fence_path,
 )
 from app.package_scan import HostScanFailure, HostScanResult, expected_host_context
@@ -63,8 +66,10 @@ from app.package_scan_scheduler import PackageScanScheduler
 from app.inventory_runtime import PackageUpdateRuntime, create_read_only_app
 from app.inventory_runtime_config import parse_r0_runtime_config
 from app.package_update_health import (
+    HealthEvaluationStatus,
     HostHealthResult,
     HostProbeResult,
+    PackageUpdateHealthError,
     PackageUpdateHealthOrchestrator,
 )
 from app.package_update_mutation import PackageUpdateMutationOrchestrator
@@ -229,7 +234,58 @@ class ScriptedHealthHostControl:
                 contract_revision=request.health_contract_revision,
                 contract_fingerprint=request.health_contract_fingerprint,
                 probes=(),
+                evaluation_status=HealthEvaluationStatus.UNRESOLVED,
                 reason="guest_unavailable",
+            )
+        if isinstance(outcome, tuple):
+            # One UNRESOLVED observation round with EXPLICIT per-probe
+            # (outcome, reason) pairs, in frozen index order. Unlike
+            # "probe_unknown" this can mix outcomes, which is what a
+            # non-decisive round legitimately looks like when one probe is
+            # still transient and another already read PASSED.
+            return HostHealthResult(
+                contract_revision=request.health_contract_revision,
+                contract_fingerprint=request.health_contract_fingerprint,
+                probes=tuple(
+                    HostProbeResult(
+                        probe_index=index,
+                        kind=probe.kind,
+                        target=probe.target,
+                        outcome=probe_outcome,
+                        reason=probe_reason,
+                    )
+                    for index, (probe, (probe_outcome, probe_reason)) in enumerate(
+                        zip(request.probes, outcome, strict=True)
+                    )
+                ),
+                evaluation_status=HealthEvaluationStatus.UNRESOLVED,
+                settling_rounds=3,
+                settling_seconds=12.5,
+                last_round_span_ms=40,
+            )
+        if outcome == "probe_unknown":
+            # A genuine per-probe UNKNOWN (a settling window that ended
+            # transient, e.g. systemd's own `activating`): the host DID answer,
+            # with bounded settling metadata, and each probe carries a real
+            # observation -- this is what durably persists as bounded
+            # OBSERVATION evidence.
+            return HostHealthResult(
+                contract_revision=request.health_contract_revision,
+                contract_fingerprint=request.health_contract_fingerprint,
+                probes=tuple(
+                    HostProbeResult(
+                        probe_index=index,
+                        kind=probe.kind,
+                        target=probe.target,
+                        outcome=HealthProbeOutcome.UNKNOWN,
+                        reason=_unknown_reason_for(probe.kind),
+                    )
+                    for index, probe in enumerate(request.probes)
+                ),
+                evaluation_status=HealthEvaluationStatus.UNRESOLVED,
+                settling_rounds=37,
+                settling_seconds=180.0,
+                last_round_span_ms=42,
             )
         probes = tuple(
             HostProbeResult(
@@ -249,20 +305,25 @@ class ScriptedHealthHostControl:
             contract_revision=request.health_contract_revision,
             contract_fingerprint=request.health_contract_fingerprint,
             probes=probes,
+            evaluation_status=HealthEvaluationStatus.DECISIVE,
         )
+
+
+def _unknown_reason_for(kind: HealthProbeKind) -> str:
+    return {
+        HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_job_pending",
+        HealthProbeKind.GUEST_OPERATIONAL: "command_timed_out",
+    }[kind]
 
 
 def _reason_for(kind: HealthProbeKind, outcome: str) -> str:
     if outcome == "passed":
         return {
             HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_active",
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_running",
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_healthy",
+            HealthProbeKind.GUEST_OPERATIONAL: "guest_operational_confirmed",
         }[kind]
     return {
         HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_not_active",
-        HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_not_running",
-        HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_unhealthy",
     }[kind]
 
 
@@ -999,6 +1060,66 @@ def test_an_unproven_mutation_stays_uncertain_and_never_rolls_back(
 # ===========================================================================
 
 
+def test_explicit_rollback_survives_a_non_pass_default_health_on_a_dead_guest(
+    tmp_path: Path,
+) -> None:
+    """The load-bearing half of the v0.5 default-health pivot.
+
+    `guest_operational` is now the NORMAL criterion, and it has no FAIL
+    outcome at all: a guest this stage cannot positively prove down -- the
+    exact current LXC proven STOPPED by PVE included -- resolves to UNKNOWN,
+    never FAILED. So the operator's explicit same-job recovery path must be
+    reachable from an UNKNOWN verdict exactly as it is from a FAILED one.
+    Losing it would mean the default probe reporting "I could not tell"
+    silently withdrew the recovery path from precisely the guest that most
+    needs it.
+
+    Nothing here is automatic: the worker submits no rollback (NO
+    AUTO-ROLLBACK), stops at `health_unknown`, and the rollback below is an
+    explicit operator arming call.
+    """
+
+    system = _system(tmp_path, health=["unknown"])
+    # A normally managed LXC carries the BACKEND-OWNED default, not the
+    # fixture's advanced contract: this is the ordinary v0.5 shape.
+    reset = system.authority.reset_resource_health_contract(
+        system.resource.resource_id
+    )
+    assert reset.probes == DEFAULT_HEALTH_PROBES
+
+    job = _start(system)
+    assert system.worker.run_once().stop_reason == "health_unknown"
+    stalled = system.job(job.job_id)
+    assert stalled.status is PackageUpdateJobStatus.ACTIVE
+    assert stalled.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert stalled.health_outcome is None
+    # NO AUTO-ROLLBACK: nothing was submitted on the job's behalf.
+    assert system.rollback_host.calls == []
+
+    # PVE now positively reports the exact current resource STOPPED -- the
+    # dead/unresponsive guest case. `status` gates health EXECUTION, and
+    # must never gate the recovery path.
+    with system.store._transaction() as connection:
+        connection.execute(
+            "UPDATE resource_incarnations SET status='stopped' WHERE resource_id=?",
+            (system.resource.resource_id,),
+        )
+
+    capabilities = InventoryPublication(
+        system.store, system.authority, package_update_activated=True
+    ).read_operator_availability().resources[0]
+    assert capabilities["can_rollback_update"] is True
+    assert capabilities["can_rerun_health_evaluation"] is True
+
+    # The hint is not the authority: the arming path itself accepts it, and
+    # the job's OWN snapshot is still there to be named.
+    armed = system.authority.arm_package_update_rollback(
+        job.job_id, _canonical(system.ownership, system.identity)
+    )
+    assert armed.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+    assert armed.status is PackageUpdateJobStatus.ACTIVE
+
+
 def test_a_failed_health_verdict_leaves_the_job_rollback_capable_and_idle(
     tmp_path: Path,
 ) -> None:
@@ -1621,6 +1742,11 @@ class ApiSystem:
             path, headers={"Authorization": f"Bearer {BEARER}"}, **kwargs
         )
 
+    def put(self, path: str, **kwargs):
+        return self.client.put(
+            path, headers={"Authorization": f"Bearer {BEARER}"}, **kwargs
+        )
+
     def start(self, request_id: str | None = None):
         return self.post(
             f"/r0/v1/resources/{self.resource_id}/package-update",
@@ -1832,9 +1958,549 @@ def test_readback_reports_bounded_typed_facts_and_no_raw_output(api) -> None:
     rendered = response.text
     for forbidden in ("stdout", "stderr", "apt-get", BEARER, "PRIVATE KEY"):
         assert forbidden not in rendered, forbidden
-    # No package rows and no per-probe results in the readback.
+    # No package rows in the readback -- exact material for that stays
+    # behind the review action. Per-probe health evidence, by contrast, IS
+    # now included (post-Human1 correction): see the dedicated test below.
     assert "packages" not in body
-    assert "health_probe_results" not in body
+
+
+def test_readback_includes_bounded_per_probe_health_evidence_on_failure(
+    tmp_path: Path,
+) -> None:
+    """Post-Human1 correction: a real operator had to read the authority
+    SQLite database directly to learn which frozen probe failed and why.
+    The explicit readback now carries exactly that -- kind, target, outcome,
+    checked_at, and a bounded reason token -- and nothing more."""
+
+    system = ApiSystem(tmp_path, health=["failed"])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "active"
+        assert body["health"]["outcome"] == "failed"
+        probes = body["health"]["probes"]
+        assert probes == [
+            {
+                "index": 0,
+                "kind": "systemd_unit_active",
+                "target": "nginx.service",
+                "outcome": "failed",
+                "checked_at": probes[0]["checked_at"],
+                "reason": "unit_not_active",
+                "definitive": True,
+            },
+            {
+                "index": 1,
+                "kind": "systemd_unit_active",
+                "target": "postgresql.service",
+                "outcome": "failed",
+                "checked_at": probes[1]["checked_at"],
+                "reason": "unit_not_active",
+                "definitive": True,
+            },
+        ]
+        assert body["health"]["evidence"] == "verdict"
+        rendered = response.text
+        for forbidden in ("stdout", "stderr", "apt-get", BEARER, "PRIVATE KEY"):
+            assert forbidden not in rendered, forbidden
+    finally:
+        system.close()
+
+
+def test_readback_includes_bounded_observation_evidence_when_unresolved(
+    tmp_path: Path,
+) -> None:
+    """Stage 2 of the frozen post-Human1 health architecture: an unresolved
+    settling window is no longer a dead end without shell/SQLite access.
+
+    The job stays ACTIVE at `health_started` with no durable verdict, but the
+    readback now carries the LAST complete round's bounded per-probe
+    evidence (`definitive: false`) plus settling metadata, and the operator
+    sees a truthfully distinct `can_rerun_health_evaluation` capability
+    instead of the generic (and, for this checkpoint, now-hidden)
+    `can_resume_update`.
+    """
+
+    system = ApiSystem(tmp_path, health=["probe_unknown"])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "active"
+        assert body["checkpoint"] == "health_started"
+        assert body["health"]["outcome"] is None
+        assert body["health"]["evidence"] == "observation"
+        probes = body["health"]["probes"]
+        assert probes == [
+            {
+                "index": 0,
+                "kind": "systemd_unit_active",
+                "target": "nginx.service",
+                "outcome": "unknown",
+                "checked_at": probes[0]["checked_at"],
+                "reason": "unit_job_pending",
+                "definitive": False,
+            },
+            {
+                "index": 1,
+                "kind": "systemd_unit_active",
+                "target": "postgresql.service",
+                "outcome": "unknown",
+                "checked_at": probes[1]["checked_at"],
+                "reason": "unit_job_pending",
+                "definitive": False,
+            },
+        ]
+        assert body["health"]["settling"] == {
+            "rounds": 37,
+            "settled_seconds": 180.0,
+            "last_round_span_ms": 42,
+        }
+        rendered = response.text
+        for forbidden in ("stdout", "stderr", "apt-get", BEARER, "PRIVATE KEY"):
+            assert forbidden not in rendered, forbidden
+
+        availability = system.get("/r0/v1/operator-availability").json()
+        capabilities = availability["resources"][0]
+        assert capabilities["can_rerun_health_evaluation"] is True
+        assert capabilities["can_resume_update"] is False
+
+        # The distinctly-labelled control still calls the SAME backend
+        # liveness entrypoint -- no new resubmission surface.
+        resumed = system.post(
+            f"/r0/v1/resources/{system.resource_id}/package-update/resume"
+        )
+        assert resumed.status_code == 202
+    finally:
+        system.close()
+
+
+def _stopped_guest_refusal() -> PackageUpdateHealthError:
+    """Exactly what `SshPackageUpdateHealthHostControl` raises when the
+    deployed helper answers ``ok:false`` with classification
+    ``guest_unavailable`` -- the exact current LXC proven STOPPED by PVE.
+    Proved to be that mapping by
+    `tests/test_package_update_health.py::test_end_to_end_a_stopped_guest_
+    under_the_default_contract_is_readable`, which drives the real helper
+    and the real boundary."""
+
+    return PackageUpdateHealthError("guest is not running", reason="guest_unavailable")
+
+
+def test_readback_exposes_the_whole_request_reason_when_no_round_ran(
+    tmp_path: Path,
+) -> None:
+    """The MAJOR PR #80 review finding, through the real HTTP route.
+
+    A whole-request refusal produces NO per-probe evidence -- there was no
+    round to observe -- so `evidence` and `probes` are legitimately empty
+    and `outcome` is legitimately null. Without the bounded whole-request
+    classification beside them, the readback says nothing at all about a job
+    an operator is actively waiting on, and `guest_operational` being the
+    default contract makes that the ordinary post-update failure shape
+    rather than a corner case.
+    """
+
+    system = ApiSystem(tmp_path, health=[_stopped_guest_refusal()])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        body = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()
+        assert body["status"] == "active"
+        assert body["checkpoint"] == "health_started"
+        assert body["health"]["outcome"] is None
+        assert body["health"]["evidence"] is None
+        assert body["health"]["probes"] == []
+        assert body["health"]["settling"] is None
+        assert body["health"]["reason"] == "guest_unavailable"
+
+        # Recovery is still reachable, and the operator is told so.
+        assert body["rollback"]["available"] is True
+        capabilities = system.get("/r0/v1/operator-availability").json()[
+            "resources"
+        ][0]
+        assert capabilities["can_rollback_update"] is True
+        assert capabilities["can_rerun_health_evaluation"] is True
+    finally:
+        system.close()
+
+
+def test_readback_reason_is_the_latest_attempt_and_never_merged(
+    tmp_path: Path,
+) -> None:
+    """Re-running an unresolved evaluation replaces the reason; it never
+    accumulates. Only the LAST attempt describes the job's current state,
+    exactly as its per-probe observation evidence already did."""
+
+    system = ApiSystem(
+        tmp_path,
+        health=[
+            PackageUpdateHealthError("boundary silent", reason="host_unreachable"),
+            _stopped_guest_refusal(),
+        ],
+    )
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+        first = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()
+        assert first["health"]["reason"] == "host_unreachable"
+
+        # The explicit operator re-run control, not an automatic retry.
+        assert system.post(
+            f"/r0/v1/resources/{system.resource_id}/package-update/resume"
+        ).status_code == 202
+        system.run_worker()
+
+        second = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()
+        assert second["health"]["reason"] == "guest_unavailable"
+        assert second["health"]["evidence"] is None
+        assert second["health"]["probes"] == []
+    finally:
+        system.close()
+
+
+def test_a_definitive_verdict_retires_the_earlier_unresolved_reason(
+    tmp_path: Path,
+) -> None:
+    """A prior attempt's UNKNOWN classification is HISTORY once a durable
+    verdict exists, never current state. Publishing it beside a PASSED
+    verdict would describe a finished job as still blocked -- and the
+    durable event is still there for anyone reading the job's history."""
+
+    system = ApiSystem(tmp_path, health=[_stopped_guest_refusal(), "passed"])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+        assert (
+            system.get(
+                f"/r0/v1/resources/{system.resource_id}/package-update"
+            ).json()["health"]["reason"]
+            == "guest_unavailable"
+        )
+
+        assert system.post(
+            f"/r0/v1/resources/{system.resource_id}/package-update/resume"
+        ).status_code == 202
+        system.run_worker()
+
+        body = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()
+        assert body["status"] == "succeeded"
+        assert body["health"]["outcome"] == "passed"
+        assert body["health"]["evidence"] == "verdict"
+        assert body["health"]["reason"] is None
+
+        # The truthful history is untouched -- only the CURRENT state field
+        # stops advertising it.
+        events = [event["event_type"] for event in body["events"]]
+        assert "health_outcome_unknown" in events
+    finally:
+        system.close()
+
+
+#: The frozen contract every `ApiSystem` job carries, in canonical
+#: `(kind, target)` order -- both probes are `systemd_unit_active` (v0.5
+#: dropped Docker health probes entirely), so index 0/1 sort purely by
+#: target: `nginx.service` before `postgresql.service`.
+_MIXED_OBSERVATION = (
+    (HealthProbeOutcome.UNKNOWN, "unit_activating"),
+    (HealthProbeOutcome.PASSED, "unit_active"),
+)
+
+#: Both probes unresolved, with DIFFERENT bounded reasons. Every token here
+#: is a legal UNKNOWN one, so nothing but the top-level reason's own
+#: correctness can distinguish a right answer from a wrong one.
+_TWO_UNKNOWN_OBSERVATION = (
+    (HealthProbeOutcome.UNKNOWN, "unit_activating"),
+    (HealthProbeOutcome.UNKNOWN, "unit_job_pending"),
+)
+
+
+def test_the_unresolved_reason_is_the_attempts_own_not_the_last_probes(
+    tmp_path: Path,
+) -> None:
+    """The whole-request classification and a probe's own reason are two
+    different facts, and the readback must not confuse them.
+
+    A non-decisive round legitimately mixes outcomes: one probe still
+    transient, another already read PASSED. The attempt's classification is
+    the BLOCKING probe's reason (`unit_activating`); `unit_active` is a
+    PASSED-only token that can never describe why an evaluation reached no
+    result. Publishing it as the top-level reason produces a payload that is
+    self-contradictory on its face -- and one Home Assistant's own validator
+    correctly refuses, so the bug would surface as a rejected readback for
+    exactly the advanced contracts this stage still supports.
+    """
+
+    system = ApiSystem(tmp_path, health=[_MIXED_OBSERVATION])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        health = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()["health"]
+
+        assert health["outcome"] is None
+        assert health["evidence"] == "observation"
+        assert health["reason"] == "unit_activating"
+        assert health["reason"] != "unit_active"
+        # It must be an UNKNOWN-family token by construction, never merely
+        # a bounded one -- that is the invariant HA independently re-proves.
+        assert health["reason"] in UNRESOLVED_HEALTH_REASONS
+
+        # Each probe still carries its OWN reason, untouched.
+        assert [
+            (probe["kind"], probe["outcome"], probe["reason"])
+            for probe in health["probes"]
+        ] == [
+            ("systemd_unit_active", "unknown", "unit_activating"),
+            ("systemd_unit_active", "passed", "unit_active"),
+        ]
+    finally:
+        system.close()
+
+
+def test_the_unresolved_reason_does_not_depend_on_which_probe_is_last(
+    tmp_path: Path,
+) -> None:
+    """The ordering witness, with every token individually legal.
+
+    Both probes are UNKNOWN and both reasons are valid UNKNOWN-family
+    tokens, so a payload built from either one would pass every bounded-set
+    check on both sides. Only the attempt's OWN classification -- the FIRST
+    unresolved probe, which is what the orchestrator recorded -- is correct,
+    and reading the last probe's reason instead is indistinguishable from
+    it by validation alone.
+    """
+
+    system = ApiSystem(tmp_path, health=[_TWO_UNKNOWN_OBSERVATION])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        health = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()["health"]
+
+        assert health["reason"] == "unit_activating"
+        assert health["reason"] != "unit_job_pending"
+        assert [probe["reason"] for probe in health["probes"]] == [
+            "unit_activating",
+            "unit_job_pending",
+        ]
+        # The durable event is the authority for what was recorded; the
+        # readback must simply not corrupt it on the way out.
+        events = system.store.list_package_update_job_events(started["job_id"])
+        unknown = [
+            event
+            for event in events
+            if event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN
+        ][-1]
+        assert unknown.details["reason"] == "unit_activating"
+    finally:
+        system.close()
+
+
+def test_the_reason_field_leaks_no_event_details_or_helper_text(
+    tmp_path: Path,
+) -> None:
+    """Exposing ONE bounded token is not a door for the rest of the event.
+
+    The durable UNKNOWN event also carries a human-readable message and, in
+    other shapes, settling metadata and per-probe rows. The readback field
+    is exactly one token from the closed taxonomy -- never the event's
+    message, never its raw `details`, never the exception string the
+    boundary raised, and never helper stdout/stderr.
+    """
+
+    system = ApiSystem(tmp_path, health=[_stopped_guest_refusal()])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        health = response.json()["health"]
+        assert set(health) == {
+            "contract_revision",
+            "contract_fingerprint",
+            "probe_count",
+            "started_at",
+            "completed_at",
+            "outcome",
+            "evidence",
+            "probes",
+            "settling",
+            "reason",
+        }
+        assert health["reason"] in UNRESOLVED_HEALTH_REASONS
+
+        # The raised boundary message never reaches the wire, and neither
+        # does anything else a helper could have said.
+        rendered = response.text
+        for forbidden in (
+            "guest is not running",
+            "stdout",
+            "stderr",
+            "pct exec",
+            "/bin/true",
+            "pvesh",
+            BEARER,
+            "PRIVATE KEY",
+        ):
+            assert forbidden not in rendered, forbidden
+    finally:
+        system.close()
+
+
+# ===========================================================================
+# The built-in v0.5 default health contract, through the real routes.
+#
+# There is no candidate-discovery route any more: v0.5 does not automatically
+# discover or recommend systemd application health probes, because absence of
+# a workload observer is not proof of workload absence. (Docker-specific
+# package-update health probes are no longer part of v0.5 at all.)
+# ===========================================================================
+
+
+def test_a_managed_lxc_needs_no_health_onboarding_before_start(
+    tmp_path: Path,
+) -> None:
+    """The whole point of the v0.5 default: an operator who approves a real
+    plan reaches **Start**, not a health-configuration dead end.
+
+    The fixture declares an advanced contract of its own, so this first takes
+    the resource back to genuinely unconfigured through the low-level clear,
+    then runs one ordinary inventory reconciliation -- the same backend-owned
+    point production uses -- and proves that alone is enough to start.
+    """
+
+    system = ApiSystem(tmp_path)
+    try:
+        assert system.authority.clear_resource_health_contract(system.resource_id)
+        blocked = system.start()
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["error"] == "health_contract_unconfigured"
+
+        _reconcile(system.authority, system.seed.resource.inventory_source_id)
+
+        contract = system.get(
+            f"/r0/v1/resources/{system.resource_id}/health-contract"
+        )
+        assert contract.status_code == 200
+        assert contract.json()["probes"] == [
+            {"kind": "guest_operational", "target": None}
+        ]
+        assert system.start().status_code == 202
+    finally:
+        system.close()
+
+
+def test_there_is_no_health_candidate_discovery_route(tmp_path: Path) -> None:
+    """The removed Stage-3B surface must be gone, not merely unused."""
+
+    system = ApiSystem(tmp_path)
+    try:
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/health-candidates"
+        )
+        assert response.status_code == 404
+        paths = {route.path for route in system.app.routes}
+        assert not any("health-candidates" in path for path in paths)
+    finally:
+        system.close()
+
+
+def test_reset_route_restores_the_default_over_an_advanced_contract(
+    tmp_path: Path,
+) -> None:
+    system = ApiSystem(tmp_path)
+    try:
+        declared = system.put(
+            f"/r0/v1/resources/{system.resource_id}/health-contract",
+            json={
+                "probes": [
+                    {"kind": "systemd_unit_active", "target": "web.service"}
+                ]
+            },
+        )
+        assert declared.status_code == 200
+        advanced_revision = declared.json()["revision"]
+
+        # A stale expected_revision cannot silently discard the newer
+        # advanced contract.
+        stale = system.post(
+            f"/r0/v1/resources/{system.resource_id}/health-contract/reset",
+            params={"expected_revision": advanced_revision - 1},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["error"] == "revision_conflict"
+
+        reset = system.post(
+            f"/r0/v1/resources/{system.resource_id}/health-contract/reset",
+            params={"expected_revision": advanced_revision},
+        )
+        assert reset.status_code == 200
+        assert reset.json()["probes"] == [
+            {"kind": "guest_operational", "target": None}
+        ]
+        assert reset.json()["revision"] == advanced_revision + 1
+    finally:
+        system.close()
+
+
+def test_reset_route_requires_authentication(tmp_path: Path) -> None:
+    system = ApiSystem(tmp_path)
+    try:
+        response = system.client.post(
+            f"/r0/v1/resources/{system.resource_id}/health-contract/reset"
+        )
+        assert response.status_code in (401, 403)
+    finally:
+        system.close()
+
+
+def test_readback_carries_no_probes_before_a_definitive_verdict(api) -> None:
+    """No verdict yet means no per-probe evidence yet -- never a synthesized
+    "everything unknown" row set."""
+
+    started = api.start().json()
+    response = api.get(f"/r0/v1/resources/{api.resource_id}/package-update")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == started["job_id"]
+    assert body["health"]["outcome"] is None
+    assert body["health"]["probes"] == []
 
 
 def test_readback_rollback_available_requires_current_job_target(
@@ -2103,7 +2769,12 @@ _RESUME_CHECKPOINT_CASES = (
     ("snapshot_confirmed", _checkpoint_snapshot_confirmed, True),
     ("mutation_may_have_started", _checkpoint_mutation_may_have_started, True),
     ("mutation_completed", _checkpoint_mutation_completed, True),
-    ("health_started_unknown", _checkpoint_health_started_unknown, True),
+    # Narrowed (frozen post-Human1 health architecture, Stage 2):
+    # `health_started` is no longer generic-Resume-capable. The worker still
+    # continues from it on the same wake, but the truthful, distinctly
+    # labelled capability for it is `can_rerun_health_evaluation` -- see
+    # `_RERUN_HEALTH_CHECKPOINT_CASES` below.
+    ("health_started_unknown", _checkpoint_health_started_unknown, False),
     ("health_completed_failed", _checkpoint_health_completed_failed, False),
     ("rollback_may_have_started", _checkpoint_rollback_may_have_started, True),
     ("rollback_completed_terminal", _checkpoint_rollback_completed, False),
@@ -2126,9 +2797,38 @@ def test_resume_capability_matches_worker_continuation_per_checkpoint(
     assert capabilities["can_resume_update"] is expected, label
 
 
+#: `can_rerun_health_evaluation` is true at EXACTLY one checkpoint: an ACTIVE
+#: job whose bounded settling window ended with no verdict. Reuses the same
+#: builders as `_RESUME_CHECKPOINT_CASES` above so the two capabilities are
+#: cross-checked as provably disjoint over every represented checkpoint.
+_RERUN_HEALTH_CHECKPOINT_CASES = tuple(
+    (label, builder, label == "health_started_unknown")
+    for label, builder, _ in _RESUME_CHECKPOINT_CASES
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "builder", "expected"),
+    _RERUN_HEALTH_CHECKPOINT_CASES,
+    ids=[case[0] for case in _RERUN_HEALTH_CHECKPOINT_CASES],
+)
+def test_rerun_health_capability_is_true_only_at_unresolved_health_started(
+    tmp_path: Path, label: str, builder, expected: bool
+) -> None:
+    system, job = builder(tmp_path)
+    capabilities = InventoryPublication(
+        system.store, system.authority, package_update_activated=True
+    ).read_operator_availability().resources[0]
+    assert capabilities["can_rerun_health_evaluation"] is expected, label
+    # The two capabilities never overlap: never both true for the same job.
+    assert not (
+        capabilities["can_resume_update"] and capabilities["can_rerun_health_evaluation"]
+    )
+
+
 def test_resume_capability_requires_activation(tmp_path: Path) -> None:
-    """Witness I: activation gates resume exactly like every other Human1
-    control, even from an otherwise resume-capable checkpoint."""
+    """Witness I: activation gates resume-family controls exactly like every
+    other Human1 control, even from an otherwise capable checkpoint."""
 
     system, job = _checkpoint_health_started_unknown(tmp_path)
     active = InventoryPublication(
@@ -2137,8 +2837,10 @@ def test_resume_capability_requires_activation(tmp_path: Path) -> None:
     inactive = InventoryPublication(
         system.store, system.authority, package_update_activated=False
     ).read_operator_availability().resources[0]
-    assert active["can_resume_update"] is True
+    assert active["can_resume_update"] is False
+    assert active["can_rerun_health_evaluation"] is True
     assert inactive["can_resume_update"] is False
+    assert inactive["can_rerun_health_evaluation"] is False
 
 
 def test_resume_endpoint_still_wakes_worker_despite_hidden_capability(

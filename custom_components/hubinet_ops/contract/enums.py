@@ -156,11 +156,47 @@ class PackageUpdateHealthOutcome(StrEnum):
 
 
 class HealthProbeKind(StrEnum):
-    """The exact typed probes an operator may declare in a health contract."""
+    """The exact typed probes an operator may declare in a health contract.
 
+    v0.5 dropped Docker-specific package-update health probes
+    (`docker_container_running`, `docker_container_healthy`) entirely: they
+    are no longer accepted or advertised anywhere in this integration. A
+    contract is either the built-in `GUEST_OPERATIONAL` singleton or one or
+    more explicit `SYSTEMD_UNIT_ACTIVE` probes -- never both at once (see
+    `health_contract_validation.validate_resource_health_contract`).
+    """
+
+    #: An explicit ADVANCED contract: one or more of these REPLACE the
+    #: built-in baseline; never declared alongside `GUEST_OPERATIONAL`.
     SYSTEMD_UNIT_ACTIVE = "systemd_unit_active"
-    DOCKER_CONTAINER_RUNNING = "docker_container_running"
-    DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
+    #: The v0.5 BUILT-IN DEFAULT for a package-managed LXC: a guest
+    #: liveness proof, never an application-health proof. The backend
+    #: provisions it as a product decision; Home Assistant never infers it
+    #: from what a guest appears to run. Carries no workload target -- see
+    #: `HealthProbe.target`. A contract declaring this kind may declare no
+    #: other probe.
+    GUEST_OPERATIONAL = "guest_operational"
+
+
+class HealthProbeOutcome(StrEnum):
+    """What ONE frozen probe was observed to be, in either evidence kind a
+    job's ``health_probes`` can carry (``HealthProbe.definitive``).
+
+    ``UNKNOWN`` can appear ONLY in non-definitive OBSERVATION evidence
+    (``definitive: False``) -- the bounded per-probe evidence of an
+    unresolved attempt, while the job still sits at ``health_started`` with
+    no durable verdict at all. It can never appear in definitive VERDICT
+    evidence (``definitive: True``): only a COMPLETE DECISIVE observation set
+    may ever be finalized, so a durable verdict's probes are each PASSED or
+    FAILED, never UNKNOWN -- not even one UNKNOWN probe beside an otherwise
+    proven FAILED job. `validate_package_update_job_view` independently
+    refuses a ``"verdict"`` payload carrying an UNKNOWN probe rather than
+    rendering it.
+    """
+
+    PASSED = "passed"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
 
 
 class HealthContractStatus(StrEnum):

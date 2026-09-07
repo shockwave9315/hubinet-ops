@@ -71,6 +71,12 @@ RESOURCE_BUTTONS = (
         capability="can_resume_update",
     ),
     HubinetOpsButtonDescription(
+        key="rerun_health_evaluation",
+        translation_key="rerun_health_evaluation",
+        icon="mdi:heart-cog-outline",
+        capability="can_rerun_health_evaluation",
+    ),
+    HubinetOpsButtonDescription(
         key="rollback_update",
         translation_key="rollback_update",
         icon="mdi:backup-restore",
@@ -122,6 +128,17 @@ def _tr(strings: Mapping[str, str], key: str, **values: Any) -> str:
     """Format one integration-owned notification translation."""
 
     return strings[_translation_key(key)].format(**values)
+
+
+def _tr_optional(strings: Mapping[str, str], key: str) -> str | None:
+    """One translation that may legitimately not exist for this key.
+
+    Used for the bounded reason taxonomy: the backend owns that closed set,
+    and an integration built against an older copy of it must degrade to
+    showing the raw token rather than raising and hiding the whole readback.
+    """
+
+    return strings.get(_translation_key(key))
 
 
 async def _notification_translations(hass: HomeAssistant) -> Mapping[str, str]:
@@ -218,6 +235,41 @@ def _job_message(job: dict[str, Any], strings: Mapping[str, str]) -> str:
     lines = [
         f"- **{label}:** {_cell(value, unknown=unknown)}" for label, value in facts
     ]
+    # The whole-request classification of the CURRENT unresolved evaluation.
+    # Rendered as its own row rather than folded into "Health result",
+    # because it is a different fact: the result is still "no definitive
+    # result", and this says why there is not one yet. It is the ONLY thing
+    # a stopped-guest `guest_operational` readback carries -- no verdict, no
+    # probe rows -- so without it that job is unreadable from Home
+    # Assistant. The backend sends a bounded token; the text is this
+    # integration's own fixed translation of it, never backend prose.
+    health_reason = job.get("health_reason")
+    if health_reason:
+        described = _tr_optional(strings, f"job.health_reason.{health_reason}")
+        lines.append(
+            f"- **{_tr(strings, 'job.labels.health_reason')}:** "
+            f"{_cell(described or health_reason, unknown=unknown)}"
+        )
+    if job["health_probes"]:
+        heading_key = (
+            "job.health_probes.heading"
+            if job.get("health_evidence") == "verdict"
+            else "job.health_probes.observation_heading"
+        )
+        lines.extend(("", f"### {_tr(strings, heading_key)}", ""))
+        if job.get("health_evidence") == "observation":
+            lines.extend((_tr(strings, "job.health_probes.observation_note"), ""))
+        outcome_labels = {
+            outcome: _tr(strings, f"job.health_probes.outcome.{outcome}")
+            for outcome in ("passed", "failed", "unknown")
+        }
+        lines.extend(
+            f"- {_cell(probe['kind'], unknown=unknown)} — "
+            f"{_cell(probe['target'], unknown=unknown)} — "
+            f"**{outcome_labels.get(probe['outcome'], unknown)}** — "
+            f"{_cell(probe['reason'], unknown=unknown)}"
+            for probe in job["health_probes"]
+        )
     if job["events"]:
         lines.extend(("", f"### {_tr(strings, 'job.recent_events')}", ""))
         lines.extend(
@@ -356,7 +408,11 @@ class HubinetOpsResourceButton(HubinetOpsResourceEntity, ButtonEntity):
             job = await async_view_update_job(self.coordinator, self.resource_id)
         elif key == "start_update":
             job = await async_start_update(self.coordinator, self.resource_id)
-        elif key == "resume_update":
+        elif key in ("resume_update", "rerun_health_evaluation"):
+            # Both names call the exact same backend liveness entrypoint --
+            # only the truthful label an operator sees differs, matching
+            # whichever one capability was actually satisfied (never both at
+            # once; see `contract/resource_validation.py`).
             job = await async_resume_update(self.coordinator, self.resource_id)
         elif key == "rollback_update":
             job = await async_rollback_update(self.coordinator, self.resource_id)

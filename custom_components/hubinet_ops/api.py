@@ -11,23 +11,25 @@ from .contract import (
     HealthContractSummary,
     HealthProbe,
     HealthProbeKind,
+    HealthProbeOutcome,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     LifecycleState,
     NodeAvailability,
     NodeSnapshot,
     ObservationalContinuity,
-    OperatorCapabilities,
     OperatorAvailabilityView,
+    OperatorCapabilities,
+    PackagePlanApprovalSnapshot,
+    PackagePlanApprovalStatus,
     PackageScanError,
     PackageScanOs,
     PackageScanPackage,
     PackageScanSnapshot,
     PackageScanStatus,
-    PackagePlanApprovalSnapshot,
-    PackagePlanApprovalStatus,
     PackageUpdateHealthOutcome,
     PackageUpdateJobEvent,
+    PackageUpdateJobHealthProbeResult,
     PackageUpdateJobState,
     PackageUpdateJobSummary,
     PackageUpdateJobView,
@@ -139,6 +141,11 @@ class HubinetOpsTransport(Protocol):
     ) -> ResourceHealthContract:
         """Install one complete health contract for one exact resource."""
 
+    async def reset_health_contract(
+        self, resource_id: str, expected_revision: int | None
+    ) -> ResourceHealthContract:
+        """Restore the backend's built-in default health contract."""
+
     async def clear_health_contract(
         self, resource_id: str, expected_revision: int | None
     ) -> None:
@@ -225,10 +232,33 @@ class HubinetOpsApi:
             resource_id, probes, expected_revision
         )
 
+    async def async_reset_health_contract(
+        self, resource_id: str, expected_revision: int | None = None
+    ) -> ResourceHealthContract:
+        """Restore the backend's own built-in default health contract.
+
+        The operator selects a RESOURCE; the backend decides what its
+        baseline is. This integration never computes the default, never
+        inspects a guest, and never sends a probe of its own here.
+        """
+
+        return await self._transport.reset_health_contract(
+            resource_id, expected_revision
+        )
+
     async def async_clear_health_contract(
         self, resource_id: str, expected_revision: int | None = None
     ) -> None:
-        """Make one resource's health contract unconfigured."""
+        """Make one resource's health contract unconfigured.
+
+        The LOW-LEVEL primitive, deliberately on no operator path: no
+        service, options flow, or Repair calls it. "Discard this contract"
+        on the native path is `async_reset_health_contract`, which restores
+        the backend's built-in default instead of leaving a managed LXC
+        update-blocked with no declared meaning of healthy -- and which the
+        backend would re-establish at the next successful reconciliation
+        anyway, so clearing is not durable removal.
+        """
 
         await self._transport.clear_health_contract(resource_id, expected_revision)
 
@@ -304,6 +334,11 @@ class _UnconfiguredPhaseZeroTransport:
         resource_id: str,
         probes: tuple[HealthProbe, ...],
         expected_revision: int | None,
+    ) -> ResourceHealthContract:
+        raise self._error()
+
+    async def reset_health_contract(
+        self, resource_id: str, expected_revision: int | None
     ) -> ResourceHealthContract:
         raise self._error()
 

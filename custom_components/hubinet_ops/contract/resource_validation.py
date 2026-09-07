@@ -166,6 +166,19 @@ def validate_operator_availability(
             resource.package_update_job.state is not PackageUpdateJobState.ACTIVE
         ):
             raise ValueError("resume availability requires an active job")
+        if capabilities.can_rerun_health_evaluation and (
+            resource.package_update_job.state is not PackageUpdateJobState.ACTIVE
+        ):
+            raise ValueError(
+                "re-run health evaluation availability requires an active job"
+            )
+        if (
+            capabilities.can_resume_update
+            and capabilities.can_rerun_health_evaluation
+        ):
+            raise ValueError(
+                "resume and re-run health evaluation are never both available"
+            )
         if (
             capabilities.can_rollback_update
             and not resource.package_update_job.rollback_available

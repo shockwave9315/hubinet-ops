@@ -60,7 +60,31 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 19
+#: v20 (post-Human1 Stage 3): added `guest_operational` to `HealthProbeKind`.
+#: `resource_health_contract_probes.kind` and `package_update_job_health_
+#: probes.kind` are SQL `CHECK(kind IN (...))` constraints GENERATED from
+#: that enum (`_HEALTH_PROBE_KIND_SQL` below), so a new member changes the
+#: DDL text new databases are created with; an already-created v19
+#: database's existing CHECK does not retroactively gain it. `target` also
+#: becomes nullable for probes of this one kind (the built-in guest-liveness
+#: default names no container or unit -- never a faked one; see
+#: `_HEALTH_PROBE_TARGET_OR_GUEST_CHECK_SQL`).
+#:
+#: v21 (v0.5 health scope reduction): removes `docker_container_running` and
+#: `docker_container_healthy` from `HealthProbeKind` -- `_HEALTH_PROBE_KIND_
+#: SQL` shrinks with the enum, so a v20 Docker probe kind is no longer
+#: SQL-valid in a freshly created database. Also adds the contract-shape
+#: invariant that a `guest_operational` probe may never share a contract (or
+#: a job's frozen probe copy) with any other probe -- an explicit advanced
+#: `systemd_unit_active` contract REPLACES the baseline, it never extends it
+#: (`_ONE_GUEST_OPERATIONAL_PROBE_SQL` already forbade more than one such
+#: probe per parent; the new triggers below forbid mixing it with anything
+#: else). See PRODUCT.md, "What healthy means".
+#:
+#: Pre-release authority schemas are not migrated in place (`AGENTS.md`):
+#: this is the anticipated backed-up-reset path, not an ad hoc in-place SQL
+#: migration.
+AUTHORITY_SCHEMA_VERSION = 21
 
 #: Every authority connection's writer wait policy -- both `PRAGMA
 #: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
@@ -168,6 +192,15 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "resource_health_contract_probe_belongs_to_declared_contract",
         "resource_health_contract_probe_update_immutable",
         "resource_health_contract_probe_delete_needs_no_live_contract",
+        # v20: at most one `guest_operational` probe per parent -- see
+        # `_ONE_GUEST_OPERATIONAL_PROBE_SQL`.
+        "resource_health_contract_probes_one_guest_operational",
+        "package_update_job_health_probes_one_guest_operational",
+        # v21: a `guest_operational` probe may never share a contract (or a
+        # job's frozen copy) with any other probe -- see
+        # `_ONE_GUEST_OPERATIONAL_PROBE_SQL`'s sibling triggers below.
+        "resource_health_contract_no_mixed_baseline",
+        "package_update_job_health_probes_no_mixed_baseline",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -236,7 +269,26 @@ _HEALTH_PROBE_TARGET_CHECK_SQL = f"""typeof(target) = 'text'
             AND instr(target, char(12)) = 0
             AND instr(target, char(13)) = 0"""
 
+#: v20: `target` is nullable, but ONLY for `guest_operational` (that kind
+#: names no container or unit; every other kind still requires the full
+#: bounded-string proof above, unchanged). Never a free pass -- a NULL
+#: target on any other kind is exactly the faked-absence this refuses.
+_HEALTH_PROBE_TARGET_OR_GUEST_CHECK_SQL = f"""(
+            (kind = 'guest_operational' AND target IS NULL)
+            OR (kind != 'guest_operational' AND {_HEALTH_PROBE_TARGET_CHECK_SQL})
+        )"""
 
+#: v20: at most one `guest_operational` probe per parent (resource contract,
+#: or job-frozen copy) -- `UNIQUE(parent, kind, target)` alone cannot express
+#: this because SQL treats every NULL `target` as distinct from every other,
+#: so two `guest_operational` rows would not collide there. This partial
+#: index is the second, independent proof (defense in depth: `health_
+#: contract.py`'s duplicate-identity check already refuses this too).
+_ONE_GUEST_OPERATIONAL_PROBE_SQL = """
+    CREATE UNIQUE INDEX {index_name}
+        ON {table}({parent_column})
+        WHERE kind = 'guest_operational'
+    """
 
 
 class InventoryAuthorityStore:
@@ -1250,7 +1302,12 @@ def _package_update_job_health(
         PackageUpdateJobHealthProbe(
             probe_index=int(probe["probe_index"]),
             kind=HealthProbeKind(str(probe["kind"])),
-            target=str(probe["target"]),
+            # NULL only for guest_operational (v20): `str(None)` would
+            # silently become the literal string "None", which is exactly
+            # the faked target the frozen design forbids.
+            target=(
+                None if probe["target"] is None else str(probe["target"])
+            ),
         )
         for probe in probe_rows
     )
@@ -1356,7 +1413,10 @@ def _resource_health_contract(
         )
     probes = tuple(
         ResourceHealthProbe(
-            kind=HealthProbeKind(str(probe["kind"])), target=str(probe["target"])
+            kind=HealthProbeKind(str(probe["kind"])),
+            target=(
+                None if probe["target"] is None else str(probe["target"])
+            ),
         )
         for probe in probe_rows
     )
@@ -1935,13 +1995,18 @@ _SCHEMA_STATEMENTS = (
             CHECK(typeof(probe_index) = 'integer' AND
                   probe_index >= 0 AND probe_index < {MAX_HEALTH_PROBES}),
         kind TEXT NOT NULL CHECK(kind IN ({_HEALTH_PROBE_KIND_SQL})),
-        target TEXT NOT NULL CHECK({_HEALTH_PROBE_TARGET_CHECK_SQL}),
+        target TEXT CHECK{_HEALTH_PROBE_TARGET_OR_GUEST_CHECK_SQL},
         PRIMARY KEY(resource_id, probe_index),
         UNIQUE(resource_id, kind, target),
         FOREIGN KEY(resource_id) REFERENCES resource_health_contracts(resource_id)
             DEFERRABLE INITIALLY DEFERRED
     )
     """,
+    _ONE_GUEST_OPERATIONAL_PROBE_SQL.format(
+        index_name="resource_health_contract_probes_one_guest_operational",
+        table="resource_health_contract_probes",
+        parent_column="resource_id",
+    ),
     f"""
     CREATE TABLE package_update_jobs (
         job_id TEXT PRIMARY KEY,
@@ -2370,13 +2435,18 @@ _SCHEMA_STATEMENTS = (
             CHECK(typeof(probe_index) = 'integer' AND
                   probe_index >= 0 AND probe_index < {MAX_HEALTH_PROBES}),
         kind TEXT NOT NULL CHECK(kind IN ({_HEALTH_PROBE_KIND_SQL})),
-        target TEXT NOT NULL CHECK({_HEALTH_PROBE_TARGET_CHECK_SQL}),
+        target TEXT CHECK{_HEALTH_PROBE_TARGET_OR_GUEST_CHECK_SQL},
         PRIMARY KEY(job_id, probe_index),
         UNIQUE(job_id, kind, target),
         FOREIGN KEY(job_id) REFERENCES package_update_jobs(job_id)
             DEFERRABLE INITIALLY DEFERRED
     )
     """,
+    _ONE_GUEST_OPERATIONAL_PROBE_SQL.format(
+        index_name="package_update_job_health_probes_one_guest_operational",
+        table="package_update_job_health_probes",
+        parent_column="job_id",
+    ),
     """
     -- The durable, definitive per-probe evidence behind one health verdict.
     --
@@ -3014,6 +3084,44 @@ _SCHEMA_STATEMENTS = (
     )
     BEGIN SELECT RAISE(ABORT,
         'a live health contract may not lose probe rows'
+    ); END
+    """,
+    """
+    -- v21: the built-in `guest_operational` baseline and an explicit
+    -- advanced contract never mix (PRODUCT.md, "What healthy means"). The
+    -- parent contract row already exists when a probe is inserted (see
+    -- `resource_health_contract_probe_belongs_to_declared_contract`), so its
+    -- own declared `probe_count` is authoritative the moment a
+    -- `guest_operational` row is written: exactly 1 is the only legal value.
+    -- `_ONE_GUEST_OPERATIONAL_PROBE_SQL`'s partial unique index already
+    -- forbids a SECOND `guest_operational` row; this forbids any OTHER kind
+    -- alongside the one it allows.
+    CREATE TRIGGER resource_health_contract_no_mixed_baseline
+    BEFORE INSERT ON resource_health_contract_probes
+    WHEN NEW.kind = 'guest_operational' AND (
+        SELECT contract.probe_count FROM resource_health_contracts contract
+        WHERE contract.resource_id = NEW.resource_id
+    ) != 1
+    BEGIN SELECT RAISE(ABORT,
+        'a guest_operational probe may not be combined with any other probe'
+    ); END
+    """,
+    """
+    -- v21: the job-frozen mirror of the trigger above. Frozen health probes
+    -- are inserted BEFORE their parent job row (see
+    -- `package_update_job_health_probe_insert_during_issuance`), so the
+    -- check runs the other way around: at the moment the job row itself is
+    -- inserted, every one of its frozen probes already exists, and if any of
+    -- them is `guest_operational` the job's own declared
+    -- `health_contract_probe_count` must be exactly 1.
+    CREATE TRIGGER package_update_job_health_probes_no_mixed_baseline
+    BEFORE INSERT ON package_update_jobs
+    WHEN EXISTS (
+        SELECT 1 FROM package_update_job_health_probes probe
+        WHERE probe.job_id = NEW.job_id AND probe.kind = 'guest_operational'
+    ) AND NEW.health_contract_probe_count != 1
+    BEGIN SELECT RAISE(ABORT,
+        'a guest_operational probe may not be combined with any other frozen probe'
     ); END
     """,
 )

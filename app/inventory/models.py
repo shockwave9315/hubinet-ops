@@ -305,17 +305,36 @@ class HealthProbeKind(StrEnum):
     argv operation a future executor can perform truthfully against a
     Debian/Ubuntu LXC guest; there is no member for "run this command", and
     there never will be. `PRODUCT.md` records why this list is what it is.
+
+    v0.5 dropped Docker-specific package-update health probes entirely
+    (``docker_container_running``, ``docker_container_healthy``): they are no
+    longer supported end-to-end, not merely hidden. A contract is now either
+    the built-in ``GUEST_OPERATIONAL`` singleton or one or more explicit
+    ``SYSTEMD_UNIT_ACTIVE`` probes -- never both at once (see
+    `health_contract.py::canonical_health_probes`). Docker workload health is
+    not part of v0.5 Hubinet Ops package-update health.
     """
 
-    #: The explicitly named systemd unit must be active.
+    #: The explicitly named systemd unit must be active. An explicit ADVANCED
+    #: contract: one or more of these REPLACE the built-in baseline; they may
+    #: never be declared alongside ``GUEST_OPERATIONAL``.
     SYSTEMD_UNIT_ACTIVE = "systemd_unit_active"
-    #: The explicitly named Docker container must be running.
-    DOCKER_CONTAINER_RUNNING = "docker_container_running"
-    #: The explicitly named Docker container must be running AND report
-    #: Docker HEALTHCHECK status healthy. A container with no HEALTHCHECK
-    #: therefore cannot satisfy this probe -- that is the point of choosing
-    #: it over ``docker_container_running``.
-    DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
+    #: The v0.5 BUILT-IN DEFAULT for a package-managed LXC, and a guest
+    #: liveness proof only -- never an application-health proof: the exact
+    #: current guest/resource identity is revalidated AND the dedicated
+    #: health boundary can perform one fixed, code-owned, read-only guest
+    #: liveness operation inside it -- never an arbitrary command, never an
+    #: operator-supplied argument. Has NO workload target (see
+    #: ``ResourceHealthProbe.target``, which is ``None`` for this kind and
+    #: only this kind -- never a faked container/unit name). It is the
+    #: product baseline the backend provisions for every current managed
+    #: LXC, NOT something inferred from what a guest appears to run:
+    #: absence of a workload observer is not proof of workload absence, so
+    #: v0.5 does not infer workload health automatically. A contract
+    #: declaring this kind may declare no other probe (see
+    #: `health_contract.py::canonical_health_probes`): an explicit advanced
+    #: contract REPLACES this baseline, it does not extend it.
+    GUEST_OPERATIONAL = "guest_operational"
 
 
 class HealthProbeOutcome(StrEnum):
@@ -330,9 +349,9 @@ class HealthProbeOutcome(StrEnum):
       state that does NOT satisfy the probe. This is a proof that the
       contract is false, not an absence of proof that it is true.
     - ``UNKNOWN`` -- the probe could not be evaluated truthfully: the host
-      round trip failed, the command timed out, the output was malformed, the
-      Docker daemon could not be reached, or the target could not be resolved
-      to one exact object. It is NEVER a pass and never a failure.
+      round trip failed, the command timed out, the output was malformed, or
+      the target could not be resolved to one exact object. It is NEVER a
+      pass and never a failure.
     """
 
     PASSED = "passed"
@@ -759,10 +778,18 @@ class PackagePlanApproval:
 
 @dataclass(frozen=True, slots=True)
 class ResourceHealthProbe:
-    """One required typed probe inside an operator-declared health contract."""
+    """One required typed probe inside an operator-declared health contract.
+
+    ``target`` is ``None`` for, and only for,
+    :attr:`HealthProbeKind.GUEST_OPERATIONAL` -- that kind names no
+    container or unit, and inventing a placeholder target for it would be
+    exactly the faked identity the frozen design forbids. Every other kind
+    requires a real bounded target string; `health_contract.py` enforces
+    which is which.
+    """
 
     kind: HealthProbeKind
-    target: str
+    target: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,18 +825,28 @@ class PackageUpdateJobHealthProbe:
 
     probe_index: int
     kind: HealthProbeKind
-    target: str
+    #: ``None`` for, and only for, ``HealthProbeKind.GUEST_OPERATIONAL`` --
+    #: see ``ResourceHealthProbe.target``.
+    target: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class PackageUpdateJobHealthProbeResult:
     """The durable, definitive result recorded for ONE frozen probe.
 
-    Only ever written by the one definitive finalization boundary, and only
-    as a complete set covering every frozen probe. ``outcome`` may be
-    ``UNKNOWN`` for an individual probe inside a FAILED contract verdict --
-    an unevaluable member alongside a proven failure is truthful history --
-    but a PASSED contract requires every one of these to be ``PASSED``.
+    Only ever written by the one definitive finalization boundary
+    (``InventoryAuthority.complete_package_update_health``), and only as a
+    complete set covering every frozen probe. ``outcome`` is never
+    ``UNKNOWN`` here: only a COMPLETE DECISIVE observation set may ever be
+    finalized, and the finalizer independently refuses to write this row set
+    at all if any reported observation is ``UNKNOWN`` -- even one UNKNOWN
+    probe beside an otherwise proven FAILED contract is refused outright, not
+    recorded. So every row is ``PASSED`` or ``FAILED``; a PASSED contract
+    requires every one of these to be ``PASSED``, and a FAILED contract
+    requires at least one. An unresolved evaluation's bounded per-probe
+    evidence is a different, non-durable thing entirely (a bounded event via
+    ``record_package_update_health_outcome_unknown``), never a row of this
+    type.
 
     ``reason`` is a bounded token from a closed taxonomy, never raw command
     output: nothing a guest printed reaches durable state.

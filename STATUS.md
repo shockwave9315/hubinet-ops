@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v19):
+  SQLite authority database (schema v21):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -54,12 +54,27 @@
   accepts only a RUNNING scan for the same resource. Schema v19 makes the
   successful job row the atomic durable consumption fact for its exact
   approval and adds a unique fence permitting at most one successful job per
-  approval.
+  approval. Schema v20 adds `guest_operational`, a fourth health-probe kind
+  whose `target` column is the one nullable exception to the otherwise
+  `NOT NULL` bounded-target `CHECK` (enforced positionally: exactly this kind
+  may be `NULL`, every other kind still requires one), with its own partial
+  unique index permitting at most one such probe per contract or per frozen
+  job copy. Schema v21 (v0.5 health scope reduction) removes
+  `docker_container_running` and `docker_container_healthy` from the
+  generated `HealthProbeKind` CHECK entirely -- leaving exactly two supported
+  kinds, `systemd_unit_active` and `guest_operational` -- and adds a second
+  pair of triggers (`resource_health_contract_no_mixed_baseline`,
+  `package_update_job_health_probes_no_mixed_baseline`) refusing a
+  `guest_operational` row whose parent's declared `probe_count` is not
+  exactly 1, so the built-in baseline and an explicit advanced contract can
+  never share one contract, enforced in SQL independently of the domain
+  validator.
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`,
   `/operator-availability`;
   authority-metadata mutations
   (`PUT /r0/v1/resources/{resource_id}/package-plan-approval`,
-  `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`); and the
+  `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`,
+  `POST .../health-contract/reset` to restore the built-in default); and the
   explicit operator update controls
   (`POST`/`GET /r0/v1/resources/{resource_id}/package-update`,
   `POST .../package-update/resume`, `POST .../package-update/rollback`,
@@ -67,7 +82,10 @@
   every endpoint except the deliberately unauthenticated minimal
   `/r0/v1/health` liveness probe, which exposes no inventory or credential
   data.
-- **Home Assistant integration** — config flow, coordinator, structural
+- **Home Assistant integration** — config flow, an options flow (v20;
+  Settings → Devices & Services → Hubinet Ops → Configure) for viewing a
+  resource's health contract and restoring the built-in default, coordinator,
+  structural
   contract validation, dynamic devices, sensors, a binary sensor, and buttons;
   package-scan summary and
   concise `none | approved | stale | consumed` approval-status sensors,
@@ -75,7 +93,7 @@
   concise per-resource package-update job status/checkpoint/package-count and
   health-outcome sensors, authoritative rollback availability, and native
   `view_update_plan` / `approve_update_plan` / `view_health_contract` /
-  `set_health_contract` / `clear_health_contract` / `start_update` /
+  `set_health_contract` / `reset_health_contract` / `start_update` /
   `view_update_job` / `resume_update` / `rollback_update` actions. Every
   response-capable action uses the native Hubinet resource-device selector and
   returns exact material — package rows, contract probes, job events — as
@@ -611,12 +629,16 @@ is how it is built. This stage shipped **configuration authority only**;
   contract across a rename or a node move. Setting, reading, and clearing all
   go through the existing current-executable-binding proof plus an LXC check,
   so a missing, quarantined, retired, or replaced incarnation fails closed.
-- **All configured probes are required.** Exactly three typed kinds:
-  `systemd_unit_active`, `docker_container_running`, and
-  `docker_container_healthy`. No OR trees, no scoring, no percentages, no
-  boolean expressions, and no caller-supplied command, argv, shell, script,
-  or environment material — a probe names a target, and a target is data for
-  a fixed argv operation the future executor builds itself.
+- **All configured probes are required.** Exactly two typed kinds:
+  `systemd_unit_active` and `guest_operational`. A contract is EITHER exactly
+  one `guest_operational` probe (the built-in baseline) OR one or more
+  `systemd_unit_active` probes (an explicit advanced contract) — never both
+  (v0.5 health scope reduction; Docker-specific probes existed through an
+  earlier iteration and were removed end-to-end). No OR trees, no scoring, no
+  percentages, no boolean expressions, and no caller-supplied command, argv,
+  shell, script, or environment material — a probe names a target, and a
+  target is data for a fixed argv operation the future executor builds
+  itself.
 - **Absence is not health.** No contract means *unconfigured*, which is never
   "healthy", "passed", or "nothing to check". `probe_count` is constrained to
   at least one, so an empty contract cannot be stored, and the HTTP read
@@ -639,19 +661,20 @@ is how it is built. This stage shipped **configuration authority only**;
   positive revision can never become valid again, and `expected_revision=0`
   keeps meaning "currently unconfigured" rather than "never configured".
 - **Operator surface.** `GET`/`PUT`/`DELETE
-  /r0/v1/resources/{resource_id}/health-contract` with bearer auth. Failures
+  /r0/v1/resources/{resource_id}/health-contract`, plus
+  `POST .../health-contract/reset`, with bearer auth. Failures
   this API raises itself carry `{"detail": {"error", "message"}}`; a
   structurally invalid request is still rejected by FastAPI/Pydantic first,
   with its ordinary list-shaped validation body (see `ARCHITECTURE.md`). Plus
   the native Home Assistant
-  `view_health_contract` / `set_health_contract` / `clear_health_contract`
+  `view_health_contract` / `set_health_contract` / `reset_health_contract`
   actions on the existing resource-device selector. The published snapshot
   carries a concise `unsupported | unconfigured | configured` summary and its
   identity; the probe list is response data from an explicitly invoked action,
   never entity attributes.
 - **Out of scope in this stage, and now built in the next one:** every part
   of health *execution*. The contract layer itself still runs nothing — no
-  `systemctl`, `docker`, `pct`, or SSH lives in it, and declaring what healthy
+  `systemctl`, `pct`, or SSH lives in it, and declaring what healthy
   means stays a different file from checking it. What changed is that a
   contract is now **required** to issue a package-update job and is copied
   into it: see "Job-bound healthcheck execution" below. The durable shape here
@@ -681,8 +704,7 @@ lifecycle "Production activation" describes.
   never truthfully be called successful. Configuration remains bounded opaque
   data, but issuance now separately requires every stored probe to be
   structurally representable by the exact executor; a bare/pattern systemd
-  target or invalid Docker execution name produces no job and cannot reach
-  snapshot or package mutation.
+  target produces no job and cannot reach snapshot or package mutation.
 - **One boundary decides which contract applies.** While the job is still
   pre-mutation, the live contract drifting away from the frozen copy makes the
   job stale and forbids the real package mutation, exactly as a changed
@@ -692,11 +714,14 @@ lifecycle "Production activation" describes.
   check stops applying and the frozen copy is the only authority -- packages
   have already changed, and re-deciding success against a contract edited
   afterwards would be moving the goalposts.
-- **PASS, FAIL, UNKNOWN are three different answers.** A contract is an
-  ALL-OF. PASS requires every frozen probe positively proven -- absence of an
-  observed failure is not a pass. FAIL needs one probe proven false; one false
-  conjunct proves an ALL-OF false, so a deterministic failure beside an
-  unevaluable probe is still a failure, and it leaves the job ACTIVE with its
+- **PASS, FAIL, UNKNOWN are three different answers, and only a complete
+  decisive set may ever be finalized.** A contract is an ALL-OF. PASS
+  requires every frozen probe positively proven -- absence of an observed
+  failure is not a pass. FAIL needs one probe positively proven false --
+  inside a COMPLETE DECISIVE observation set, never beside one still
+  UNKNOWN: the authority finalizer independently refuses ANY observation set
+  containing an unresolved probe, defense in depth beside the orchestrator's
+  own DECISIVE-round gate. A proven failure leaves the job ACTIVE with its
   snapshot and its rollback authority intact. UNKNOWN is never success and is
   never durable: nothing is written but a bounded event, and the evaluation
   may simply be repeated.
@@ -709,29 +734,35 @@ lifecycle "Production activation" describes.
   failing one impossible without a complete result set containing a proven
   failure. No package command exit code, proven mutation, reachable guest, or
   absence of observed failures can produce `SUCCEEDED` on its own.
-- **Read-only, and that shapes the whole stage.** It runs `systemctl show` and
-  `docker inspect` and changes nothing, so there is deliberately no host
-  operation journal, no write-ahead uncertainty checkpoint, no lease, and no
+- **Read-only, and that shapes the whole stage.** It runs `systemctl show`
+  (or, for the built-in baseline, one fixed `/bin/true`) and changes nothing,
+  so there is deliberately no host operation journal, no write-ahead
+  uncertainty checkpoint, no lease, and no
   at-most-once submission fence -- inventing one would mimic the destructive
   stages without their reason for existing. What is kept is at-most-once
   *acceptance*: one definitive completion can commit, and write-once triggers
   stop a late result overwriting an accepted verdict or a rollback that moved
   the job on. A restart leaves a `health_started` job ACTIVE and fenced and
   never marks it succeeded; the evaluation is then simply run again.
-- **Fixed argv, verified against the real tools** (systemd 257, Docker 26.1.5)
-  rather than assumed. `systemctl is-active` expands globs and succeeds if ANY
-  match is active, and `--` does not stop it, so it is not used; `systemctl
-  show` plus a glob-free target charset plus an exactly-one-block rule is what
-  names one unit (a glob can match exactly one, so the block rule alone is not
-  enough), and an explicit unit-type suffix is required rather than guessed.
-  `docker inspect` resolves by ID prefix, so the returned `.Name` must equal
-  the requested container. Timeout and overflow are classified before the
-  killed process's non-zero return code, and a generic non-zero is never
-  absence merely because the daemon answers. Only a successful bounded fixed
-  listing of every complete container name that omits the requested exact name
-  proves absence. `docker_container_healthy` is never downgraded to
-  "running": not running, `unhealthy`, `starting`, and no HEALTHCHECK at all
-  are each a definitive failure.
+- **Fixed argv, verified against the real tool** (systemd 257) rather than
+  assumed. `systemctl is-active` expands globs and succeeds if ANY match is
+  active, and `--` does not stop it, so it is not used; `systemctl show` plus
+  a glob-free target charset plus an exactly-one-block rule is what names one
+  unit (a glob can match exactly one, so the block rule alone is not enough),
+  and an explicit unit-type suffix is required rather than guessed. Timeout
+  and overflow are classified before the killed process's non-zero return
+  code, and a generic non-zero is never a verdict merely because the command
+  ran. systemd's `activating`/`deactivating`/`reloading`/pending-`Job` states
+  are all UNKNOWN, never definitive failures (post-Human1 Stage 1: bounded
+  health settling, ADVANCED contract only) -- each is a transient
+  post-restart bookkeeping state, entered automatically, never a workload
+  verdict. The built-in `guest_operational` baseline runs one fixed,
+  argument-less `/bin/true` and is structurally independent of this settling
+  machinery entirely (v0.5 health scope reduction; see "Job-bound healthcheck
+  execution" below and `ARCHITECTURE.md`). Docker-specific package-update
+  health probes (`docker_container_running`, `docker_container_healthy`)
+  existed through an earlier iteration of this stage and were removed
+  end-to-end.
 - **Atomic final live-target proof.** The backend re-proves the exact
   resource/locator context before the host call and once as an early rejection
   after it; the helper's single guest dispatcher revalidates before every `pct
@@ -750,16 +781,98 @@ lifecycle "Production activation" describes.
   operator, not this stage, asks for it.
 - **Production reachable** through the one worker, at `mutation_completed` or
   `health_started`. One wake performs at most one truthful attempt, and PR
-  #73's deliberate absence of a retry policy is preserved exactly: an UNKNOWN
-  verdict leaves the job ACTIVE at `health_started` with its snapshot and
-  rollback authority intact and the worker idle for it, and an operator asks
-  again through the explicit `resume_update` control rather than a timer doing
-  it. A FAILED verdict leaves the job ACTIVE and rollback-capable and submits
-  nothing. The health helper is deployed behind its OWN dedicated key and
-  forced command and needs **no new PVE privilege** at all -- it reads through
-  host-local `pct exec`, so the provisioned role stays exactly the audit-only
-  pair. Human0 proved both a passing frozen contract and a deterministic failed
-  frozen contract against real update jobs.
+  #73's deliberate absence of a retry policy ABOVE the health stage is
+  preserved exactly. What one attempt means depends on the contract shape
+  (v0.5 health scope reduction): for the built-in `guest_operational`
+  baseline it is exactly ONE `/bin/true` execution, no sleep, no settling
+  window at all (see "Major fix: baseline independence" below); for an
+  explicit `systemd_unit_active` contract it remains the **bounded settling
+  window** from post-Human1 Stage 1, up to 180 seconds, entirely inside one
+  host round trip, observing the complete frozen probe set every 5 seconds in
+  rounds batched into one `systemctl show` call, never one guest command per
+  probe, until a decisive round (at least the second, completed within 15
+  seconds, with no probe transient) reaches PASSED or FAILED, or the window
+  and round bounds are exhausted. An unresolved evaluation leaves the job
+  ACTIVE at `health_started`
+  with its snapshot and rollback authority intact and the worker idle for it,
+  now carrying (Stage 2) the last complete round's bounded per-probe evidence
+  and settling metadata in its event history, and an operator asks again
+  through the distinct `can_rerun_health_evaluation`-gated control (the
+  generic `can_resume_update` is narrowed to exclude this checkpoint) rather
+  than a timer doing it. A FAILED verdict leaves the job ACTIVE and
+  rollback-capable and submits nothing. The health helper is deployed behind
+  its OWN dedicated key and forced command and needs **no new PVE privilege**
+  at all -- it reads through host-local `pct exec`, so the provisioned role
+  stays exactly the audit-only pair. Human0 proved both a passing frozen
+  contract and a deterministic failed frozen contract against real update
+  jobs.
+- **Post-Human1 Stage 1: bounded health settling closes the entire transient
+  family, not only one state.** A real Human1 operator test approved a
+  package plan that legitimately restarted the declared workload's runtime
+  (at the time, Docker/containerd); every declared object was observed in a
+  transient state at the instant health ran and settled back within seconds
+  with no operator action in between, but the original classification
+  durably recorded a FAILED verdict anyway. The immediate fix was UNKNOWN,
+  not FAILED, for that one state; the frozen follow-up generalized it to the
+  whole family (systemd's `activating`/`deactivating`/`reloading`/
+  pending-`Job`) and gave the backend a bounded internal settling window (see
+  above), for the advanced `systemd_unit_active` contract, so an ORDINARY
+  restart resolves automatically within it instead of needing a manual
+  re-run every time. See `ARCHITECTURE.md`, "Job-bound healthcheck
+  execution".
+- **v0.5 health scope reduction: Docker package-update health probes removed
+  end-to-end, and the built-in baseline made structurally independent of
+  settling.** `docker_container_running` and `docker_container_healthy` are
+  no longer supported anywhere -- not hidden from Home Assistant, not an
+  undocumented backend-only mode, removed from the domain model, the SQL
+  schema (bump to v21), the execution-eligibility grammar, the deployed
+  health helper, and every mirrored HA taxonomy. A confirmed review finding
+  proved the ADVANCED settling rules above (`MAX_ROUND_SPAN_SECONDS`,
+  `MIN_DECISIVE_ROUND`) were incorrectly applied to a `guest_operational`-only
+  contract: a `/bin/true` that genuinely took longer than 15 seconds to exit
+  `0` was discarded as non-decisive, and the job could get stuck ACTIVE at
+  `health_started` for a workload that never failed. The built-in baseline is
+  now a structurally SEPARATE one-shot code path
+  (`_evaluate_guest_operational_once`) that the settling loop never runs at
+  all: exactly one execution, no sleep, no second confirmation round, exit
+  `0` is DECISIVE PASS immediately however long it took, and anything else is
+  UNKNOWN after that one attempt. A second confirmed finding proved the
+  durable finalizer could combine a FAILED probe with a still-UNKNOWN sibling
+  into a durable FAILED verdict from a non-decisive round;
+  `InventoryAuthority.complete_package_update_health` and Home Assistant's
+  own job-view validation now both independently refuse ANY observation set
+  containing an UNKNOWN probe before finalizing one, as defense in depth
+  beside the orchestrator's own DECISIVE-round gate. The two contract shapes
+  (the baseline singleton, or one-or-more `systemd_unit_active` probes) are
+  enforced as mutually exclusive at every layer: domain validation, SQL
+  triggers, the backend HTTP API, and Home Assistant's own validation. See
+  `ARCHITECTURE.md`, "The `guest_operational` baseline is independent of
+  settling", and `PRODUCT.md`, "Exactly two supported contract shapes".
+- **Post-Human1 Stage 2: an unresolved health evaluation is actionable, and
+  truthfully re-runnable.** The job readback's `health.evidence` is now
+  `null`, `"observation"` (bounded per-probe evidence from an unresolved
+  evaluation -- never a verdict, never `definitive`), or `"verdict"` (a
+  durable, non-recheckable PASSED/FAILED result, `definitive: true`). The
+  `can_resume_update` capability excludes `health_started`; the new
+  `can_rerun_health_evaluation` capability is true exactly there, rendered by
+  Home Assistant as a distinctly labelled **Re-run health evaluation**
+  control that calls the same `/resume` liveness entrypoint. A definitive
+  FAILED verdict still offers neither control and remains rollback-capable
+  and non-recheckable.
+- **Post-Human1 addition: per-probe health evidence is readable from Home
+  Assistant.** The explicit job readback (`GET .../package-update`, the
+  `start_update`/`resume_update`/`rollback_update`/`view_update_job`
+  responses, and the native `view_update_job` HA action/notification) now
+  include each probe's `kind`, `target`, `outcome`, `checked_at`, bounded
+  `reason` token, and (Stage 2) a `definitive` flag -- once a definitive
+  verdict exists (`evidence == "verdict"`, `definitive: true`), or, now, once
+  an unresolved evaluation's bounded observation evidence exists
+  (`evidence == "observation"`, `definitive: false`). A real operator had to
+  read the authority SQLite database directly to learn that three probes had
+  failed, or which probe an unresolved evaluation was still waiting on; this
+  closes both gaps without exposing raw helper stdout/stderr, command text, or
+  unbounded attributes -- every field is a durable, typed, bounded authority
+  fact already computed by this stage.
 
 ## Production activation (implemented)
 
@@ -829,17 +942,17 @@ The operator-triggered update lifecycle is production reachable.
   execution queue and the recovery authority; a worker wakeup is an in-memory
   hint and needed no second durable queue. Making the lifecycle reachable
   caused no authority migration and no reset on its own. The current authority
-  schema is v19; see "Implemented" and "Known limitations" below.
+  schema is v20; see "Implemented" and "Known limitations" below.
 - **Human0: COMPLETE / PASS.** See "Human0 production lifecycle" above.
 
 ## Product stages
 
 ### Current — Human1 Home Assistant operator controls
 
-- Existing dynamic LXC devices now carry seven explicit buttons: review the
+- Existing dynamic LXC devices now carry eight explicit buttons: review the
   exact plan, approve the reviewed plan, start an approved update, view the
-  latest job, resume an active job, request same-job rollback, and view the
-  health contract.
+  latest job, resume an active job, re-run an unresolved health evaluation,
+  request same-job rollback, and view the health contract.
 - Exact package rows, contract probes, and bounded job facts/events are shown
   in on-demand persistent notifications rather than stored as large entity
   attributes. Sensors expose concise state, scan, pending-count, approval,
@@ -862,6 +975,114 @@ The operator-triggered update lifecycle is production reachable.
 - The authority schema remains v19. Operator availability is transient
   presentation data and richer job summaries are revisioned publication facts;
   no new durable authority state was needed.
+- **Post-Human1 live-defect remediation.** A real operator test exposed two
+  further HA-facing gaps, both closed without new durable authority: (1) an
+  operator who reviews and approves a plan but has not yet declared a health
+  contract now sees a native Home Assistant Repair (Settings → Repairs)
+  naming the existing `set_health_contract` action, instead of a silent dead
+  end after a disabled Start button; (2) the explicit job readback
+  (`view_update_job`, and the response of `start_update`/`resume_update`/
+  `rollback_update`) now includes each frozen probe's kind, target, outcome,
+  checked-at time, and bounded reason token once a definitive verdict exists,
+  so a FAILED or UNKNOWN health result is answerable from Home Assistant
+  without shell/SQLite access. Neither change stores new durable HA state or
+  lets Home Assistant choose a health contract on the operator's behalf.
+
+- **Post-Human1 Stage 1+2: bounded health settling and actionable UNKNOWN
+  evidence.** Closes the live-defect family the item above only partially
+  closed: `deploy/hubinet-package-health-helper.py` runs (at the time,
+  historically, for both Docker and systemd probes; Docker-specific probes
+  were later removed end-to-end -- see "v0.5 health scope reduction" above) a
+  bounded internal settling window (up to 180s, batched per-round
+  observation, decisive-round rules) inside its one host round trip, so an
+  ORDINARY restart after a package update settles automatically instead of
+  durably failing or needing a manual re-run every few seconds. Every
+  transient state (not only `starting`) is UNKNOWN, never a definitive
+  failure. An unresolved evaluation persists
+  bounded per-probe observation evidence and settling metadata in the job's
+  event history (`health.evidence == "observation"`, `definitive: false`,
+  distinct from a durable verdict's `definitive: true`), and the new
+  `can_rerun_health_evaluation` capability (narrowed out of the generic
+  `can_resume_update`) renders a truthfully distinct **Re-run health
+  evaluation** control. The authority schema remains v19; no new durable
+  authority state was needed for either stage. See `ARCHITECTURE.md`,
+  "Job-bound healthcheck execution".
+
+- **Post-Human1 PR #80 review remediation, schema v20, backend discovery,
+  and native onboarding.** A code review of Stage 1+2 found five concrete
+  gaps in the bounded-settling stage, each closed structurally: an explicit
+  typed `evaluation_status` (`decisive`/`unresolved`) now travels on the wire
+  and is checked *before* aggregation, never re-inferred from probe outcomes;
+  the 180s settling window is now one real absolute monotonic deadline
+  enforced before every round/sleep/command, with every per-command timeout
+  clamped to the remaining budget; a structural target problem (a bad
+  target, an ambiguous pattern) now returns immediately, never waiting out
+  the window; Home Assistant independently proves kind/outcome/reason and
+  verdict/probe-set coherence with exact JSON-type checks (closing a
+  `bool("false") is True` coercion trap), not just bounded-set membership;
+  and the backend now states its own timing policy
+  (`settling_policy: {deadline_seconds, observation_interval_seconds}`) on
+  the wire, with the helper validating and clamping against its own hard
+  ceilings rather than trusting Home Assistant to supply correct values —
+  Home Assistant never states or overrides this policy.
+
+  **The authority schema is v20** (bumped from v19, a normal pre-release
+  reset per `AGENTS.md`): a fourth probe kind, `guest_operational`, with no
+  target at all (`CHECK`-enforced nullable `target`, a partial unique index
+  permitting at most one per contract). It proves guest liveness
+  (`/bin/true`, fixed, no operator input), never application health, and
+  structurally can only ever PASS or UNKNOWN, never FAIL.
+
+  **`guest_operational` is the v0.5 built-in default health criterion for a
+  package-managed LXC.** The backend provisions it inside the
+  successful-reconciliation transaction for every current managed LXC with no
+  contract of its own, so an approved update can start with no separate
+  health-onboarding step. It is a product decision, not an observation:
+  nothing reads the guest to create it, an operator's explicit contract is
+  never overwritten by it, and repeated reconciliation is idempotent.
+  `POST .../health-contract/reset` (and the `reset_health_contract` action, or
+  the Options flow) restores that baseline under the usual compare-and-set
+  discipline; `DELETE` remains the low-level clear.
+
+  **v0.5 does not automatically discover or recommend `systemd_unit_active`
+  application health probes.** Absence of a workload observer is not proof of
+  workload absence, so v0.5 does not infer workload health automatically. The
+  candidate-discovery route, DTOs, adapter-presence oracle, recommendation
+  ranking, and the HA discovery flow were removed rather than left as a dead
+  architecture. `systemd_unit_active` remains fully supported as explicit
+  advanced operator configuration, executed by the same job-bound helper as
+  before; its absence or failure has no influence on the default path. (At
+  this point in the product's history Docker probes were still supported the
+  same way; "v0.5 health scope reduction" above records their later,
+  complete removal.)
+
+  **An unresolved health evaluation now publishes WHY, not only that it is
+  unresolved.** Independent review of the pivot found that the reason was
+  computed, bounded, and durably recorded — and then lost before Home
+  Assistant. With `guest_operational` as the default contract, PVE proving
+  the exact current LXC STOPPED is the ORDINARY post-update failure: the
+  helper refuses the whole request before any probe round, so the job
+  truthfully has no verdict, no evidence kind, and no probe rows. Those
+  three absences were all an operator saw; the actual classification
+  (`guest_unavailable`) lived only in the durable event's `details`, which
+  the HA transport does not carry. `GET .../package-update` now publishes
+  `health.reason` — exactly one token from the closed UNKNOWN taxonomy, from
+  the LATEST attempt only, never merged, and retired the moment a durable
+  verdict exists. Home Assistant re-proves the taxonomy itself rather than
+  trusting the string, refuses a reason published beside a definitive
+  verdict, and renders a fixed EN/PL description of the token — never
+  backend prose, never helper output. Nothing else about the event reaches
+  the wire. Rollback is unaffected and was reverified: `health_started` stays
+  rollback-eligible and `_post_mutation_job_context_is_current` still imposes
+  no running-status requirement, so a dead guest keeps its explicit same-job
+  recovery path. Still no auto-rollback, and still no new Repair family.
+
+  **The `health_contract_unconfigured` Repair is a non-fixable safety net.**
+  The backend default normally makes its premise unreachable; when it does
+  occur it names the two explicit remedies (Options → reset, or
+  `set_health_contract`) and clears itself once a contract exists. See
+  `ARCHITECTURE.md`, "The built-in `guest_operational` default" and "Native HA
+  health maintenance".
 
 ### Next — Human1 follow-ons deliberately deferred
 
@@ -870,9 +1091,6 @@ The operator-triggered update lifecycle is production reachable.
   forced-command boundaries; combining that deployment/host-control work with
   the package operator surface would make the boundary harder to review.
   Manual snapshots must remain distinct from job-owned rollback authority.
-- Health-contract inspection is native, but editing the variable-length typed
-  probe list remains in `set_health_contract` / `clear_health_contract` actions.
-  A scalar Text/Select entity would be a misleading editor for this contract.
 - A dedicated operator-facing bearer-token handoff/retrieval path remains to
   be designed. The token must not enter ordinary logs, diagnostics, or the
   published snapshot.
@@ -912,14 +1130,17 @@ not attestation or defense against an omnipotent PVE root.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v19 is incompatible with v18 and every earlier version,
+- Pre-release: schema v21 is incompatible with v20 and every earlier version,
   and there is no in-place migration path. Schema v17 added the durable
   per-resource `issuance_sequence` package-update jobs now use for latest-job
   ordering, and schema v18 adds the durable post-success package-scan request
   and constrained scan link. Schema v19 adds durable one-shot-on-success
-  approval consumption and the unique successful-job-per-approval fence (see
-  "Implemented" above), so an existing schema-v18 (or earlier) installation is
-  incompatible. An existing installation now uses
+  approval consumption and the unique successful-job-per-approval fence.
+  Schema v20 adds the nullable-target `guest_operational` probe kind and its
+  partial unique index. Schema v21 (v0.5 health scope reduction) removes the
+  two Docker health-probe kinds and adds the mixed-baseline-contract triggers
+  (see "Implemented" above), so an existing schema-v20 (or earlier)
+  installation is incompatible. An existing installation now uses
   `deploy/update-proxmox-0.5.sh` for
   this: it detects the incompatible authority schema, backs it up, and resets
   only the authority database (see "In-place product updates" below) while

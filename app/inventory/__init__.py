@@ -11,6 +11,8 @@ from .canonicalization import (
     canonicalize_transport_locator,
 )
 from .health_contract import (
+    DEFAULT_HEALTH_CONTRACT_FINGERPRINT,
+    DEFAULT_HEALTH_PROBES,
     HealthContractError,
     MAX_HEALTH_PROBES,
     MAX_HEALTH_PROBE_TARGET_LENGTH,
@@ -20,6 +22,7 @@ from .health_contract import (
 )
 from .health_observation import (
     HEALTH_PROBE_REASONS,
+    UNRESOLVED_HEALTH_REASONS,
 )
 from .package_update_issuance import (
     PACKAGE_UPDATE_ISSUANCE_REFUSALS,
@@ -175,6 +178,8 @@ __all__ = [
     "DEFINITIVE_HEALTH_OUTCOMES",
     "DiscoveryRun",
     "DiscoveryRunCompletionEvidence",
+    "DEFAULT_HEALTH_CONTRACT_FINGERPRINT",
+    "DEFAULT_HEALTH_PROBES",
     "DiscoveryRunLifecycle",
     "DetailReadStatus",
     "DiscoveredNode",
@@ -270,6 +275,7 @@ __all__ = [
     "SnapshotSubmissionRefusedBeforeCallback",
     "SourceEndpoint",
     "SourceRuntimeHealth",
+    "UNRESOLVED_HEALTH_REASONS",
     "WRITER_SCHEDULING_MARGIN_SECONDS",
     "aggregate_health_outcome",
     "build_snapshot_ownership",

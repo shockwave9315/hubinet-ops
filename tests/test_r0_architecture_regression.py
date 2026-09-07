@@ -263,22 +263,23 @@ def test_r0_production_modules_define_only_authority_metadata_mutations() -> Non
 
     Two `@app.put` (the exact-plan approval and the health-contract
     replacement), one `@app.delete` (the health-contract clear), and exactly
-    four `@app.post` -- start, resume, and roll back one update, plus the
-    product updater's own exclusive maintenance fence. The first three are
-    explicit operator controls over the update lifecycle; the fourth performs
-    no workload action at all and exists only to make a product update and a
-    workload update mutually exclusive. None is a generic dispatcher, and
-    `@app.patch` stays absent entirely.
+    five `@app.post` -- start, resume, and roll back one update, restore the
+    built-in health default, plus the product updater's own exclusive
+    maintenance fence. The first three are explicit operator controls over
+    the update lifecycle; the health reset writes authority metadata only and
+    reaches no guest; the last performs no workload action at all and exists
+    only to make a product update and a workload update mutually exclusive.
+    None is a generic dispatcher, and `@app.patch` stays absent entirely.
 
     Production activation is what made a destructive verb possible at all, so
-    this list is now the thing that stops a fifth one appearing quietly.
+    this list is now the thing that stops a sixth one appearing quietly.
     """
 
     text = (REPO_ROOT / "app/inventory_runtime.py").read_text(encoding="utf-8")
     assert "@app.patch(" not in text
     assert text.count("@app.put(") == 2
     assert text.count("@app.delete(") == 1
-    assert text.count("@app.post(") == 4
+    assert text.count("@app.post(") == 5
     assert (
         'f"{API_PREFIX}/resources/{{resource_id}}/package-plan-approval"'
         in text
@@ -401,6 +402,198 @@ def test_only_an_explicit_operator_request_can_issue_an_update_job() -> None:
     for rel_path in _MODULES_THAT_MAY_NEVER_ISSUE_AN_UPDATE_JOB:
         text = _code(REPO_ROOT / rel_path)
         assert "issue_package_update_job" not in text, rel_path
+
+
+#: The default-health provisioning/onboarding surface. Every module here
+#: participates in deciding that a current managed LXC has a health contract,
+#: and none of them may ever decide it by looking at what the guest runs.
+_DEFAULT_HEALTH_PROVISIONING_MODULES = (
+    "app/inventory/authority.py",
+    "app/inventory/health_contract.py",
+    "app/inventory/reconciliation.py",
+    "app/inventory_runtime.py",
+    "custom_components/hubinet_ops/config_flow.py",
+    "custom_components/hubinet_ops/repairs.py",
+    "custom_components/hubinet_ops/coordinator.py",
+)
+
+#: Text that only workload DISCOVERY needs. An advanced explicit probe still
+#: legitimately runs `systemctl show` -- but it runs it in the job-bound
+#: health helper, never in any module above. Docker-specific package-update
+#: health probes were removed end-to-end in v0.5 (`docker_container_running`,
+#: `docker_container_healthy`), so Docker markers are no longer merely
+#: excluded from provisioning -- they must not appear ANYWHERE in this
+#: repository's executable code, health helper included; see
+#: `test_no_health_module_still_executes_docker` below.
+#:
+#: Every marker must be a SINGLE argv token or identifier. `_code` joins the
+#: token stream with newlines, so a multi-word marker like ``"docker ps"``
+#: can never match an argv tuple ``("docker", "ps", ...)`` -- which is how
+#: every command in this repository is actually spelled -- and would be a
+#: fence that silently constrains nothing. `test_the_workload_inference_
+#: markers_are_all_matchable` below pins that property.
+_WORKLOAD_INFERENCE_MARKERS = (
+    "command -v",
+    "systemctl",
+    "list-unit-files",
+    "list-units",
+    "health-candidates",
+    "health_candidates",
+    "discover_health_candidates",
+    "HealthDiscovery",
+    "adapter_presence",
+)
+
+#: Docker-specific health-execution vocabulary that must appear NOWHERE in
+#: this repository's executable code -- not excluded from a subset of
+#: modules like `_WORKLOAD_INFERENCE_MARKERS` above, but removed end-to-end
+#: (v0.5 health scope reduction). Legitimate unrelated Docker usage outside
+#: package-update health (there is none in this repository today) would not
+#: match these identifiers, which name only the removed health-specific
+#: surface.
+_REMOVED_DOCKER_HEALTH_MARKERS = (
+    "docker_container_running",
+    "docker_container_healthy",
+    "DOCKER_CONTAINER_RUNNING",
+    "DOCKER_CONTAINER_HEALTHY",
+    "_docker_daemon_names",
+    "_docker_inspect_batch",
+    "_docker_round",
+    "_classify_docker_container",
+    "_require_exact_docker_name",
+    "DOCKER_INSPECT_FORMAT",
+    "DOCKER_NAME_LIST_FORMAT",
+    "DOCKER_NAME_PATTERN",
+    "docker_daemon_unavailable",
+    "container_not_running",
+    "container_absent",
+    "container_unhealthy",
+    "container_health_starting",
+    "container_has_no_healthcheck",
+    "container_restarting",
+    "container_not_started_yet",
+    "container_removing",
+    "container_running",
+    "container_healthy",
+)
+
+
+def test_the_default_health_path_can_never_regress_into_workload_inference() -> None:
+    """The v0.5 pivot's fence.
+
+    A managed LXC's default health criterion is `guest_operational`, and it
+    is a PRODUCT decision made in authority, not an observation of the guest:
+    absence of a workload observer is not proof of workload absence. So the
+    provisioning/onboarding path must contain no adapter probe, no runtime
+    probe, and no candidate-discovery vocabulary of any kind.
+
+    This is deliberately NOT a global ban on the remaining advanced kind. An
+    operator who explicitly declares `systemd_unit_active("nginx.service")`
+    still gets a real systemd check, executed by the job-bound health helper
+    -- which is excluded here precisely because that is its job.
+    """
+
+    for rel_path in _DEFAULT_HEALTH_PROVISIONING_MODULES:
+        path = REPO_ROOT / rel_path
+        if not path.exists():
+            continue
+        text = _code(path)
+        for marker in _WORKLOAD_INFERENCE_MARKERS:
+            assert marker not in text, (rel_path, marker)
+
+    # Positive control: the explicit-probe executor still legitimately owns
+    # the systemd command, so the markers above are a statement about WHERE
+    # inference may not live, not a global prohibition. It also proves the
+    # strongest marker can actually FIRE -- a fence whose markers match
+    # nothing anywhere would pass above for the wrong reason.
+    helper = _code(REPO_ROOT / "deploy/hubinet-package-health-helper.py")
+    assert "systemctl" in helper
+    # `systemctl show` is RETAINED here deliberately: an explicit
+    # `systemd_unit_active` contract needs it. What the helper must no longer
+    # carry is the DISCOVERY surface -- adapter presence, service/unit
+    # enumeration, and candidate ranking -- which is a different thing from
+    # executing a named probe.
+    assert '"show"' in helper
+    for marker in (
+        "command -v",
+        "list-unit-files",
+        "list-units",
+        "discover_health_candidates",
+        "adapter_presence",
+    ):
+        assert marker not in helper, marker
+
+
+def test_no_health_module_still_executes_docker() -> None:
+    """v0.5 health scope reduction: Docker package-update health probes were
+    removed end-to-end, not merely hidden or excluded from provisioning.
+
+    Every module that ever spoke Docker for package-update health -- the
+    domain model, the SQL schema generator, the execution-eligibility
+    grammar, the job-bound health helper, the backend host-control transport,
+    and the Home Assistant contract mirror -- must carry none of the removed
+    vocabulary any more.
+    """
+
+    modules = (
+        "app/inventory/models.py",
+        "app/inventory/health_contract.py",
+        "app/inventory/health_execution.py",
+        "app/inventory/health_observation.py",
+        "app/inventory/store.py",
+        "app/inventory/authority.py",
+        "app/package_update_health.py",
+        "app/package_update_health_host_control.py",
+        "deploy/hubinet-package-health-helper.py",
+        "custom_components/hubinet_ops/contract/enums.py",
+        "custom_components/hubinet_ops/contract/package_update_validation.py",
+    )
+    for rel_path in modules:
+        text = _code(REPO_ROOT / rel_path)
+        for marker in _REMOVED_DOCKER_HEALTH_MARKERS:
+            assert marker not in text, (rel_path, marker)
+
+
+def test_the_workload_inference_markers_are_all_matchable() -> None:
+    """A fence marker that cannot match is a fence that guards nothing.
+
+    `_code` returns one token per line, so a marker containing a space can
+    only ever match text INSIDE a single string literal -- never an argv
+    tuple, which is how this repository spells every command it runs. A
+    marker like ``"docker ps"`` therefore reads as a real constraint while
+    being satisfied by construction, and would keep passing even if a
+    provisioning module started shelling out to Docker.
+    """
+
+    for marker in _WORKLOAD_INFERENCE_MARKERS:
+        if " " in marker:
+            # The one legitimate multi-word shape: text that only ever
+            # appears as a single string literal, never as separate argv
+            # elements. Proved by exhibiting it as one literal.
+            assert marker == "command -v", marker
+
+
+def test_no_backend_or_integration_module_still_names_health_discovery() -> None:
+    """The removed Stage-3/3B surface is gone, not merely unreferenced.
+
+    Leaving the DTOs, the route, or the HA flow behind would advertise a
+    capability v0.5 deliberately does not have.
+    """
+
+    for base in ("app", "custom_components", "deploy", "scripts"):
+        for path in sorted((REPO_ROOT / base).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            text = path.read_text(encoding="utf-8")
+            rel = path.relative_to(REPO_ROOT)
+            for marker in (
+                "HealthDiscovery",
+                "discover_health_candidates",
+                "health-candidates",
+                "UNDECIDED_DISCOVERY_STATUSES",
+                "ResourceHealthDiscoveryRequest",
+            ):
+                assert marker not in text, (str(rel), marker)
 
 
 def test_the_maintenance_fence_is_read_inside_the_issuance_transaction() -> None:
@@ -985,6 +1178,7 @@ def test_r0_ha_transport_defines_an_exact_operator_method_allowlist() -> None:
         "approve_package_plan",
         "fetch_health_contract",
         "replace_health_contract",
+        "reset_health_contract",
         "clear_health_contract",
         "start_package_update",
         "fetch_package_update",
@@ -1690,59 +1884,28 @@ def test_the_health_helper_builds_only_fixed_argv_around_a_data_target() -> None
     """A probe target is DATA, and the commands around it are constants.
 
     Asserted structurally over the AST rather than by substring: every string
-    inside the three probe evaluators must be a literal this file owns, so a
-    target can never be concatenated, formatted, or templated into command
-    text. The one interpolation allowed anywhere near Docker is the exact
-    `/`-prefixed name comparison, which is a CHECK on the answer, not part of
-    a command.
+    inside the batched round builder (the one remaining family, systemd --
+    Docker health probes were removed end-to-end in v0.5) must be a literal
+    this file owns, so a target can never be concatenated, formatted, or
+    templated into command text -- it is only ever star-unpacked as its own
+    argv element(s).
     """
 
     path = REPO_ROOT / "deploy/hubinet-package-health-helper.py"
     module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    evaluators = {
+    builders = {
         node.name: node
         for node in module.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name.startswith("evaluate_")
+        if isinstance(node, ast.FunctionDef) and node.name == "_systemd_round"
     }
-    assert set(evaluators) == {
-        "evaluate_systemd_unit_active",
-        "evaluate_docker_container_running",
-        "evaluate_docker_container_healthy",
-    }
-    for name, node in evaluators.items():
+    assert set(builders) == {"_systemd_round"}
+    for name, node in builders.items():
         for inner in ast.walk(node):
             # An f-string or a `%`/`.format()` call building a command would
             # be exactly the interpolation this stage forbids.
-            assert not isinstance(inner, ast.JoinedStr) or name.startswith(
-                "evaluate_docker"
-            ), name
+            assert not isinstance(inner, ast.JoinedStr), name
             if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
                 assert inner.func.attr != "format", name
-
-    # The Docker template is a module-level constant, not built anywhere.
-    constants = {
-        target.id: node
-        for node in module.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
-    template = constants["DOCKER_INSPECT_FORMAT"]
-    assert isinstance(template.value, (ast.Constant, ast.JoinedStr, ast.BinOp))
-    assert "{{.Name}}" in _load_health_helper().DOCKER_INSPECT_FORMAT
-
-
-def _load_health_helper():
-    spec = importlib.util.spec_from_file_location(
-        "hubinet_package_health_helper_r0",
-        REPO_ROOT / "deploy" / "hubinet-package-health-helper.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def test_the_health_helper_is_the_only_file_that_can_probe_a_workload() -> None:
@@ -2057,3 +2220,47 @@ def test_no_detached_boundary_keeps_the_old_unchecked_spawn(source_name: str) ->
 
     source = (REPO_ROOT / "deploy" / source_name).read_text(encoding="utf-8")
     assert "_spawn_detached_runner" not in source
+
+
+def test_ha_integration_contains_no_docker_or_systemd_inspection_logic() -> None:
+    """Home Assistant is presentation plus explicit operator input.
+
+    It contains no workload discovery and no workload inference of any kind
+    -- it never runs, parses, or reimplements a systemd read, and it never
+    decides from one what a resource's health contract should be. The
+    BASELINE is backend product policy (the built-in `guest_operational`
+    contract, provisioned during reconciliation). An ADVANCED
+    `systemd_unit_active` contract is typed by an operator and forwarded
+    unchanged. systemd is actually executed in exactly one place: the
+    job-bound forced-command helper
+    (`deploy/hubinet-package-health-helper.py`), for probes an operator
+    explicitly declared. Docker-specific package-update health probes are no
+    longer part of v0.5 at all, so the Docker markers below name a surface
+    that must never exist anywhere, not merely be absent from here.
+
+    Asserted as the absence of the exact literals such logic would need --
+    Docker/systemd CLI invocations, their output-field names, and any local
+    execution primitive -- across every Python file the integration ships.
+    A multi-word literal is meaningful here because this scans RAW source
+    rather than a token stream (contrast `_WORKLOAD_INFERENCE_MARKERS`,
+    which must stay single-token for exactly that reason).
+    """
+
+    forbidden_substrings = (
+        "docker inspect",
+        "docker ps",
+        "systemctl show",
+        "systemctl list-unit-files",
+        "systemctl list-units",
+        "Healthcheck",
+        "FragmentPath",
+        "subprocess",
+        "paramiko",
+    )
+    integration_root = REPO_ROOT / "custom_components" / "hubinet_ops"
+    python_files = sorted(integration_root.glob("**/*.py"))
+    assert len(python_files) > 10  # sanity: the glob actually found the package
+    for path in python_files:
+        text = path.read_text(encoding="utf-8")
+        for forbidden in forbidden_substrings:
+            assert forbidden not in text, (path.relative_to(REPO_ROOT), forbidden)

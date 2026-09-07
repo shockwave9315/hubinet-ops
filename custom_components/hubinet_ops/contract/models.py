@@ -12,6 +12,7 @@ from .enums import (
     DetailStatus,
     HealthContractStatus,
     HealthProbeKind,
+    HealthProbeOutcome,
     LifecycleState,
     NodeAvailability,
     ObservationalContinuity,
@@ -244,10 +245,16 @@ class PackagePlanApprovalSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class HealthProbe:
-    """One required typed probe: `kind` selects fixed argv, `target` is data."""
+    """One required typed probe: `kind` selects fixed argv, `target` is data.
+
+    ``target`` is ``None`` for, and only for,
+    ``HealthProbeKind.GUEST_OPERATIONAL`` -- that kind names no container or
+    unit, and a faked target for it is exactly what the frozen design
+    forbids.
+    """
 
     kind: HealthProbeKind
-    target: str
+    target: str | None
 
     def __post_init__(self) -> None:
         validate_health_probe(self)
@@ -363,6 +370,7 @@ class OperatorCapabilities:
     can_start_update: bool = False
     can_view_update_job: bool = False
     can_resume_update: bool = False
+    can_rerun_health_evaluation: bool = False
     can_rollback_update: bool = False
     can_view_health_contract: bool = False
     can_configure_health_contract: bool = False
@@ -437,6 +445,34 @@ class PackageUpdateJobEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class PackageUpdateJobHealthProbeResult:
+    """One frozen probe's health evidence, as an operator reads it.
+
+    Every field is a bounded typed authority fact -- never raw helper
+    stdout/stderr and never command text. ``kind``/``target`` are this job's
+    own frozen probe material (already shown by ``view_health_contract``);
+    ``outcome``/``checked_at``/``reason`` are what was observed for it.
+
+    ``definitive`` distinguishes the two evidence kinds a job's
+    ``health_evidence`` can carry (frozen post-Human1 health architecture,
+    Stage 2): ``True`` means a durable, non-recheckable PASSED/FAILED
+    verdict (``health_evidence == "verdict"``); ``False`` means an unresolved
+    evaluation's bounded OBSERVATION evidence (``health_evidence ==
+    "observation"``) -- never a verdict, and never laundered into one by
+    re-running. Empty for a job with neither yet.
+    """
+
+    probe_index: int
+    kind: HealthProbeKind
+    #: ``None`` for, and only for, ``HealthProbeKind.GUEST_OPERATIONAL``.
+    target: str | None
+    outcome: HealthProbeOutcome
+    checked_at: str
+    reason: str
+    definitive: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class PackageUpdateJobView:
     """One complete package-update job, as an explicit action returns it.
 
@@ -444,9 +480,18 @@ class PackageUpdateJobView:
     Flat by design: Home Assistant renders these as a response mapping, and a
     nested shape would only invite a template to reach into it. Every field
     but one is a durable authority fact -- no helper output, no PVE task log,
-    no command text, no package rows, and no per-probe results.
+    no command text, and no package rows. ``health_probes`` IS included
+    (post-Human1 correction): a real operator had to read the backend's
+    SQLite database directly to learn which frozen probe failed and why, so
+    the per-probe evidence this stage already computes -- kind, target,
+    outcome, checked-at, and a bounded reason token -- is now part of the
+    explicit readback too. It carries a definitive verdict's results, and
+    (post-Human1 Stage 2) an unresolved evaluation's bounded observation
+    evidence; it is empty when neither exists, including the whole-request
+    refusal that ``health_reason`` below is there to explain.
 
-    ``rollback_available`` is the one exception, and deliberately so (GitHub
+    ``rollback_available`` is the one *authority-freshness* exception, and
+    deliberately so (GitHub
     review P2 #3, Option A): it is the backend's own fresh, current-target-
     checked verdict -- the same proof
     ``InventoryAuthority.arm_package_update_rollback`` requires -- not merely
@@ -478,6 +523,26 @@ class PackageUpdateJobView:
     terminalized_at: str | None = None
     terminal_reason: str | None = None
     events: tuple[PackageUpdateJobEvent, ...] = ()
+    health_probes: tuple[PackageUpdateJobHealthProbeResult, ...] = ()
+    #: ``None`` (nothing to show yet), ``"observation"`` (bounded per-probe
+    #: evidence from an unresolved evaluation), or ``"verdict"`` (a durable
+    #: definitive result) -- see `PackageUpdateJobHealthProbeResult.definitive`.
+    health_evidence: str | None = None
+    #: The CURRENT unresolved evaluation's whole-request classification: one
+    #: bounded token from the closed UNKNOWN taxonomy, or ``None``.
+    #:
+    #: Independent of ``health_evidence``, and that independence is the
+    #: point. A refusal that happened before any probe round ran carries no
+    #: per-probe evidence -- and with `guest_operational` as the default
+    #: contract, "the exact current LXC is stopped" is exactly that shape:
+    #: no verdict, no probes, no evidence. This field is what makes that
+    #: state readable instead of three silent absences.
+    #:
+    #: Present only while the job is genuinely unresolved. A durable verdict
+    #: retires it: a prior attempt's UNKNOWN classification is history, not
+    #: current state, and `validate_package_update_job_view` refuses a
+    #: payload that publishes one beside a definitive result.
+    health_reason: str | None = None
 
     def __post_init__(self) -> None:
         _require_uuid_identity(self.job_id, "job_id")

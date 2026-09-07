@@ -37,6 +37,9 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.hubinet_ops.api import (
     BackendInformation,
     DetailStatus,
+    HealthProbe,
+    HealthProbeKind,
+    HealthProbeOutcome,
     HubinetOpsCannotConnect,
     HubinetOpsConflict,
     HubinetOpsInvalidAuth,
@@ -1131,6 +1134,453 @@ def _rollback_job_payload(resource_id: str) -> dict[str, Any]:
             "available": True,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Post-Human1 correction: per-probe health evidence must survive the real
+# backend JSON payload -> PackageUpdateJobView parse, not only the
+# FakeTransport shortcut the rest of the integration suite uses. A real
+# operator test needed exactly this evidence and it was durably computed by
+# the backend but never reached Home Assistant -- see ARCHITECTURE.md and
+# STATUS.md, "Job-bound healthcheck execution".
+# ---------------------------------------------------------------------------
+
+
+def test_package_update_job_view_parses_per_probe_health_evidence() -> None:
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_started"
+    payload["health"] = {
+        "contract_revision": 3,
+        "started_at": "2026-09-06T13:40:16.792041+00:00",
+        "completed_at": None,
+        "outcome": None,
+        "evidence": "observation",
+        "probes": [
+            {
+                "index": 0,
+                "kind": "systemd_unit_active",
+                "target": "weatherhub-redis.service",
+                "outcome": "unknown",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "unit_activating",
+                "definitive": False,
+            },
+            {
+                "index": 1,
+                "kind": "systemd_unit_active",
+                "target": "weatherhub-weather-api.service",
+                "outcome": "unknown",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "unit_activating",
+                "definitive": False,
+            },
+        ],
+    }
+
+    view = _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+    assert view.health_evidence == "observation"
+    assert len(view.health_probes) == 2
+    first = view.health_probes[0]
+    assert first.probe_index == 0
+    assert first.kind is HealthProbeKind.SYSTEMD_UNIT_ACTIVE
+    assert first.target == "weatherhub-redis.service"
+    assert first.outcome is HealthProbeOutcome.UNKNOWN
+    assert first.reason == "unit_activating"
+    assert first.checked_at == "2026-09-06T13:40:23.444652+00:00"
+    assert first.definitive is False
+
+
+def test_package_update_job_view_defaults_to_no_probes_when_absent() -> None:
+    """A job with no durable verdict carries no per-probe evidence at all --
+    an absent ``probes`` key must not be treated as a parse failure."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    assert "probes" not in payload["health"]
+
+    view = _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+    assert view.health_probes == ()
+
+
+def test_package_update_job_view_parses_a_whole_request_unresolved_reason() -> None:
+    """The MAJOR PR #80 review finding, from Home Assistant's side.
+
+    The exact wire shape a stopped guest under the default
+    `guest_operational` contract produces: no verdict, no evidence kind, no
+    probe rows -- and one bounded classification that is the ONLY thing
+    telling an operator why. All four must survive the real parse together;
+    a payload like this used to arrive stripped of the fourth.
+    """
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_started"
+    payload["health"] = {
+        "contract_revision": 3,
+        "started_at": "2026-09-06T13:40:16.792041+00:00",
+        "completed_at": None,
+        "outcome": None,
+        "evidence": None,
+        "probes": [],
+        "settling": None,
+        "reason": "guest_unavailable",
+    }
+
+    view = _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+    assert view.health_outcome is None
+    assert view.health_evidence is None
+    assert view.health_probes == ()
+    assert view.health_reason == "guest_unavailable"
+
+
+def test_package_update_job_view_defaults_to_no_unresolved_reason() -> None:
+    """An absent key is "nothing to report", never a parse failure."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    assert "reason" not in payload["health"]
+
+    view = _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+    assert view.health_reason is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "definitely-not-a-token",
+        "",
+        "unit_active",
+        "container_absent",
+        7,
+        True,
+    ),
+    ids=(
+        "free_form",
+        "empty",
+        "passed_only_token",
+        "failed_only_token",
+        "integer",
+        "boolean",
+    ),
+)
+def test_package_update_job_view_rejects_a_non_unresolved_reason(reason) -> None:
+    """Home Assistant proves the taxonomy itself, never trusting a string
+    merely because a backend sent it.
+
+    `unit_active` and `container_absent` are the interesting rows: both ARE
+    bounded tokens of the wider probe taxonomy, and both are impossible as
+    the reason a job reached NO result -- one only ever describes a positive
+    proof, the other a proven-false conjunct.
+    """
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_started"
+    payload["health"] = {
+        "contract_revision": 3,
+        "outcome": None,
+        "evidence": None,
+        "probes": [],
+        "reason": reason,
+    }
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+def test_package_update_job_view_rejects_a_stale_reason_beside_a_verdict() -> None:
+    """Once a durable verdict exists the earlier UNKNOWN classification is
+    history. A payload publishing both describes a finished job as still
+    blocked, and a PASSED job as having been unable to reach the guest --
+    self-contradictory, and refused rather than rendered."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_completed"
+    payload["health"] = {
+        "contract_revision": 3,
+        "outcome": "passed",
+        "evidence": "verdict",
+        "probes": [
+            {
+                "index": 0,
+                "kind": "guest_operational",
+                "target": None,
+                "outcome": "passed",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "guest_operational_confirmed",
+                "definitive": True,
+            },
+        ],
+        "reason": "guest_unavailable",
+    }
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+def _mixed_observation_payload(unresolved_reason: str) -> dict:
+    """The exact wire shape a NON-DECISIVE round over an advanced contract
+    produces: one probe still transient, one already PASSED, no verdict --
+    parameterized by the whole-request classification the backend puts
+    beside them."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_started"
+    payload["health"] = {
+        "contract_revision": 3,
+        "started_at": "2026-09-06T13:40:16.792041+00:00",
+        "completed_at": None,
+        "outcome": None,
+        "evidence": "observation",
+        "probes": [
+            {
+                "index": 0,
+                "kind": "systemd_unit_active",
+                "target": "worker.service",
+                "outcome": "unknown",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "unit_activating",
+                "definitive": False,
+            },
+            {
+                "index": 1,
+                "kind": "systemd_unit_active",
+                "target": "nginx.service",
+                "outcome": "passed",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "unit_active",
+                "definitive": False,
+            },
+        ],
+        "settling": {"rounds": 3, "settled_seconds": 12.5, "last_round_span_ms": 40},
+        "reason": unresolved_reason,
+    }
+    return payload
+
+
+def test_a_mixed_observation_round_parses_with_its_own_blocking_reason() -> None:
+    """The corrected backend payload survives the real parse.
+
+    The attempt's classification is the BLOCKING probe's reason; the PASSED
+    probe keeps its own `unit_active` untouched. Both facts coexist, and
+    neither is derived from the other.
+    """
+
+    view = _transport_http_module._package_update_job_view(
+        RESOURCE_CT, _mixed_observation_payload("unit_activating")
+    )
+
+    assert view.health_outcome is None
+    assert view.health_evidence == "observation"
+    assert view.health_reason == "unit_activating"
+    assert [(probe.outcome.value, probe.reason) for probe in view.health_probes] == [
+        ("unknown", "unit_activating"),
+        ("passed", "unit_active"),
+    ]
+
+
+def test_the_last_probes_reason_is_not_a_legal_whole_request_reason() -> None:
+    """The consequence of the backend bug this test pins, from HA's side.
+
+    A readback that published the LAST probe's reason as the attempt's own
+    would send `unit_active` -- a PASSED-only token -- as the reason a job
+    reached NO result. Home Assistant refuses it, so the defect surfaced as
+    a rejected readback for exactly the advanced contracts that produce
+    mixed rounds, not as a subtly wrong string.
+    """
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _mixed_observation_payload("unit_active")
+        )
+
+
+def test_package_update_job_view_rejects_an_unknown_probe_outcome() -> None:
+    """A malformed backend answer must fail closed, never render a guess."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_completed"
+    payload["health"] = {
+        "contract_revision": 3,
+        "outcome": "failed",
+        "probes": [
+            {
+                "index": 0,
+                "kind": "systemd_unit_active",
+                "target": "web.service",
+                "outcome": "maybe",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "unit_activating",
+            },
+        ],
+    }
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+def _probe_health_payload(**probe_overrides) -> dict:
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_completed"
+    probe = {
+        "index": 0,
+        "kind": "systemd_unit_active",
+        "target": "web.service",
+        "outcome": "passed",
+        "checked_at": "2026-09-06T13:40:23.444652+00:00",
+        "reason": "unit_active",
+        "definitive": True,
+    }
+    probe.update(probe_overrides)
+    payload["health"] = {
+        "contract_revision": 3,
+        "outcome": "passed",
+        "evidence": "verdict",
+        "probes": [probe],
+    }
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# PR #80 review finding 2.4.1: exact JSON types, never a coercion that turns
+# a malformed value into valid-looking data (`bool("false")` is `True`).
+# ---------------------------------------------------------------------------
+
+
+def test_package_update_job_view_rejects_a_string_boolean_for_definitive() -> None:
+    """`bool("false")` is `True` in Python -- exactly the false-positive this
+    must never let a malformed backend answer produce."""
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _probe_health_payload(definitive="false")
+        )
+
+
+def test_package_update_job_view_rejects_a_numeric_string_index() -> None:
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _probe_health_payload(index="0")
+        )
+
+
+def test_package_update_job_view_rejects_a_non_string_reason() -> None:
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _probe_health_payload(reason=123)
+        )
+
+
+def test_package_update_job_view_rejects_a_non_string_target() -> None:
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _probe_health_payload(target=["web"])
+        )
+
+
+def test_package_update_job_view_rejects_a_string_boolean_rollback_available() -> None:
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["rollback"]["available"] = "false"
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+def test_package_update_job_view_rejects_a_malformed_evidence_type() -> None:
+    payload = _probe_health_payload()
+    payload["health"]["evidence"] = 1
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+def test_package_update_job_view_rejects_a_failed_verdict_with_no_failed_probe() -> None:
+    """Independent HA-side proof that the aggregate verdict and the
+    accompanying per-probe rows agree -- a FAILED verdict with an all-PASSED
+    probe set is rejected, never rendered."""
+
+    payload = _probe_health_payload()
+    payload["health"]["outcome"] = "failed"
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+# ---------------------------------------------------------------------------
+# The health-contract mutations. There is deliberately no candidate-discovery
+# parser here any more: v0.5 has no route that asks a guest what it runs.
+# ---------------------------------------------------------------------------
+
+
+async def test_reset_health_contract_posts_the_typed_reset_route(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    """The reset carries a resource and a compare-and-set revision, and
+    nothing else. No probe, kind, target, or body crosses this boundary --
+    the backend owns what its built-in default is."""
+
+    aioclient_mock.post(
+        f"{BASE_URL}/r0/v1/resources/{RESOURCE_CT}/health-contract/reset",
+        json={
+            "resource_id": RESOURCE_CT,
+            "status": "configured",
+            "revision": 4,
+            "fingerprint": "d" * 64,
+            "created_at": "2026-08-08T12:00:00+00:00",
+            "updated_at": "2026-08-08T12:06:00+00:00",
+            "probes": [{"kind": "guest_operational", "target": None}],
+        },
+    )
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    contract = await transport.reset_health_contract(RESOURCE_CT, 3)
+
+    assert contract.resource_id == RESOURCE_CT
+    assert contract.revision == 4
+    assert contract.probes == (
+        HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
+    )
+    (request,) = aioclient_mock.mock_calls
+    method, url, body, _headers = request
+    assert method == "POST"
+    assert url.path == f"/r0/v1/resources/{RESOURCE_CT}/health-contract/reset"
+    assert dict(url.query) == {"expected_revision": "3"}
+    assert body is None
+
+
+async def test_reset_health_contract_omits_the_revision_when_unconditional(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    aioclient_mock.post(
+        f"{BASE_URL}/r0/v1/resources/{RESOURCE_CT}/health-contract/reset",
+        json={
+            "resource_id": RESOURCE_CT,
+            "status": "configured",
+            "revision": 1,
+            "fingerprint": "d" * 64,
+            "created_at": "2026-08-08T12:00:00+00:00",
+            "updated_at": "2026-08-08T12:06:00+00:00",
+            "probes": [{"kind": "guest_operational", "target": None}],
+        },
+    )
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    await transport.reset_health_contract(RESOURCE_CT, None)
+
+    (request,) = aioclient_mock.mock_calls
+    assert dict(request[1].query) == {}
+
+
+def test_the_transport_exposes_no_health_candidate_discovery() -> None:
+    """The removed Stage-3B client surface is gone, not merely unused."""
+
+    assert not hasattr(HttpHubinetOpsTransport, "fetch_health_candidates")
+    assert not hasattr(_transport_http_module, "_health_discovery_result")
+    assert not hasattr(_transport_http_module, "_health_discovery_candidate")
+    source = Path(_transport_http_module.__file__).read_text(encoding="utf-8")
+    for marker in ("health-candidates", "HealthDiscovery", "discovery_status"):
+        assert marker not in source, marker
 
 
 class _DelayedRollbackServer:

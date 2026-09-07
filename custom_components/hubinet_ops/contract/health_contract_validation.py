@@ -19,7 +19,10 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from .enums import HealthContractStatus, HealthProbeKind
+from .enums import (
+    HealthContractStatus,
+    HealthProbeKind,
+)
 from .primitives import _require_enum_instance, _require_text
 
 if TYPE_CHECKING:
@@ -41,6 +44,14 @@ _FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 
 def validate_health_probe(probe: "HealthProbe") -> None:
     _require_enum_instance(probe.kind, HealthProbeKind, "health probe kind")
+    if probe.kind is HealthProbeKind.GUEST_OPERATIONAL:
+        if probe.target is not None:
+            raise ValueError(
+                "a guest_operational health probe must not carry a target"
+            )
+        return
+    if probe.target is None:
+        raise ValueError("health probe target is required for this kind")
     _require_text(probe.target, "health probe target")
     if len(probe.target) > MAX_HEALTH_PROBE_TARGET_LENGTH:
         raise ValueError("health probe target is too long")
@@ -125,3 +136,13 @@ def validate_resource_health_contract(contract: "ResourceHealthContract") -> Non
     identities = {(probe.kind, probe.target) for probe in probes}
     if len(identities) != len(probes):
         raise ValueError("health contract contains a duplicate probe")
+    # Mirrors the backend's own invariant (`app/inventory/health_contract.py
+    # ::canonical_health_probes`): the built-in `guest_operational` baseline
+    # and an explicit advanced contract never mix. A payload naming both is
+    # outside the contract and is refused rather than rendered.
+    if len(probes) > 1 and any(
+        probe.kind is HealthProbeKind.GUEST_OPERATIONAL for probe in probes
+    ):
+        raise ValueError(
+            "guest_operational may not be combined with any other probe"
+        )

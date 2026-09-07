@@ -85,22 +85,68 @@ will not invent one. A guest that answers, an `apt` exit code, and the
 package-mutation completion proof are each already-meaningful facts, and none
 of them says anything about what the guest is *for*.
 
-**Health is operator-declared, per resource.** For each dynamic resource the
-operator declares a health contract: the list of things that must be true for
-that workload to be considered up. It attaches to the durable `resource_id`,
-never to a VMID, a hostname, a node, or a list in a repository or config file —
-adding or removing a guest in Proxmox still never requires a code change. A
-guest that replaces another at the same VMID is a different resource
-incarnation and inherits nothing; the same resource keeps its contract when it
-is renamed or moves node.
+**Default.** For a package-managed LXC, v0.5 uses `guest_operational` as the
+built-in post-update health criterion. The backend provisions it for every
+current managed LXC, so an approved update can start without a separate
+health-onboarding step.
+
+**Meaning.** `guest_operational` proves only guest liveness/process
+execution. It does not prove application health, systemd workload health,
+HTTP reachability, network reachability, or that a database is accepting
+queries. It is also a single one-shot check: it does not settle, does not
+retry, and does not depend on the bounded settling machinery described
+below for `systemd_unit_active` (see "A job's success criterion is frozen
+when the job is issued" and `ARCHITECTURE.md`, "Job-bound healthcheck
+execution").
+
+**No automatic workload discovery.** v0.5 does not automatically discover or
+recommend `systemd_unit_active` application health probes. Absence of a
+workload observer is not proof of workload absence, so v0.5 does not infer
+workload health automatically. Docker workload health is not part of v0.5
+Hubinet Ops package-update health: Docker-specific probes
+(`docker_container_running`, `docker_container_healthy`) existed through an
+earlier iteration and were removed end-to-end, not merely hidden.
+
+**Advanced probes.** `systemd_unit_active` remains explicit advanced operator
+configuration, declared through the health-contract mutation. A manually
+configured systemd contract still truthfully checks systemd. An advanced
+contract REPLACES the built-in baseline; it is never combined with it (see
+"Exactly two supported contract shapes" below).
+
+**Health is per resource, and an operator's own contract always wins.** A
+health contract attaches to the durable `resource_id`, never to a VMID, a
+hostname, a node, or a list in a repository or config file — adding or
+removing a guest in Proxmox still never requires a code change. A guest that
+replaces another at the same VMID is a different resource incarnation and
+inherits nothing (it gets its own fresh built-in default, never the
+predecessor's contract); the same resource keeps its contract when it is
+renamed or moves node. An explicitly declared contract is never silently
+replaced by the default — only an explicit operator reset restores the
+baseline.
 
 **A contract is one or more typed probes, and all of them are required.**
-There are exactly three probe kinds:
+There are exactly two probe kinds, and exactly two supported contract shapes
+(see below) — never a third shape mixing them:
 
-- `systemd_unit_active` — the named systemd unit must be active;
-- `docker_container_running` — the named Docker container must be running;
-- `docker_container_healthy` — the named Docker container must be running and
-  report Docker `HEALTHCHECK` status healthy.
+- `guest_operational` (schema v20) — the exact current LXC remained reachable
+  through the trusted PVE boundary and successfully executed one fixed,
+  code-owned command, exactly once. It carries no target at all, never even a
+  faked one (a literal `"guest"`, a VMID string). This is the built-in
+  default above: a proof of guest liveness, never a substitute for
+  application-health proof, and never combined with the settling behavior
+  below. An operator who wants their workload checked declares
+  `systemd_unit_active` instead, which REPLACES this baseline entirely.
+- `systemd_unit_active` — the named systemd unit must be active.
+
+**Exactly two supported contract shapes, never mixed.** A contract is EITHER
+exactly one `guest_operational` probe (the built-in baseline, target `NULL`)
+OR one or more `systemd_unit_active` probes (an explicit advanced contract).
+Declaring `guest_operational` alongside any `systemd_unit_active` probe is
+refused, consistently, at every layer that can produce or accept a contract:
+domain validation, the SQL schema, the backend HTTP API, and Home Assistant's
+own independent validation. An advanced contract REPLACES the baseline; it
+does not extend it, and mixing them would reintroduce exactly the settling
+coupling the baseline is deliberately free of.
 
 Every declared probe must hold. There is no OR, no scoring, no percentage, and
 no boolean expression — a contract that needs those is a contract nobody can
@@ -109,18 +155,21 @@ a shell fragment, and no caller-supplied text ever becomes command text (see
 "Arbitrary remote shell" under "Not the product").
 
 **Configuration and execution eligibility are separate.** The configuration
-layer keeps probe targets as bounded opaque data; it does not guess, append a
-systemd suffix, or silently rewrite a Docker name. A package-update job is
-narrower: before it is issued, every probe must be structurally representable
-by the exact executor. A bare or pattern systemd target, or a non-exact Docker
-name, may remain stored configuration but cannot authorize snapshot or package
-mutation for an update whose frozen success criterion could never pass.
+layer keeps probe targets as bounded opaque data; it does not guess or append
+a systemd suffix. A package-update job is narrower: before it is issued,
+every probe must be structurally representable by the exact executor. A bare
+or pattern systemd target may remain stored configuration but cannot
+authorize snapshot or package mutation for an update whose frozen success
+criterion could never pass.
 
 **No contract means unconfigured, and unconfigured is never success.** A
 resource with no declared contract cannot be health-checked, so its update job
 cannot be called successful and no automatic health-triggered rollback can be
 justified for it. Unconfigured is not "healthy", "passed", or "nothing to
 check" — it is the absence of a statement, and Hubinet Ops reports it as such.
+This is not the normal state of a managed LXC: the built-in default above
+means a current managed LXC is configured from the moment it is reconciled,
+and resetting health restores that baseline rather than removing it.
 An empty contract is invalid for the same reason: a list of zero required
 things is not a definition of health. A resource that has declared nothing
 therefore cannot be given an update job at all: a job whose success criterion
@@ -144,14 +193,20 @@ Which of the two contracts wins depends on one boundary, and only that one:
   authority. The operator may edit or clear the live contract freely; this job
   is still judged by what it was issued to satisfy.
 
-**The verdict is all-of, and there are three of them.** *Passed* means every
-declared probe was positively proven — absence of an observed failure is not a
-pass, and neither is a probe that could not be checked. *Failed* means at least
-one probe was positively proven false; one false requirement is enough, even if
-another probe could not be checked at all. *Unknown* is everything else: nothing
-proved the contract false, but something required could not be checked
-truthfully. Unknown is never success and is never recorded as a result — a
-healthcheck only reads, so it is simply run again.
+**Only a complete decisive observation set may ever be finalized.** A
+healthcheck only reads, so an unresolved attempt is simply run again — never
+recorded, and never a step toward a durable answer on its own. Within a
+decisive complete set, there are three verdicts: *Passed* means every
+declared probe was positively proven — absence of an observed failure is not
+a pass, and neither is a probe that could not be checked. *Failed* means at
+least one probe was positively proven false; one false requirement is enough
+to fail the whole contract. *Unknown* is impossible in material accepted for
+durable finalization: it is never success, and both the orchestrator and the
+authority finalizer independently refuse to record a verdict from an
+observation set containing so much as one unresolved probe, even beside a
+proven failure. Do not read this as "one FAILED probe creates a durable
+FAILED verdict while another probe is still UNKNOWN" — that combination is
+refused outright, not finalized.
 
 **Retained snapshots.** A job's snapshot is kept. There is no automatic
 deletion after a successful update, no retention count, and no age policy

@@ -55,6 +55,16 @@ _ROLLBACK_AVAILABLE_CHECKPOINTS = frozenset(
 #: never reachable while ACTIVE at all (the job is ``rolled_back`` by then);
 #: it is excluded here purely for closure/defense-in-depth, matching
 #: ``_step``'s own unreachable fallback for it.
+#:
+#: ``health_started`` is ALSO excluded here (frozen post-Human1 health
+#: architecture, Stage 2): it is not that the worker cannot continue from
+#: it -- ``_step`` still does, on the exact same wake -- but that "Resume"
+#: is not a truthful label for what pressing it does at that checkpoint. An
+#: unresolved bounded health settling window means truthfully "re-run this
+#: job's health evaluation", never "continue a stalled mutation", so it gets
+#: its own capability, ``can_rerun_health_evaluation``, with its own label.
+#: Both ultimately wake the same worker through the same ``/resume`` route;
+#: only the presentation is split.
 _RESUME_CAPABLE_CHECKPOINTS = frozenset(
     {
         "issued",
@@ -63,10 +73,16 @@ _RESUME_CAPABLE_CHECKPOINTS = frozenset(
         "snapshot_confirmed",
         "mutation_may_have_started",
         "mutation_completed",
-        "health_started",
         "rollback_may_have_started",
     }
 )
+
+#: The one checkpoint `can_rerun_health_evaluation` names: an ACTIVE job
+#: whose bounded settling window ended without a verdict. Deliberately a
+#: single-element set defined beside `_RESUME_CAPABLE_CHECKPOINTS` above so
+#: the two capabilities are provably disjoint and provably exhaustive over
+#: every checkpoint the worker treats as "still owns the slot, may continue".
+_RERUN_HEALTH_EVALUATION_CHECKPOINTS = frozenset({"health_started"})
 
 
 def _freeze(value: Any) -> Any:
@@ -747,6 +763,7 @@ class InventoryPublication:
             "can_start_update": False,
             "can_view_update_job": False,
             "can_resume_update": False,
+            "can_rerun_health_evaluation": False,
             "can_rollback_update": False,
             "can_view_health_contract": False,
             "can_configure_health_contract": False,
@@ -773,6 +790,9 @@ class InventoryPublication:
         # from -- see `_RESUME_CAPABLE_CHECKPOINTS`.
         resumable_checkpoint = active_job and job["checkpoint"] in (
             _RESUME_CAPABLE_CHECKPOINTS
+        )
+        rerun_health_checkpoint = active_job and job["checkpoint"] in (
+            _RERUN_HEALTH_EVALUATION_CHECKPOINTS
         )
         rollback_available = bool(job["rollback_available"])
         # The durable checkpoint fact above says a rollback COULD apply to
@@ -812,6 +832,9 @@ class InventoryPublication:
             "can_view_update_job": has_job,
             "can_resume_update": (
                 self._package_update_activated and resumable_checkpoint
+            ),
+            "can_rerun_health_evaluation": (
+                self._package_update_activated and rerun_health_checkpoint
             ),
             "can_rollback_update": (
                 self._package_update_activated and rollback_target_current

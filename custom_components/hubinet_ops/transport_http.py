@@ -30,6 +30,7 @@ from .api import (
     HealthContractSummary,
     HealthProbe,
     HealthProbeKind,
+    HealthProbeOutcome,
     HubinetOpsApi,
     HubinetOpsApiFactory,
     HubinetOpsCannotConnect,
@@ -55,6 +56,7 @@ from .api import (
     PackagePlanApprovalStatus,
     PackageUpdateHealthOutcome,
     PackageUpdateJobEvent,
+    PackageUpdateJobHealthProbeResult,
     PackageUpdateJobState,
     PackageUpdateJobSummary,
     PackageUpdateJobView,
@@ -347,7 +349,12 @@ def _resource_health_contract(
             )
         probes = tuple(
             HealthProbe(
-                kind=HealthProbeKind(probe["kind"]), target=str(probe["target"])
+                kind=HealthProbeKind(probe["kind"]),
+                # `None` only for guest_operational -- `str(None)` would
+                # silently become the literal string "None".
+                target=(
+                    None if probe["target"] is None else str(probe["target"])
+                ),
             )
             for probe in payload["probes"]
         )
@@ -408,6 +415,72 @@ def _default_package_update_job_summary(
     )
 
 
+def _strict_str(value: Any, field: str) -> str:
+    """Exact JSON type first, domain meaning second.
+
+    ``str(value)`` would silently turn a malformed non-string JSON value
+    into a valid-looking one (an int, a list, ``None``); this refuses it
+    outright instead, so a truly malformed backend answer fails closed as
+    ``HubinetOpsInvalidResponse`` rather than being normalized into
+    something that merely LOOKS like valid data.
+    """
+
+    if not isinstance(value, str):
+        raise HubinetOpsInvalidResponse(f"{field} must be a string")
+    return value
+
+
+def _strict_int(value: Any, field: str) -> int:
+    """Exact JSON type: a numeric-looking STRING (``"1"``) is not an int."""
+
+    if type(value) is not int:
+        raise HubinetOpsInvalidResponse(f"{field} must be an integer")
+    return value
+
+
+def _strict_probe_target(value: Any, kind: "HealthProbeKind", field: str) -> str | None:
+    """A probe target is a string for every kind except one.
+
+    ``guest_operational`` names no container or unit and MUST be exactly
+    JSON ``null``; every other kind requires the exact string type -- never
+    a coercion, and never a target silently accepted for the one kind that
+    must never carry one.
+    """
+
+    if kind is HealthProbeKind.GUEST_OPERATIONAL:
+        if value is not None:
+            raise HubinetOpsInvalidResponse(
+                f"{field} must be null for a guest_operational probe"
+            )
+        return None
+    return _strict_str(value, field)
+
+
+def _strict_bool(value: Any, field: str) -> bool:
+    """Exact JSON type. ``bool("false")`` is ``True`` in Python -- exactly
+    the false-negative-turned-false-positive this refuses to let happen for
+    a field an operator-visible capability or verdict may depend on."""
+
+    if type(value) is not bool:
+        raise HubinetOpsInvalidResponse(f"{field} must be a boolean")
+    return value
+
+
+def _package_update_job_health_probe_result(
+    probe: Any,
+) -> PackageUpdateJobHealthProbeResult:
+    kind = HealthProbeKind(probe["kind"])
+    return PackageUpdateJobHealthProbeResult(
+        probe_index=_strict_int(probe["index"], "probe.index"),
+        kind=kind,
+        target=_strict_probe_target(probe["target"], kind, "probe.target"),
+        outcome=HealthProbeOutcome(probe["outcome"]),
+        checked_at=_strict_str(probe["checked_at"], "probe.checked_at"),
+        reason=_strict_str(probe["reason"], "probe.reason"),
+        definitive=_strict_bool(probe["definitive"], "probe.definitive"),
+    )
+
+
 def _package_update_job_view(
     resource_id: str, payload: Any
 ) -> PackageUpdateJobView:
@@ -417,7 +490,11 @@ def _package_update_job_view(
     flattens exactly the fields the integration is contracted to show and
     ignores nothing silently -- a missing required field raises rather than
     defaulting, because a job rendered with an invented field is a job
-    described untruthfully.
+    described untruthfully. Every field below is validated against its
+    EXACT JSON type before being trusted (PR #80 review 2.4.1): a
+    malformed-but-coercible value (a numeric string for an index, the
+    string ``"false"`` for a boolean) is refused rather than silently
+    normalized into valid-looking data.
     """
 
     if not isinstance(payload, Mapping):
@@ -432,15 +509,26 @@ def _package_update_job_view(
         health = payload["health"]
         rollback = payload["rollback"]
         outcome = health.get("outcome")
+        evidence = health.get("evidence")
+        if evidence is not None:
+            evidence = _strict_str(evidence, "health.evidence")
+        health_reason = health.get("reason")
+        if health_reason is not None:
+            # Strictly typed here; the closed-taxonomy and
+            # not-beside-a-verdict rules are re-proved independently in
+            # `validate_package_update_job_view`.
+            health_reason = _strict_str(health_reason, "health.reason")
         return PackageUpdateJobView(
-            job_id=str(payload["job_id"]),
-            request_id=str(payload["request_id"]),
+            job_id=_strict_str(payload["job_id"], "job_id"),
+            request_id=_strict_str(payload["request_id"], "request_id"),
             resource_id=resource_id,
             status=PackageUpdateJobState(payload["status"]),
-            checkpoint=str(payload["checkpoint"]),
-            issued_at=str(payload["issued_at"]),
-            approved_plan_fingerprint=str(payload["approved_plan_fingerprint"]),
-            package_count=int(payload["package_count"]),
+            checkpoint=_strict_str(payload["checkpoint"], "checkpoint"),
+            issued_at=_strict_str(payload["issued_at"], "issued_at"),
+            approved_plan_fingerprint=_strict_str(
+                payload["approved_plan_fingerprint"], "approved_plan_fingerprint"
+            ),
+            package_count=_strict_int(payload["package_count"], "package_count"),
             snapshot_name=snapshot.get("name"),
             snapshot_confirmed_at=snapshot.get("confirmed_at"),
             mutation_may_have_started_at=mutation.get("may_have_started_at"),
@@ -453,20 +541,28 @@ def _package_update_job_view(
             ),
             rollback_may_have_started_at=rollback.get("may_have_started_at"),
             rollback_completed_at=rollback.get("completed_at"),
-            rollback_available=bool(rollback["available"]),
+            rollback_available=_strict_bool(
+                rollback["available"], "rollback.available"
+            ),
             terminalized_at=payload.get("terminalized_at"),
             terminal_reason=payload.get("terminal_reason"),
             events=tuple(
                 PackageUpdateJobEvent(
-                    sequence=int(event["sequence"]),
-                    created_at=str(event["created_at"]),
-                    level=str(event["level"]),
-                    stage=str(event["stage"]),
-                    event_type=str(event["event_type"]),
-                    message=str(event["message"]),
+                    sequence=_strict_int(event["sequence"], "event.sequence"),
+                    created_at=_strict_str(event["created_at"], "event.created_at"),
+                    level=_strict_str(event["level"], "event.level"),
+                    stage=_strict_str(event["stage"], "event.stage"),
+                    event_type=_strict_str(event["event_type"], "event.event_type"),
+                    message=_strict_str(event["message"], "event.message"),
                 )
                 for event in payload.get("events", ())
             ),
+            health_probes=tuple(
+                _package_update_job_health_probe_result(probe)
+                for probe in health.get("probes", ())
+            ),
+            health_evidence=evidence,
+            health_reason=health_reason,
         )
     except HubinetOpsInvalidResponse:
         raise
@@ -552,6 +648,7 @@ def _operator_capabilities(payload: Any) -> OperatorCapabilities:
         can_start_update=payload["can_start_update"],
         can_view_update_job=payload["can_view_update_job"],
         can_resume_update=payload["can_resume_update"],
+        can_rerun_health_evaluation=payload["can_rerun_health_evaluation"],
         can_rollback_update=payload["can_rollback_update"],
         can_view_health_contract=payload["can_view_health_contract"],
         can_configure_health_contract=payload["can_configure_health_contract"],
@@ -689,9 +786,10 @@ class HttpHubinetOpsTransport:
             ) from exc
 
     async def _health_contract_request(
-        self, method: str, resource_id: str, **kwargs: Any
+        self, method: str, resource_id: str, *, path_suffix: str = "", **kwargs: Any
     ) -> Any:
-        url = f"{self._base_url}{_HEALTH_CONTRACT_ROUTE.format(resource_id=resource_id)}"
+        route = _HEALTH_CONTRACT_ROUTE.format(resource_id=resource_id)
+        url = f"{self._base_url}{route}{path_suffix}"
         headers = {"Authorization": f"Bearer {self._api_token}"}
         try:
             async with self._session.request(
@@ -1013,6 +1111,25 @@ class HttpHubinetOpsTransport:
         if expected_revision is not None:
             body["expected_revision"] = expected_revision
         payload = await self._health_contract_request("PUT", resource_id, json=body)
+        return _resource_health_contract(resource_id, payload)
+
+    async def reset_health_contract(
+        self, resource_id: str, expected_revision: int | None
+    ) -> ResourceHealthContract:
+        """Restore the backend's built-in default health contract.
+
+        No probe, kind, or target crosses this boundary: the operator
+        selects a RESOURCE and the backend installs its own baseline. Home
+        Assistant never computes what the default is, and never inspects a
+        guest to decide.
+        """
+
+        params: dict[str, Any] = {}
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        payload = await self._health_contract_request(
+            "POST", resource_id, path_suffix="/reset", params=params
+        )
         return _resource_health_contract(resource_id, payload)
 
     async def clear_health_contract(

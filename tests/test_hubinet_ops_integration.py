@@ -29,6 +29,7 @@ from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers import service as service_helper
 from homeassistant.helpers.translation import async_get_translations
 from homeassistant.helpers.update_coordinator import UpdateFailed
@@ -43,6 +44,7 @@ from custom_components.hubinet_ops.api import (
     HealthContractSummary,
     HealthProbe,
     HealthProbeKind,
+    HealthProbeOutcome,
     HubinetOpsApi,
     HubinetOpsCannotConnect,
     HubinetOpsConflict,
@@ -67,6 +69,7 @@ from custom_components.hubinet_ops.api import (
     PackagePlanApprovalStatus,
     PackageUpdateHealthOutcome,
     PackageUpdateJobEvent,
+    PackageUpdateJobHealthProbeResult,
     PackageUpdateJobState,
     PackageUpdateJobSummary,
     PackageUpdateJobView,
@@ -93,7 +96,7 @@ from custom_components.hubinet_ops.const import (
     DOMAIN,
     MODEL_LXC,
     SERVICE_APPROVE_UPDATE_PLAN,
-    SERVICE_CLEAR_HEALTH_CONTRACT,
+    SERVICE_RESET_HEALTH_CONTRACT,
     SERVICE_RESUME_UPDATE,
     SERVICE_ROLLBACK_UPDATE,
     SERVICE_SET_HEALTH_CONTRACT,
@@ -505,6 +508,7 @@ class FakeTransport:
         self.health_contract_reads: list[str] = []
         self.health_contract_writes: list[tuple[str, tuple, int | None]] = []
         self.health_contract_clears: list[tuple[str, int | None]] = []
+        self.health_contract_resets: list[tuple[str, int | None]] = []
         # Stands in for the backend's durable job authority. Every operator
         # update control records what it was asked and returns the job it
         # acted on, so a test can assert exactly what crossed the boundary --
@@ -594,6 +598,33 @@ class FakeTransport:
             updated_at="2026-08-08T12:05:00+00:00",
             probes=tuple(
                 sorted(probes, key=lambda probe: (probe.kind.value, probe.target))
+            ),
+        )
+        self.health_contracts[resource_id] = contract
+        return contract
+
+    async def reset_health_contract(
+        self, resource_id: str, expected_revision: int | None
+    ) -> ResourceHealthContract:
+        """Stands in for the backend restoring its OWN built-in default.
+
+        The probe set is decided entirely here (i.e. backend-side); nothing
+        the caller passes can influence what the default is.
+        """
+
+        self.health_contract_resets.append((resource_id, expected_revision))
+        if self.health_contract_error is not None:
+            raise self.health_contract_error
+        previous = self.health_contracts.get(resource_id)
+        contract = ResourceHealthContract(
+            resource_id=resource_id,
+            status=HealthContractStatus.CONFIGURED,
+            revision=1 if previous is None else previous.revision + 1,
+            fingerprint="d" * 64,
+            created_at="2026-08-08T12:00:00+00:00",
+            updated_at="2026-08-08T12:06:00+00:00",
+            probes=(
+                HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
             ),
         )
         self.health_contracts[resource_id] = contract
@@ -1003,6 +1034,7 @@ async def test_devices_and_entities_are_keyed_by_backend_resource_id(
             "start_update",
             "view_update_job",
             "resume_update",
+            "rerun_health_evaluation",
             "rollback_update",
             "view_health_contract",
             "pending_updates",
@@ -1199,6 +1231,7 @@ async def test_retained_and_successor_generations_share_vmid_without_collision(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     }
@@ -1269,6 +1302,7 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
         "pending_updates",
@@ -1281,6 +1315,7 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     }
@@ -1347,6 +1382,7 @@ async def test_replacement_transition_retains_old_entities_unavailable(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     }
@@ -1418,6 +1454,7 @@ async def test_present_unavailable_node_only_blocks_node_dependent_entities(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     }
@@ -1615,7 +1652,7 @@ async def test_view_update_plan_reads_fresh_snapshot_and_returns_exact_rows(
         )
         if item.unique_id.startswith(f"{resource_key}:")
     ]
-    assert len(resource_entities) == 26
+    assert len(resource_entities) == 27
     for item in resource_entities:
         state = hass.states.get(item.entity_id)
         assert state is not None
@@ -1975,7 +2012,7 @@ def test_update_plan_action_metadata_and_polish_translations_are_structural() ->
         SERVICE_APPROVE_UPDATE_PLAN,
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
         SERVICE_START_UPDATE,
         SERVICE_VIEW_UPDATE_JOB,
         SERVICE_RESUME_UPDATE,
@@ -2097,7 +2134,7 @@ def test_operator_error_translations_are_structural() -> None:
         "control_unavailable",
         "health_contract_read_failed",
         "health_contract_set_refused",
-        "health_contract_clear_refused",
+        "health_contract_reset_refused",
         "device_not_found",
         "device_not_unique_resource",
     } <= raised_keys
@@ -2708,6 +2745,7 @@ async def test_operator_availability_unsupported_route_falls_back_to_all_false(
         "start_update",
         "view_update_job",
         "resume_update",
+        "rerun_health_evaluation",
         "rollback_update",
         "view_health_contract",
     ):
@@ -4982,7 +5020,7 @@ async def test_second_entry_failure_leaves_first_intact_then_retry_loads_cleanly
 
 HEALTH_PROBES = [
     {"kind": "systemd_unit_active", "target": "nginx.service"},
-    {"kind": "docker_container_healthy", "target": "immich_server"},
+    {"kind": "systemd_unit_active", "target": "immich-server.service"},
 ]
 
 
@@ -4998,13 +5036,37 @@ def configured_contract(
         updated_at="2026-08-08T11:30:00+00:00",
         probes=(
             HealthProbe(
-                kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY, target="immich_server"
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                target="immich-server.service",
             ),
             HealthProbe(
                 kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
             ),
         ),
     )
+
+
+def test_resource_health_contract_rejects_a_mixed_baseline_payload() -> None:
+    """v0.5 health scope reduction, HA layer: mirrors the backend's own
+    `canonical_health_probes` invariant -- `guest_operational` may never
+    share a contract with any other probe. A backend response naming both is
+    outside the agreed contract shape and is refused rather than rendered."""
+
+    with pytest.raises(ValueError, match="guest_operational"):
+        ResourceHealthContract(
+            resource_id=RESOURCE_CT,
+            status=HealthContractStatus.CONFIGURED,
+            revision=1,
+            fingerprint="a" * 64,
+            created_at="2026-08-08T11:00:00+00:00",
+            updated_at="2026-08-08T11:30:00+00:00",
+            probes=(
+                HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
+                HealthProbe(
+                    kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
+                ),
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -5015,7 +5077,7 @@ async def test_health_contract_actions_are_registered_and_removed_with_the_domai
     for service in (
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
     ):
         assert hass.services.has_service(DOMAIN, service)
 
@@ -5024,7 +5086,7 @@ async def test_health_contract_actions_are_registered_and_removed_with_the_domai
     for service in (
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
     ):
         assert not hass.services.has_service(DOMAIN, service)
 
@@ -5057,7 +5119,7 @@ async def test_view_health_contract_returns_material_as_response_data(
         "created_at": "2026-08-08T11:00:00+00:00",
         "updated_at": "2026-08-08T11:30:00+00:00",
         "probes": [
-            {"kind": "docker_container_healthy", "target": "immich_server"},
+            {"kind": "systemd_unit_active", "target": "immich-server.service"},
             {"kind": "systemd_unit_active", "target": "nginx.service"},
         ],
     }
@@ -5069,7 +5131,7 @@ async def test_view_health_contract_returns_material_as_response_data(
         state = hass.states.get(item.entity_id)
         assert state is not None
         assert "probes" not in state.attributes
-        assert "immich_server" not in str(state.attributes)
+        assert "immich-server.service" not in str(state.attributes)
 
 
 @pytest.mark.asyncio
@@ -5093,6 +5155,116 @@ async def test_view_health_contract_reports_unconfigured_without_faking_a_contra
     assert response["probes"] is None
     assert response["revision"] is None
     assert response["fingerprint"] is None
+
+
+# ---------------------------------------------------------------------------
+# Defect A (post-Human1): a real operator reviewed and approved a plan,
+# reached a disabled Start button, learned the health contract was
+# unconfigured, and had no discoverable native continuation from the
+# resource device. A Repairs issue is the fix: native, visible from
+# Settings -> Repairs without reading source code, and it grants no
+# authority -- it only points at the existing `set_health_contract` action.
+# ---------------------------------------------------------------------------
+
+
+def _health_contract_repair_ids(hass: HomeAssistant) -> set[str]:
+    return {
+        issue.issue_id
+        for issue in ir.async_get(hass).issues.values()
+        if issue.domain == DOMAIN
+        and issue.issue_id.startswith("health_contract_unconfigured::")
+    }
+
+
+@pytest.mark.asyncio
+async def test_approved_but_unconfigured_resource_raises_a_repair_issue(
+    hass: HomeAssistant,
+) -> None:
+    """Exactly the live dead end: reviewed, approved, and stuck."""
+
+    planned = exact_plan_resource(approved=True)
+    assert planned.resource_id == RESOURCE_CT
+    assert planned.package_plan_approval.status is PackagePlanApprovalStatus.APPROVED
+    assert planned.health_contract.status is HealthContractStatus.UNCONFIGURED
+
+    entry = await setup_entry(hass, FakeTransport([snapshot((planned,))]))
+
+    issues = _health_contract_repair_ids(hass)
+    assert len(issues) == 1
+    issue = ir.async_get(hass).issues[(DOMAIN, next(iter(issues)))]
+    # v0.5: NOT fixable from here. The backend's built-in default is what
+    # normally prevents this state, and the remedies are the two explicit
+    # operator surfaces the issue text names -- never a Home-Assistant-side
+    # discovery flow.
+    assert issue.is_fixable is False
+    assert issue.severity == ir.IssueSeverity.WARNING
+    assert issue.translation_key == "health_contract_unconfigured"
+    assert issue.translation_placeholders == {"name": "CT101 Cloudflared"}
+    assert issue.data == {"entry_id": entry.entry_id, "resource_id": RESOURCE_CT}
+
+
+@pytest.mark.asyncio
+async def test_no_repair_issue_before_a_plan_is_approved(
+    hass: HomeAssistant,
+) -> None:
+    """An ordinary freshly enrolled resource is not yet blocked on anything --
+    raising this issue before an operator even tries to update would be
+    noise, not a discoverable continuation."""
+
+    await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+
+    assert _health_contract_repair_ids(hass) == set()
+
+
+@pytest.mark.asyncio
+async def test_repair_issue_clears_once_a_health_contract_is_declared(
+    hass: HomeAssistant,
+) -> None:
+    """The issue is recomputed every refresh, never durable HA state: once
+    the operator declares a contract, it disappears on its own."""
+
+    planned = exact_plan_resource(approved=True)
+    configured = replace(
+        planned,
+        health_contract=HealthContractSummary(
+            status=HealthContractStatus.CONFIGURED,
+            revision=1,
+            fingerprint="c" * 64,
+            probe_count=1,
+            updated_at="2026-08-08T12:05:00+00:00",
+        ),
+    )
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [
+                snapshot((INITIAL_RESOURCES[0], planned, INITIAL_RESOURCES[2])),
+                snapshot(
+                    (INITIAL_RESOURCES[0], configured, INITIAL_RESOURCES[2]),
+                    inventory_revision=11,
+                    published_state_revision=21,
+                ),
+            ]
+        ),
+    )
+    assert len(_health_contract_repair_ids(hass)) == 1
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert _health_contract_repair_ids(hass) == set()
+
+
+@pytest.mark.asyncio
+async def test_repair_issue_is_cleared_on_unload(hass: HomeAssistant) -> None:
+    planned = exact_plan_resource(approved=True)
+    entry = await setup_entry(hass, FakeTransport([snapshot((planned,))]))
+    assert len(_health_contract_repair_ids(hass)) == 1
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert _health_contract_repair_ids(hass) == set()
 
 
 @pytest.mark.asyncio
@@ -5123,8 +5295,8 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
                     kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
                 ),
                 HealthProbe(
-                    kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-                    target="immich_server",
+                    kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                    target="immich-server.service",
                 ),
             ),
             0,
@@ -5133,7 +5305,7 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
     assert response["status"] == "configured"
     assert response["revision"] == 1
     assert response["probes"] == [
-        {"kind": "docker_container_healthy", "target": "immich_server"},
+        {"kind": "systemd_unit_active", "target": "immich-server.service"},
         {"kind": "systemd_unit_active", "target": "nginx.service"},
     ]
 
@@ -5143,16 +5315,46 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
         SERVICE_SET_HEALTH_CONTRACT,
         {
             "device_id": resource_device_id(hass, RESOURCE_CT),
-            "probes": [{"kind": "docker_container_running", "target": "redis"}],
+            "probes": [{"kind": "guest_operational"}],
         },
         blocking=True,
         return_response=True,
     )
-    assert replaced["probes"] == [
-        {"kind": "docker_container_running", "target": "redis"}
-    ]
+    assert replaced["probes"] == [{"kind": "guest_operational", "target": None}]
     assert replaced["revision"] == 2
     assert transport.health_contract_writes[-1][2] is None
+
+
+@pytest.mark.asyncio
+async def test_set_health_contract_accepts_guest_operational_with_no_target(
+    hass: HomeAssistant,
+) -> None:
+    """v20: the one supported probe kind an operator may declare with no
+    target at all -- never a faked one."""
+
+    transport = FakeTransport([snapshot(INITIAL_RESOURCES)])
+    await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_SET_HEALTH_CONTRACT,
+        {
+            "device_id": resource_device_id(hass, RESOURCE_CT),
+            "probes": [{"kind": "guest_operational"}],
+        },
+        blocking=True,
+        return_response=True,
+    )
+    await hass.async_block_till_done()
+
+    assert transport.health_contract_writes == [
+        (
+            RESOURCE_CT,
+            (HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),),
+            None,
+        )
+    ]
+    assert response["probes"] == [{"kind": "guest_operational", "target": None}]
 
 
 @pytest.mark.asyncio
@@ -5161,6 +5363,11 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
     (
         [],
         [{"kind": "http_get", "target": "https://example.invalid"}],
+        # v0.5 health scope reduction: Docker-specific package-update health
+        # probes are no longer accepted or advertised anywhere in this
+        # integration -- refused exactly like any other unsupported kind.
+        [{"kind": "docker_container_running", "target": "web"}],
+        [{"kind": "docker_container_healthy", "target": "web"}],
         [{"kind": "systemd_unit_active"}],
         [{"kind": "systemd_unit_active", "target": ""}],
         [{"kind": "systemd_unit_active", "target": "a b.service"}],
@@ -5173,6 +5380,10 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
                 "command": "rm -rf /",
             }
         ],
+        # v20: guest_operational must never carry a target -- never even a
+        # syntactically valid one.
+        [{"kind": "guest_operational", "target": "guest"}],
+        [{"kind": "guest_operational", "target": "nginx.service"}],
         [
             {"kind": "systemd_unit_active", "target": f"unit-{index}.service"}
             for index in range(33)
@@ -5200,9 +5411,17 @@ async def test_set_health_contract_refuses_malformed_declarations(
 
 
 @pytest.mark.asyncio
-async def test_clear_health_contract_leaves_the_resource_unconfigured(
+async def test_reset_health_contract_restores_the_backend_built_in_default(
     hass: HomeAssistant,
 ) -> None:
+    """Reset is not clear: the resource ends CONFIGURED with the backend's
+    own baseline, so an approved update is never blocked by resetting.
+
+    Home Assistant sends a resource and a compare-and-set revision and
+    nothing else -- no probe, no kind, no target -- so what the default IS
+    remains entirely the backend's decision.
+    """
+
     transport = FakeTransport(
         [snapshot(INITIAL_RESOURCES)],
         health_contracts={RESOURCE_CT: configured_contract()},
@@ -5211,7 +5430,7 @@ async def test_clear_health_contract_leaves_the_resource_unconfigured(
 
     response = await hass.services.async_call(
         DOMAIN,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
         {
             "device_id": resource_device_id(hass, RESOURCE_CT),
             "expected_revision": 3,
@@ -5221,10 +5440,16 @@ async def test_clear_health_contract_leaves_the_resource_unconfigured(
     )
     await hass.async_block_till_done()
 
-    assert transport.health_contract_clears == [(RESOURCE_CT, 3)]
-    assert response["status"] == "unconfigured"
-    assert response["probes"] is None
-    assert transport.health_contracts == {}
+    assert transport.health_contract_resets == [(RESOURCE_CT, 3)]
+    assert transport.health_contract_clears == []
+    assert transport.health_contract_writes == []
+    assert response["status"] == "configured"
+    assert response["probes"] == [
+        {"kind": "guest_operational", "target": None}
+    ]
+    assert transport.health_contracts[RESOURCE_CT].probes == (
+        HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
+    )
 
 
 @pytest.mark.asyncio
@@ -5248,7 +5473,7 @@ async def test_health_contract_actions_use_the_dynamic_resource_device_selector(
         for service, payload in (
             (SERVICE_VIEW_HEALTH_CONTRACT, {}),
             (SERVICE_SET_HEALTH_CONTRACT, {"probes": HEALTH_PROBES}),
-            (SERVICE_CLEAR_HEALTH_CONTRACT, {}),
+            (SERVICE_RESET_HEALTH_CONTRACT, {}),
         ):
             with pytest.raises(HomeAssistantError):
                 await hass.services.async_call(
@@ -5279,7 +5504,7 @@ async def test_health_contract_actions_surface_a_backend_refusal_as_an_error(
     for service, payload in (
         (SERVICE_VIEW_HEALTH_CONTRACT, {}),
         (SERVICE_SET_HEALTH_CONTRACT, {"probes": HEALTH_PROBES}),
-        (SERVICE_CLEAR_HEALTH_CONTRACT, {}),
+        (SERVICE_RESET_HEALTH_CONTRACT, {}),
     ):
         with pytest.raises(HomeAssistantError):
             await hass.services.async_call(
@@ -5367,7 +5592,7 @@ async def test_health_contract_action_metadata_and_translations_are_structural(
         "probes",
         "expected_revision",
     }
-    assert set(descriptions[DOMAIN][SERVICE_CLEAR_HEALTH_CONTRACT]["fields"]) == {
+    assert set(descriptions[DOMAIN][SERVICE_RESET_HEALTH_CONTRACT]["fields"]) == {
         "device_id",
         "expected_revision",
     }
@@ -5378,7 +5603,7 @@ async def test_health_contract_action_metadata_and_translations_are_structural(
     for service in (
         SERVICE_VIEW_HEALTH_CONTRACT,
         SERVICE_SET_HEALTH_CONTRACT,
-        SERVICE_CLEAR_HEALTH_CONTRACT,
+        SERVICE_RESET_HEALTH_CONTRACT,
     ):
         assert polish[f"component.{DOMAIN}.services.{service}.name"]
 
@@ -5447,7 +5672,12 @@ def job_view(
     rollback_available: bool = False,
     terminalized_at: str | None = None,
     events: tuple[PackageUpdateJobEvent, ...] = (),
+    health_probes: tuple[PackageUpdateJobHealthProbeResult, ...] = (),
+    health_evidence: str | None = None,
+    health_reason: str | None = None,
 ) -> PackageUpdateJobView:
+    if health_evidence is None and health_probes:
+        health_evidence = "verdict"
     return PackageUpdateJobView(
         job_id=JOB_ID,
         request_id=REQUEST_ID,
@@ -5463,12 +5693,270 @@ def job_view(
         mutation_completed_at="2026-08-08T11:09:00+00:00",
         health_contract_revision=3,
         health_started_at=None,
-        health_completed_at=None,
+        health_completed_at=(
+            "2026-09-06T13:40:23.444652+00:00" if health_outcome else None
+        ),
         health_outcome=health_outcome,
         rollback_available=rollback_available,
         terminalized_at=terminalized_at,
         events=events,
+        health_probes=health_probes,
+        health_evidence=health_evidence,
+        health_reason=health_reason,
     )
+
+
+def _probe_result(
+    *,
+    probe_index: int = 0,
+    kind: HealthProbeKind = HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+    target: str = "web.service",
+    outcome: HealthProbeOutcome = HealthProbeOutcome.FAILED,
+    reason: str = "unit_not_active",
+    definitive: bool = True,
+) -> PackageUpdateJobHealthProbeResult:
+    return PackageUpdateJobHealthProbeResult(
+        probe_index=probe_index,
+        kind=kind,
+        target=target,
+        outcome=outcome,
+        checked_at="2026-08-08T11:10:00+00:00",
+        reason=reason,
+        definitive=definitive,
+    )
+
+
+def test_job_view_accepts_coherent_per_probe_health_evidence() -> None:
+    job_view(
+        checkpoint="health_completed",
+        health_outcome=PackageUpdateHealthOutcome.FAILED,
+        health_probes=(_probe_result(),),
+    )
+
+
+def test_job_view_rejects_probes_without_a_definitive_verdict() -> None:
+    """`health_probes` may exist only once a verdict does -- a job with no
+    verdict has nothing definitive to show."""
+
+    with pytest.raises(ValueError):
+        job_view(health_outcome=None, health_probes=(_probe_result(),))
+
+
+def test_job_view_rejects_a_verdict_with_no_probe_evidence() -> None:
+    """The inverse: a completed verdict always has its complete result set."""
+
+    with pytest.raises(ValueError):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(),
+        )
+
+
+def test_job_view_rejects_a_duplicate_probe_index() -> None:
+    with pytest.raises(ValueError):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(
+                _probe_result(probe_index=0),
+                _probe_result(probe_index=0, target="other"),
+            ),
+        )
+
+
+def test_job_view_rejects_a_non_contiguous_probe_index() -> None:
+    with pytest.raises(ValueError):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(_probe_result(probe_index=1),),
+        )
+
+
+# ---------------------------------------------------------------------------
+# PR #80 review finding 2.4: HA must independently prove aggregate verdict
+# <-> per-probe coherence and per-probe kind/outcome/reason coherence, not
+# merely that each reason is a bounded token.
+# ---------------------------------------------------------------------------
+
+
+def test_job_view_rejects_a_failed_verdict_with_only_unknown_probes() -> None:
+    """The exact impossible payload PR #80 review named: a FAILED verdict
+    whose only probe is UNKNOWN -- an ALL-OF verdict of FAILED requires at
+    least one probe to be positively proven FAILED; UNKNOWN proves nothing
+    either way.
+
+    v0.5 health scope reduction, item N: this exact payload is now caught
+    earlier and more fundamentally -- only a COMPLETE DECISIVE observation
+    set may ever be finalized, so ANY UNKNOWN probe inside a "verdict" is
+    refused before the FAILED-specific coherence check is even reached."""
+
+    with pytest.raises(ValueError, match="unresolved"):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(
+                _probe_result(
+                    outcome=HealthProbeOutcome.UNKNOWN,
+                    reason="unit_activating",
+                ),
+            ),
+        )
+
+
+def test_job_view_rejects_a_passed_verdict_with_a_failed_probe() -> None:
+    with pytest.raises(ValueError, match="every probe"):
+        job_view(
+            status=PackageUpdateJobState.SUCCEEDED,
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.PASSED,
+            health_probes=(
+                _probe_result(
+                    outcome=HealthProbeOutcome.FAILED, reason="unit_not_active"
+                ),
+            ),
+        )
+
+
+def test_job_view_rejects_a_reason_that_contradicts_its_own_outcome() -> None:
+    """`unit_activating` is an UNKNOWN-only token; pairing it with
+    `outcome=passed` is individually-typed nonsense."""
+
+    with pytest.raises(ValueError, match="contradicts its own outcome"):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(
+                _probe_result(
+                    outcome=HealthProbeOutcome.PASSED,
+                    reason="unit_activating",
+                ),
+            ),
+        )
+
+
+def test_job_view_rejects_a_reason_impossible_for_its_probe_kind() -> None:
+    """`guest_operational_confirmed` can never describe a `systemd_unit_active`
+    probe."""
+
+    with pytest.raises(ValueError, match="impossible for that probe kind"):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(
+                _probe_result(
+                    kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                    target="nginx.service",
+                    outcome=HealthProbeOutcome.PASSED,
+                    reason="guest_operational_confirmed",
+                ),
+            ),
+        )
+
+
+# ===========================================================================
+# PR #80 FINAL REVIEW, coherence cleanups.
+# ===========================================================================
+
+
+def test_job_view_rejects_a_target_shaped_reason_on_a_targetless_probe() -> None:
+    """`guest_operational` NAMES no target, so no target-shaped reason can
+    truthfully describe it. Both tokens are produced only where a
+    request-supplied target actually exists."""
+
+    for reason in ("probe_target_not_exact", "probe_target_ambiguous"):
+        with pytest.raises(ValueError, match="impossible for that probe kind"):
+            job_view(
+                checkpoint="health_completed",
+                health_outcome=PackageUpdateHealthOutcome.FAILED,
+                health_probes=(
+                    _probe_result(
+                        kind=HealthProbeKind.GUEST_OPERATIONAL,
+                        target=None,
+                        outcome=HealthProbeOutcome.UNKNOWN,
+                        reason=reason,
+                    ),
+                    _probe_result(
+                        probe_index=1,
+                        kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                        target="web.service",
+                        outcome=HealthProbeOutcome.FAILED,
+                        reason="unit_not_active",
+                    ),
+                ),
+            )
+
+
+def test_positive_control_a_targeted_probe_may_still_report_a_target_reason() -> None:
+    """Restricting those tokens must not remove them from the kind that DOES
+    have a target.
+
+    A target-shaped UNKNOWN reason can never appear inside a "verdict" any
+    more (v0.5 health scope reduction, item N: a durable verdict admits no
+    UNKNOWN probe at all), so the positive control here is an unresolved
+    evaluation's bounded "observation" evidence instead -- the one context
+    where an UNKNOWN, non-definitive probe is legitimate."""
+
+    view = job_view(
+        checkpoint="health_started",
+        health_outcome=None,
+        health_evidence="observation",
+        health_probes=(
+            _probe_result(
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                target="nginx.service",
+                outcome=HealthProbeOutcome.UNKNOWN,
+                reason="probe_target_not_exact",
+                definitive=False,
+            ),
+            _probe_result(
+                probe_index=1,
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                target="web.service",
+                outcome=HealthProbeOutcome.UNKNOWN,
+                reason="unit_activating",
+                definitive=False,
+            ),
+        ),
+    )
+    assert view.health_probes[0].reason == "probe_target_not_exact"
+
+
+def test_the_ha_reason_taxonomy_mirrors_the_backend_exactly() -> None:
+    """Two mirrored tables must not drift. HA validates independently, but
+    it must validate the SAME closed taxonomy the backend owns."""
+
+    from app.inventory import health_observation as backend
+
+    from custom_components.hubinet_ops.contract import package_update_validation as ha
+
+    assert ha.HEALTH_PROBE_REASONS == backend.HEALTH_PROBE_REASONS
+    assert {
+        outcome.value: sorted(reasons)
+        for outcome, reasons in ha.HEALTH_PROBE_REASONS_BY_OUTCOME.items()
+    } == {
+        outcome.value: sorted(reasons)
+        for outcome, reasons in backend.HEALTH_PROBE_REASONS_BY_OUTCOME.items()
+    }
+    assert {
+        reason: sorted(kind.value for kind in kinds)
+        for reason, kinds in ha.HEALTH_PROBE_REASON_KINDS.items()
+    } == {
+        reason: sorted(kind.value for kind in kinds)
+        for reason, kinds in backend.HEALTH_PROBE_REASON_KINDS.items()
+    }
+
+
+def test_job_view_rejects_a_reason_outside_the_bounded_taxonomy() -> None:
+    """Never render raw guest output as if it were a classification token."""
+
+    with pytest.raises(ValueError):
+        job_view(
+            checkpoint="health_completed",
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_probes=(_probe_result(reason="totally made up nonsense"),),
+        )
 
 
 @pytest.mark.asyncio
@@ -5616,6 +6104,357 @@ async def test_view_update_job_returns_bounded_facts_as_response_data(
         assert "hubinet-pre-update-0001" not in str(state.attributes)
 
 
+# ---------------------------------------------------------------------------
+# Defect C (post-Human1): the explicit job readback must carry per-probe
+# health evidence. A real operator had to read the backend's SQLite database
+# directly to learn which frozen probe failed and why; the explicit
+# `view_update_job` action/notification is where that evidence belongs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_view_update_job_response_carries_per_probe_health_evidence(
+    hass: HomeAssistant,
+) -> None:
+    probes = (
+        PackageUpdateJobHealthProbeResult(
+            probe_index=0,
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+            target="weatherhub-redis.service",
+            outcome=HealthProbeOutcome.FAILED,
+            checked_at="2026-09-06T13:40:23.444652+00:00",
+            reason="unit_not_active",
+        ),
+        PackageUpdateJobHealthProbeResult(
+            probe_index=1,
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+            target="weatherhub-weather-api.service",
+            outcome=HealthProbeOutcome.FAILED,
+            checked_at="2026-09-06T13:40:23.444652+00:00",
+            reason="unit_not_active",
+        ),
+    )
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        package_update_jobs={
+            RESOURCE_CT: job_view(
+                checkpoint="health_completed",
+                health_outcome=PackageUpdateHealthOutcome.FAILED,
+                rollback_available=True,
+                health_probes=probes,
+            )
+        },
+    )
+    entry = await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_JOB,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response["health_probes"] == [
+        {
+            "index": 0,
+            "kind": "systemd_unit_active",
+            "target": "weatherhub-redis.service",
+            "outcome": "failed",
+            "checked_at": "2026-09-06T13:40:23.444652+00:00",
+            "reason": "unit_not_active",
+            "definitive": True,
+        },
+        {
+            "index": 1,
+            "kind": "systemd_unit_active",
+            "target": "weatherhub-weather-api.service",
+            "outcome": "failed",
+            "checked_at": "2026-09-06T13:40:23.444652+00:00",
+            "reason": "unit_not_active",
+            "definitive": True,
+        },
+    ]
+    assert response["health_evidence"] == "verdict"
+    # Answers exactly the operator's real questions: which probe, which
+    # target, FAILED or UNKNOWN, and why -- without shell/SQLite access.
+    assert "weatherhub-redis.service" in str(response["health_probes"])
+    assert "unit_not_active" in str(response["health_probes"])
+
+    # Still bounded, typed material -- never entity attributes.
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    for item in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id):
+        if not item.unique_id.startswith(f"{key}:"):
+            continue
+        state = hass.states.get(item.entity_id)
+        assert state is not None
+        assert "health_probes" not in state.attributes
+        assert "weatherhub-redis.service" not in str(state.attributes)
+
+
+@pytest.mark.asyncio
+async def test_view_update_job_notification_lists_which_probe_failed_and_why(
+    hass: HomeAssistant,
+) -> None:
+    """The persistent-notification rendering an operator actually reads.
+
+    Real Human1 evidence: probes all failed with the same bounded reason
+    after a restart, and the operator had to read the backend's SQLite
+    database directly to learn that. This is the fix. (The original evidence
+    was three ``docker_container_healthy`` probes; v0.5 dropped Docker health
+    probes entirely, so this now uses the surviving targeted kind,
+    `systemd_unit_active`, unchanged in every other respect.)
+    """
+
+    probes = (
+        PackageUpdateJobHealthProbeResult(
+            probe_index=0,
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+            target="weatherhub-redis.service",
+            outcome=HealthProbeOutcome.FAILED,
+            checked_at="2026-09-06T13:40:23.444652+00:00",
+            reason="unit_not_active",
+        ),
+    )
+    active = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        package_update_job=PackageUpdateJobSummary(
+            state=PackageUpdateJobState.ACTIVE,
+            job_id=JOB_ID,
+            checkpoint="health_completed",
+            issued_at="2026-08-08T11:00:00+00:00",
+            package_count=24,
+            health_outcome=PackageUpdateHealthOutcome.FAILED,
+            health_started_at="2026-08-08T11:09:00+00:00",
+            health_completed_at="2026-09-06T13:40:23.444652+00:00",
+            snapshot_confirmed_at="2026-08-08T11:01:00+00:00",
+            mutation_completed_at="2026-08-08T11:08:00+00:00",
+            rollback_available=True,
+        ),
+    )
+    transport = FakeTransport(
+        [snapshot((active,))],
+        package_update_jobs={
+            RESOURCE_CT: job_view(
+                checkpoint="health_completed",
+                health_outcome=PackageUpdateHealthOutcome.FAILED,
+                rollback_available=True,
+                health_probes=probes,
+            )
+        },
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(can_view_update_job=True)
+        },
+    )
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "view_update_job"
+                )
+            },
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    create_notification.assert_called_once()
+    message = create_notification.call_args.args[1]
+    # `_cell` escapes Markdown-structural punctuation (including `-`/`_`) in
+    # exact backend data, exactly like every other rendered notification.
+    assert r"weatherhub\-redis" in message
+    assert r"unit\_not\_active" in message
+    assert r"systemd\_unit\_active" in message
+
+
+def _stopped_guest_job():
+    """The exact shape a stopped guest under the DEFAULT contract produces:
+    no verdict, no evidence kind, no probe rows -- and one bounded
+    whole-request classification."""
+
+    return job_view(
+        checkpoint="health_started",
+        health_outcome=None,
+        rollback_available=True,
+        health_probes=(),
+        health_evidence=None,
+        health_reason="guest_unavailable",
+    )
+
+
+def _stopped_guest_transport():
+    active = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        package_update_job=PackageUpdateJobSummary(
+            state=PackageUpdateJobState.ACTIVE,
+            job_id=JOB_ID,
+            checkpoint="health_started",
+            issued_at="2026-08-08T11:00:00+00:00",
+            package_count=24,
+            health_outcome=None,
+            health_started_at="2026-08-08T11:09:00+00:00",
+            snapshot_confirmed_at="2026-08-08T11:01:00+00:00",
+            mutation_completed_at="2026-08-08T11:08:00+00:00",
+            rollback_available=True,
+        ),
+    )
+    return FakeTransport(
+        [snapshot((active,))],
+        package_update_jobs={RESOURCE_CT: _stopped_guest_job()},
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(can_view_update_job=True)
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_view_update_job_response_carries_the_unresolved_health_reason(
+    hass: HomeAssistant,
+) -> None:
+    """The MAJOR PR #80 review finding, at the action an operator invokes.
+
+    `guest_operational` is the default contract and has no FAIL outcome, so
+    "the container did not come back" arrives as no verdict, no evidence,
+    and no probe rows. The bounded whole-request classification is the only
+    field that makes that job explicable without backend shell access.
+    """
+
+    transport = _stopped_guest_transport()
+    await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_JOB,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response["health_outcome"] is None
+    assert response["health_evidence"] is None
+    assert response["health_probes"] == []
+    assert response["health_reason"] == "guest_unavailable"
+    assert response["rollback_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_view_update_job_notification_explains_a_stopped_guest(
+    hass: HomeAssistant,
+) -> None:
+    """The zero-probe case must still READ as something, in English.
+
+    The rendered text is this integration's own fixed translation of a
+    bounded token -- never backend prose, never helper output.
+    """
+
+    transport = _stopped_guest_transport()
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "view_update_job"
+                )
+            },
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    message = create_notification.call_args.args[1]
+    assert "No definitive result" in message
+    assert "**Reason:**" in message
+    assert "The guest is not running" in message
+    assert "trusted boundary" in message
+    # Truthfully still recoverable, and still explicitly so.
+    assert "**Rollback available:** Yes" in message
+    # The raw token is not what an operator is asked to interpret.
+    assert "guest_unavailable" not in message
+
+
+@pytest.mark.asyncio
+async def test_stopped_guest_notification_uses_polish_operator_translations(
+    hass: HomeAssistant,
+) -> None:
+    hass.config.language = "pl"
+    transport = _stopped_guest_transport()
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "view_update_job"
+                )
+            },
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    message = create_notification.call_args.args[1]
+    assert "**Powód:**" in message
+    assert "Kontener nie jest uruchomiony" in message
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_reason_token_degrades_to_the_token_not_a_crash(
+    hass: HomeAssistant,
+) -> None:
+    """A bounded token this integration has no translation for yet.
+
+    The taxonomy is backend-owned, so an integration built against an older
+    copy of it must still render the readback -- showing the raw token
+    rather than raising and hiding the whole job.
+    """
+
+    transport = _stopped_guest_transport()
+    transport.package_update_jobs[RESOURCE_CT] = job_view(
+        checkpoint="health_started",
+        rollback_available=True,
+        health_reason="settling_budget_exhausted",
+    )
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button._tr_optional", return_value=None
+    ), patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "view_update_job"
+                )
+            },
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    message = create_notification.call_args.args[1]
+    assert r"settling\_budget\_exhausted" in message
+
+
 @pytest.mark.asyncio
 async def test_resume_and_rollback_name_only_the_resource(
     hass: HomeAssistant,
@@ -5629,6 +6468,7 @@ async def test_resume_and_rollback_name_only_the_resource(
                 checkpoint="health_completed",
                 health_outcome=PackageUpdateHealthOutcome.FAILED,
                 rollback_available=True,
+                health_probes=(_probe_result(),),
             )
         },
     )

@@ -13,8 +13,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.selector import (
     TextSelector,
     TextSelectorConfig,
@@ -24,17 +29,23 @@ from homeassistant.helpers.selector import (
 from . import create_api_client
 from .api import (
     BackendInformation,
+    HealthProbe,
     HubinetOpsApiError,
     HubinetOpsCannotConnect,
+    HubinetOpsConflict,
+    HubinetOpsHealthContractUnconfigured,
     HubinetOpsInvalidAuth,
+    ResourceType,
 )
 from .const import (
     CONF_API_TOKEN,
     CONF_BASE_URL,
     CONF_VERIFY_TLS,
+    DATA_COORDINATORS,
     DEFAULT_VERIFY_TLS,
     DOMAIN,
 )
+from .coordinator import resource_device_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -106,6 +117,15 @@ class HubinetOpsConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
     MINOR_VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> HubinetOpsOptionsFlow:
+        """Native per-resource health-contract maintenance (Settings ->
+        Devices & Services -> Hubinet Ops -> Configure). See
+        `HubinetOpsOptionsFlow`."""
+
+        return HubinetOpsOptionsFlow()
 
     @override
     async def async_step_user(
@@ -217,4 +237,135 @@ class HubinetOpsConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="reconfigure",
             data_schema=_connection_schema(defaults=suggested),
             errors=errors,
+        )
+
+
+def _probe_line(probe: HealthProbe) -> str:
+    target = probe.target if probe.target is not None else (
+        "(no target -- guest liveness only)"
+    )
+    return f"- **{probe.kind.value}** `{target}`"
+
+
+class HubinetOpsOptionsFlow(OptionsFlow):
+    """Native per-resource health maintenance: view the current contract and
+    restore the backend's built-in default.
+
+    Reached from Settings -> Devices & Services -> Hubinet Ops -> Configure,
+    never Developer Tools. It is deliberately NOT part of the normal update
+    flow: a managed LXC already carries the backend's built-in
+    ``guest_operational`` contract before its first update, so nothing here
+    has to be visited to reach **Start**.
+
+    There is no discovery step. Home Assistant does not inspect systemd,
+    does not rank workloads, and does not decide what "healthy" means for a
+    guest -- absence of a workload observer is not proof of workload
+    absence, so v0.5 does not infer workload health automatically. An
+    operator who wants an advanced ``systemd_unit_active`` contract declares
+    it explicitly through the ``hubinet_ops.set_health_contract`` action,
+    which this flow's own description names. Docker workload health is not
+    part of v0.5 Hubinet Ops package-update health.
+
+    The contract's `revision`, read the moment this flow looked at it, is
+    sent back as `expected_revision` on the reset -- a concurrent change is
+    refused (`HubinetOpsConflict`) rather than silently overwritten, and this
+    flow re-reads current state and lets the operator try again instead of
+    retrying blindly.
+    """
+
+    _resource_id: str = ""
+    _resource_name: str = ""
+    _current_probes: tuple[HealthProbe, ...] = ()
+    #: `0` means *currently unconfigured* -- the backend's own compare-and-set
+    #: assertion for "there is no contract yet", never "no opinion".
+    _current_revision: int = 0
+
+    def _coordinator(self):
+        coordinators = self.hass.data.get(DOMAIN, {}).get(DATA_COORDINATORS, {})
+        return coordinators.get(self.config_entry.entry_id)
+
+    async def async_step_init(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
+        coordinator = self._coordinator()
+        if coordinator is None:
+            return self.async_abort(reason="entry_not_loaded")
+        resources = {
+            resource.resource_id: resource_device_name(resource)
+            for resource in coordinator.data.resources
+            if resource.resource_type is ResourceType.LXC
+        }
+        if not resources:
+            return self.async_abort(reason="no_lxc_resources")
+        if user_input is not None:
+            self._resource_id = user_input["resource_id"]
+            self._resource_name = resources[self._resource_id]
+            return await self.async_step_reset_confirm()
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema({vol.Required("resource_id"): vol.In(resources)}),
+        )
+
+    async def _read_current_contract(self) -> str | None:
+        """Refresh `_current_probes`/`_current_revision`. Returns an abort
+        reason on failure, else ``None``."""
+
+        coordinator = self._coordinator()
+        if coordinator is None:
+            return "entry_not_loaded"
+        try:
+            contract = await coordinator.api.async_fetch_health_contract(
+                self._resource_id
+            )
+            self._current_probes = contract.probes or ()
+            self._current_revision = contract.revision
+        except HubinetOpsHealthContractUnconfigured:
+            self._current_probes = ()
+            self._current_revision = 0
+        except HubinetOpsApiError:
+            return "health_contract_read_failed"
+        return None
+
+    async def async_step_reset_confirm(
+        self, user_input: dict[str, bool] | None = None
+    ) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        if user_input is None:
+            abort_reason = await self._read_current_contract()
+            if abort_reason is not None:
+                return self.async_abort(reason=abort_reason)
+        else:
+            if not user_input.get("confirm"):
+                errors["base"] = "reset_not_confirmed"
+            else:
+                coordinator = self._coordinator()
+                if coordinator is None:
+                    return self.async_abort(reason="entry_not_loaded")
+                try:
+                    # The backend owns the default; this sends no probe, kind,
+                    # or target of its own.
+                    await coordinator.api.async_reset_health_contract(
+                        self._resource_id, self._current_revision
+                    )
+                except HubinetOpsConflict:
+                    errors["base"] = "revision_changed"
+                    await self._read_current_contract()
+                except HubinetOpsApiError:
+                    errors["base"] = "reset_failed"
+                else:
+                    await coordinator.async_request_refresh()
+                    return self.async_create_entry(title="", data={})
+
+        current = (
+            "\n".join(_probe_line(probe) for probe in self._current_probes)
+            or "- (unconfigured -- no declared meaning of healthy)"
+        )
+        return self.async_show_form(
+            step_id="reset_confirm",
+            data_schema=vol.Schema({vol.Required("confirm", default=False): bool}),
+            errors=errors,
+            description_placeholders={
+                "name": self._resource_name,
+                "current": current,
+            },
         )

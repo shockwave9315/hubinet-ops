@@ -75,11 +75,12 @@ from fastapi import (
     Request,
 )
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.inventory import (
     AuthorityConflict,
     AuthorityNotFound,
+    HEALTH_PROBE_REASONS,
     HealthContractRevisionConflict,
     HealthProbeKind,
     InventoryAuthority,
@@ -89,12 +90,14 @@ from app.inventory import (
     MAX_HEALTH_PROBE_TARGET_LENGTH,
     MIN_HEALTH_PROBES,
     PackageUpdateCheckpoint,
+    PackageUpdateEventType,
     PackageUpdateIssuanceRefused,
     PackageUpdateJob,
     PackageUpdateJobStatus,
     ProductUpdateFenceError,
     ResourceHealthContract,
     ResourceHealthProbe,
+    UNRESOLVED_HEALTH_REASONS,
 )
 from app.inventory_runtime_config import (
     PACKAGE_UPDATE_EXECUTION_TIMEOUT_SECONDS,
@@ -160,6 +163,10 @@ class HealthProbeRequest(BaseModel):
     here, and ``extra="forbid"`` means a caller cannot smuggle one in: the
     future executor builds fixed argv from ``kind``, and ``target`` is data
     that only ever becomes one bounded argument.
+
+    ``target`` is optional ONLY for ``guest_operational`` (v20): that kind
+    names no container or unit, and a caller supplying one anyway is refused
+    here with a 422 rather than silently ignored -- never a faked target.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -169,7 +176,21 @@ class HealthProbeRequest(BaseModel):
     # enum member. The value set stays exactly `HealthProbeKind` -- anything
     # else is still a 422.
     kind: Annotated[HealthProbeKind, Field(strict=False)]
-    target: str = Field(min_length=1, max_length=MAX_HEALTH_PROBE_TARGET_LENGTH)
+    target: (
+        Annotated[str, Field(min_length=1, max_length=MAX_HEALTH_PROBE_TARGET_LENGTH)]
+        | None
+    ) = None
+
+    @model_validator(mode="after")
+    def _target_matches_kind(self) -> "HealthProbeRequest":
+        if self.kind is HealthProbeKind.GUEST_OPERATIONAL:
+            if self.target is not None:
+                raise ValueError(
+                    "a guest_operational health probe must not carry a target"
+                )
+        elif self.target is None:
+            raise ValueError("a target is required for this probe kind")
+        return self
 
 
 class HealthContractRequest(BaseModel):
@@ -276,15 +297,238 @@ _RETRYABLE_ISSUANCE_REFUSALS = frozenset(
 )
 
 
+def _package_update_health_verdict_probes_body(
+    job: PackageUpdateJob,
+) -> list[dict[str, Any]]:
+    """Render this job's completed per-probe health evidence, if any.
+
+    Empty until a definitive verdict is durably recorded: `health_probe_results`
+    is written only as one complete set, atomically with the verdict, never
+    partially. Bounded by the same `health_contract_probe_count` ceiling
+    (<= `MAX_HEALTH_PROBES`) as the frozen contract itself, and every field is
+    a durable typed authority fact -- the probe's own frozen `kind`/`target`
+    plus its recorded `outcome`, `checked_at`, and bounded `reason` token.
+    Never raw helper stdout/stderr and never command text; the store's own
+    read path (`_package_update_job_health`) already refuses to hand back a
+    job whose frozen probes and result set are not coherent, so this is
+    defense in depth rather than the load-bearing proof.
+    """
+
+    if not job.health_probe_results:
+        return []
+    frozen_by_index = {probe.probe_index: probe for probe in job.health_probes}
+    probes: list[dict[str, Any]] = []
+    for result in sorted(job.health_probe_results, key=lambda r: r.probe_index):
+        probe = frozen_by_index.get(result.probe_index)
+        if probe is None:  # pragma: no cover - store already refuses this
+            continue
+        probes.append(
+            {
+                "index": result.probe_index,
+                "kind": probe.kind.value,
+                "target": probe.target,
+                "outcome": result.outcome.value,
+                "checked_at": result.checked_at,
+                "reason": result.reason,
+                # `evidence == "verdict"`: this row is DEFINITIVE and durable.
+                "definitive": True,
+            }
+        )
+    return probes
+
+
+def _latest_health_outcome_unknown_event(
+    store: InventoryAuthorityStore, job_id: str
+) -> Any | None:
+    """The most recent bounded UNKNOWN health-evaluation event, if any.
+
+    Re-runs at ``health_started`` keep appending one such event per attempt;
+    only the LAST one describes the job's current unresolved state -- never
+    merged with an earlier attempt's evidence.
+    """
+
+    events = store.list_package_update_job_events(job_id, limit=200)
+    for event in reversed(events):
+        if event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN:
+            return event
+    return None
+
+
+def _package_update_health_observation_body(
+    job: PackageUpdateJob, *, store: InventoryAuthorityStore
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
+    """Render the LAST unresolved health evaluation's bounded evidence.
+
+    Only meaningful while the job is ACTIVE at ``health_started`` with no
+    durable verdict yet (see `_package_update_health_body`, which is the only
+    caller and already gates on that). ``kind``/``target`` are joined here
+    from the job's own frozen probe rows -- never repeated into event JSON,
+    per `InventoryAuthority.record_package_update_health_outcome_unknown`.
+
+    The third element is that attempt's WHOLE-REQUEST classification, and it
+    is the only reason an operator has when the evaluation was refused
+    BEFORE any probe round ran -- the exact current LXC proven stopped being
+    the ordinary case now that `guest_operational` is the default contract.
+    Without it a readback of that job says nothing at all: no verdict, no
+    probe rows, and no reason. It is re-validated against the closed
+    taxonomy here rather than trusted from event JSON, and only ever the
+    LATEST attempt's -- attempts are never merged.
+
+    ``unresolved_reason`` and a probe's own ``probe_reason`` are held in
+    SEPARATE names on purpose, and the names are load-bearing rather than
+    stylistic. They are two different facts drawn from two different closed
+    sets: the attempt's classification must be an UNKNOWN-family token,
+    while a probe's may be any bounded token including a PASSED-only one --
+    a non-decisive round legitimately contains a probe that already read
+    PASSED. Reusing one name let the loop's last iteration decide the
+    attempt's classification, which published `unit_active` as the reason a
+    job had no result: bounded, but self-contradictory, and correctly
+    refused by Home Assistant's own validator.
+    """
+
+    event = _latest_health_outcome_unknown_event(store, job.job_id)
+    if event is None:
+        return [], None, None
+    raw_unresolved_reason = event.details.get("reason")
+    unresolved_reason = (
+        raw_unresolved_reason
+        if isinstance(raw_unresolved_reason, str)
+        and raw_unresolved_reason in UNRESOLVED_HEALTH_REASONS
+        else None
+    )
+    frozen_by_index = {probe.probe_index: probe for probe in job.health_probes}
+    raw_probes = event.details.get("probes")
+    probes: list[dict[str, Any]] = []
+    if isinstance(raw_probes, list):
+        for raw in raw_probes:
+            if not isinstance(raw, Mapping):
+                continue
+            index = raw.get("index")
+            outcome = raw.get("outcome")
+            probe_reason = raw.get("reason")
+            frozen = (
+                frozen_by_index.get(index) if type(index) is int else None
+            )
+            if (
+                frozen is None
+                or not isinstance(outcome, str)
+                or not isinstance(probe_reason, str)
+                or probe_reason not in HEALTH_PROBE_REASONS
+            ):
+                continue
+            probes.append(
+                {
+                    "index": index,
+                    "kind": frozen.kind.value,
+                    "target": frozen.target,
+                    "outcome": outcome,
+                    "checked_at": event.created_at,
+                    "reason": probe_reason,
+                    # `evidence == "observation"`: never a verdict, and never
+                    # merged from more than one round or attempt.
+                    "definitive": False,
+                }
+            )
+    settling: dict[str, Any] | None = None
+    rounds = event.details.get("rounds")
+    settled_seconds = event.details.get("settled_seconds")
+    last_round_span_ms = event.details.get("last_round_span_ms")
+    if rounds is not None or settled_seconds is not None or last_round_span_ms is not None:
+        settling = {
+            "rounds": rounds,
+            "settled_seconds": settled_seconds,
+            "last_round_span_ms": last_round_span_ms,
+        }
+    return probes, settling, unresolved_reason
+
+
+def _package_update_health_body(
+    job: PackageUpdateJob, *, store: InventoryAuthorityStore
+) -> dict[str, Any]:
+    """The job's complete health readback: a verdict, bounded observation
+    evidence, or neither yet.
+
+    ``evidence`` is exactly one of ``None`` (nothing to report yet),
+    ``"observation"`` (an unresolved evaluation's bounded per-probe evidence
+    -- never a verdict, never recheck-until-pass, and truthfully re-runnable
+    via the distinct `can_rerun_health_evaluation` capability), or
+    ``"verdict"`` (a durable, non-recheckable PASSED/FAILED result). A
+    verdict always wins once one exists -- `health_completed_at` is set
+    exactly once, by the same write-once boundary that would also stop any
+    further UNKNOWN event from being appended for this job.
+
+    ``reason`` is the CURRENT unresolved attempt's whole-request bounded
+    classification, and it is deliberately independent of ``evidence``: a
+    refusal that happened before any probe round ran carries no per-probe
+    evidence at all, yet is exactly the case an operator most needs
+    explained. ``guest_operational`` is now the default contract and has no
+    FAIL outcome, so "the exact current LXC is stopped" reaches Home
+    Assistant as `evidence: None`, `probes: []`, `outcome: null` -- three
+    absences, and previously nothing else. `reason: "guest_unavailable"` is
+    the fourth field that makes that state readable.
+
+    It is present ONLY while the job is genuinely unresolved. Once a durable
+    verdict exists the prior attempt's UNKNOWN classification is history,
+    not current state, and publishing it beside a definitive result would
+    describe the job as still-blocked when it is not -- so the verdict
+    branch returns ``None`` for it, exactly as it does for settling.
+
+    Bounded by construction: exactly one token from the closed UNKNOWN
+    taxonomy, re-validated on the way out. Never the event's message, never
+    the rest of its ``details``, never helper stdout/stderr, and never an
+    exception string.
+    """
+
+    verdict_probes = _package_update_health_verdict_probes_body(job)
+    if verdict_probes:
+        return {
+            "evidence": "verdict",
+            "probes": verdict_probes,
+            "settling": None,
+            "reason": None,
+        }
+    if (
+        job.status is PackageUpdateJobStatus.ACTIVE
+        and job.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    ):
+        probes, settling, reason = _package_update_health_observation_body(
+            job, store=store
+        )
+        if probes:
+            return {
+                "evidence": "observation",
+                "probes": probes,
+                "settling": settling,
+                "reason": reason,
+            }
+        if reason is not None:
+            # The whole-request refusal case: no round ever completed, so
+            # there is no observation to show -- only the classification.
+            return {
+                "evidence": None,
+                "probes": [],
+                "settling": None,
+                "reason": reason,
+            }
+    return {"evidence": None, "probes": [], "settling": None, "reason": None}
+
+
 def _package_update_job_body(
     job: PackageUpdateJob, *, store: InventoryAuthorityStore, activated: bool
 ) -> dict[str, Any]:
     """Render one job as bounded typed facts.
 
     Deliberately absent: helper stdout/stderr, raw PVE task logs, command
-    text, credentials, the frozen package rows, and the per-probe health
-    result rows. What an operator needs here is what the job IS and what it
-    is doing; exact material is read through the actions that exist for it.
+    text, credentials, and the frozen package rows -- those are exact
+    material an operator reads through the actions that exist for them
+    (``view_update_plan``). The completed health verdict's per-probe results
+    ARE included here (kind, target, outcome, checked_at, and a bounded
+    reason token): a FAILED or UNKNOWN health result is only actionable if an
+    operator can see which probe produced it and why without shell/SQLite
+    access. This corrects the Human1 job-readback contract's original
+    per-probe exclusion once live evidence showed it made a real failure
+    undiagnosable from Home Assistant; every field below is still bounded,
+    typed, and drawn only from durable authority -- never raw guest output.
     """
 
     return {
@@ -315,6 +559,7 @@ def _package_update_job_body(
             "started_at": job.health_started_at,
             "completed_at": job.health_completed_at,
             "outcome": None if job.health_outcome is None else job.health_outcome.value,
+            **_package_update_health_body(job, store=store),
         },
         "rollback": {
             "operation_id": job.rollback_operation_id,
@@ -476,13 +721,17 @@ def _thaw(value: Any) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class PackageUpdateRuntime:
-    """The production update composition: one worker, one read-only observer.
+    """The production update composition: one worker, two read-only observers.
 
     ``snapshot_host_control`` is held here, beside the worker, for exactly one
     reason: the explicit operator rollback route must obtain a FRESH canonical
     PVE snapshot listing before it may arm anything, and
     ``inspect_job_snapshot_state`` is the existing read-only operation that
     produces one. It submits nothing, seals nothing, and creates nothing.
+
+    The health boundary is deliberately NOT held here: it is reachable only
+    through the worker's job-bound health orchestrator. v0.5 has no route
+    that talks to a guest outside a package-update job.
     """
 
     worker: PackageUpdateWorker
@@ -1278,6 +1527,41 @@ def create_read_only_app(
             "status": "unconfigured",
             "cleared": cleared,
         }
+
+    @app.post(
+        f"{_HEALTH_CONTRACT_ROUTE}/reset",
+        dependencies=[Depends(_require_bearer_token)],
+    )
+    def reset_health_contract(
+        resource_id: Annotated[str, ApiPath(pattern=_CANONICAL_UUID_PATTERN)],
+        expected_revision: Annotated[int | None, Query(ge=0)] = None,
+    ) -> dict[str, Any]:
+        """Restore the built-in v0.5 default health contract.
+
+        The native "reset health" action. It installs exactly the backend's
+        own `guest_operational` baseline -- the caller supplies no probe,
+        kind, or target, and nothing here reads the guest to decide what to
+        install. Unlike ``DELETE`` this never leaves a managed LXC
+        update-blocked with no declared meaning of healthy.
+
+        ``expected_revision`` is the same compare-and-set every other
+        contract mutation takes, so resetting from a stale view cannot
+        silently discard a newer advanced contract.
+        """
+
+        try:
+            contract = authority.reset_resource_health_contract(
+                resource_id, expected_revision=expected_revision
+            )
+        except AuthorityNotFound as exc:
+            raise _health_contract_error(404, "resource_not_found", str(exc)) from exc
+        except HealthContractRevisionConflict as exc:
+            raise _health_contract_error(409, "revision_conflict", str(exc)) from exc
+        except AuthorityConflict as exc:
+            raise _health_contract_error(409, "resource_not_current", str(exc)) from exc
+        except ValueError as exc:
+            raise _health_contract_error(422, "invalid_contract", str(exc)) from exc
+        return _health_contract_body(resource_id, contract)
 
     return app
 
