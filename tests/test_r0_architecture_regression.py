@@ -420,10 +420,16 @@ _DEFAULT_HEALTH_PROVISIONING_MODULES = (
 #: Text that only workload DISCOVERY needs. Advanced explicit probes still
 #: legitimately run `docker inspect` and `systemctl show` -- but they run
 #: them in the job-bound health helper, never in any module above.
+#:
+#: Every marker must be a SINGLE argv token or identifier. `_code` joins the
+#: token stream with newlines, so a multi-word marker like ``"docker ps"``
+#: can never match an argv tuple ``("docker", "ps", ...)`` -- which is how
+#: every command in this repository is actually spelled -- and would be a
+#: fence that silently constrains nothing. `test_the_workload_inference_
+#: markers_are_all_matchable` below pins that property.
 _WORKLOAD_INFERENCE_MARKERS = (
     "command -v",
-    "docker ps",
-    "docker inspect",
+    "docker",
     "dockerd",
     "containerd",
     "docker.sock",
@@ -463,19 +469,45 @@ def test_the_default_health_path_can_never_regress_into_workload_inference() -> 
 
     # Positive control: the explicit-probe executor still legitimately owns
     # the Docker and systemd commands, so the markers above are a statement
-    # about WHERE inference may not live, not a global prohibition.
+    # about WHERE inference may not live, not a global prohibition. It also
+    # proves the two strongest markers can actually FIRE -- a fence whose
+    # markers match nothing anywhere would pass above for the wrong reason.
     helper = _code(REPO_ROOT / "deploy/hubinet-package-health-helper.py")
     assert "docker" in helper and "systemctl" in helper
-    # ...but even it no longer carries the removed discovery surface.
+    # The batched `docker ps` daemon oracle and `docker inspect` are RETAINED
+    # here deliberately: an explicit `docker_container_healthy` contract
+    # needs both. What the helper must no longer carry is the DISCOVERY
+    # surface -- adapter presence, service/unit enumeration, and candidate
+    # ranking -- which is a different thing from executing a named probe.
+    for retained in ('"ps"', '"inspect"', '"show"'):
+        assert retained in helper, retained
     for marker in (
         "command -v",
-        "docker ps",
         "list-unit-files",
         "list-units",
         "discover_health_candidates",
         "adapter_presence",
     ):
         assert marker not in helper, marker
+
+
+def test_the_workload_inference_markers_are_all_matchable() -> None:
+    """A fence marker that cannot match is a fence that guards nothing.
+
+    `_code` returns one token per line, so a marker containing a space can
+    only ever match text INSIDE a single string literal -- never an argv
+    tuple, which is how this repository spells every command it runs. A
+    marker like ``"docker ps"`` therefore reads as a real constraint while
+    being satisfied by construction, and would keep passing even if a
+    provisioning module started shelling out to Docker.
+    """
+
+    for marker in _WORKLOAD_INFERENCE_MARKERS:
+        if " " in marker:
+            # The one legitimate multi-word shape: text that only ever
+            # appears as a single string literal, never as separate argv
+            # elements. Proved by exhibiting it as one literal.
+            assert marker == "command -v", marker
 
 
 def test_no_backend_or_integration_module_still_names_health_discovery() -> None:

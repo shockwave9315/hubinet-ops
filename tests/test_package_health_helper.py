@@ -786,7 +786,8 @@ def test_an_unusable_daemon_oracle_is_unknown_for_every_docker_probe() -> None:
 
 
 # ===========================================================================
-# 2.5. guest_operational (v20): a FALLBACK, not application health.
+# 2.5. guest_operational: the v0.5 DEFAULT, and guest liveness only --
+#      never application health.
 # ===========================================================================
 
 

@@ -34,7 +34,8 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "unit_deactivating",
         "unit_reloading",
         "unit_job_pending",
-        # v20 (post-Human1 Stage 3): the guest_operational FALLBACK kind.
+        # The guest_operational kind -- v0.5's BUILT-IN DEFAULT contract
+        # for a package-managed LXC, no longer a discovery fallback.
         # PASS only -- the exact resource context revalidated and the one
         # fixed, code-owned, read-only guest liveness operation succeeded.
         # There is deliberately no distinct FAIL token: infrastructure

@@ -195,7 +195,7 @@ def _unconfigured(authority, resource_id: str) -> None:
 
 
 # ===========================================================================
-# guest_operational (v20): a FALLBACK, never a faked target.
+# guest_operational: the v0.5 built-in DEFAULT, never a faked target.
 # ===========================================================================
 
 
@@ -1570,3 +1570,50 @@ def test_contract_writes_republish_without_touching_the_inventory_revision(
     after = store.backend_instance()
     assert after.inventory_revision == before.inventory_revision
     assert after.published_state_revision > before.published_state_revision
+
+
+def test_a_stopped_managed_lxc_still_receives_the_builtin_default(
+    tmp_path: Path,
+) -> None:
+    """The default contract is CONFIGURATION, never a runtime observation.
+
+    The eligibility predicate is exactly "current, package-managed LXC":
+    present, active, `lxc`, with a current locator binding and a current
+    node. `status` is deliberately NOT part of it. A stopped guest is still
+    the resource whose health this contract describes, and gating the
+    baseline on a temporary runtime condition would recreate the very dead
+    end this pivot removed -- a managed LXC that is UNCONFIGURED, and
+    therefore cannot be given an approved update, purely because it happened
+    to be down during the reconciliation that would have configured it.
+
+    Running remains a requirement only for scan/update/health EXECUTION
+    (`_package_scan_context_is_current`, and the helper's own
+    `revalidate_live_target`), never for contract creation.
+    """
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    source_id = resource.inventory_source_id
+    _unconfigured(authority, rid)
+    assert authority.resource_health_contract(rid) is None
+
+    _reconcile(
+        authority,
+        source_id,
+        status="stopped",
+        observed_at="2026-08-28T10:00:00+00:00",
+    )
+
+    assert store.list_resources()[0].status == "stopped"
+    contract = authority.resource_health_contract(rid)
+    assert contract is not None
+    assert contract.probes == DEFAULT_HEALTH_PROBES
+    assert contract.fingerprint == health_contract_fingerprint(DEFAULT_HEALTH_PROBES)
+    assert _health_contract_view(store, authority, rid)["status"] == "configured"
+
+    # The predicate provisioning shares with the package-scan target proof
+    # accepts the stopped resource too: neither is gated on `status`.
+    with sqlite3.connect(store.path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = authority._require_package_scan_target(connection, rid)
+    assert str(row["status"]) == "stopped"

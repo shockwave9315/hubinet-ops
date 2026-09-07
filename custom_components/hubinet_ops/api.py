@@ -249,7 +249,16 @@ class HubinetOpsApi:
     async def async_clear_health_contract(
         self, resource_id: str, expected_revision: int | None = None
     ) -> None:
-        """Make one resource's health contract unconfigured."""
+        """Make one resource's health contract unconfigured.
+
+        The LOW-LEVEL primitive, deliberately on no operator path: no
+        service, options flow, or Repair calls it. "Discard this contract"
+        on the native path is `async_reset_health_contract`, which restores
+        the backend's built-in default instead of leaving a managed LXC
+        update-blocked with no declared meaning of healthy -- and which the
+        backend would re-establish at the next successful reconciliation
+        anyway, so clearing is not durable removal.
+        """
 
         await self._transport.clear_health_contract(resource_id, expected_revision)
 

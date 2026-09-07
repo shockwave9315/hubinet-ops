@@ -43,6 +43,7 @@ import pytest
 
 from app.inventory import (
     AuthorityConflict,
+    DEFAULT_HEALTH_PROBES,
     HealthOutcome,
     HealthProbeKind,
     HealthProbeOutcome,
@@ -1032,6 +1033,66 @@ def test_an_unproven_mutation_stays_uncertain_and_never_rolls_back(
 # ===========================================================================
 # E. HEALTH FAIL AND UNKNOWN
 # ===========================================================================
+
+
+def test_explicit_rollback_survives_a_non_pass_default_health_on_a_dead_guest(
+    tmp_path: Path,
+) -> None:
+    """The load-bearing half of the v0.5 default-health pivot.
+
+    `guest_operational` is now the NORMAL criterion, and it has no FAIL
+    outcome at all: a guest this stage cannot positively prove down -- the
+    exact current LXC proven STOPPED by PVE included -- resolves to UNKNOWN,
+    never FAILED. So the operator's explicit same-job recovery path must be
+    reachable from an UNKNOWN verdict exactly as it is from a FAILED one.
+    Losing it would mean the default probe reporting "I could not tell"
+    silently withdrew the recovery path from precisely the guest that most
+    needs it.
+
+    Nothing here is automatic: the worker submits no rollback (NO
+    AUTO-ROLLBACK), stops at `health_unknown`, and the rollback below is an
+    explicit operator arming call.
+    """
+
+    system = _system(tmp_path, health=["unknown"])
+    # A normally managed LXC carries the BACKEND-OWNED default, not the
+    # fixture's advanced contract: this is the ordinary v0.5 shape.
+    reset = system.authority.reset_resource_health_contract(
+        system.resource.resource_id
+    )
+    assert reset.probes == DEFAULT_HEALTH_PROBES
+
+    job = _start(system)
+    assert system.worker.run_once().stop_reason == "health_unknown"
+    stalled = system.job(job.job_id)
+    assert stalled.status is PackageUpdateJobStatus.ACTIVE
+    assert stalled.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert stalled.health_outcome is None
+    # NO AUTO-ROLLBACK: nothing was submitted on the job's behalf.
+    assert system.rollback_host.calls == []
+
+    # PVE now positively reports the exact current resource STOPPED -- the
+    # dead/unresponsive guest case. `status` gates health EXECUTION, and
+    # must never gate the recovery path.
+    with system.store._transaction() as connection:
+        connection.execute(
+            "UPDATE resource_incarnations SET status='stopped' WHERE resource_id=?",
+            (system.resource.resource_id,),
+        )
+
+    capabilities = InventoryPublication(
+        system.store, system.authority, package_update_activated=True
+    ).read_operator_availability().resources[0]
+    assert capabilities["can_rollback_update"] is True
+    assert capabilities["can_rerun_health_evaluation"] is True
+
+    # The hint is not the authority: the arming path itself accepts it, and
+    # the job's OWN snapshot is still there to be named.
+    armed = system.authority.arm_package_update_rollback(
+        job.job_id, _canonical(system.ownership, system.identity)
+    )
+    assert armed.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+    assert armed.status is PackageUpdateJobStatus.ACTIVE
 
 
 def test_a_failed_health_verdict_leaves_the_job_rollback_capable_and_idle(

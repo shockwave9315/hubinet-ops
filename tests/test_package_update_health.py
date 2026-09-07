@@ -2412,7 +2412,7 @@ def test_end_to_end_a_healthy_workload_succeeds(tmp_path: Path) -> None:
     ]
 
 
-def test_end_to_end_guest_operational_fallback_succeeds(tmp_path: Path) -> None:
+def test_end_to_end_guest_operational_default_succeeds(tmp_path: Path) -> None:
     """The full path: authority issuance -> job-frozen (kind, None) probe ->
     the real SSH transport's JSON encoding (target serializes as `null`) ->
     the real deployed helper -> the fixed `/bin/true` guest command -> a
