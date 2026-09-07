@@ -135,8 +135,15 @@ def _rediscover(
 
 
 SYSTEMD = HealthProbeKind.SYSTEMD_UNIT_ACTIVE
-RUNNING = HealthProbeKind.DOCKER_CONTAINER_RUNNING
-HEALTHY = HealthProbeKind.DOCKER_CONTAINER_HEALTHY
+# v0.5 dropped Docker-specific health probes entirely (see
+# tests/test_health_scope_reduction.py for the explicit-refusal coverage).
+# `systemd_unit_active` is now the only targeted advanced kind, and these two
+# names stay distinct aliases for it -- purely so the many generic
+# revision/versioning/race tests below that only need "two probes with
+# different (kind, target) identities" read the way they always did, never
+# because the two names still mean two different KINDS.
+RUNNING = HealthProbeKind.SYSTEMD_UNIT_ACTIVE
+HEALTHY = HealthProbeKind.SYSTEMD_UNIT_ACTIVE
 
 
 def _probes(*pairs: tuple[HealthProbeKind, str]) -> tuple[ResourceHealthProbe, ...]:
@@ -258,19 +265,21 @@ def test_at_most_one_guest_operational_probe_is_ever_accepted(
         )
 
 
-def test_guest_operational_may_be_declared_alongside_workload_probes(
+def test_guest_operational_and_systemd_mixed_contract_refused(
     tmp_path: Path,
 ) -> None:
-    """A mixed contract is structurally legal (recommendation policy is a
-    separate, backend-owned concern from what an operator may explicitly
-    declare)."""
+    """v0.5 health scope reduction: the baseline and an advanced contract
+    never mix. `guest_operational` is the backend-owned baseline; an explicit
+    `systemd_unit_active` contract REPLACES it entirely, it does not extend
+    it -- mixing them would silently reintroduce the settling coupling the
+    baseline is deliberately free of (PRODUCT.md, "What healthy means")."""
 
     _, _, authority, resource = _system(tmp_path)
-    contract = authority.replace_resource_health_contract(
-        resource.resource_id,
-        DEFAULT_PROBES + (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),),
-    )
-    assert len(contract.probes) == 3
+    with pytest.raises(HealthContractError, match="guest_operational"):
+        authority.replace_resource_health_contract(
+            resource.resource_id,
+            DEFAULT_PROBES + (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),),
+        )
 
 
 def test_sql_directly_refuses_inserting_a_non_null_target_for_guest_operational(
@@ -293,6 +302,56 @@ def test_sql_directly_refuses_inserting_a_non_null_target_for_guest_operational(
             )
 
 
+def test_sql_directly_refuses_a_guest_operational_row_beside_another_probe(
+    tmp_path: Path,
+) -> None:
+    """v21 defense in depth: `resource_health_contract_no_mixed_baseline`
+    refuses a `guest_operational` row the moment its parent contract's own
+    declared `probe_count` is not exactly 1 -- independently of the Python
+    `canonical_health_probes` check every ordinary write already goes
+    through, and independently of `_ONE_GUEST_OPERATIONAL_PROBE_SQL`'s
+    partial unique index (which only stops a SECOND `guest_operational`
+    row, not a DIFFERENT kind alongside the first)."""
+
+    _, store, authority, resource = _system(tmp_path)
+    existing = authority.resource_health_contract(resource.resource_id)
+    assert existing.probes == (ResourceHealthProbe(kind=GUEST_OPERATIONAL, target=None),)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        # Replace the real singleton contract row with one that CLAIMS two
+        # probes but has none yet -- the exact pre-state a legitimate
+        # two-probe contract has for one instant during its own atomic
+        # replacement (contract row inserted, probe rows not yet filled).
+        connection.execute(
+            "DELETE FROM resource_health_contracts WHERE resource_id=?",
+            (resource.resource_id,),
+        )
+        connection.execute(
+            "DELETE FROM resource_health_contract_probes WHERE resource_id=?",
+            (resource.resource_id,),
+        )
+        connection.execute(
+            "INSERT INTO resource_health_contracts("
+            "resource_id, revision, fingerprint, probe_count, created_at, "
+            "updated_at) VALUES (?, ?, ?, 2, ?, ?)",
+            (
+                resource.resource_id,
+                existing.revision,
+                existing.fingerprint,
+                existing.created_at,
+                existing.updated_at,
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO resource_health_contract_probes"
+                "(resource_id, probe_index, kind, target) "
+                "VALUES (?, 0, 'guest_operational', NULL)",
+                (resource.resource_id,),
+            )
+
+
 # ===========================================================================
 # A. SCHEMA
 # ===========================================================================
@@ -303,7 +362,7 @@ def test_fresh_database_is_schema_v15_with_the_health_contract_tables(
 ) -> None:
     from app.inventory.store import AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION
 
-    assert AUTHORITY_SCHEMA_VERSION == 20
+    assert AUTHORITY_SCHEMA_VERSION == 21
     InventoryAuthorityStore(tmp_path / "authority.db")
     with sqlite3.connect(tmp_path / "authority.db") as connection:
         marker, version = connection.execute(
@@ -408,7 +467,7 @@ def test_sql_refuses_a_duplicate_probe_and_a_probe_beyond_the_declared_set(
             connection.execute(
                 "INSERT INTO resource_health_contract_probes("
                 "resource_id, probe_index, kind, target) "
-                "VALUES(?, 1, 'docker_container_running', 'redis')",
+                "VALUES(?, 1, 'systemd_unit_active', 'redis.service')",
                 (resource.resource_id,),
             )
         # And a duplicate identity is refused even at a legal-looking index.
@@ -543,18 +602,26 @@ def test_the_fingerprint_is_independent_of_declaration_order(tmp_path: Path) -> 
     assert repeated == first
     assert [probe.target for probe in first.probes] == [
         "immich_server",
-        "redis",
         "nginx.service",
+        "redis",
     ]
 
 
-def test_the_fingerprint_separates_kind_from_target(tmp_path: Path) -> None:
-    """Same target, different required condition, is a different contract."""
+def test_the_fingerprint_separates_target_within_one_kind(tmp_path: Path) -> None:
+    """Same kind, different target, is a different contract.
 
-    running = health_contract_fingerprint(_probes((RUNNING, "immich_server")))
-    healthy = health_contract_fingerprint(_probes((HEALTHY, "immich_server")))
-    assert running != healthy
-    assert healthy != health_contract_fingerprint(_probes((HEALTHY, "immich_web")))
+    Pre-v0.5-reduction this also proved the fingerprint separates KIND from
+    target using two different targeted Docker kinds; `systemd_unit_active`
+    is now the only targeted kind that can share a contract shape with
+    itself (an advanced contract can hold several), so that half of the
+    property is proven the only way still constructible. Kind is still part
+    of the fingerprint payload by construction (`health_contract_fingerprint`
+    hashes `{kind, target}` pairs), not merely by absence of a counterexample.
+    """
+
+    web = health_contract_fingerprint(_probes((SYSTEMD, "immich_web.service")))
+    server = health_contract_fingerprint(_probes((SYSTEMD, "immich_server.service")))
+    assert web != server
 
 
 @pytest.mark.parametrize(
@@ -705,7 +772,7 @@ def test_replacement_never_leaves_a_mixed_revision_probe_set(tmp_path: Path) -> 
     contracts, probes = _raw_rows(store)
     assert len(contracts) == 1
     assert [(str(row["kind"]), str(row["target"])) for row in probes] == [
-        ("docker_container_running", "redis")
+        ("systemd_unit_active", "redis")
     ]
     assert int(contracts[0]["probe_count"]) == 1
     assert store.resource_health_contract(resource.resource_id) == replaced

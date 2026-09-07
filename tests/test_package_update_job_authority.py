@@ -33,9 +33,7 @@ from tests.test_package_scan_authority import START, _packages, _reconcile, _sys
 #: in tests/test_package_update_health.py for the refusal itself.
 HEALTH_PROBES = (
     ResourceHealthProbe(kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"),
-    ResourceHealthProbe(
-        kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING, target="web"
-    ),
+    ResourceHealthProbe(kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="postgresql.service"),
 )
 
 

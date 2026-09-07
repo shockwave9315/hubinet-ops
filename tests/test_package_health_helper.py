@@ -8,26 +8,28 @@ exactly the fixed argv shapes the helper issues -- an unrecognised command is a
 test failure, not a silent empty result -- and it asserts the argv itself, not
 only the verdict.
 
-The CLI behaviours these tests encode were verified against the real tools
-(systemd 257, Docker 26.1.5) rather than assumed; `ARCHITECTURE.md`,
-"Job-bound healthcheck execution", records what was observed. In particular:
+The CLI behaviours these tests encode were verified against the real tool
+(systemd 257) rather than assumed; `ARCHITECTURE.md`, "Job-bound healthcheck
+execution", records what was observed. In particular:
 
 - `systemctl is-active` expands globs and succeeds if ANY match is active,
   and `--` does not stop it -- which is why this helper does not use it;
 - a systemd glob can match exactly ONE unit, so "one property block" alone is
   not enough and the target charset must exclude `*`, `?`, `[`;
 - `ssh.service` and `sshd.service` are aliases and report the SAME `Id`, so
-  batched systemd results are mapped BY POSITION, never by `Id`;
-- `docker inspect` resolves by ID prefix as well as by name, and a missing
-  name among several batched targets does not shift or suppress the others,
-  so batched Docker results are mapped BY NAME, never by position;
-- `docker inspect` cannot distinguish "no such container" from "daemon
-  unavailable" by exit code.
+  batched systemd results are mapped BY POSITION, never by `Id`.
 
-Every scenario below runs through a fake, instantly-advancing clock: bounded
-settling requires at least `MIN_DECISIVE_ROUND` (2) rounds before any verdict,
-so `_evaluate` always injects a deterministic clock rather than sleeping for
-real. Nothing here runs a real `pvesh`, `pct`, `ssh`, `systemctl`, or `docker`.
+v0.5 dropped Docker-specific package-update health probes entirely --
+`docker_container_running` and `docker_container_healthy` no longer exist, so
+there is no Docker behaviour left for this file to encode.
+
+Every scenario below runs through a fake, instantly-advancing clock: the
+advanced `systemd_unit_active` settling loop requires at least
+`MIN_DECISIVE_ROUND` (2) rounds before any verdict, so `_evaluate` always
+injects a deterministic clock rather than sleeping for real. The built-in
+`guest_operational` baseline is a single one-shot execution and never sleeps
+at all (see section 2 below). Nothing here runs a real `pvesh`, `pct`, `ssh`,
+or `systemctl`.
 """
 
 from __future__ import annotations
@@ -94,11 +96,10 @@ class FakeClock:
 class FakeGuest:
     """A deterministic stand-in for one running Debian LXC guest.
 
-    Its systemd and Docker behaviour models what the real tools were OBSERVED
-    to do, including the parts that make a naive probe unsafe: `systemctl
-    show` emits one blank-line-separated property block per matched unit and
-    expands `*`, `?`, `[`; `docker inspect` resolves by ID prefix and reports
-    the container's own name with a leading slash.
+    Its systemd behaviour models what the real tool was OBSERVED to do,
+    including the parts that make a naive probe unsafe: `systemctl show`
+    emits one blank-line-separated property block per matched unit and
+    expands `*`, `?`, `[`.
     """
 
     def __init__(self) -> None:
@@ -108,19 +109,17 @@ class FakeGuest:
         self.running = True
         self.resource_type = "lxc"
         self.current_node = NODE
-        #: unit id -> (LoadState, ActiveState, Job)
+        #: unit id -> (LoadState, ActiveState, Job). `nginx.service` and
+        #: `postgresql.service` are both active by default so the default
+        #: two-probe advanced contract (`tests.test_package_update_job_
+        #: authority.HEALTH_PROBES`) passes with no extra configuration.
         self.units: dict[str, tuple[str, str, str]] = {
             "nginx.service": ("loaded", "active", ""),
+            "postgresql.service": ("loaded", "active", ""),
             "worker.service": ("loaded", "failed", ""),
         }
         #: Alias -> canonical unit id, exactly as systemd resolves one.
         self.unit_aliases: dict[str, str] = {}
-        #: container name -> (Status, Restarting, Health), "<none>" health
-        #: for a container that declares no HEALTHCHECK.
-        self.containers: dict[str, tuple[str, str, str]] = {
-            "web": ("running", "false", "healthy"),
-        }
-        self.docker_daemon_up = True
         self.systemctl_returncode = 0
         self.systemctl_stdout_override: str | None = None
         self.commands: list[tuple[str, ...]] = []
@@ -178,8 +177,6 @@ class FakeGuest:
         command = tail[2]
         if command == "systemctl":
             return self._systemctl(tail)
-        if command == "docker":
-            return self._docker(tail)
         raise AssertionError(f"unexpected guest command: {tail}")
 
     # -- guest_operational -----------------------------------------------
@@ -241,74 +238,11 @@ class FakeGuest:
         canonical = self.unit_aliases.get(requested, requested)
         return [canonical] if canonical in self.units else []
 
-    # -- docker --------------------------------------------------------
-
-    def _docker(self, tail):
-        if tail[3] == "ps":
-            assert tuple(tail[3:]) == (
-                "ps",
-                "--all",
-                "--no-trunc",
-                "--format",
-                helper.DOCKER_NAME_LIST_FORMAT,
-            ), tail
-            if not self.docker_daemon_up:
-                return helper.CommandResult(
-                    1, b"", b"Cannot connect to the Docker daemon"
-                )
-            return self._ok(
-                b"".join(
-                    json.dumps(name).encode() + b"\n" for name in self.containers
-                )
-            )
-        assert tail[3] == "inspect", tail
-        assert tuple(tail[4:6]) == ("--type", "container"), tail
-        assert tail[6] == helper.DOCKER_INSPECT_FORMAT_FLAG, tail
-        # The template is a CONSTANT owned by the helper, byte for byte.
-        assert tail[7] == helper.DOCKER_INSPECT_FORMAT, tail
-        assert tail[8] == "--", tail
-        if self.timeout_on == "docker":
-            return helper.CommandResult(0, b"", b"", timed_out=True)
-        if not self.docker_daemon_up:
-            return helper.CommandResult(
-                1, b"", b"Cannot connect to the Docker daemon"
-            )
-        requested = tail[9:]
-        lines = []
-        errors = []
-        for name in requested:
-            resolved = self._resolve_container(name)
-            if resolved is None:
-                errors.append(name)
-                continue
-            resolved_name, (status, restarting, health) = resolved
-            lines.append(f"/{resolved_name}\t{status}\t{restarting}\t{health}")
-        stdout = ("\n".join(lines) + "\n").encode() if lines else b""
-        returncode = 1 if errors else 0
-        return helper.CommandResult(returncode, stdout, b"boom" if errors else b"")
-
-    def _resolve_container(self, requested: str):
-        if requested in self.containers:
-            return requested, self.containers[requested]
-        # Docker also resolves a container by ID PREFIX, and then reports the
-        # container's real name -- which is what makes an exact-name check
-        # load-bearing rather than decorative.
-        for name in self.containers:
-            if _fake_container_id(name).startswith(requested) and len(requested) >= 4:
-                return name, self.containers[name]
-        return None
-
     # -- helpers -------------------------------------------------------
 
     @staticmethod
     def _ok(stdout: bytes):
         return helper.CommandResult(0, stdout, b"")
-
-
-def _fake_container_id(name: str) -> str:
-    import hashlib
-
-    return hashlib.sha256(name.encode()).hexdigest()
 
 
 def _request(probes, *, vmid: int = VMID, node: str = NODE) -> dict:
@@ -599,195 +533,10 @@ def test_a_systemctl_timeout_is_unknown() -> None:
 
 
 # ===========================================================================
-# 2. docker_container_running
-# ===========================================================================
-
-
-def test_a_running_container_passes_with_the_exact_fixed_argv() -> None:
-    guest = FakeGuest()
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("passed", "container_running")
-    ]
-    inspect = next(
-        argv
-        for argv in guest.commands
-        if argv[:2] == ("pct", "exec") and "inspect" in argv
-    )
-    assert inspect == (
-        "pct",
-        "exec",
-        str(VMID),
-        "--",
-        "env",
-        "LC_ALL=C",
-        "docker",
-        "inspect",
-        "--type",
-        "container",
-        "--format",
-        helper.DOCKER_INSPECT_FORMAT,
-        "--",
-        "web",
-    )
-    # No pipeline, no grep, no `docker ps` parsing for the verdict itself.
-    assert all("|" not in element for argv in guest.commands for element in argv)
-
-
-@pytest.mark.parametrize(
-    ("status", "reason"),
-    (
-        ("exited", "container_not_running"),
-        ("dead", "container_not_running"),
-        ("paused", "container_not_running"),
-    ),
-)
-def test_a_settled_non_running_container_is_a_definitive_failure(
-    status: str, reason: str
-) -> None:
-    guest = FakeGuest()
-    guest.containers["web"] = (status, "false", "<none>")
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("failed", reason)
-    ]
-
-
-@pytest.mark.parametrize(
-    ("status", "restarting", "reason"),
-    (
-        ("created", "false", "container_not_started_yet"),
-        ("restarting", "true", "container_restarting"),
-        ("removing", "false", "container_removing"),
-    ),
-)
-def test_docker_own_transient_lifecycle_states_are_unknown_not_failed(
-    status: str, restarting: str, reason: str
-) -> None:
-    """Docker's own transient lifecycle, entered automatically and expected
-    to resolve on its own -- never a workload verdict, for either Docker
-    probe kind."""
-
-    guest = FakeGuest()
-    guest.containers["web"] = (status, restarting, "<none>")
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("unknown", reason)
-    ]
-    assert _evaluate(guest, (("docker_container_healthy", "web"),)) == [
-        ("unknown", reason)
-    ]
-
-
-def test_an_absent_container_is_a_failure_only_because_the_daemon_answered() -> None:
-    guest = FakeGuest()
-    assert _evaluate(guest, (("docker_container_running", "gone"),)) == [
-        ("failed", "container_absent")
-    ]
-    # The one daemon-oracle-and-absence-proof call ran; no inspect for a name
-    # it never enumerated.
-    ps_calls = [
-        argv
-        for argv in guest.commands
-        if argv[:2] == ("pct", "exec") and "ps" in argv
-    ]
-    assert ps_calls
-    assert not any(
-        argv[:2] == ("pct", "exec") and "inspect" in argv for argv in guest.commands
-    )
-
-
-def test_a_docker_daemon_that_is_down_is_unknown_never_absent() -> None:
-    guest = FakeGuest()
-    guest.docker_daemon_up = False
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("unknown", "docker_daemon_unavailable")
-    ]
-
-
-def test_an_id_prefix_can_never_resolve_to_a_pass() -> None:
-    """`docker inspect` resolves by ID prefix, but the batched daemon oracle
-    (`docker ps` `.Names`) is consulted FIRST and lists real NAMES only, never
-    IDs -- so an ID-prefix-looking target is proven absent from the exact
-    name universe before `docker inspect` ever gets a chance to resolve it by
-    prefix. The ID-prefix confusion the old per-probe design had to defend
-    against inside `docker inspect` is structurally unreachable here."""
-
-    guest = FakeGuest()
-    prefix = _fake_container_id("web")[:12]
-    assert _evaluate(guest, (("docker_container_running", prefix),)) == [
-        ("failed", "container_absent")
-    ]
-    assert not any(
-        argv[:2] == ("pct", "exec") and "inspect" in argv for argv in guest.commands
-    )
-
-
-@pytest.mark.parametrize("target", ("--help", "-f", "/web", "web name"))
-def test_an_option_or_path_like_container_target_is_refused(target: str) -> None:
-    guest = FakeGuest()
-    assert _evaluate(guest, (("docker_container_running", target),)) == [
-        ("unknown", "probe_target_not_exact")
-    ]
-
-
-def test_malformed_inspect_output_is_unknown() -> None:
-    guest = FakeGuest()
-
-    original = guest._docker
-
-    def broken(tail):
-        if tail[3] == "inspect":
-            return helper.CommandResult(0, b"/web\tmaybe\tfalse\thealthy\n", b"")
-        return original(tail)
-
-    guest._docker = broken
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("unknown", "malformed_output")
-    ]
-
-
-def test_an_inspect_timeout_is_unknown() -> None:
-    guest = FakeGuest()
-    guest.timeout_on = "docker"
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("unknown", "command_timed_out")
-    ]
-
-
-def test_a_generic_inspect_failure_is_not_absence_while_name_still_exists() -> None:
-    """The daemon oracle already proved the name exists this round; a
-    separate inspect glitch afterwards is a race, never absence."""
-
-    guest = FakeGuest()
-    original = guest._docker
-
-    def failed(tail):
-        if tail[3] == "inspect":
-            return helper.CommandResult(1, b"", b"generic inspect failure")
-        return original(tail)
-
-    guest._docker = failed
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("unknown", "command_failed")
-    ]
-
-
-def test_an_unusable_daemon_oracle_is_unknown_for_every_docker_probe() -> None:
-    guest = FakeGuest()
-    original = guest._docker
-
-    def unusable_listing(tail):
-        if tail[3] == "ps":
-            return helper.CommandResult(0, b"not-json\n", b"")
-        return original(tail)
-
-    guest._docker = unusable_listing
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("unknown", "malformed_output")
-    ]
-
-
-# ===========================================================================
-# 2.5. guest_operational: the v0.5 DEFAULT, and guest liveness only --
-#      never application health.
+# 2. guest_operational: the v0.5 DEFAULT, and guest liveness only --
+#    never application health. ONE-SHOT: no settling, no retry within one
+#    evaluation attempt (v0.5 health scope reduction -- see ARCHITECTURE.md,
+#    "Job-bound healthcheck execution -- baseline independence").
 # ===========================================================================
 
 
@@ -849,99 +598,89 @@ def test_guest_operational_still_revalidates_the_live_target_first() -> None:
     assert response["error"]["classification"] == "guest_unavailable"
 
 
-def test_guest_operational_alongside_a_docker_probe_in_the_same_round() -> None:
-    """A mixed contract is legal, and each family stays independently
-    batched: one guest_operational command, one Docker round, same round."""
+def test_guest_operational_cannot_mix_with_a_systemd_probe() -> None:
+    """The built-in baseline and an explicit advanced contract never mix
+    (v0.5 health scope reduction, PRODUCT.md "What healthy means"): an
+    advanced contract REPLACES the baseline, it does not extend it. Refused
+    structurally at request validation, before any guest command runs."""
 
-    guest = FakeGuest()
-    assert _evaluate(
-        guest,
+    payload = _request(
         (
             ("guest_operational", None),
-            ("docker_container_running", "web"),
-        ),
-    ) == [
-        ("passed", "guest_operational_confirmed"),
-        ("passed", "container_running"),
+            ("systemd_unit_active", "nginx.service"),
+        )
+    )
+    with pytest.raises(helper.RequestError, match="guest_operational"):
+        helper.validate_request(payload)
+
+
+def test_guest_operational_executes_exactly_once_per_attempt() -> None:
+    """No internal retry loop of any kind for the baseline: one attempt is
+    one guest command, whatever the outcome."""
+
+    guest = FakeGuest()
+    _evaluate(guest, (("guest_operational", None),))
+    guest_commands = [argv for argv in guest.commands if argv[:2] == ("pct", "exec")]
+    assert len(guest_commands) == 1
+
+
+def test_a_slow_but_successful_guest_operation_is_still_one_decisive_pass() -> None:
+    """THE MAJOR FIX (v0.5 health scope reduction). At the starting SHA,
+    `evaluate_health_contract_settling`'s generic advanced-settling rules
+    (`MAX_ROUND_SPAN_SECONDS = 15`, `MIN_DECISIVE_ROUND = 2`) were incorrectly
+    applied to a `guest_operational`-only contract: a `/bin/true` that
+    genuinely took longer than 15 seconds to exit 0 was discarded as
+    "non-decisive", and the evaluation kept re-running the command until the
+    deadline, ending UNKNOWN with a stuck ACTIVE job -- for a workload that
+    never actually failed.
+
+    The baseline is now structurally independent of that settling machinery
+    (`_evaluate_guest_operational_once`, called directly by `handle_request`,
+    never `evaluate_health_contract_settling`): a single execution that
+    exits 0 after MORE than `MAX_ROUND_SPAN_SECONDS` -- but comfortably
+    inside the settling deadline -- is DECISIVE PASS from exactly ONE guest
+    command, no sleep, and no second confirmation round.
+    """
+
+    guest = FakeGuest()
+    clock = FakeClock()
+    guest.clock = clock
+    slow_seconds = helper.MAX_ROUND_SPAN_SECONDS + 1.0
+    # Host call order for one guest_operational attempt: 0 = `_local_node`,
+    # 1 = the prologue's own `revalidate_live_target`, 2 = the SECOND
+    # revalidation `_run_guest_command` issues immediately before its own
+    # guest command, 3 = the real `/bin/true` guest command itself. Consuming
+    # the slow duration there proves a genuinely slow, but successful,
+    # `/bin/true` alone -- not a slow revalidation -- is what stays PASS.
+    guest.consume_seconds_by_call_index[3] = slow_seconds
+    response = helper.handle_request(
+        _request((("guest_operational", None),)),
+        runner=guest,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    assert response["ok"] is True
+    assert response["evaluation_status"] == "decisive"
+    assert response["probes"] == [
+        {
+            "index": 0,
+            "kind": "guest_operational",
+            "target": None,
+            "outcome": "passed",
+            "reason": "guest_operational_confirmed",
+        }
     ]
+    assert response["settling"]["rounds"] == 1
+    guest_commands = [argv for argv in guest.commands if argv[:2] == ("pct", "exec")]
+    assert len(guest_commands) == 1
+    assert guest_commands[0] == ("pct", "exec", str(VMID), "--", "/bin/true")
 
 
 # ===========================================================================
-# 3. docker_container_healthy
-# ===========================================================================
-
-
-def test_a_healthy_container_passes() -> None:
-    guest = FakeGuest()
-    assert _evaluate(guest, (("docker_container_healthy", "web"),)) == [
-        ("passed", "container_healthy")
-    ]
-
-
-@pytest.mark.parametrize(
-    ("state", "reason"),
-    (
-        (("running", "false", "unhealthy"), "container_unhealthy"),
-        (("running", "false", "<none>"), "container_has_no_healthcheck"),
-        (("exited", "false", "healthy"), "container_not_running"),
-    ),
-)
-def test_docker_health_is_never_downgraded_to_merely_running(
-    state, reason: str
-) -> None:
-    """The operator asked for Docker HEALTHCHECK health specifically, so none
-    of these may be quietly accepted as "well, it is running"."""
-
-    guest = FakeGuest()
-    guest.containers["web"] = state
-    assert _evaluate(guest, (("docker_container_healthy", "web"),)) == [
-        ("failed", reason)
-    ]
-
-
-def test_docker_health_starting_is_unknown_not_failed() -> None:
-    """Live Human1 evidence: a package update that restarts Docker/containerd
-    puts every container's health state machine through "starting" again on
-    a perfectly healthy workload. That is Docker's own transient state, not
-    a workload verdict, so it must never become a durable FAIL -- unlike
-    `unhealthy`, `<none>`, and not-running above, which stay definitive
-    failures because the operator specifically demanded Docker health."""
-
-    guest = FakeGuest()
-    guest.containers["web"] = ("running", "false", "starting")
-    assert _evaluate(guest, (("docker_container_healthy", "web"),)) == [
-        ("unknown", "container_health_starting")
-    ]
-
-
-def test_a_container_running_probe_still_passes_for_an_unhealthy_container() -> None:
-    """The two Docker kinds are genuinely different questions."""
-
-    guest = FakeGuest()
-    guest.containers["web"] = ("running", "false", "unhealthy")
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("passed", "container_running")
-    ]
-
-
-def test_an_unknown_health_status_is_unknown_not_a_guess() -> None:
-    guest = FakeGuest()
-    guest.containers["web"] = ("running", "false", "mysterious")
-    assert _evaluate(guest, (("docker_container_healthy", "web"),)) == [
-        ("unknown", "malformed_output")
-    ]
-
-
-def test_an_unknown_status_value_is_unknown_not_a_guess() -> None:
-    guest = FakeGuest()
-    guest.containers["web"] = ("quantum", "false", "<none>")
-    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
-        ("unknown", "malformed_output")
-    ]
-
-
-# ===========================================================================
-# 4. Bounded settling: full-round temporal coherence and decisive rounds
+# 3. Bounded settling: full-round temporal coherence and decisive rounds.
+#    ONLY reachable for an advanced `systemd_unit_active` contract -- the
+#    `guest_operational` baseline never enters this loop at all (section 2
+#    above).
 # ===========================================================================
 
 
@@ -968,11 +707,15 @@ def test_full_round_temporal_coherence_earlier_pass_never_survives_a_later_fail(
     """The required counterexample regression: round 1 has A=PASS, B=
     TRANSIENT; round 2 has A=FAIL, B=PASS. The result must never be PASS --
     an earlier PASS contributes no terminal authority once a later round
-    disproves it, and only the LAST complete round's evidence may decide."""
+    disproves it, and only the LAST complete round's evidence may decide.
+
+    Both probes are `systemd_unit_active`, batched into one `systemctl show`
+    call per round -- Docker health probes no longer exist (v0.5 health
+    scope reduction), so this is now the only remaining targeted kind."""
 
     guest = FakeGuest()
     guest.units["nginx.service"] = ("loaded", "active", "")  # A: PASS round 1
-    guest.containers["web"] = ("running", "false", "starting")  # B: TRANSIENT
+    guest.units["cache.service"] = ("loaded", "activating", "")  # B: TRANSIENT
 
     calls = {"n": 0}
     original_systemctl = guest._systemctl
@@ -980,26 +723,18 @@ def test_full_round_temporal_coherence_earlier_pass_never_survives_a_later_fail(
     def flipping(tail):
         calls["n"] += 1
         if calls["n"] >= 2:
-            # Round 2 onward: A now fails definitively.
+            # Round 2 onward: A now fails definitively, B settles to PASS.
             guest.units["nginx.service"] = ("loaded", "failed", "")
+            guest.units["cache.service"] = ("loaded", "active", "")
         return original_systemctl(tail)
 
     guest._systemctl = flipping
-
-    original_docker = guest._docker
-
-    def settling(tail):
-        if tail[3] == "inspect":
-            guest.containers["web"] = ("running", "false", "healthy")  # B: PASS
-        return original_docker(tail)
-
-    guest._docker = settling
 
     response = _evaluate_full(
         guest,
         (
             ("systemd_unit_active", "nginx.service"),
-            ("docker_container_healthy", "web"),
+            ("systemd_unit_active", "cache.service"),
         ),
     )
     outcomes = {probe["index"]: probe["outcome"] for probe in response["probes"]}
@@ -1011,37 +746,37 @@ def test_full_round_temporal_coherence_earlier_pass_never_survives_a_later_fail(
 
 def test_transient_settles_to_pass_within_the_bounded_window() -> None:
     guest = FakeGuest()
-    guest.containers["web"] = ("running", "false", "starting")
+    guest.units["nginx.service"] = ("loaded", "activating", "")
     calls = {"n": 0}
-    original = guest._docker
+    original = guest._systemctl
 
     def settling(tail):
         calls["n"] += 1
-        if tail[3] == "inspect" and calls["n"] >= 3:
-            guest.containers["web"] = ("running", "false", "healthy")
+        if calls["n"] >= 3:
+            guest.units["nginx.service"] = ("loaded", "active", "")
         return original(tail)
 
-    guest._docker = settling
-    assert _evaluate(guest, (("docker_container_healthy", "web"),)) == [
-        ("passed", "container_healthy")
+    guest._systemctl = settling
+    assert _evaluate(guest, (("systemd_unit_active", "nginx.service"),)) == [
+        ("passed", "unit_active")
     ]
 
 
 def test_transient_settles_to_a_definitive_failure() -> None:
     guest = FakeGuest()
-    guest.containers["web"] = ("running", "false", "starting")
+    guest.units["nginx.service"] = ("loaded", "activating", "")
     calls = {"n": 0}
-    original = guest._docker
+    original = guest._systemctl
 
     def settling(tail):
         calls["n"] += 1
-        if tail[3] == "inspect" and calls["n"] >= 3:
-            guest.containers["web"] = ("running", "false", "unhealthy")
+        if calls["n"] >= 3:
+            guest.units["nginx.service"] = ("loaded", "failed", "")
         return original(tail)
 
-    guest._docker = settling
-    assert _evaluate(guest, (("docker_container_healthy", "web"),)) == [
-        ("failed", "container_unhealthy")
+    guest._systemctl = settling
+    assert _evaluate(guest, (("systemd_unit_active", "nginx.service"),)) == [
+        ("failed", "unit_not_active")
     ]
 
 
@@ -1052,17 +787,17 @@ def test_persistent_transient_exhausts_the_deadline_as_unknown() -> None:
 
     guest = FakeGuest()
     clock = FakeClock()
-    guest.containers["web"] = ("running", "false", "starting")
+    guest.units["nginx.service"] = ("loaded", "activating", "")
     response = _evaluate_full(
-        guest, (("docker_container_healthy", "web"),), clock=clock
+        guest, (("systemd_unit_active", "nginx.service"),), clock=clock
     )
     assert response["probes"] == [
         {
             "index": 0,
-            "kind": "docker_container_healthy",
-            "target": "web",
+            "kind": "systemd_unit_active",
+            "target": "nginx.service",
             "outcome": "unknown",
-            "reason": "container_health_starting",
+            "reason": "unit_activating",
         }
     ]
     # The wall-clock deadline (180s / 5s observation interval) is reached
@@ -1148,16 +883,15 @@ def test_a_round_slower_than_the_span_bound_is_never_decisive() -> None:
 
 def test_every_guest_command_revalidates_the_live_target_first() -> None:
     """The dispatcher owns the invariant, so no caller can amortize one
-    check across two commands and send a later one to a replacement guest."""
+    check across two commands and send a later one to a replacement guest.
+
+    `MIN_DECISIVE_ROUND = 2` already guarantees at least two separate
+    `systemctl show` guest commands for an otherwise-passing single-probe
+    contract, which is enough distinct commands to prove the invariant now
+    that Docker health probes no longer exist to provide a second family."""
 
     guest = FakeGuest()
-    _evaluate(
-        guest,
-        (
-            ("systemd_unit_active", "nginx.service"),
-            ("docker_container_running", "web"),
-        ),
-    )
+    _evaluate(guest, (("systemd_unit_active", "nginx.service"),))
     sequence = [
         "revalidate" if argv[2] == "/cluster/resources" else "guest"
         for argv in guest.commands
@@ -1216,28 +950,25 @@ def test_revalidation_that_consumes_most_of_the_budget_does_not_hand_the_actual_
     assert command_timeout < revalidation_timeout - 15
 
 
-def test_an_earlier_family_that_exhausts_the_budget_stops_a_later_family_from_starting_at_all() -> None:
-    """Witness B. A systemd probe (family 1) and a `guest_operational` probe
-    (family 2) share one round. The systemd family's own guest command is
-    made to consume nearly the entire settling deadline; the guest family
-    must then never even ATTEMPT its own revalidation -- proving a later
-    family cannot begin once an earlier one has exhausted the real budget,
-    not only that its command gets a small timeout."""
+def test_a_round_that_exhausts_the_budget_stops_the_next_round_from_starting_at_all() -> None:
+    """Witness B. Docker health probes no longer exist to provide a second
+    FAMILY sharing one round with systemd, so this now proves the same
+    invariant across ROUNDS of the one remaining family: round 1's own
+    `systemctl show` is made to consume nearly its entire granted timeout,
+    leaving no real budget for round 2 -- which must then never even ATTEMPT
+    its own revalidation, proving a later round cannot begin once an earlier
+    one has exhausted the real budget, not only that its command would get a
+    small timeout."""
 
     guest = FakeGuest()
     clock = FakeClock()
     guest.clock = clock
-    # Call index 3 is the systemd family's own `systemctl show` -- consume
-    # its ENTIRE granted timeout (a real bounded command can never consume
-    # more than the timeout it was actually given).
+    # Call index 3 is round 1's own `systemctl show` -- consume its ENTIRE
+    # granted timeout (a real bounded command can never consume more than the
+    # timeout it was actually given).
     guest.consume_seconds_by_call_index = {3: 1_000_000.0}
 
-    payload = _request(
-        (
-            ("systemd_unit_active", "nginx.service"),
-            ("guest_operational", None),
-        )
-    )
+    payload = _request((("systemd_unit_active", "nginx.service"),))
     payload["settling_policy"]["deadline_seconds"] = (
         helper.MIN_SETTLING_DEADLINE_SECONDS
     )
@@ -1246,17 +977,14 @@ def test_an_earlier_family_that_exhausts_the_budget_stops_a_later_family_from_st
     )
     assert response["ok"] is True
 
-    # The guest_operational family's own revalidation (and therefore its
-    # `/bin/true`) was never launched: exactly the 4 pre-existing calls
-    # (_local_node, pre-flight revalidate, this round's systemd revalidate,
-    # this round's `systemctl show`) happened, and nothing after.
+    # Round 2's own revalidation was never launched: exactly the 4
+    # pre-existing calls (_local_node, pre-flight revalidate, round 1's own
+    # revalidate, round 1's `systemctl show`) happened, and nothing after --
+    # whether or not the loop logically counts a further budget-exhausted
+    # round with zero real commands of its own.
     assert len(guest.commands) == 4
-    assert not any(argv[-1:] == ("/bin/true",) for argv in guest.commands)
-
-    outcomes = {probe["index"]: probe for probe in response["probes"]}
-    assert outcomes[1]["outcome"] == "unknown"
-    assert outcomes[1]["reason"] == "settling_budget_exhausted"
-    # Controlled unresolved result, never a durable verdict.
+    # Never decisive: round 1's own span vastly exceeds MAX_ROUND_SPAN_
+    # SECONDS, so it could never be decisive even before the budget ran out.
     assert response["evaluation_status"] == "unresolved"
     # The actual wall-clock runtime never ran meaningfully past the intended
     # deadline -- only the bounded transport-return margin's worth, not a
@@ -1337,12 +1065,7 @@ def test_a_guest_replaced_mid_evaluation_makes_that_probe_unknown() -> None:
 
     clock = FakeClock()
     response = helper.handle_request(
-        _request(
-            (
-                ("systemd_unit_active", "nginx.service"),
-                ("docker_container_running", "web"),
-            )
-        ),
+        _request((("systemd_unit_active", "nginx.service"),)),
         runner=moving,
         monotonic=clock.monotonic,
         sleep=clock.sleep,
@@ -1444,11 +1167,11 @@ def test_a_requested_deadline_beyond_the_hard_ceiling_never_exceeds_it() -> None
     settling window longer than this file's own hard ceiling."""
 
     guest = FakeGuest()
-    guest.containers["web"] = ("running", "false", "starting")
+    guest.units["nginx.service"] = ("loaded", "activating", "")
     clock = FakeClock()
     response = helper.handle_request(
         {
-            **_request((("docker_container_healthy", "web"),)),
+            **_request((("systemd_unit_active", "nginx.service"),)),
             "settling_policy": {
                 "deadline_seconds": 10_000.0,
                 "observation_interval_seconds": 5.0,
@@ -1578,7 +1301,7 @@ def test_a_real_round_trip_produces_typed_probe_results(tmp_path: Path) -> None:
     guest.vmid = request.vmid
     guest.node = guest.current_node = request.expected_node
     guest.units["nginx.service"] = ("loaded", "active", "")
-    guest.containers["web"] = ("running", "false", "healthy")
+    guest.units["postgresql.service"] = ("loaded", "active", "")
 
     result = _transport(_round_trip_runner(guest)).evaluate_health_contract(request)
 
@@ -1760,20 +1483,24 @@ def test_a_remote_guest_is_probed_through_a_command_line_needing_no_quoting() ->
     """
 
     guest = RemoteGuest()
+    guest.units["worker.service"] = ("loaded", "active", "")
     assert _evaluate(
         guest,
         (
             ("systemd_unit_active", "nginx.service"),
-            ("docker_container_running", "web"),
+            ("systemd_unit_active", "worker.service"),
         ),
         node="pve-b",
-    ) == [("passed", "unit_active"), ("passed", "container_running")]
+    ) == [("passed", "unit_active"), ("passed", "unit_active")]
 
     assert guest.remote_command_lines
-    # The caller-derived elements appear as bare words. The Docker format
-    # template is a constant this file owns and is quoted normally.
-    assert any(line.endswith(" -- nginx.service") for line in guest.remote_command_lines)
-    assert any(line.endswith(" -- web") for line in guest.remote_command_lines)
+    # The caller-derived elements appear as bare words, batched into one
+    # `systemctl show` call ending with both targets in the request's own
+    # canonical order.
+    assert any(
+        line.endswith(" -- nginx.service worker.service")
+        for line in guest.remote_command_lines
+    )
 
 
 def test_an_element_that_would_need_quoting_is_refused_rather_than_quoted() -> None:
@@ -1816,26 +1543,17 @@ def test_the_helper_can_only_report_reasons_the_backend_accepts() -> None:
     assert HOST_PROBE_REASONS <= HEALTH_PROBE_REASONS
 
     produced: set[str] = set()
-    produced.update(helper._DOCKER_TRANSIENT_REASONS.values())
     produced.update(helper._SYSTEMD_TRANSIENT_REASONS.values())
     produced.update(
         {
             "unit_active",
             "unit_not_active",
             "unit_job_pending",
-            "container_running",
-            "container_healthy",
-            "container_not_running",
-            "container_absent",
-            "container_unhealthy",
-            "container_health_starting",
-            "container_has_no_healthcheck",
             "probe_target_not_exact",
             "probe_target_ambiguous",
             "malformed_output",
             "command_failed",
             "command_timed_out",
-            "docker_daemon_unavailable",
             "guest_unavailable",
             "guest_operational_confirmed",
             "settling_budget_exhausted",
@@ -1848,14 +1566,12 @@ def test_backend_eligibility_and_standalone_helper_grammars_are_identical() -> N
     """Issuance must never accept a target the standalone helper refuses."""
 
     from app.inventory.health_execution import (
-        DOCKER_NAME_PATTERN,
         SYSTEMD_UNIT_PATTERN,
         SYSTEMD_UNIT_SUFFIXES,
     )
 
     assert helper.SYSTEMD_UNIT_RE.pattern == SYSTEMD_UNIT_PATTERN
     assert helper.SYSTEMD_UNIT_SUFFIXES == SYSTEMD_UNIT_SUFFIXES
-    assert helper.DOCKER_NAME_RE.pattern == DOCKER_NAME_PATTERN
 
 
 # ===========================================================================
@@ -1935,42 +1651,38 @@ def test_a_health_prologue_that_exhausts_the_budget_launches_no_guest_command() 
 
 
 def test_guest_operational_never_reaches_a_target_validator(monkeypatch) -> None:
-    """It carries no target, so neither the Docker nor the systemd target
-    grammar may ever be consulted for it -- and certainly not via
-    `str(None)`, which happens to look like a legal Docker name."""
+    """It carries no target, and it never even reaches the advanced settling
+    loop's `_structural_probe_outcome` at all -- the baseline is a
+    structurally SEPARATE one-shot code path
+    (`_evaluate_guest_operational_once`), called directly by
+    `handle_request`, never through the systemd settling machinery. So
+    `_require_exact_systemd_unit` must never be called while evaluating a
+    `guest_operational` contract -- and certainly not via `str(None)`, which
+    happens to look like a legal systemd unit name once suffixed."""
 
-    called: list[tuple[str, object]] = []
-    real_docker = helper._require_exact_docker_name
+    called: list[object] = []
     real_systemd = helper._require_exact_systemd_unit
 
-    def spy_docker(target):
-        called.append(("docker", target))
-        return real_docker(target)
-
     def spy_systemd(target):
-        called.append(("systemd", target))
+        called.append(target)
         return real_systemd(target)
 
-    monkeypatch.setattr(helper, "_require_exact_docker_name", spy_docker)
     monkeypatch.setattr(helper, "_require_exact_systemd_unit", spy_systemd)
 
-    assert helper._structural_probe_outcome("guest_operational", None) is None
+    guest = FakeGuest()
+    _evaluate(guest, (("guest_operational", None),))
     assert called == []
 
-    # Positive control: the kinds that DO have targets still validate them.
-    assert helper._structural_probe_outcome("docker_container_running", "web") is None
-    assert (
-        helper._structural_probe_outcome("systemd_unit_active", "nginx.service")
-        is None
-    )
-    assert [entry[0] for entry in called] == ["docker", "systemd"]
-    assert "None" not in [entry[1] for entry in called]
+    # Positive control: the advanced kind still validates its target.
+    _evaluate(guest, (("systemd_unit_active", "nginx.service"),))
+    assert called == ["nginx.service"]
+    assert "None" not in called
 
 
-def test_an_unknown_probe_kind_is_never_validated_as_docker_shaped() -> None:
-    """The `else: docker validator` catch-all is gone: an unrecognised kind
-    is UNKNOWN, never silently accepted because it happens to match Docker's
-    name grammar."""
+def test_an_unknown_probe_kind_is_never_validated_as_something_it_is_not() -> None:
+    """The advanced settling loop's structural check is exact kind branching,
+    never an ``else:`` catch-all that would make an unrecognised kind look
+    like a valid one."""
 
     assert helper._structural_probe_outcome("podman_container_running", "web") == (
         "unknown",
@@ -1979,7 +1691,7 @@ def test_an_unknown_probe_kind_is_never_validated_as_docker_shaped() -> None:
 
 
 def test_a_kinded_probe_with_a_non_string_target_is_unknown_not_stringified() -> None:
-    assert helper._structural_probe_outcome("docker_container_running", None) == (
+    assert helper._structural_probe_outcome("systemd_unit_active", None) == (
         "unknown",
         "probe_target_not_exact",
     )

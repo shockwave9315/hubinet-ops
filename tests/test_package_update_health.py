@@ -15,13 +15,14 @@ successful:
 - the ONE legal success transition, and the SQL that makes every other route to
   `succeeded` unstorable;
 - same-job rollback from the health branch, without pretending health passed;
-- the fixed argv of all three probe kinds against a fake guest, including every
-  way an option-like, glob-like, or ambiguous target must fail to produce a
-  PASS.
+- the fixed argv of both remaining probe kinds against a fake guest, including
+  every way an option-like or glob-like target must fail to produce a PASS,
+  and the built-in `guest_operational` baseline's one-shot independence from
+  all of that settling machinery.
 
-Nothing here runs a real `pvesh`, `pct`, `ssh`, `systemctl`, `docker`, or PVE
-operation. The host boundary is the actual dark helper module driven by a fake
-guest, with a JSON round trip through the real transport parser.
+Nothing here runs a real `pvesh`, `pct`, `ssh`, `systemctl`, or PVE operation.
+The host boundary is the actual dark helper module driven by a fake guest,
+with a JSON round trip through the real transport parser.
 """
 
 from __future__ import annotations
@@ -149,18 +150,14 @@ def _observations(job, outcomes, reasons=None):
     default = {
         HealthProbeOutcome.PASSED: {
             HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_active",
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_running",
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_healthy",
+            HealthProbeKind.GUEST_OPERATIONAL: "guest_operational_confirmed",
         },
         HealthProbeOutcome.FAILED: {
             HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_not_active",
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_not_running",
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_unhealthy",
         },
         HealthProbeOutcome.UNKNOWN: {
             HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "command_failed",
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING: "docker_daemon_unavailable",
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "docker_daemon_unavailable",
+            HealthProbeKind.GUEST_OPERATIONAL: "command_failed",
         },
     }
     return tuple(
@@ -276,7 +273,7 @@ def test_issuance_refuses_a_resource_with_no_health_contract(
             kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx*"
         ),
         ResourceHealthProbe(
-            kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING, target="web/name"
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx#1.service"
         ),
     ),
 )
@@ -305,12 +302,7 @@ def test_storage_valid_but_non_executable_contracts_are_refused_at_issuance(
         ResourceHealthProbe(
             kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
         ),
-        ResourceHealthProbe(
-            kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING, target="web"
-        ),
-        ResourceHealthProbe(
-            kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY, target="web"
-        ),
+        ResourceHealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
     ),
 )
 def test_every_exact_executor_probe_kind_remains_issuable(
@@ -648,25 +640,39 @@ def test_an_empty_probe_set_is_never_a_pass() -> None:
         aggregate_health_outcome(())
 
 
-def test_a_deterministic_failure_beside_an_unknown_is_still_a_failure(
+def test_a_failure_beside_an_unknown_is_refused_never_a_durable_failure(
     tmp_path: Path,
 ) -> None:
-    _, _, authority, _, _, _, job = _mutated_job(tmp_path)
+    """v0.5 health scope reduction, second confirmed review finding.
+
+    At the starting SHA, `complete_package_update_health` aggregated a
+    FAILED probe beside a still-UNKNOWN one into a durable FAILED verdict --
+    correct only for a COMPLETE DECISIVE observation set, but this method had
+    no independent proof that the set it was given was one. The production
+    orchestrator already refuses to call it except after a DECISIVE round
+    (which cannot contain an UNKNOWN probe by construction), but this is
+    defense in depth against any OTHER caller: a purported "definitive"
+    observation set containing so much as one UNKNOWN probe is refused
+    outright, before aggregation, whatever any other probe in it proves.
+    """
+
+    _, store, authority, _, _, _, job = _mutated_job(tmp_path)
     started = authority.start_package_update_health(job.job_id)
 
-    decided = authority.complete_package_update_health(
-        job.job_id,
-        _observations(
-            started, (HealthProbeOutcome.FAILED, HealthProbeOutcome.UNKNOWN)
-        ),
-    )
+    with pytest.raises(AuthorityConflict, match="unresolved"):
+        authority.complete_package_update_health(
+            job.job_id,
+            _observations(
+                started, (HealthProbeOutcome.FAILED, HealthProbeOutcome.UNKNOWN)
+            ),
+        )
 
-    assert decided.health_outcome is HealthOutcome.FAILED
-    assert decided.status is PackageUpdateJobStatus.ACTIVE
-    assert [result.outcome for result in decided.health_probe_results] == [
-        HealthProbeOutcome.FAILED,
-        HealthProbeOutcome.UNKNOWN,
-    ]
+    after = authority.package_update_job(job.job_id)
+    assert after.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert after.health_completed_at is None
+    assert after.health_outcome is None
+    assert after.health_probe_results == ()
+    assert store.record_counts()["package_update_job_health_probe_results"] == 0
 
 
 def test_an_unknown_aggregate_is_refused_by_the_definitive_finalizer(
@@ -675,7 +681,7 @@ def test_an_unknown_aggregate_is_refused_by_the_definitive_finalizer(
     _, store, authority, _, _, _, job = _mutated_job(tmp_path)
     started = authority.start_package_update_health(job.job_id)
 
-    with pytest.raises(AuthorityConflict, match="unknown health outcome"):
+    with pytest.raises(AuthorityConflict, match="unresolved"):
         authority.complete_package_update_health(
             job.job_id,
             _observations(
@@ -751,10 +757,10 @@ def test_a_wrong_kind_is_refused(tmp_path: Path) -> None:
     full = list(_observations(job, (HealthProbeOutcome.PASSED,) * 2))
     full[0] = HealthProbeObservation(
         probe_index=full[0].probe_index,
-        kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+        kind=HealthProbeKind.GUEST_OPERATIONAL,
         target=full[0].target,
         outcome=HealthProbeOutcome.PASSED,
-        reason="container_healthy",
+        reason="guest_operational_confirmed",
     )
     with pytest.raises(AuthorityConflict, match="does not describe the frozen probe"):
         authority.complete_package_update_health(job.job_id, tuple(full))
@@ -1497,18 +1503,14 @@ class FakeHealthHostControl:
         reasons = {
             HealthProbeOutcome.PASSED: {
                 HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_active",
-                HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_running",
-                HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_healthy",
+                HealthProbeKind.GUEST_OPERATIONAL: "guest_operational_confirmed",
             },
             HealthProbeOutcome.FAILED: {
                 HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_not_active",
-                HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_absent",
-                HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_unhealthy",
             },
             HealthProbeOutcome.UNKNOWN: {
                 HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "command_timed_out",
-                HealthProbeKind.DOCKER_CONTAINER_RUNNING: "docker_daemon_unavailable",
-                HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "docker_daemon_unavailable",
+                HealthProbeKind.GUEST_OPERATIONAL: "command_timed_out",
             },
         }
         result = HostHealthResult(
@@ -1884,10 +1886,10 @@ def test_a_probe_result_about_another_kind_is_rejected(tmp_path: Path) -> None:
     swapped = (
         HostProbeResult(
             probe_index=0,
-            kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+            kind=HealthProbeKind.GUEST_OPERATIONAL,
             target=full.probes[0].target,
             outcome=HealthProbeOutcome.PASSED,
-            reason="container_healthy",
+            reason="guest_operational_confirmed",
         ),
         full.probes[1],
     )
@@ -1896,7 +1898,7 @@ def test_a_probe_result_about_another_kind_is_rejected(tmp_path: Path) -> None:
 
 
 def test_a_reason_that_contradicts_its_outcome_is_rejected(tmp_path: Path) -> None:
-    """A host claiming PASS with `container_absent` is contradicting itself,
+    """A host claiming PASS with `unit_not_active` is contradicting itself,
     and a self-contradictory answer is not evidence."""
 
     _, _, _, _, _, _, job = _mutated_job(tmp_path)
@@ -1908,7 +1910,7 @@ def test_a_reason_that_contradicts_its_outcome_is_rejected(tmp_path: Path) -> No
             kind=full.probes[1].kind,
             target=full.probes[1].target,
             outcome=HealthProbeOutcome.PASSED,
-            reason="container_absent",
+            reason="unit_not_active",
         ),
     )
     with pytest.raises(PackageUpdateHealthError, match="contradicts its own outcome"):
@@ -1920,16 +1922,18 @@ def test_a_reason_impossible_for_that_probe_kind_is_rejected(
 ) -> None:
     _, _, _, _, _, _, job = _mutated_job(tmp_path)
     full = _host_result(job)
-    # Probe 0 is the Docker probe (canonical order is by (kind, target)), so
-    # a systemd reason on it is describing something never looked at.
-    assert full.probes[0].kind is HealthProbeKind.DOCKER_CONTAINER_RUNNING
+    # Both frozen probes are systemd_unit_active (v0.5 health scope
+    # reduction dropped the only other targeted kind); `guest_operational_
+    # confirmed` is impossible for it, since HEALTH_PROBE_REASON_KINDS
+    # restricts that reason to GUEST_OPERATIONAL alone.
+    assert full.probes[0].kind is HealthProbeKind.SYSTEMD_UNIT_ACTIVE
     impossible = (
         HostProbeResult(
             probe_index=0,
             kind=full.probes[0].kind,
             target=full.probes[0].target,
             outcome=HealthProbeOutcome.PASSED,
-            reason="unit_active",
+            reason="guest_operational_confirmed",
         ),
         full.probes[1],
     )
@@ -1961,13 +1965,11 @@ def test_a_reason_impossible_for_that_probe_kind_is_rejected(
                 kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
             ),
             HealthProbeOutcome.PASSED,
-            "container_running",
+            "guest_operational_confirmed",
             "impossible for that probe kind",
         ),
         (
-            ResourceHealthProbe(
-                kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING, target="web"
-            ),
+            ResourceHealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
             HealthProbeOutcome.PASSED,
             "unit_active",
             "impossible for that probe kind",
@@ -2097,8 +2099,8 @@ def test_sql_forbids_inserting_a_job_row_that_already_claims_a_verdict(
 def test_the_unknown_event_names_the_probe_that_could_not_be_evaluated(
     tmp_path: Path,
 ) -> None:
-    """"The Docker daemon did not answer" is what an operator needs to see,
-    not a generic "something went wrong"."""
+    """"The guest command timed out" is what an operator needs to see, not a
+    generic "something went wrong"."""
 
     _, store, authority, _, _, _, job = _mutated_job(tmp_path)
     host = FakeHealthHostControl(
@@ -2112,7 +2114,7 @@ def test_the_unknown_event_names_the_probe_that_could_not_be_evaluated(
     assert result.status is HealthStageStatus.UNKNOWN
     event = store.list_package_update_job_events(job.job_id)[-1]
     assert event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN
-    assert event.details["reason"] == "docker_daemon_unavailable"
+    assert event.details["reason"] == "command_timed_out"
 
 
 def test_a_job_that_moved_on_mid_attempt_still_reports_no_verdict(
@@ -2346,7 +2348,7 @@ def test_unresolved_evaluation_status_can_never_become_a_durable_verdict(
 # request assembly -> the real SSH transport's JSON encoding -> the real
 # helper module -> a fake guest -> the real response parser -> validation ->
 # aggregation -> the durable verdict. Nothing here runs a real `pvesh`,
-# `pct`, `ssh`, `systemctl`, or `docker`.
+# `pct`, `ssh`, or `systemctl`.
 
 
 def _end_to_end(tmp_path: Path, configure=None, *, probes=None):
@@ -2407,7 +2409,7 @@ def test_end_to_end_a_healthy_workload_succeeds(tmp_path: Path) -> None:
     assert result.job.status is PackageUpdateJobStatus.SUCCEEDED
     assert result.job.health_outcome is HealthOutcome.PASSED
     assert [r.reason for r in result.job.health_probe_results] == [
-        "container_running",
+        "unit_active",
         "unit_active",
     ]
 
@@ -2459,8 +2461,8 @@ def test_end_to_end_a_stopped_unit_fails_and_keeps_rollback_authority(
     assert [
         (r.outcome, r.reason) for r in result.job.health_probe_results
     ] == [
-        (HealthProbeOutcome.PASSED, "container_running"),
         (HealthProbeOutcome.FAILED, "unit_not_active"),
+        (HealthProbeOutcome.PASSED, "unit_active"),
     ]
     assert authority.package_update_rollback_identity(result.job.job_id)
 
@@ -2542,31 +2544,6 @@ def test_end_to_end_a_guest_that_moved_node_is_unknown(tmp_path: Path) -> None:
     assert event.details["reason"] == "resource_context_changed"
 
 
-def test_end_to_end_an_unavailable_docker_daemon_is_unknown(tmp_path: Path) -> None:
-    def stop_docker(guest):
-        guest.docker_daemon_up = False
-
-    store, authority, guest, result = _end_to_end(tmp_path, stop_docker)
-
-    assert result.status is HealthStageStatus.UNKNOWN
-    assert result.job.health_outcome is None
-    event = store.list_package_update_job_events(result.job.job_id)[-1]
-    assert event.details["reason"] == "docker_daemon_unavailable"
-
-
-def test_end_to_end_a_missing_container_fails_because_the_daemon_answered(
-    tmp_path: Path,
-) -> None:
-    def remove_the_container(guest):
-        guest.containers.clear()
-
-    store, authority, guest, result = _end_to_end(tmp_path, remove_the_container)
-
-    assert result.status is HealthStageStatus.FAILED
-    assert result.job.health_outcome is HealthOutcome.FAILED
-    assert [r.reason for r in result.job.health_probe_results][0] == "container_absent"
-
-
 def test_end_to_end_a_glob_target_is_refused_before_a_job_or_mutation_exists(
     tmp_path: Path,
 ) -> None:
@@ -2594,28 +2571,6 @@ def test_end_to_end_a_glob_target_is_refused_before_a_job_or_mutation_exists(
         assert connection.execute(
             "SELECT COUNT(*) AS count FROM package_update_jobs"
         ).fetchone()["count"] == 0
-
-
-def test_end_to_end_docker_health_is_required_when_it_was_asked_for(
-    tmp_path: Path,
-) -> None:
-    def make_it_merely_running(guest):
-        guest.containers["web"] = ("running", "false", "unhealthy")
-
-    store, authority, guest, result = _end_to_end(
-        tmp_path,
-        make_it_merely_running,
-        probes=(
-            ResourceHealthProbe(
-                kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY, target="web"
-            ),
-        ),
-    )
-
-    assert result.status is HealthStageStatus.FAILED
-    assert [r.reason for r in result.job.health_probe_results] == [
-        "container_unhealthy"
-    ]
 
 
 def test_contract_drift_mid_snapshot_cannot_starve_the_global_slot(

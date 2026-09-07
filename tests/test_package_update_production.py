@@ -265,7 +265,7 @@ class ScriptedHealthHostControl:
             )
         if outcome == "probe_unknown":
             # A genuine per-probe UNKNOWN (a settling window that ended
-            # transient, e.g. Docker's own `starting`): the host DID answer,
+            # transient, e.g. systemd's own `activating`): the host DID answer,
             # with bounded settling metadata, and each probe carries a real
             # observation -- this is what durably persists as bounded
             # OBSERVATION evidence.
@@ -312,8 +312,7 @@ class ScriptedHealthHostControl:
 def _unknown_reason_for(kind: HealthProbeKind) -> str:
     return {
         HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_job_pending",
-        HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_restarting",
-        HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_health_starting",
+        HealthProbeKind.GUEST_OPERATIONAL: "command_timed_out",
     }[kind]
 
 
@@ -321,13 +320,10 @@ def _reason_for(kind: HealthProbeKind, outcome: str) -> str:
     if outcome == "passed":
         return {
             HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_active",
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_running",
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_healthy",
+            HealthProbeKind.GUEST_OPERATIONAL: "guest_operational_confirmed",
         }[kind]
     return {
         HealthProbeKind.SYSTEMD_UNIT_ACTIVE: "unit_not_active",
-        HealthProbeKind.DOCKER_CONTAINER_RUNNING: "container_not_running",
-        HealthProbeKind.DOCKER_CONTAINER_HEALTHY: "container_unhealthy",
     }[kind]
 
 
@@ -1994,17 +1990,17 @@ def test_readback_includes_bounded_per_probe_health_evidence_on_failure(
         assert probes == [
             {
                 "index": 0,
-                "kind": "docker_container_running",
-                "target": "web",
+                "kind": "systemd_unit_active",
+                "target": "nginx.service",
                 "outcome": "failed",
                 "checked_at": probes[0]["checked_at"],
-                "reason": "container_not_running",
+                "reason": "unit_not_active",
                 "definitive": True,
             },
             {
                 "index": 1,
                 "kind": "systemd_unit_active",
-                "target": "nginx.service",
+                "target": "postgresql.service",
                 "outcome": "failed",
                 "checked_at": probes[1]["checked_at"],
                 "reason": "unit_not_active",
@@ -2052,17 +2048,17 @@ def test_readback_includes_bounded_observation_evidence_when_unresolved(
         assert probes == [
             {
                 "index": 0,
-                "kind": "docker_container_running",
-                "target": "web",
+                "kind": "systemd_unit_active",
+                "target": "nginx.service",
                 "outcome": "unknown",
                 "checked_at": probes[0]["checked_at"],
-                "reason": "container_restarting",
+                "reason": "unit_job_pending",
                 "definitive": False,
             },
             {
                 "index": 1,
                 "kind": "systemd_unit_active",
-                "target": "nginx.service",
+                "target": "postgresql.service",
                 "outcome": "unknown",
                 "checked_at": probes[1]["checked_at"],
                 "reason": "unit_job_pending",
@@ -2228,10 +2224,11 @@ def test_a_definitive_verdict_retires_the_earlier_unresolved_reason(
 
 
 #: The frozen contract every `ApiSystem` job carries, in canonical
-#: `(kind, target)` order -- `docker_container_running` sorts before
-#: `systemd_unit_active`, so index 0 is the Docker probe.
+#: `(kind, target)` order -- both probes are `systemd_unit_active` (v0.5
+#: dropped Docker health probes entirely), so index 0/1 sort purely by
+#: target: `nginx.service` before `postgresql.service`.
 _MIXED_OBSERVATION = (
-    (HealthProbeOutcome.UNKNOWN, "container_restarting"),
+    (HealthProbeOutcome.UNKNOWN, "unit_activating"),
     (HealthProbeOutcome.PASSED, "unit_active"),
 )
 
@@ -2239,7 +2236,7 @@ _MIXED_OBSERVATION = (
 #: is a legal UNKNOWN one, so nothing but the top-level reason's own
 #: correctness can distinguish a right answer from a wrong one.
 _TWO_UNKNOWN_OBSERVATION = (
-    (HealthProbeOutcome.UNKNOWN, "container_restarting"),
+    (HealthProbeOutcome.UNKNOWN, "unit_activating"),
     (HealthProbeOutcome.UNKNOWN, "unit_job_pending"),
 )
 
@@ -2252,7 +2249,7 @@ def test_the_unresolved_reason_is_the_attempts_own_not_the_last_probes(
 
     A non-decisive round legitimately mixes outcomes: one probe still
     transient, another already read PASSED. The attempt's classification is
-    the BLOCKING probe's reason (`container_restarting`); `unit_active` is a
+    the BLOCKING probe's reason (`unit_activating`); `unit_active` is a
     PASSED-only token that can never describe why an evaluation reached no
     result. Publishing it as the top-level reason produces a payload that is
     self-contradictory on its face -- and one Home Assistant's own validator
@@ -2272,7 +2269,7 @@ def test_the_unresolved_reason_is_the_attempts_own_not_the_last_probes(
 
         assert health["outcome"] is None
         assert health["evidence"] == "observation"
-        assert health["reason"] == "container_restarting"
+        assert health["reason"] == "unit_activating"
         assert health["reason"] != "unit_active"
         # It must be an UNKNOWN-family token by construction, never merely
         # a bounded one -- that is the invariant HA independently re-proves.
@@ -2283,7 +2280,7 @@ def test_the_unresolved_reason_is_the_attempts_own_not_the_last_probes(
             (probe["kind"], probe["outcome"], probe["reason"])
             for probe in health["probes"]
         ] == [
-            ("docker_container_running", "unknown", "container_restarting"),
+            ("systemd_unit_active", "unknown", "unit_activating"),
             ("systemd_unit_active", "passed", "unit_active"),
         ]
     finally:
@@ -2313,10 +2310,10 @@ def test_the_unresolved_reason_does_not_depend_on_which_probe_is_last(
             f"/r0/v1/resources/{system.resource_id}/package-update"
         ).json()["health"]
 
-        assert health["reason"] == "container_restarting"
+        assert health["reason"] == "unit_activating"
         assert health["reason"] != "unit_job_pending"
         assert [probe["reason"] for probe in health["probes"]] == [
-            "container_restarting",
+            "unit_activating",
             "unit_job_pending",
         ]
         # The durable event is the authority for what was recorded; the
@@ -2327,7 +2324,7 @@ def test_the_unresolved_reason_does_not_depend_on_which_probe_is_last(
             for event in events
             if event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN
         ][-1]
-        assert unknown.details["reason"] == "container_restarting"
+        assert unknown.details["reason"] == "unit_activating"
     finally:
         system.close()
 
@@ -2389,8 +2386,9 @@ def test_the_reason_field_leaks_no_event_details_or_helper_text(
 # The built-in v0.5 default health contract, through the real routes.
 #
 # There is no candidate-discovery route any more: v0.5 does not automatically
-# discover or recommend Docker/systemd application health probes, because
-# absence of a workload observer is not proof of workload absence.
+# discover or recommend systemd application health probes, because absence of
+# a workload observer is not proof of workload absence. (Docker-specific
+# package-update health probes are no longer part of v0.5 at all.)
 # ===========================================================================
 
 
@@ -2451,7 +2449,7 @@ def test_reset_route_restores_the_default_over_an_advanced_contract(
             f"/r0/v1/resources/{system.resource_id}/health-contract",
             json={
                 "probes": [
-                    {"kind": "docker_container_healthy", "target": "web"}
+                    {"kind": "systemd_unit_active", "target": "web.service"}
                 ]
             },
         )

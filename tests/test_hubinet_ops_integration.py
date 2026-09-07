@@ -5020,7 +5020,7 @@ async def test_second_entry_failure_leaves_first_intact_then_retry_loads_cleanly
 
 HEALTH_PROBES = [
     {"kind": "systemd_unit_active", "target": "nginx.service"},
-    {"kind": "docker_container_healthy", "target": "immich_server"},
+    {"kind": "systemd_unit_active", "target": "immich-server.service"},
 ]
 
 
@@ -5036,13 +5036,37 @@ def configured_contract(
         updated_at="2026-08-08T11:30:00+00:00",
         probes=(
             HealthProbe(
-                kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY, target="immich_server"
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                target="immich-server.service",
             ),
             HealthProbe(
                 kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
             ),
         ),
     )
+
+
+def test_resource_health_contract_rejects_a_mixed_baseline_payload() -> None:
+    """v0.5 health scope reduction, HA layer: mirrors the backend's own
+    `canonical_health_probes` invariant -- `guest_operational` may never
+    share a contract with any other probe. A backend response naming both is
+    outside the agreed contract shape and is refused rather than rendered."""
+
+    with pytest.raises(ValueError, match="guest_operational"):
+        ResourceHealthContract(
+            resource_id=RESOURCE_CT,
+            status=HealthContractStatus.CONFIGURED,
+            revision=1,
+            fingerprint="a" * 64,
+            created_at="2026-08-08T11:00:00+00:00",
+            updated_at="2026-08-08T11:30:00+00:00",
+            probes=(
+                HealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
+                HealthProbe(
+                    kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
+                ),
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -5095,7 +5119,7 @@ async def test_view_health_contract_returns_material_as_response_data(
         "created_at": "2026-08-08T11:00:00+00:00",
         "updated_at": "2026-08-08T11:30:00+00:00",
         "probes": [
-            {"kind": "docker_container_healthy", "target": "immich_server"},
+            {"kind": "systemd_unit_active", "target": "immich-server.service"},
             {"kind": "systemd_unit_active", "target": "nginx.service"},
         ],
     }
@@ -5107,7 +5131,7 @@ async def test_view_health_contract_returns_material_as_response_data(
         state = hass.states.get(item.entity_id)
         assert state is not None
         assert "probes" not in state.attributes
-        assert "immich_server" not in str(state.attributes)
+        assert "immich-server.service" not in str(state.attributes)
 
 
 @pytest.mark.asyncio
@@ -5271,8 +5295,8 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
                     kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
                 ),
                 HealthProbe(
-                    kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-                    target="immich_server",
+                    kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                    target="immich-server.service",
                 ),
             ),
             0,
@@ -5281,7 +5305,7 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
     assert response["status"] == "configured"
     assert response["revision"] == 1
     assert response["probes"] == [
-        {"kind": "docker_container_healthy", "target": "immich_server"},
+        {"kind": "systemd_unit_active", "target": "immich-server.service"},
         {"kind": "systemd_unit_active", "target": "nginx.service"},
     ]
 
@@ -5291,14 +5315,12 @@ async def test_set_health_contract_serializes_the_complete_declared_set(
         SERVICE_SET_HEALTH_CONTRACT,
         {
             "device_id": resource_device_id(hass, RESOURCE_CT),
-            "probes": [{"kind": "docker_container_running", "target": "redis"}],
+            "probes": [{"kind": "guest_operational"}],
         },
         blocking=True,
         return_response=True,
     )
-    assert replaced["probes"] == [
-        {"kind": "docker_container_running", "target": "redis"}
-    ]
+    assert replaced["probes"] == [{"kind": "guest_operational", "target": None}]
     assert replaced["revision"] == 2
     assert transport.health_contract_writes[-1][2] is None
 
@@ -5341,6 +5363,11 @@ async def test_set_health_contract_accepts_guest_operational_with_no_target(
     (
         [],
         [{"kind": "http_get", "target": "https://example.invalid"}],
+        # v0.5 health scope reduction: Docker-specific package-update health
+        # probes are no longer accepted or advertised anywhere in this
+        # integration -- refused exactly like any other unsupported kind.
+        [{"kind": "docker_container_running", "target": "web"}],
+        [{"kind": "docker_container_healthy", "target": "web"}],
         [{"kind": "systemd_unit_active"}],
         [{"kind": "systemd_unit_active", "target": ""}],
         [{"kind": "systemd_unit_active", "target": "a b.service"}],
@@ -5682,10 +5709,10 @@ def job_view(
 def _probe_result(
     *,
     probe_index: int = 0,
-    kind: HealthProbeKind = HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-    target: str = "web",
+    kind: HealthProbeKind = HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+    target: str = "web.service",
     outcome: HealthProbeOutcome = HealthProbeOutcome.FAILED,
-    reason: str = "container_unhealthy",
+    reason: str = "unit_not_active",
     definitive: bool = True,
 ) -> PackageUpdateJobHealthProbeResult:
     return PackageUpdateJobHealthProbeResult(
@@ -5758,16 +5785,21 @@ def test_job_view_rejects_a_failed_verdict_with_only_unknown_probes() -> None:
     """The exact impossible payload PR #80 review named: a FAILED verdict
     whose only probe is UNKNOWN -- an ALL-OF verdict of FAILED requires at
     least one probe to be positively proven FAILED; UNKNOWN proves nothing
-    either way."""
+    either way.
 
-    with pytest.raises(ValueError, match="at least one probe"):
+    v0.5 health scope reduction, item N: this exact payload is now caught
+    earlier and more fundamentally -- only a COMPLETE DECISIVE observation
+    set may ever be finalized, so ANY UNKNOWN probe inside a "verdict" is
+    refused before the FAILED-specific coherence check is even reached."""
+
+    with pytest.raises(ValueError, match="unresolved"):
         job_view(
             checkpoint="health_completed",
             health_outcome=PackageUpdateHealthOutcome.FAILED,
             health_probes=(
                 _probe_result(
                     outcome=HealthProbeOutcome.UNKNOWN,
-                    reason="container_health_starting",
+                    reason="unit_activating",
                 ),
             ),
         )
@@ -5781,14 +5813,14 @@ def test_job_view_rejects_a_passed_verdict_with_a_failed_probe() -> None:
             health_outcome=PackageUpdateHealthOutcome.PASSED,
             health_probes=(
                 _probe_result(
-                    outcome=HealthProbeOutcome.FAILED, reason="container_unhealthy"
+                    outcome=HealthProbeOutcome.FAILED, reason="unit_not_active"
                 ),
             ),
         )
 
 
 def test_job_view_rejects_a_reason_that_contradicts_its_own_outcome() -> None:
-    """`container_health_starting` is an UNKNOWN-only token; pairing it with
+    """`unit_activating` is an UNKNOWN-only token; pairing it with
     `outcome=passed` is individually-typed nonsense."""
 
     with pytest.raises(ValueError, match="contradicts its own outcome"):
@@ -5798,14 +5830,14 @@ def test_job_view_rejects_a_reason_that_contradicts_its_own_outcome() -> None:
             health_probes=(
                 _probe_result(
                     outcome=HealthProbeOutcome.PASSED,
-                    reason="container_health_starting",
+                    reason="unit_activating",
                 ),
             ),
         )
 
 
 def test_job_view_rejects_a_reason_impossible_for_its_probe_kind() -> None:
-    """`container_healthy` can never describe a `systemd_unit_active`
+    """`guest_operational_confirmed` can never describe a `systemd_unit_active`
     probe."""
 
     with pytest.raises(ValueError, match="impossible for that probe kind"):
@@ -5817,7 +5849,7 @@ def test_job_view_rejects_a_reason_impossible_for_its_probe_kind() -> None:
                     kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
                     target="nginx.service",
                     outcome=HealthProbeOutcome.PASSED,
-                    reason="container_healthy",
+                    reason="guest_operational_confirmed",
                 ),
             ),
         )
@@ -5847,35 +5879,44 @@ def test_job_view_rejects_a_target_shaped_reason_on_a_targetless_probe() -> None
                     ),
                     _probe_result(
                         probe_index=1,
-                        kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-                        target="web",
+                        kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                        target="web.service",
                         outcome=HealthProbeOutcome.FAILED,
-                        reason="container_not_running",
+                        reason="unit_not_active",
                     ),
                 ),
             )
 
 
 def test_positive_control_a_targeted_probe_may_still_report_a_target_reason() -> None:
-    """Restricting those tokens must not remove them from the kinds that DO
-    have a target."""
+    """Restricting those tokens must not remove them from the kind that DOES
+    have a target.
+
+    A target-shaped UNKNOWN reason can never appear inside a "verdict" any
+    more (v0.5 health scope reduction, item N: a durable verdict admits no
+    UNKNOWN probe at all), so the positive control here is an unresolved
+    evaluation's bounded "observation" evidence instead -- the one context
+    where an UNKNOWN, non-definitive probe is legitimate."""
 
     view = job_view(
-        checkpoint="health_completed",
-        health_outcome=PackageUpdateHealthOutcome.FAILED,
+        checkpoint="health_started",
+        health_outcome=None,
+        health_evidence="observation",
         health_probes=(
             _probe_result(
                 kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
                 target="nginx.service",
                 outcome=HealthProbeOutcome.UNKNOWN,
                 reason="probe_target_not_exact",
+                definitive=False,
             ),
             _probe_result(
                 probe_index=1,
-                kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-                target="web",
-                outcome=HealthProbeOutcome.FAILED,
-                reason="container_not_running",
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+                target="web.service",
+                outcome=HealthProbeOutcome.UNKNOWN,
+                reason="unit_activating",
+                definitive=False,
             ),
         ),
     )
@@ -6078,19 +6119,19 @@ async def test_view_update_job_response_carries_per_probe_health_evidence(
     probes = (
         PackageUpdateJobHealthProbeResult(
             probe_index=0,
-            kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-            target="weatherhub-redis-1",
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+            target="weatherhub-redis.service",
             outcome=HealthProbeOutcome.FAILED,
             checked_at="2026-09-06T13:40:23.444652+00:00",
-            reason="container_unhealthy",
+            reason="unit_not_active",
         ),
         PackageUpdateJobHealthProbeResult(
             probe_index=1,
-            kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-            target="weatherhub-weather-api-1",
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+            target="weatherhub-weather-api.service",
             outcome=HealthProbeOutcome.FAILED,
             checked_at="2026-09-06T13:40:23.444652+00:00",
-            reason="container_unhealthy",
+            reason="unit_not_active",
         ),
     )
     transport = FakeTransport(
@@ -6117,28 +6158,28 @@ async def test_view_update_job_response_carries_per_probe_health_evidence(
     assert response["health_probes"] == [
         {
             "index": 0,
-            "kind": "docker_container_healthy",
-            "target": "weatherhub-redis-1",
+            "kind": "systemd_unit_active",
+            "target": "weatherhub-redis.service",
             "outcome": "failed",
             "checked_at": "2026-09-06T13:40:23.444652+00:00",
-            "reason": "container_unhealthy",
+            "reason": "unit_not_active",
             "definitive": True,
         },
         {
             "index": 1,
-            "kind": "docker_container_healthy",
-            "target": "weatherhub-weather-api-1",
+            "kind": "systemd_unit_active",
+            "target": "weatherhub-weather-api.service",
             "outcome": "failed",
             "checked_at": "2026-09-06T13:40:23.444652+00:00",
-            "reason": "container_unhealthy",
+            "reason": "unit_not_active",
             "definitive": True,
         },
     ]
     assert response["health_evidence"] == "verdict"
     # Answers exactly the operator's real questions: which probe, which
     # target, FAILED or UNKNOWN, and why -- without shell/SQLite access.
-    assert "weatherhub-redis-1" in str(response["health_probes"])
-    assert "container_unhealthy" in str(response["health_probes"])
+    assert "weatherhub-redis.service" in str(response["health_probes"])
+    assert "unit_not_active" in str(response["health_probes"])
 
     # Still bounded, typed material -- never entity attributes.
     key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
@@ -6148,7 +6189,7 @@ async def test_view_update_job_response_carries_per_probe_health_evidence(
         state = hass.states.get(item.entity_id)
         assert state is not None
         assert "health_probes" not in state.attributes
-        assert "weatherhub-redis-1" not in str(state.attributes)
+        assert "weatherhub-redis.service" not in str(state.attributes)
 
 
 @pytest.mark.asyncio
@@ -6157,19 +6198,22 @@ async def test_view_update_job_notification_lists_which_probe_failed_and_why(
 ) -> None:
     """The persistent-notification rendering an operator actually reads.
 
-    Real Human1 evidence: three ``docker_container_healthy`` probes all
-    failed with the same bounded reason, and the operator had to read the
-    backend's SQLite database directly to learn that. This is the fix.
+    Real Human1 evidence: probes all failed with the same bounded reason
+    after a restart, and the operator had to read the backend's SQLite
+    database directly to learn that. This is the fix. (The original evidence
+    was three ``docker_container_healthy`` probes; v0.5 dropped Docker health
+    probes entirely, so this now uses the surviving targeted kind,
+    `systemd_unit_active`, unchanged in every other respect.)
     """
 
     probes = (
         PackageUpdateJobHealthProbeResult(
             probe_index=0,
-            kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-            target="weatherhub-redis-1",
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+            target="weatherhub-redis.service",
             outcome=HealthProbeOutcome.FAILED,
             checked_at="2026-09-06T13:40:23.444652+00:00",
-            reason="container_unhealthy",
+            reason="unit_not_active",
         ),
     )
     active = resource(
@@ -6226,9 +6270,9 @@ async def test_view_update_job_notification_lists_which_probe_failed_and_why(
     message = create_notification.call_args.args[1]
     # `_cell` escapes Markdown-structural punctuation (including `-`/`_`) in
     # exact backend data, exactly like every other rendered notification.
-    assert r"weatherhub\-redis\-1" in message
-    assert r"container\_unhealthy" in message
-    assert r"docker\_container\_healthy" in message
+    assert r"weatherhub\-redis" in message
+    assert r"unit\_not\_active" in message
+    assert r"systemd\_unit\_active" in message
 
 
 def _stopped_guest_job():

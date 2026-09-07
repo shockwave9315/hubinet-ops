@@ -695,7 +695,7 @@ def test_40_composition_root_never_touches_an_unrelated_legacy_db_on_disk(
 
 _HEALTH_PROBES = [
     {"kind": "systemd_unit_active", "target": "nginx.service"},
-    {"kind": "docker_container_healthy", "target": "immich_server"},
+    {"kind": "systemd_unit_active", "target": "immich-server.service"},
 ]
 
 
@@ -797,7 +797,7 @@ def test_health_contract_put_then_get_returns_the_exact_canonical_contract(
     assert body["revision"] == 2
     # Canonical order, independent of how the operator listed them.
     assert body["probes"] == [
-        {"kind": "docker_container_healthy", "target": "immich_server"},
+        {"kind": "systemd_unit_active", "target": "immich-server.service"},
         {"kind": "systemd_unit_active", "target": "nginx.service"},
     ]
     assert client.get(path, headers=headers).json() == body
@@ -807,7 +807,7 @@ def test_health_contract_put_then_get_returns_the_exact_canonical_contract(
     replaced = client.put(
         path,
         headers=headers,
-        json={"probes": [{"kind": "docker_container_running", "target": "redis"}]},
+        json={"probes": [{"kind": "guest_operational"}]},
     ).json()
     assert replaced["revision"] == 3
     assert replaced["fingerprint"] != body["fingerprint"]
@@ -844,6 +844,10 @@ _MATERIAL = "invalid_contract"
         (_STRUCTURAL, {"probes": []}),
         (_STRUCTURAL, {"probes": _HEALTH_PROBES, "unexpected": True}),
         (_STRUCTURAL, {"probes": [{"kind": "http_get", "target": "https://example"}]}),
+        # v0.5 health scope reduction: Docker-specific package-update health
+        # probes are no longer SQL-valid or API-acceptable at all.
+        (_STRUCTURAL, {"probes": [{"kind": "docker_container_running", "target": "web"}]}),
+        (_STRUCTURAL, {"probes": [{"kind": "docker_container_healthy", "target": "web"}]}),
         (_STRUCTURAL, {"probes": [{"kind": "systemd_unit_active"}]}),
         (_STRUCTURAL, {"probes": [{"kind": "systemd_unit_active", "target": ""}]}),
         (_STRUCTURAL, {"probes": [{"kind": "systemd_unit_active", "target": "x" * 201}]}),
@@ -944,7 +948,7 @@ def test_health_contract_compare_and_set_refuses_a_stale_editor(
         path,
         headers=headers,
         json={
-            "probes": [{"kind": "docker_container_running", "target": "redis"}],
+            "probes": [{"kind": "systemd_unit_active", "target": "redis.service"}],
             "expected_revision": 0,
         },
     )
@@ -989,7 +993,7 @@ def test_health_contract_revision_is_never_reused_over_http(
         path,
         headers=headers,
         json={
-            "probes": [{"kind": "docker_container_running", "target": "redis"}],
+            "probes": [{"kind": "systemd_unit_active", "target": "redis.service"}],
             "expected_revision": 0,
         },
     )
