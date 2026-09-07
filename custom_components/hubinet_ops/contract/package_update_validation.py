@@ -74,17 +74,7 @@ PACKAGE_UPDATE_CHECKPOINTS: frozenset[str] = frozenset(
 HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
     {
         "unit_active",
-        "container_running",
-        "container_healthy",
         "unit_not_active",
-        "container_not_running",
-        "container_absent",
-        "container_unhealthy",
-        "container_health_starting",
-        "container_has_no_healthcheck",
-        "container_restarting",
-        "container_not_started_yet",
-        "container_removing",
         "unit_activating",
         "unit_deactivating",
         "unit_reloading",
@@ -96,7 +86,6 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "command_failed",
         "command_timed_out",
         "malformed_output",
-        "docker_daemon_unavailable",
         "host_unreachable",
         "host_response_rejected",
         "resource_context_changed",
@@ -127,14 +116,9 @@ UNRESOLVED_HEALTH_REASONS: frozenset[str] = frozenset(
         "command_failed",
         "command_timed_out",
         "malformed_output",
-        "docker_daemon_unavailable",
         "host_unreachable",
         "host_response_rejected",
         "resource_context_changed",
-        "container_health_starting",
-        "container_restarting",
-        "container_not_started_yet",
-        "container_removing",
         "unit_activating",
         "unit_deactivating",
         "unit_reloading",
@@ -153,18 +137,12 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
     HealthProbeOutcome.PASSED: frozenset(
         {
             "unit_active",
-            "container_running",
-            "container_healthy",
             "guest_operational_confirmed",
         }
     ),
     HealthProbeOutcome.FAILED: frozenset(
         {
             "unit_not_active",
-            "container_not_running",
-            "container_absent",
-            "container_unhealthy",
-            "container_has_no_healthcheck",
         }
     ),
     HealthProbeOutcome.UNKNOWN: frozenset(
@@ -175,14 +153,9 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
             "command_failed",
             "command_timed_out",
             "malformed_output",
-            "docker_daemon_unavailable",
             "host_unreachable",
             "host_response_rejected",
             "resource_context_changed",
-            "container_health_starting",
-            "container_restarting",
-            "container_not_started_yet",
-            "container_removing",
             "unit_activating",
             "unit_deactivating",
             "unit_reloading",
@@ -195,17 +168,13 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
 #: Mirrors `app/inventory/health_observation.py::HEALTH_PROBE_REASON_KINDS`.
 #: A reason absent from this mapping is generic/structural (a whole-request
 #: or transport-level classification, e.g. `command_failed`) and legal for
-#: any probe kind; one present here is legal ONLY for the kind(s) listed --
-#: e.g. `container_healthy` can never accompany a `systemd_unit_active`
-#: probe, and `unit_not_active` can never accompany a Docker one.
+#: any probe kind; one present here is legal ONLY for the kind(s) listed.
 #: Mirrors `app/inventory/health_observation.py::_TARGETED_HEALTH_PROBE_
 #: KINDS`: every probe kind that NAMES a target. `GUEST_OPERATIONAL` names
 #: none, and is deliberately absent.
 _TARGETED_HEALTH_PROBE_KINDS: frozenset[HealthProbeKind] = frozenset(
     {
         HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
-        HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-        HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
     }
 )
 
@@ -216,49 +185,6 @@ HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
     "unit_deactivating": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
     "unit_reloading": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
     "unit_job_pending": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
-    "container_running": frozenset({HealthProbeKind.DOCKER_CONTAINER_RUNNING}),
-    "container_healthy": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
-    "container_not_running": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_absent": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_restarting": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_not_started_yet": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_removing": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_unhealthy": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
-    "container_health_starting": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
-    "container_has_no_healthcheck": frozenset(
-        {HealthProbeKind.DOCKER_CONTAINER_HEALTHY}
-    ),
-    "docker_daemon_unavailable": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
     "guest_operational_confirmed": frozenset({HealthProbeKind.GUEST_OPERATIONAL}),
     # PR #80 final review: a targetless probe kind can never truthfully
     # report a target-SHAPED reason. Mirrors the backend's own
@@ -516,10 +442,10 @@ def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> 
             )
         # Independent semantic coherence -- a probe kind/outcome/reason
         # triple that is individually well-typed but jointly impossible
-        # (e.g. outcome=passed with reason=container_health_starting, an
-        # UNKNOWN-only token; or a systemd probe carrying a Docker-only
-        # reason) is refused here rather than rendered as if it described a
-        # real observation. Mirrors `app/inventory/health_observation.py::
+        # (e.g. outcome=passed with reason=unit_activating, an UNKNOWN-only
+        # token; or a guest_operational probe carrying a systemd-only reason)
+        # is refused here rather than rendered as if it described a real
+        # observation. Mirrors `app/inventory/health_observation.py::
         # require_health_probe_semantics`.
         if probe.reason not in HEALTH_PROBE_REASONS_BY_OUTCOME[probe.outcome]:
             raise ValueError(
@@ -544,6 +470,17 @@ def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> 
     # outcome`): a payload naming a verdict that the accompanying probe rows
     # positively disprove is refused, never rendered as if it were truthful.
     if view.health_evidence == "verdict":
+        # Only a COMPLETE DECISIVE observation set may ever be finalized
+        # (PRODUCT.md, "What healthy means"): a definitive verdict can never
+        # carry a probe this integration itself could not resolve, even
+        # beside a proven FAILED sibling. Checked independently of the
+        # backend's own refusal (`InventoryAuthority.
+        # complete_package_update_health`) rather than trusted.
+        if any(probe.outcome is HealthProbeOutcome.UNKNOWN for probe in probes):
+            raise ValueError(
+                "a definitive health verdict may not carry an unresolved "
+                "(UNKNOWN) probe"
+            )
         if view.health_outcome is PackageUpdateHealthOutcome.PASSED and not all(
             probe.outcome is HealthProbeOutcome.PASSED for probe in probes
         ):

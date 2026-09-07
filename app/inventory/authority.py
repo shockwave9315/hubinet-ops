@@ -1625,8 +1625,8 @@ class InventoryAuthority:
           `DEFAULT_HEALTH_PROBES`, chosen because absence of a workload
           observer is not proof of workload absence.
         - **An explicit contract always wins.** The query only ever selects
-          resources with NO contract row, so an operator's advanced Docker or
-          systemd contract is never seen, never compared, and never
+          resources with NO contract row, so an operator's advanced systemd
+          contract is never seen, never compared, and never
           overwritten.
         - **It is idempotent.** The second reconciliation of the same
           inventory selects nothing, allocates no revision, and writes no
@@ -1976,8 +1976,8 @@ class InventoryAuthority:
                     # targets.  A package-update job is narrower: every
                     # frozen probe must be structurally representable by the
                     # exact executor before this transaction may issue it.
-                    # This is pure validation -- no systemctl, Docker, pct,
-                    # SSH, or PVE call occurs here.
+                    # This is pure validation -- no systemctl, pct, SSH, or
+                    # PVE call occurs here.
                     try:
                         require_health_contract_execution_eligible(contract.probes)
                     except HealthContractExecutionError as exc:
@@ -4626,11 +4626,15 @@ class InventoryAuthority:
           Nothing here triggers a rollback: this stage ships no automatic
           compensation policy at all (`PRODUCT.md`, `STATUS.md`).
 
-        An UNKNOWN aggregate is refused. It is not a verdict, it must never
-        become durable, and health execution is a read-only evaluation that
-        is safe to repeat -- see
-        :meth:`record_package_update_health_outcome_unknown`, which records
-        it as bounded history while keeping the job at ``health_started``.
+        An UNKNOWN aggregate is refused, and so -- independently, as defense
+        in depth -- is any observation set containing so much as ONE UNKNOWN
+        probe, even beside a proven FAILED one: only a COMPLETE DECISIVE
+        observation set may ever be finalized (PRODUCT.md, "What healthy
+        means"). Neither is a verdict, neither may become durable, and
+        health execution is a read-only evaluation that is safe to repeat --
+        see :meth:`record_package_update_health_outcome_unknown`, which
+        records it as bounded history while keeping the job at
+        ``health_started``.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
@@ -4665,6 +4669,24 @@ class InventoryAuthority:
                     "package update job resource or locator context is stale"
                 )
             ordered = _match_health_observations_to_frozen_probes(probes, reported)
+            # Independent defense in depth (PR #80 second review finding):
+            # the production orchestrator already refuses to call this method
+            # at all unless the host's own bounded settling window reported a
+            # DECISIVE round, and a decisive round cannot contain an UNKNOWN
+            # probe (`validate_host_health_result` rejects that combination
+            # outright). This method does not trust that upstream discipline
+            # -- a purported "definitive" observation set containing ANY
+            # UNKNOWN probe is refused HERE too, before aggregation, so a
+            # FAILED probe can never combine with a still-UNKNOWN sibling to
+            # manufacture a durable FAILED verdict from a non-decisive round.
+            if any(
+                observation.outcome is HealthProbeOutcome.UNKNOWN
+                for observation in ordered
+            ):
+                raise AuthorityConflict(
+                    "a health completion may not carry any unresolved "
+                    "(UNKNOWN) probe observation"
+                )
             outcome = aggregate_health_outcome(
                 observation.outcome for observation in ordered
             )

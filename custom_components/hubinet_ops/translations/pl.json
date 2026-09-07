@@ -67,7 +67,7 @@
       },
       "reset_confirm": {
         "title": "Zresetuj kontrakt kondycji dla {name}",
-        "description": "Obecnie zadeklarowano:\n\n{current}\n\nReset zastąpi go wbudowanym domyślnym kontraktem Hubinet Ops dla kontenera LXC zarządzanego pakietowo: pojedynczą sondą `guest_operational`, która dowodzi wyłącznie, że dokładnie ten kontener jest nadal osiągalny i nadal potrafi uruchomić proces. Nie dowodzi kondycji aplikacji.\n\nHubinet Ops nie wykrywa za Ciebie ładunków Docker ani systemd — brak obserwatora ładunku nie jest dowodem braku ładunku — więc zaawansowany kontrakt Docker/systemd pozostaje jawnym wyborem dokonywanym akcją `hubinet_ops.set_health_contract`.\n\nZaznacz pole i wybierz **Zatwierdź**, aby potwierdzić.",
+        "description": "Obecnie zadeklarowano:\n\n{current}\n\nReset zastąpi go wbudowanym domyślnym kontraktem Hubinet Ops dla kontenera LXC zarządzanego pakietowo: pojedynczą sondą `guest_operational`, która dowodzi wyłącznie, że dokładnie ten kontener jest nadal osiągalny i nadal potrafi uruchomić proces. Nie dowodzi kondycji aplikacji.\n\nHubinet Ops nie wykrywa za Ciebie ładunków systemd — brak obserwatora ładunku nie jest dowodem braku ładunku — więc zaawansowany kontrakt `systemd_unit_active` pozostaje jawnym wyborem dokonywanym akcją `hubinet_ops.set_health_contract`. Kondycja obciążeń Docker nie jest częścią kondycji aktualizacji pakietów Hubinet Ops w wersji 0.5.\n\nZaznacz pole i wybierz **Zatwierdź**, aby potwierdzić.",
         "data": {
           "confirm": "Rozumiem — przywróć wbudowany domyślny kontrakt"
         }
@@ -251,7 +251,7 @@
         },
         "probes": {
           "name": "Sondy",
-          "description": "Pełna lista wymaganych sond, każda z rodzajem (systemd_unit_active, docker_container_running lub docker_container_healthy) i nazwą celu."
+          "description": "Pełna lista wymaganych sond: albo pojedyncza bezcelowa sonda guest_operational, albo jedna lub więcej sond systemd_unit_active, z których każda wskazuje dokładną jednostkę — nigdy oba rodzaje w tym samym kontrakcie."
         },
         "expected_revision": {
           "name": "Oczekiwana rewizja",
@@ -371,11 +371,6 @@
       "health_reason": {
         "command_failed": "Wymagane polecenie tylko do odczytu w kontenerze nie powiodło się.",
         "command_timed_out": "Wymagane polecenie tylko do odczytu w kontenerze nie zakończyło się na czas.",
-        "container_health_starting": "Zadeklarowany kontener wciąż wykonuje pierwsze sprawdzenie kondycji po restarcie.",
-        "container_not_started_yet": "Zadeklarowany kontener został utworzony, ale jeszcze nie uruchomiony.",
-        "container_removing": "Zadeklarowany kontener jest usuwany.",
-        "container_restarting": "Zadeklarowany kontener jest restartowany.",
-        "docker_daemon_unavailable": "Demon Dockera nie odpowiedział wewnątrz kontenera.",
         "guest_unavailable": "Kontener nie jest uruchomiony albo PVE nie mogło go osiągnąć przez zaufaną granicę.",
         "host_response_rejected": "Odpowiedzi granicy sprawdzania kondycji nie można było uznać za wiarygodną, więc nie zapisano żadnego werdyktu.",
         "host_unreachable": "Granica sprawdzania kondycji nie zwróciła odpowiedzi.",
@@ -392,7 +387,7 @@
     },
     "health": {
       "title": "Kontrakt kondycji Hubinet Ops — {name}",
-      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany. Nie jest to stan normalny: Hubinet Ops nadaje każdemu zarządzanemu pakietowo kontenerowi LXC wbudowany kontrakt `guest_operational`, a następne udane wykrywanie inwentarza przywraca go automatycznie. Aby przywrócić go teraz, użyj **Ustawienia → Urządzenia i usługi → Hubinet Ops → Konfiguruj** albo akcji **`hubinet_ops.reset_health_contract`**. Aby zamiast tego zadeklarować zaawansowany kontrakt, użyj **`hubinet_ops.set_health_contract`** — dostępnej z zakładki **Akcje** tego urządzenia lub z Narzędzi deweloperskich → Akcje — podając każdy wymagany rodzaj sondy (`systemd_unit_active`, `docker_container_running`, `docker_container_healthy` albo bezcelową `guest_operational`, czyli sondę żywotności gościa) i jej cel.",
+      "unconfigured": "Nie skonfigurowano kontraktu kondycji. Jest to stan **nieskonfigurowany**, a nie zdrowy; aktualizacja pakietów nie może się rozpocząć, dopóki kontrakt nie zostanie zadeklarowany. Nie jest to stan normalny: Hubinet Ops nadaje każdemu zarządzanemu pakietowo kontenerowi LXC wbudowany kontrakt `guest_operational`, a następne udane wykrywanie inwentarza przywraca go automatycznie. Aby przywrócić go teraz, użyj **Ustawienia → Urządzenia i usługi → Hubinet Ops → Konfiguruj** albo akcji **`hubinet_ops.reset_health_contract`**. Aby zamiast tego zadeklarować zaawansowany kontrakt, użyj **`hubinet_ops.set_health_contract`** — dostępnej z zakładki **Akcje** tego urządzenia lub z Narzędzi deweloperskich → Akcje — podając albo samą bezcelową sondę żywotności gościa `guest_operational`, albo jedną lub więcej sond `systemd_unit_active` wraz z ich celami.",
       "revision": "Rewizja",
       "all_required": "Wszystkie poniższe sondy są wymagane:"
     }
@@ -400,7 +395,7 @@
   "issues": {
     "health_contract_unconfigured": {
       "title": "{name}: aktualizacja pakietów zablokowana brakiem kontraktu kondycji",
-      "description": "Sprawdzony plan pakietów dla **{name}** jest zatwierdzony, ale nie zadeklarowano kontraktu kondycji, więc **Uruchom zatwierdzoną aktualizację** pozostaje nieaktywne.\n\nNormalnie nie powinno się to zdarzyć: Hubinet Ops nadaje każdemu zarządzanemu pakietowo kontenerowi LXC wbudowany kontrakt kondycji `guest_operational`, a następne udane wykrywanie inwentarza przywróci go dla tego zasobu automatycznie. Aby przywrócić go teraz, użyj **Ustawienia → Urządzenia i usługi → Hubinet Ops → Konfiguruj** albo akcji `hubinet_ops.reset_health_contract` dla tego urządzenia. Aby zamiast tego zadeklarować zaawansowany kontrakt Docker/systemd, użyj akcji `hubinet_ops.set_health_contract` (zakładka **Akcje** tego urządzenia lub Narzędzia deweloperskie → Akcje).\n\nTo zgłoszenie znika samo, gdy kontrakt dla tego zasobu już istnieje."
+      "description": "Sprawdzony plan pakietów dla **{name}** jest zatwierdzony, ale nie zadeklarowano kontraktu kondycji, więc **Uruchom zatwierdzoną aktualizację** pozostaje nieaktywne.\n\nNormalnie nie powinno się to zdarzyć: Hubinet Ops nadaje każdemu zarządzanemu pakietowo kontenerowi LXC wbudowany kontrakt kondycji `guest_operational`, a następne udane wykrywanie inwentarza przywróci go dla tego zasobu automatycznie. Aby przywrócić go teraz, użyj **Ustawienia → Urządzenia i usługi → Hubinet Ops → Konfiguruj** albo akcji `hubinet_ops.reset_health_contract` dla tego urządzenia. Aby zamiast tego zadeklarować zaawansowany kontrakt `systemd_unit_active`, użyj akcji `hubinet_ops.set_health_contract` (zakładka **Akcje** tego urządzenia lub Narzędzia deweloperskie → Akcje).\n\nTo zgłoszenie znika samo, gdy kontrakt dla tego zasobu już istnieje."
     }
   },
   "exceptions": {

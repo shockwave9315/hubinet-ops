@@ -56,9 +56,14 @@ A contract is an ALL-OF over its declared probes, so:
 - **PASS** requires every frozen probe to be POSITIVELY proven. Absence of an
   observed failure is not a pass, and neither is a probe that could not be
   evaluated.
-- **FAIL** needs one probe positively proven false. One false conjunct proves
-  an ALL-OF false whatever the others did, so a deterministic failure beside
-  an unevaluable probe is still a failure.
+- **FAIL** needs one probe positively proven false, inside a COMPLETE DECISIVE
+  observation set. One false conjunct proves an ALL-OF false whatever the
+  others did -- but UNKNOWN is impossible in material accepted for durable
+  finalization: a decisive round admits no unevaluated probe at all (a host
+  claiming both at once is rejected outright by `validate_host_health_result`
+  below), and `InventoryAuthority.complete_package_update_health` refuses any
+  observation set carrying an UNKNOWN outcome independently of that, as
+  defense in depth.
 - **UNKNOWN** is the remainder, and it is never success. It writes no verdict
   and no durable result rows: the job stays ACTIVE at `health_started`, keeps
   its snapshot and its rollback authority, and the evaluation may simply be
@@ -66,31 +71,29 @@ A contract is an ALL-OF over its declared probes, so:
 
 Retrying is safe here in a way it is emphatically NOT for the snapshot,
 mutation, and rollback stages, and for one structural reason: **health
-execution is read-only.** It runs `systemctl show` and `docker inspect`, and
-neither of those changes anything. There is therefore deliberately no host
-operation journal, no `may_have_started` uncertainty checkpoint, and no
-at-most-once fence in this stage -- inventing one would be mimicking the shape
-of the destructive stages without their reason for existing.
+execution is read-only.** It runs `systemctl show` (or, for the built-in
+`guest_operational` baseline, one fixed `/bin/true` liveness check), and
+neither changes anything. There is therefore deliberately no host operation
+journal, no `may_have_started` uncertainty checkpoint, and no at-most-once
+fence in this stage -- inventing one would be mimicking the shape of the
+destructive stages without their reason for existing.
 
 ## Verified CLI semantics
 
 Every fixed argv here was verified against the real tools rather than assumed;
 `ARCHITECTURE.md`, "Job-bound healthcheck execution", records what was
-observed and why each command is the one that cannot false-PASS. The two facts
-that shaped the design:
+observed and why the systemd command is the one that cannot false-PASS:
+`systemctl is-active <pattern>` expands globs and exits 0 if ANY matching unit
+is active, and `--` does NOT stop that expansion, so it is unusable for a
+probe that must name one exact unit. The executor uses `systemctl show`
+instead, requires exactly one property block, and validates the target
+charset so it cannot be a glob.
 
-- `systemctl is-active <pattern>` expands globs and exits 0 if ANY matching
-  unit is active, and `--` does NOT stop that expansion. It is unusable for a
-  probe that must name one exact unit.
-- `docker inspect` resolves a container by name OR by ID prefix, and the
-  daemon-unavailable and no-such-container failures share an exit code.
-
-So the executor uses `systemctl show`, requires exactly one property block,
-and validates the target charset so it cannot be a glob; and it uses
-`docker inspect` with a code-owned constant template, requires the returned
-`.Name` to be exactly the requested container, and treats an inspect failure
-as definitive absence ONLY when a separate fixed command proves the daemon
-answered.
+The `guest_operational` baseline runs no discovery command at all: it is one
+fixed, code-owned, argument-less liveness check (`/bin/true`) against the
+exact current resource context, executed exactly once per evaluation attempt
+-- never settled, never retried within one attempt. Docker workload health is
+not part of v0.5 Hubinet Ops package-update health.
 """
 
 from __future__ import annotations
@@ -157,17 +160,7 @@ HOST_REFUSAL_REASONS: dict[str, str] = {
 HOST_PROBE_REASONS: frozenset[str] = frozenset(
     {
         "unit_active",
-        "container_running",
-        "container_healthy",
         "unit_not_active",
-        "container_not_running",
-        "container_absent",
-        "container_unhealthy",
-        "container_health_starting",
-        "container_has_no_healthcheck",
-        "container_restarting",
-        "container_not_started_yet",
-        "container_removing",
         "unit_activating",
         "unit_deactivating",
         "unit_reloading",
@@ -179,10 +172,11 @@ HOST_PROBE_REASONS: frozenset[str] = frozenset(
         "command_failed",
         "command_timed_out",
         "malformed_output",
-        "docker_daemon_unavailable",
         # PR #80 review finding 1: the host's own absolute settling deadline
         # ran out before this probe's family could safely start (or finish)
-        # another subprocess.
+        # another subprocess. Meaningful only for the advanced systemd
+        # settling window -- the guest_operational baseline is a single
+        # one-shot execution and never settles.
         "settling_budget_exhausted",
     }
 )
@@ -309,9 +303,9 @@ class PackageUpdateHealthOrchestrator:
     transactions. The authority transitions here are short and local: start
     the evaluation, or atomically re-prove live context and accept its exact
     result. Nothing holds the writer lock
-    across SSH, `pct`, `systemctl`, `docker`, or a probe loop -- which is
-    affordable precisely because a read-only evaluation needs no critical
-    section to stop a second destructive submission.
+    across SSH, `pct`, `systemctl`, or a probe loop -- which is affordable
+    precisely because a read-only evaluation needs no critical section to
+    stop a second destructive submission.
     """
 
     def __init__(

@@ -10,9 +10,11 @@ Two things declare one, and the split is the whole v0.5 product decision.
 The BASELINE is BACKEND-OWNED: every current package-managed LXC is
 provisioned `DEFAULT_HEALTH_PROBES` below, as product policy. An ADVANCED
 contract is OPERATOR-DECLARED: an operator may explicitly replace that
-baseline with named Docker/systemd probes, and it is then theirs until they
-explicitly reset it. Neither half is INFERRED -- nothing anywhere reads a
-guest to decide what its contract should be.
+baseline with one or more named `systemd_unit_active` probes, and it is then
+theirs until they explicitly reset it. Neither half is INFERRED -- nothing
+anywhere reads a guest to decide what its contract should be. v0.5 dropped
+Docker-specific package-update health probes entirely; Docker workload health
+is not part of v0.5 Hubinet Ops package-update health.
 
 The rules that shape everything below:
 
@@ -33,10 +35,17 @@ The rules that shape everything below:
   choose it, because absence of a workload observer is not proof of workload
   absence. An operator's own explicit contract always wins and is never
   overwritten by it.
+- **The baseline and an advanced contract never mix.** A contract is either
+  exactly one `guest_operational` probe (target `NULL`) or one-or-more
+  `systemd_unit_active` probes -- never both in the same contract. An
+  explicit advanced contract REPLACES the baseline; it does not extend it,
+  and mixing them would silently reintroduce the settling coupling this
+  design deliberately removed from the baseline (see
+  `evaluate_health_contract_settling` in the deployed health helper).
 
 A probe target is DATA. The executor uses fixed argv operations, so a target is
 never command text and this configuration module deliberately does not
-implement systemd or Docker execution grammar. Structural execution
+implement systemd execution grammar. Structural execution
 eligibility is a separate pure check in ``health_execution.py`` at package-job
 issuance. This layer only enforces that a target cannot stop being one bounded
 opaque argument: no NUL, no control character, no whitespace, no unbounded
@@ -62,9 +71,8 @@ class HealthContractError(ValueError):
 MIN_HEALTH_PROBES = 1
 MAX_HEALTH_PROBES = 32
 
-#: A systemd unit name and a Docker container name are both far shorter than
-#: this in practice; the bound exists to keep the durable row bounded, not to
-#: model either grammar.
+#: A systemd unit name is far shorter than this in practice; the bound exists
+#: to keep the durable row bounded, not to model its grammar.
 MAX_HEALTH_PROBE_TARGET_LENGTH = 200
 
 #: Domain-separated from every other digest in this repository so a health
@@ -161,6 +169,19 @@ def canonical_health_probes(
         raise HealthContractError(
             f"a health contract may declare at most {MAX_HEALTH_PROBES} probes"
         )
+    if (
+        len(normalized) > 1
+        and any(probe.kind is HealthProbeKind.GUEST_OPERATIONAL for probe in normalized)
+    ):
+        # The built-in baseline and an explicit advanced contract never mix
+        # (PRODUCT.md, "What healthy means"). An advanced contract REPLACES
+        # the baseline; declaring GUEST_OPERATIONAL alongside anything else
+        # would silently reintroduce the settling coupling the baseline is
+        # deliberately free of.
+        raise HealthContractError(
+            "guest_operational may not be combined with any other probe; "
+            "an explicit advanced contract replaces the baseline entirely"
+        )
     return tuple(
         sorted(normalized, key=lambda probe: (probe.kind.value, probe.target or ""))
     )
@@ -173,8 +194,10 @@ def canonical_health_probes(
 #: command". It is a PRODUCT DEFAULT owned by the backend, not an inference
 #: about what the guest runs -- absence of a workload observer is not proof
 #: of workload absence, so v0.5 does not infer workload health
-#: automatically. Docker and systemd probes remain available, but only as an
-#: explicit operator-declared advanced contract.
+#: automatically. `systemd_unit_active` remains available, but only as an
+#: explicit operator-declared advanced contract that REPLACES this baseline
+#: entirely (never mixed with it). Docker workload health is not part of
+#: v0.5 Hubinet Ops package-update health.
 DEFAULT_HEALTH_PROBES: tuple[ResourceHealthProbe, ...] = (
     ResourceHealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),
 )

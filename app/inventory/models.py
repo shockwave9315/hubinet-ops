@@ -305,17 +305,20 @@ class HealthProbeKind(StrEnum):
     argv operation a future executor can perform truthfully against a
     Debian/Ubuntu LXC guest; there is no member for "run this command", and
     there never will be. `PRODUCT.md` records why this list is what it is.
+
+    v0.5 dropped Docker-specific package-update health probes entirely
+    (``docker_container_running``, ``docker_container_healthy``): they are no
+    longer supported end-to-end, not merely hidden. A contract is now either
+    the built-in ``GUEST_OPERATIONAL`` singleton or one or more explicit
+    ``SYSTEMD_UNIT_ACTIVE`` probes -- never both at once (see
+    `health_contract.py::canonical_health_probes`). Docker workload health is
+    not part of v0.5 Hubinet Ops package-update health.
     """
 
-    #: The explicitly named systemd unit must be active.
+    #: The explicitly named systemd unit must be active. An explicit ADVANCED
+    #: contract: one or more of these REPLACE the built-in baseline; they may
+    #: never be declared alongside ``GUEST_OPERATIONAL``.
     SYSTEMD_UNIT_ACTIVE = "systemd_unit_active"
-    #: The explicitly named Docker container must be running.
-    DOCKER_CONTAINER_RUNNING = "docker_container_running"
-    #: The explicitly named Docker container must be running AND report
-    #: Docker HEALTHCHECK status healthy. A container with no HEALTHCHECK
-    #: therefore cannot satisfy this probe -- that is the point of choosing
-    #: it over ``docker_container_running``.
-    DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
     #: The v0.5 BUILT-IN DEFAULT for a package-managed LXC, and a guest
     #: liveness proof only -- never an application-health proof: the exact
     #: current guest/resource identity is revalidated AND the dedicated
@@ -327,7 +330,10 @@ class HealthProbeKind(StrEnum):
     #: product baseline the backend provisions for every current managed
     #: LXC, NOT something inferred from what a guest appears to run:
     #: absence of a workload observer is not proof of workload absence, so
-    #: v0.5 does not infer workload health automatically.
+    #: v0.5 does not infer workload health automatically. A contract
+    #: declaring this kind may declare no other probe (see
+    #: `health_contract.py::canonical_health_probes`): an explicit advanced
+    #: contract REPLACES this baseline, it does not extend it.
     GUEST_OPERATIONAL = "guest_operational"
 
 
@@ -343,9 +349,9 @@ class HealthProbeOutcome(StrEnum):
       state that does NOT satisfy the probe. This is a proof that the
       contract is false, not an absence of proof that it is true.
     - ``UNKNOWN`` -- the probe could not be evaluated truthfully: the host
-      round trip failed, the command timed out, the output was malformed, the
-      Docker daemon could not be reached, or the target could not be resolved
-      to one exact object. It is NEVER a pass and never a failure.
+      round trip failed, the command timed out, the output was malformed, or
+      the target could not be resolved to one exact object. It is NEVER a
+      pass and never a failure.
     """
 
     PASSED = "passed"

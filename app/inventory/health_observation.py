@@ -8,10 +8,12 @@ from .models import HealthProbeKind, HealthProbeOutcome
 # Closed durable taxonomy.  Raw guest output never becomes a reason.
 #
 # Bounded health settling (ARCHITECTURE.md, "Job-bound healthcheck execution")
-# closes the entire transient-health family, not only Docker `starting`: every
-# token below is either a POSITIVE proof (PASSED), a proof the declared object
-# exists but does not satisfy the probe (FAILED, never recheckable once
-# durable), or a truthful non-answer that a bounded settling round may
+# applies only to the explicit advanced `systemd_unit_active` contract now --
+# the built-in `guest_operational` baseline is a single one-shot execution,
+# never settled (see "Major fix: baseline independence" in ARCHITECTURE.md).
+# Every token below is either a POSITIVE proof (PASSED), a proof the declared
+# object exists but does not satisfy the probe (FAILED, never recheckable
+# once durable), or a truthful non-answer that a bounded settling round may
 # legitimately see again on its very next observation (UNKNOWN). A reason is
 # added here only when the helper and the backend both need to name the exact
 # same fact; see `deploy/hubinet-package-health-helper.py` for the guest-side
@@ -19,17 +21,7 @@ from .models import HealthProbeKind, HealthProbeOutcome
 HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
     {
         "unit_active",
-        "container_running",
-        "container_healthy",
         "unit_not_active",
-        "container_not_running",
-        "container_absent",
-        "container_unhealthy",
-        "container_health_starting",
-        "container_has_no_healthcheck",
-        "container_restarting",
-        "container_not_started_yet",
-        "container_removing",
         "unit_activating",
         "unit_deactivating",
         "unit_reloading",
@@ -50,7 +42,6 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "command_failed",
         "command_timed_out",
         "malformed_output",
-        "docker_daemon_unavailable",
         "host_unreachable",
         "host_response_rejected",
         "resource_context_changed",
@@ -59,7 +50,9 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         # another subprocess -- computed fresh, immediately before each one,
         # never inferred from a value calculated before an earlier
         # subprocess in the same round consumed real wall-clock time. Never
-        # a verdict, and applies to any probe kind's family.
+        # a verdict, and applies to any probe kind's family. Meaningful only
+        # for the advanced systemd settling window: the baseline's one-shot
+        # execution has no round to exhaust.
         "settling_budget_exhausted",
     }
 )
@@ -68,18 +61,12 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
     HealthProbeOutcome.PASSED: frozenset(
         {
             "unit_active",
-            "container_running",
-            "container_healthy",
             "guest_operational_confirmed",
         }
     ),
     HealthProbeOutcome.FAILED: frozenset(
         {
             "unit_not_active",
-            "container_not_running",
-            "container_absent",
-            "container_unhealthy",
-            "container_has_no_healthcheck",
         }
     ),
     HealthProbeOutcome.UNKNOWN: frozenset(
@@ -90,23 +77,11 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
             "command_failed",
             "command_timed_out",
             "malformed_output",
-            "docker_daemon_unavailable",
             "host_unreachable",
             "host_response_rejected",
             "resource_context_changed",
-            # Docker's OWN transient states, entered automatically by every
-            # container (re)start before its first health probe can run --
-            # never a workload verdict. A package-triggered Docker/containerd
-            # restart produces these on a workload that is about to settle
-            # back to a definitive state on its own; see
-            # `deploy/hubinet-package-health-helper.py` and ARCHITECTURE.md,
-            # "Job-bound healthcheck execution".
-            "container_health_starting",
-            "container_restarting",
-            "container_not_started_yet",
-            "container_removing",
-            # systemd's own transient job states, symmetrically: a unit mid
-            # (de)activation or reload is not yet a verdict either way, and
+            # systemd's own transient job states: a unit mid (de)activation
+            # or reload is not yet a verdict either way, and
             # `unit_job_pending` is the same fact for a unit currently
             # inactive/failed with systemd's own Job property still pending --
             # `systemctl show --property=Job` is the load-bearing distinction
@@ -135,13 +110,10 @@ UNRESOLVED_HEALTH_REASONS: frozenset[str] = HEALTH_PROBE_REASONS_BY_OUTCOME[
 ]
 
 #: Every probe kind that NAMES a target. `GUEST_OPERATIONAL` is deliberately
-#: absent: it names no container or unit, so no target-shaped reason can
-#: describe it.
+#: absent: it names no unit, so no target-shaped reason can describe it.
 _TARGETED_HEALTH_PROBE_KINDS: frozenset[HealthProbeKind] = frozenset(
     {
         HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
-        HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-        HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
     }
 )
 
@@ -152,51 +124,6 @@ HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
     "unit_deactivating": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
     "unit_reloading": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
     "unit_job_pending": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
-    "container_running": frozenset({HealthProbeKind.DOCKER_CONTAINER_RUNNING}),
-    "container_healthy": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
-    "container_not_running": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_absent": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_restarting": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_not_started_yet": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_removing": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_unhealthy": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
-    "container_health_starting": frozenset(
-        {HealthProbeKind.DOCKER_CONTAINER_HEALTHY}
-    ),
-    "container_has_no_healthcheck": frozenset(
-        {HealthProbeKind.DOCKER_CONTAINER_HEALTHY}
-    ),
-    "docker_daemon_unavailable": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
     "guest_operational_confirmed": frozenset({HealthProbeKind.GUEST_OPERATIONAL}),
     # PR #80 final review: a probe kind that carries NO target can never
     # truthfully report a target-SHAPED reason. Both tokens are produced

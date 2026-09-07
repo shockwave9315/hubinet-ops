@@ -67,7 +67,7 @@
       },
       "reset_confirm": {
         "title": "Reset the health contract for {name}",
-        "description": "This currently declares:\n\n{current}\n\nResetting replaces it with the Hubinet Ops built-in default for a package-managed LXC: a single `guest_operational` probe, which proves only that the exact container is still reachable and can still run a process. It does not prove application health.\n\nHubinet Ops does not discover Docker or systemd workloads for you — absence of a workload observer is not proof of workload absence — so an advanced Docker/systemd contract stays an explicit choice you make with the `hubinet_ops.set_health_contract` action.\n\nCheck the box and select **Submit** to confirm.",
+        "description": "This currently declares:\n\n{current}\n\nResetting replaces it with the Hubinet Ops built-in default for a package-managed LXC: a single `guest_operational` probe, which proves only that the exact container is still reachable and can still run a process. It does not prove application health.\n\nHubinet Ops does not discover systemd workloads for you — absence of a workload observer is not proof of workload absence — so an advanced `systemd_unit_active` contract stays an explicit choice you make with the `hubinet_ops.set_health_contract` action. Docker workload health is not part of v0.5 Hubinet Ops package-update health.\n\nCheck the box and select **Submit** to confirm.",
         "data": {
           "confirm": "I understand — restore the built-in default"
         }
@@ -251,7 +251,7 @@
         },
         "probes": {
           "name": "Probes",
-          "description": "The complete list of required probes, each with a kind (systemd_unit_active, docker_container_running, or docker_container_healthy) and a target name."
+          "description": "The complete list of required probes: either a single targetless guest_operational probe, or one or more systemd_unit_active probes each naming an exact unit — never both kinds in the same contract."
         },
         "expected_revision": {
           "name": "Expected revision",
@@ -371,11 +371,6 @@
       "health_reason": {
         "command_failed": "A required read-only guest command did not succeed.",
         "command_timed_out": "A required read-only guest command did not finish in time.",
-        "container_health_starting": "A declared container is still running its first health check after a restart.",
-        "container_not_started_yet": "A declared container has been created but not started yet.",
-        "container_removing": "A declared container is being removed.",
-        "container_restarting": "A declared container is restarting.",
-        "docker_daemon_unavailable": "The Docker daemon did not answer inside the guest.",
         "guest_unavailable": "The guest is not running, or PVE could not reach it through the trusted boundary.",
         "host_response_rejected": "The health boundary's answer could not be believed, so no verdict was recorded.",
         "host_unreachable": "The health boundary did not return an answer.",
@@ -392,7 +387,7 @@
     },
     "health": {
       "title": "Hubinet Ops health contract — {name}",
-      "unconfigured": "No health contract is configured. This is **unconfigured**, not healthy, and a package update cannot start until a contract is declared. This is not the normal state: Hubinet Ops gives every package-managed LXC a built-in `guest_operational` contract, and the next successful inventory discovery restores it automatically. To restore it now, use **Settings → Devices & Services → Hubinet Ops → Configure**, or the **`hubinet_ops.reset_health_contract`** action. To declare an advanced contract instead, use **`hubinet_ops.set_health_contract`** — reachable from this device's **Actions** tab, or from Developer Tools → Actions — naming each required probe kind (`systemd_unit_active`, `docker_container_running`, `docker_container_healthy`, or the targetless `guest_operational` guest-liveness probe) and its target.",
+      "unconfigured": "No health contract is configured. This is **unconfigured**, not healthy, and a package update cannot start until a contract is declared. This is not the normal state: Hubinet Ops gives every package-managed LXC a built-in `guest_operational` contract, and the next successful inventory discovery restores it automatically. To restore it now, use **Settings → Devices & Services → Hubinet Ops → Configure**, or the **`hubinet_ops.reset_health_contract`** action. To declare an advanced contract instead, use **`hubinet_ops.set_health_contract`** — reachable from this device's **Actions** tab, or from Developer Tools → Actions — naming either the targetless `guest_operational` guest-liveness probe alone, or one or more `systemd_unit_active` probes and their targets.",
       "revision": "Revision",
       "all_required": "Every probe below is required:"
     }
@@ -400,7 +395,7 @@
   "issues": {
     "health_contract_unconfigured": {
       "title": "{name}: package update blocked on a missing health contract",
-      "description": "The reviewed package plan for **{name}** is approved, but no health contract is declared, so **Start approved update** stays disabled.\n\nThis should not normally happen: Hubinet Ops gives every package-managed LXC a built-in `guest_operational` health contract, and the next successful inventory discovery restores it for this resource automatically. To restore it now, use **Settings → Devices & Services → Hubinet Ops → Configure**, or the `hubinet_ops.reset_health_contract` action for this device. To declare an advanced Docker/systemd contract instead, use the `hubinet_ops.set_health_contract` action (this device's **Actions** tab, or Developer Tools → Actions).\n\nThis issue clears itself automatically once a contract exists for this resource."
+      "description": "The reviewed package plan for **{name}** is approved, but no health contract is declared, so **Start approved update** stays disabled.\n\nThis should not normally happen: Hubinet Ops gives every package-managed LXC a built-in `guest_operational` health contract, and the next successful inventory discovery restores it for this resource automatically. To restore it now, use **Settings → Devices & Services → Hubinet Ops → Configure**, or the `hubinet_ops.reset_health_contract` action for this device. To declare an advanced `systemd_unit_active` contract instead, use the `hubinet_ops.set_health_contract` action (this device's **Actions** tab, or Developer Tools → Actions).\n\nThis issue clears itself automatically once a contract exists for this resource."
     }
   },
   "exceptions": {

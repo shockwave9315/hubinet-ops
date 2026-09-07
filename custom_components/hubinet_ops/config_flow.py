@@ -257,13 +257,14 @@ class HubinetOpsOptionsFlow(OptionsFlow):
     ``guest_operational`` contract before its first update, so nothing here
     has to be visited to reach **Start**.
 
-    There is no discovery step. Home Assistant does not inspect Docker or
-    systemd, does not rank workloads, and does not decide what "healthy"
-    means for a guest -- absence of a workload observer is not proof of
-    workload absence, so v0.5 does not infer workload health automatically.
-    An operator who wants an advanced Docker/systemd contract declares it
-    explicitly through the ``hubinet_ops.set_health_contract`` action, which
-    this flow's own description names.
+    There is no discovery step. Home Assistant does not inspect systemd,
+    does not rank workloads, and does not decide what "healthy" means for a
+    guest -- absence of a workload observer is not proof of workload
+    absence, so v0.5 does not infer workload health automatically. An
+    operator who wants an advanced ``systemd_unit_active`` contract declares
+    it explicitly through the ``hubinet_ops.set_health_contract`` action,
+    which this flow's own description names. Docker workload health is not
+    part of v0.5 Hubinet Ops package-update health.
 
     The contract's `revision`, read the moment this flow looked at it, is
     sent back as `expected_revision` on the reset -- a concurrent change is

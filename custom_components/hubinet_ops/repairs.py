@@ -10,10 +10,11 @@ backend provisions the built-in ``guest_operational`` default for every
 current package-managed LXC during reconciliation, so a normally managed
 resource is already health-configured before its first update and needs no
 onboarding click at all. There is deliberately no discovery/candidate flow
-here any more -- Home Assistant does not inspect Docker or systemd, does not
-rank workloads, and does not decide what "healthy" means. Absence of a
-workload observer is not proof of workload absence, so v0.5 does not infer
-workload health automatically.
+here any more -- Home Assistant does not inspect systemd, does not rank
+workloads, and does not decide what "healthy" means. Absence of a workload
+observer is not proof of workload absence, so v0.5 does not infer workload
+health automatically. Docker workload health is not part of v0.5 Hubinet Ops
+package-update health.
 
 What remains is a narrow, NON-fixable safety net. A resource can still be
 genuinely unconfigured -- an operator used the low-level clear API -- and if
