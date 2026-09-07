@@ -122,8 +122,11 @@ tests as `$ROOT/.venv/bin/python -m pytest ...`, not by probing with bare
 `$ROOT/.venv-ha/bin/python`; its canonical invocation is:
 
 ```bash
-$ROOT/.venv-ha/bin/python -m pytest -q --tb=short \
-  -o asyncio_mode=auto tests/test_hubinet_ops_integration.py
+$ROOT/.venv-ha/bin/python -m pytest -q --tb=short -o asyncio_mode=auto \
+  tests/test_hubinet_ops_integration.py \
+  tests/test_hubinet_ops_options_flow.py \
+  tests/test_hubinet_ops_repairs.py \
+  tests/test_hubinet_ops_transport_http.py
 ```
 
 Do not create or reinstall another environment merely because bare

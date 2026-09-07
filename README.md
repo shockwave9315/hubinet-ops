@@ -258,7 +258,11 @@ needs Python ≥ 3.14.2 on Linux:
 ```bash
 python3.14 -m venv .venv-ha
 .venv-ha/bin/python -m pip install -r requirements-ha-test.txt
-.venv-ha/bin/python -m pytest -q --tb=short -o asyncio_mode=auto tests/test_hubinet_ops_integration.py
+.venv-ha/bin/python -m pytest -q --tb=short -o asyncio_mode=auto \
+  tests/test_hubinet_ops_integration.py \
+  tests/test_hubinet_ops_options_flow.py \
+  tests/test_hubinet_ops_repairs.py \
+  tests/test_hubinet_ops_transport_http.py
 ```
 
 `tests/test_bootstrap_proxmox_0_5_smoke.py` executes the real bootstrap script
