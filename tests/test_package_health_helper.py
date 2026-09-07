@@ -36,6 +36,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import time
 from types import ModuleType
 import uuid
 
@@ -1050,8 +1051,11 @@ def test_persistent_transient_exhausts_the_deadline_as_unknown() -> None:
     round's evidence, never a merged or partial one."""
 
     guest = FakeGuest()
+    clock = FakeClock()
     guest.containers["web"] = ("running", "false", "starting")
-    response = _evaluate_full(guest, (("docker_container_healthy", "web"),))
+    response = _evaluate_full(
+        guest, (("docker_container_healthy", "web"),), clock=clock
+    )
     assert response["probes"] == [
         {
             "index": 0,
@@ -1072,10 +1076,23 @@ def test_persistent_transient_exhausts_the_deadline_as_unknown() -> None:
     )
     assert response["settling"]["rounds"] == expected_rounds
     assert expected_rounds < helper.MAX_SETTLING_ROUNDS
+    # The settling window ran right up to the shared absolute deadline: it
+    # spends whatever the prologue (`_local_node`, the first live-target
+    # revalidation) did NOT, rather than starting a fresh 180s of its own
+    # (PR #80 review MINOR-1). So it gets very nearly the whole deadline,
+    # and never more than it.
     assert (
-        response["settling"]["settled_seconds"]
-        >= helper.DEFAULT_SETTLING_DEADLINE_SECONDS
+        helper.DEFAULT_SETTLING_DEADLINE_SECONDS - 1.0
+        <= response["settling"]["settled_seconds"]
+        <= helper.DEFAULT_SETTLING_DEADLINE_SECONDS
     )
+    # And the property that actually matters to the 300s outer transport:
+    # the TOTAL operation -- prologue included -- stayed inside the
+    # requested deadline. Before the fix this was "prologue + deadline".
+    # (+0.1s covers only FakeClock's own 1ms-per-read ticks spent ASSEMBLING
+    # the response after the loop broke -- no subprocess runs after the
+    # deadline.)
+    assert clock.t <= helper.DEFAULT_SETTLING_DEADLINE_SECONDS + 0.1
     assert response["settling"]["last_round_span_ms"] >= 0
 
 
@@ -1883,7 +1900,19 @@ class DiscoveryGuest:
         self.present = True
         self.running = True
         self.resource_type = "lxc"
+        #: PR #80 review BLOCKER: adapter INSTALLED-ness and adapter
+        #: ANSWERING are four distinct states, not two. `docker_installed`
+        #: False means the guest has no `docker` binary at all (the presence
+        #: oracle proves ABSENT); `docker_daemon_up` False means Docker is
+        #: installed but its daemon will not answer (uncertainty). The same
+        #: split applies to systemd.
+        self.docker_installed = True
+        self.systemd_installed = True
         self.docker_daemon_up = True
+        #: Force the presence oracle itself to answer badly -- adapter name
+        #: -> CommandResult. Anything outside the helper's own chosen exit
+        #: vocabulary must be undecidable, never absence.
+        self.presence_oracle_results: dict[str, object] = {}
         #: name -> (status, "healthcheck"|"none")
         self.docker_info: dict[str, tuple[str, str]] = {}
         #: (unit, unit-file-state)
@@ -1950,11 +1979,52 @@ class DiscoveryGuest:
     def _guest(self, tail):
         assert tail[0] == "env" and tail[1] == "LC_ALL=C", tail
         command = tail[2]
+        if command == "sh":
+            return self._presence(tail)
         if command == "docker":
+            if not self.docker_installed:
+                # Faithful to a real guest: `env` exits 127 for a program it
+                # cannot resolve. This is precisely the status the pre-fix
+                # code read as "the query failed" -> undecidable.
+                return helper.CommandResult(
+                    127, b"", b"env: 'docker': No such file or directory"
+                )
             return self._docker(tail)
         if command == "systemctl":
+            if not self.systemd_installed:
+                return helper.CommandResult(
+                    127, b"", b"env: 'systemctl': No such file or directory"
+                )
             return self._systemctl(tail)
         raise AssertionError(f"unexpected guest command: {tail}")
+
+    def _presence(self, tail):
+        """The fixed adapter-presence oracle (`env LC_ALL=C sh -c <script>`).
+
+        Answers in the helper's OWN chosen exit vocabulary -- 0 present, 10
+        absent, anything else undecidable -- exactly as a real guest shell
+        running that code-owned script would.
+        """
+
+        assert tail[3] == "-c", tail
+        script = tail[4]
+        if "docker" in script:
+            adapter, installed = "docker", self.docker_installed
+        elif "systemctl" in script:
+            adapter, installed = "systemd", self.systemd_installed
+        else:  # pragma: no cover - the script is a code-owned constant
+            raise AssertionError(f"unexpected presence script: {script!r}")
+        assert script == helper._adapter_presence_script(
+            helper.ADAPTER_PRESENCE_PROGRAMS[adapter]
+        ), script
+        override = self.presence_oracle_results.get(adapter)
+        if override is not None:
+            return override
+        return helper.CommandResult(
+            helper.ADAPTER_PRESENT_EXIT if installed else helper.ADAPTER_ABSENT_EXIT,
+            b"",
+            b"",
+        )
 
     def _docker(self, tail):
         if tail[3] == "ps":
@@ -2022,9 +2092,19 @@ class DiscoveryGuest:
         return helper.CommandResult(0, stdout, b"")
 
 
-def _discover(guest) -> dict:
+def _discover(guest, *, monotonic=None, deadline=None) -> dict:
+    clock = monotonic if monotonic is not None else time.monotonic
     return helper.discover_health_candidates(
-        guest, guest.vmid, guest.current_node, guest.node
+        guest,
+        guest.vmid,
+        guest.current_node,
+        guest.node,
+        absolute_deadline=(
+            deadline
+            if deadline is not None
+            else clock() + helper.DISCOVERY_DEADLINE_SECONDS
+        ),
+        monotonic=clock,
     )
 
 
@@ -2708,3 +2788,400 @@ def test_the_evaluate_acceptance_marker_is_unaffected_by_discovery() -> None:
         helper.RequestError, match="request must have the exact health-evaluation shape"
     ):
         helper.handle_request({}, runner=DiscoveryGuest())
+
+
+# ===========================================================================
+# PR #80 FINAL REVIEW BLOCKER: an adapter that is NOT INSTALLED is positive,
+# complete absence -- not uncertainty.
+#
+# Before this fix a guest with no `docker` binary answered `undecidable`
+# forever, because `env LC_ALL=C docker ps` exits 127 and every non-zero
+# family exit was read as "the query failed". That made `guest_operational`
+# and every systemd recommendation unreachable on exactly the bare /
+# systemd-only guests PRODUCT.md says the fallback exists for, and made the
+# native onboarding flow abort every single time.
+#
+# The distinction is now proven by a separate, fixed, code-owned presence
+# oracle with its OWN chosen exit vocabulary, so no generic shell/exec
+# status can be mistaken for an answer. The four states below are distinct:
+#
+#   adapter absent                  -> family positively complete, 0 candidates
+#   adapter present, query complete -> family positively complete
+#   adapter present, query failed   -> undecidable
+#   presence itself unprovable      -> undecidable
+# ===========================================================================
+
+
+def test_the_presence_oracle_is_a_fixed_code_owned_constant() -> None:
+    """No request-derived material, no operator input, no arbitrary argv."""
+
+    for adapter, program in helper.ADAPTER_PRESENCE_PROGRAMS.items():
+        script = helper._adapter_presence_script(program)
+        assert script == (
+            f"command -v {program} > /dev/null 2>&1 && exit 0; exit 10"
+        )
+    assert set(helper.ADAPTER_PRESENCE_PROGRAMS) == {"docker", "systemd"}
+    assert helper.ADAPTER_PRESENT_EXIT == 0
+    assert helper.ADAPTER_ABSENT_EXIT == 10
+    # A program this file does not own can never be asked about.
+    with pytest.raises(AssertionError):
+        helper._adapter_presence_script("curl")
+
+    # The oracle resolves its program exactly the way the family command
+    # does -- through `env`/PATH -- never through an assumed absolute path.
+    guest = DiscoveryGuest()
+    guest.docker_installed = False
+    _discover(guest)
+    presence_commands = [
+        argv for argv in guest.commands if argv[:2] == ("pct", "exec") and argv[6] == "sh"
+    ]
+    assert presence_commands, guest.commands
+    for argv in presence_commands:
+        assert argv[4:8] == ("env", "LC_ALL=C", "sh", "-c")
+        assert not any("/usr/bin" in element for element in argv)
+
+
+def test_witness_a_docker_absent_plus_a_real_systemd_workload() -> None:
+    """A: Docker positively absent, systemd complete with one workload.
+
+    Before the fix this answered `undecidable` with zero candidates, hiding
+    a perfectly discovered systemd workload.
+    """
+
+    guest = DiscoveryGuest()
+    guest.docker_installed = False
+    guest.unit_files = [
+        ("mariadb.service", "enabled"),
+        ("ssh.service", "enabled"),
+    ]
+    result = _discover(guest)
+    assert result["status"] == "ok"
+    assert result["recommendation_basis"] == "single_systemd_candidate"
+    by_target = {c["target"]: c for c in result["candidates"]}
+    assert by_target["mariadb.service"]["recommended"] is True
+    assert by_target["ssh.service"]["recommended"] is False
+    # An adapter that is absent contributes NOTHING -- not a candidate, and
+    # certainly not the fallback beside a real workload.
+    assert not any(c["adapter"] == "docker" for c in result["candidates"])
+    assert not any(c["kind"] == "guest_operational" for c in result["candidates"])
+    # And no Docker family command was spent at all: the presence oracle
+    # already answered the whole family.
+    assert not any(argv[6:7] == ("docker",) for argv in guest.commands)
+
+
+def test_witness_b_docker_absent_plus_a_genuinely_bare_systemd_guest() -> None:
+    """B: the exact guest the fallback exists for -- no Docker installed at
+    all, systemd complete with only platform units."""
+
+    guest = DiscoveryGuest()
+    guest.docker_installed = False
+    guest.unit_files = [("ssh.service", "enabled"), ("cron.service", "enabled")]
+    result = _discover(guest)
+    assert result["status"] == "no_candidates"
+    assert result["recommendation_basis"] == "guest_fallback"
+    guest_candidates = [c for c in result["candidates"] if c["adapter"] == "guest"]
+    assert len(guest_candidates) == 1
+    assert guest_candidates[0]["kind"] == "guest_operational"
+    assert guest_candidates[0]["target"] is None
+    assert guest_candidates[0]["recommended"] is True
+
+
+def test_witness_c_docker_present_but_daemon_down_stays_undecidable() -> None:
+    """C -- the load-bearing positive control. Proving ABSENCE positively
+    must not weaken the original rule by one inch: Docker INSTALLED whose
+    daemon will not answer is still uncertainty, and uncertainty still
+    blocks the fallback completely."""
+
+    guest = DiscoveryGuest()
+    guest.docker_installed = True
+    guest.docker_daemon_up = False
+    # A systemd read that would, on its own, look like "nothing here".
+    guest.unit_files = [("ssh.service", "enabled")]
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+    assert result["candidates"] == []
+    assert not any(c["kind"] == "guest_operational" for c in result["candidates"])
+
+
+def test_witness_d_docker_absent_plus_systemd_undecidable() -> None:
+    """D: positive absence in ONE family never neutralizes uncertainty in
+    the other."""
+
+    guest = DiscoveryGuest()
+    guest.docker_installed = False
+    guest.unit_files = [("mosquitto.service", "enabled")]
+    guest.show_returncode = 1
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+    assert result["candidates"] == []
+
+
+def test_witness_e_systemctl_absent_plus_a_docker_workload() -> None:
+    """E: the mirror family. No systemd at all, Docker complete."""
+
+    guest = DiscoveryGuest()
+    guest.systemd_installed = False
+    guest.docker_info = {"web": ("running", "healthcheck")}
+    result = _discover(guest)
+    assert result["status"] == "ok"
+    assert result["recommendation_basis"] == "docker_healthcheck"
+    by_target = {c["target"]: c for c in result["candidates"]}
+    assert by_target["web"]["recommended"] is True
+    assert not any(c["adapter"] == "systemd" for c in result["candidates"])
+    assert not any(argv[6:7] == ("systemctl",) for argv in guest.commands)
+
+
+def test_witness_f_systemctl_absent_plus_complete_empty_docker() -> None:
+    """F: both families positively complete with nothing -- the fallback is
+    legitimately reachable through the systemd-absent path too."""
+
+    guest = DiscoveryGuest()
+    guest.systemd_installed = False
+    guest.docker_info = {}
+    result = _discover(guest)
+    assert result["status"] == "no_candidates"
+    assert result["recommendation_basis"] == "guest_fallback"
+    assert [c["kind"] for c in result["candidates"]] == ["guest_operational"]
+
+
+@pytest.mark.parametrize(
+    "oracle_result",
+    [
+        # Exit statuses OUTSIDE this file's own chosen vocabulary. 127 is
+        # specifically the one a naive `returncode == 127` rule would have
+        # granted positive-absence authority to.
+        helper.CommandResult(127, b"", b"sh: not found"),
+        helper.CommandResult(126, b"", b""),
+        helper.CommandResult(255, b"", b""),
+        helper.CommandResult(1, b"", b""),
+        helper.CommandResult(0, b"", b"", True, False),   # timed out
+        helper.CommandResult(0, b"", b"", False, True),   # output overflow
+    ],
+)
+def test_witness_g_a_presence_oracle_that_does_not_answer_is_undecidable(
+    oracle_result,
+) -> None:
+    """G: the oracle failing is never adapter absence. A guest that would
+    otherwise look perfectly bare must NOT reach the fallback."""
+
+    guest = DiscoveryGuest()
+    guest.docker_info = {}
+    guest.unit_files = [("ssh.service", "enabled")]
+    guest.presence_oracle_results = {"docker": oracle_result}
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+    assert result["candidates"] == []
+
+
+def test_witness_g_a_live_target_failure_during_presence_is_undecidable() -> None:
+    """G, second shape: the presence oracle's own live-target revalidation
+    failing is uncertainty, never absence.
+
+    This is the guest going away AFTER `handle_discover_request`'s prologue
+    already proved it live, so it surfaces as `undecidable` -- exactly what
+    the two family reads already do for the same mid-read disappearance.
+    """
+
+    guest = DiscoveryGuest()
+    guest.docker_info = {}
+    guest.unit_files = [("ssh.service", "enabled")]
+    guest.present = False
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+    assert result["candidates"] == []
+
+
+# ===========================================================================
+# PR #80 FINAL REVIEW MINOR-1: ONE absolute deadline, prologue included.
+#
+# `_local_node` and the first `revalidate_live_target` used to run at the
+# unconditional 60s per-command allowance BEFORE any deadline existed, so a
+# bounded operation's real wall clock was "prologue + deadline" rather than
+# "deadline" -- up to ~302s against a 300s outer SSH transport timeout.
+# These inspect the ACTUAL timeouts granted to subprocesses and the actual
+# commands launched, never only the final status.
+# ===========================================================================
+
+
+def test_the_health_prologue_spends_the_same_budget_as_the_settling_rounds() -> None:
+    """Witness: the local-node read consumes real time, then the pre-flight
+    revalidation consumes more, and the FIRST guest command of round 1 is
+    granted only what is genuinely left -- not a fresh full allowance."""
+
+    guest = FakeGuest()
+    clock = FakeClock()
+    guest.clock = clock
+    # Call 0 is `_local_node`; call 1 is the pre-flight revalidation.
+    guest.consume_seconds_by_call_index = {0: 12.0, 1: 9.0}
+
+    payload = _request((("guest_operational", None),))
+    payload["settling_policy"]["deadline_seconds"] = (
+        helper.MIN_SETTLING_DEADLINE_SECONDS
+    )
+    response = helper.handle_request(
+        payload, runner=guest, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+    assert response["ok"] is True
+
+    local_node_timeout = guest.call_timeouts[0]
+    revalidation_timeout = guest.call_timeouts[1]
+    first_round_timeout = guest.call_timeouts[2]
+    # Before the fix `_local_node` got COMMAND_TIMEOUT_SECONDS unconditionally.
+    assert local_node_timeout < helper.COMMAND_TIMEOUT_SECONDS
+    assert local_node_timeout <= helper.MIN_SETTLING_DEADLINE_SECONDS
+    # Each later prologue/round command sees strictly less budget than the
+    # one before it, because they all draw down ONE deadline.
+    assert revalidation_timeout < local_node_timeout - 11
+    assert first_round_timeout < revalidation_timeout - 8
+    # And the whole operation stayed inside the requested deadline.
+    assert clock.t <= helper.MIN_SETTLING_DEADLINE_SECONDS + 0.1
+
+
+def test_a_health_prologue_that_exhausts_the_budget_launches_no_guest_command() -> None:
+    """Fail-closed, and never a verdict: if the prologue consumes the whole
+    deadline, the settling rounds never start at all."""
+
+    guest = FakeGuest()
+    clock = FakeClock()
+    guest.clock = clock
+    guest.consume_seconds_by_call_index = {0: 1_000_000.0}
+
+    payload = _request((("systemd_unit_active", "nginx.service"),))
+    payload["settling_policy"]["deadline_seconds"] = (
+        helper.MIN_SETTLING_DEADLINE_SECONDS
+    )
+    response = helper.handle_request(
+        payload, runner=guest, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+    # A whole-request refusal, never a probe verdict and never "healthy".
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "execution_failed"
+    # Exactly one command ran -- the local-node read that ate the budget.
+    assert len(guest.commands) == 1
+    assert not any(argv[:2] == ("pct", "exec") for argv in guest.commands)
+
+
+def test_the_discovery_prologue_spends_the_same_budget_as_the_family_reads() -> None:
+    """The discovery analogue, including the adapter-presence oracles: an
+    earlier read can consume the budget such that a later family is never
+    launched at all."""
+
+    guest = DiscoveryGuest()
+    clock = FakeClock()
+    guest.clock = clock
+    # Call 0 `_local_node`, call 1 the pre-flight revalidation: together
+    # they eat almost the entire discovery deadline.
+    guest.consume_seconds_by_call_index = {
+        0: helper.DISCOVERY_DEADLINE_SECONDS / 2,
+        1: helper.DISCOVERY_DEADLINE_SECONDS / 2,
+    }
+    guest.docker_info = {}
+    guest.unit_files = [("ssh.service", "enabled")]
+
+    result = helper.handle_discover_request(
+        {
+            "request_version": 1,
+            "operation": "discover_health_candidates",
+            "target": {"vmid": guest.vmid, "expected_node": guest.node},
+            "ownership": {
+                "resource_id": str(uuid.uuid4()),
+                "binding_id": str(uuid.uuid4()),
+                "locator_generation": 1,
+                "resource_continuity_revision": 1,
+                "backend_instance_id": str(uuid.uuid4()),
+            },
+        },
+        runner=guest,
+        monotonic=clock.monotonic,
+    )
+    # Fail-closed: never "no workload found", and never the fallback.
+    assert result["discovery_status"] == "undecidable"
+    assert result["candidates"] == []
+    assert result["recommendation_basis"] is None
+    # The prologue's local-node read was bounded by the discovery deadline,
+    # not by the fixed per-command allowance.
+    assert guest.call_timeouts[0] <= helper.DISCOVERY_DEADLINE_SECONDS
+    assert guest.call_timeouts[0] < helper.COMMAND_TIMEOUT_SECONDS
+    # No family command -- not even a presence oracle -- was launched.
+    assert not any(argv[:2] == ("pct", "exec") for argv in guest.commands)
+
+
+# ===========================================================================
+# PR #80 FINAL REVIEW MINOR-2: `guest_operational` never reaches a target
+# validator, and no `"None"` string is ever manufactured for it.
+# ===========================================================================
+
+
+def test_guest_operational_never_reaches_a_target_validator(monkeypatch) -> None:
+    """It carries no target, so neither the Docker nor the systemd target
+    grammar may ever be consulted for it -- and certainly not via
+    `str(None)`, which happens to look like a legal Docker name."""
+
+    called: list[tuple[str, object]] = []
+    real_docker = helper._require_exact_docker_name
+    real_systemd = helper._require_exact_systemd_unit
+
+    def spy_docker(target):
+        called.append(("docker", target))
+        return real_docker(target)
+
+    def spy_systemd(target):
+        called.append(("systemd", target))
+        return real_systemd(target)
+
+    monkeypatch.setattr(helper, "_require_exact_docker_name", spy_docker)
+    monkeypatch.setattr(helper, "_require_exact_systemd_unit", spy_systemd)
+
+    assert helper._structural_probe_outcome("guest_operational", None) is None
+    assert called == []
+
+    # Positive control: the kinds that DO have targets still validate them.
+    assert helper._structural_probe_outcome("docker_container_running", "web") is None
+    assert (
+        helper._structural_probe_outcome("systemd_unit_active", "nginx.service")
+        is None
+    )
+    assert [entry[0] for entry in called] == ["docker", "systemd"]
+    assert "None" not in [entry[1] for entry in called]
+
+
+def test_an_unknown_probe_kind_is_never_validated_as_docker_shaped() -> None:
+    """The `else: docker validator` catch-all is gone: an unrecognised kind
+    is UNKNOWN, never silently accepted because it happens to match Docker's
+    name grammar."""
+
+    assert helper._structural_probe_outcome("podman_container_running", "web") == (
+        "unknown",
+        "malformed_output",
+    )
+
+
+def test_a_kinded_probe_with_a_non_string_target_is_unknown_not_stringified() -> None:
+    assert helper._structural_probe_outcome("docker_container_running", None) == (
+        "unknown",
+        "probe_target_not_exact",
+    )
+    assert helper._structural_probe_outcome("systemd_unit_active", 12) == (
+        "unknown",
+        "probe_target_not_exact",
+    )
+
+
+def test_guest_operational_carries_none_end_to_end_with_no_fake_string() -> None:
+    """The whole round trip: request in, guest command run, response out --
+    `None` stays `None`, and the literal string "None" appears nowhere."""
+
+    guest = FakeGuest()
+    response = _evaluate_full(guest, (("guest_operational", None),))
+    assert response["probes"][0]["target"] is None
+    assert response["probes"][0]["outcome"] == "passed"
+    assert response["probes"][0]["reason"] == "guest_operational_confirmed"
+    assert "None" not in json.dumps(response)
+    # The fixed liveness command ran; no target became an argv element.
+    guest_commands = [argv for argv in guest.commands if argv[:2] == ("pct", "exec")]
+    assert any(argv[-1:] == ("/bin/true",) for argv in guest_commands)
+    assert not any("None" in element for argv in guest.commands for element in argv)

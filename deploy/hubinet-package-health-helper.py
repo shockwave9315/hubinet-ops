@@ -47,7 +47,15 @@ command per probe), until either:
 
 `PACKAGE_UPDATE_HEALTH_TIMEOUT_SECONDS = 300` on the backend side
 (`app/inventory_runtime_config.py`) already gives this settling window its
-transport headroom: 180s of settling plus per-command allowance and margin.
+transport headroom, and that headroom is now a real bound rather than an
+approximate one: ONE absolute monotonic deadline is established in
+`handle_request` from the clamped policy BEFORE any subprocess runs, and the
+prologue (`_local_node`, the first `revalidate_live_target`) spends that same
+budget instead of an unconditional per-command allowance added on top of it
+(PR #80 review MINOR-1). The whole call is therefore bounded by the requested
+deadline plus `_TRANSPORT_RETURN_MARGIN_SECONDS`, never by
+"prologue + deadline". `handle_discover_request` is built the same way around
+`DISCOVERY_DEADLINE_SECONDS`.
 
 ## Why the commands are what they are
 
@@ -659,12 +667,42 @@ def _command(
     return runner(argv, timeout, max_output)
 
 
-def _local_node(runner: Runner) -> str:
-    """Ask this PVE node's own trusted local state who it is."""
+def _require_prologue_timeout(absolute_deadline: float, *, monotonic: Clock) -> float:
+    """The timeout for one PROLOGUE subprocess, from the SAME absolute
+    deadline the rest of the operation spends.
+
+    PR #80 review MINOR-1: `_local_node` and the operation's first
+    `revalidate_live_target` used to run at the unconditional
+    ``COMMAND_TIMEOUT_SECONDS`` *before* any deadline existed, so a bounded
+    operation's real wall clock was "prologue + deadline", not "deadline".
+    One absolute monotonic deadline now governs the whole operation, and the
+    prologue is inside it like every other subprocess. Budget exhaustion
+    here is fail-closed -- never a verdict, never positive absence.
+    """
+
+    timeout = _next_command_timeout(absolute_deadline, monotonic=monotonic)
+    if timeout is None:
+        raise HealthError(
+            "execution_failed",
+            "the bounded budget was exhausted before the guest could be read",
+        )
+    return timeout
+
+
+def _local_node(
+    runner: Runner, *, absolute_deadline: float, monotonic: Clock
+) -> str:
+    """Ask this PVE node's own trusted local state who it is.
+
+    Bounded by whatever is ACTUALLY left of the one absolute deadline, read
+    fresh immediately before the subprocess starts -- never the fixed
+    per-command allowance alone.
+    """
 
     result = _command(
         runner,
         ("pvesh", "get", "/cluster/status", "--output-format", "json"),
+        timeout=_require_prologue_timeout(absolute_deadline, monotonic=monotonic),
         max_output=1 * 1024 * 1024,
     )
     if result.timed_out or result.output_exceeded or result.returncode != 0:
@@ -892,15 +930,44 @@ def _guest_family_reason(exc: ProbeUnknown | HealthError) -> str:
     )
 
 
-def _structural_probe_outcome(kind: str, target: str) -> tuple[str, str] | None:
-    """A fixed, round-independent (outcome, reason) if the target can never
-    settle, else ``None`` meaning "ask the guest"."""
+def _require_probe_target_string(target: object) -> str:
+    """A kind that HAS a target must actually carry a string one.
 
+    Never ``str(target)``: PR #80 review MINOR-2 -- coercing a legitimately
+    absent (``None``) target into the literal string ``"None"`` is exactly
+    the faked target the frozen design forbids, and it silently made one
+    kind's structural classification depend on another kind's charset.
+    """
+
+    if not isinstance(target, str):
+        raise ProbeUnknown("probe_target_not_exact")
+    return target
+
+
+def _structural_probe_outcome(
+    kind: str, target: str | None
+) -> tuple[str, str] | None:
+    """A fixed, round-independent (outcome, reason) if the target can never
+    settle, else ``None`` meaning "ask the guest".
+
+    Exact kind branching, never an ``else:`` catch-all that would make an
+    unrecognised kind Docker-shaped. ``guest_operational`` names no object
+    at all -- `validate_request` already proved its target is ``None`` -- so
+    there is nothing structural to decide and it always goes to the guest.
+    """
+
+    if kind == _GUEST_OPERATIONAL_KIND:
+        return None
     try:
         if kind == "systemd_unit_active":
-            _require_exact_systemd_unit(target)
-        else:
-            _require_exact_docker_name(target)
+            _require_exact_systemd_unit(_require_probe_target_string(target))
+        elif kind in ("docker_container_running", "docker_container_healthy"):
+            _require_exact_docker_name(_require_probe_target_string(target))
+        else:  # pragma: no cover - `validate_request` refuses unknown kinds
+            # Never guessed at, and never silently validated as some other
+            # kind's grammar: an unrecognised kind is an answer this file
+            # cannot produce, which is UNKNOWN.
+            return "unknown", "malformed_output"
     except ProbeUnknown as exc:
         return "unknown", exc.reason
     return None
@@ -1407,7 +1474,7 @@ def evaluate_health_contract_settling(
     local_node: str,
     probes: Sequence[dict[str, Any]],
     *,
-    settling_deadline_seconds: float = DEFAULT_SETTLING_DEADLINE_SECONDS,
+    absolute_deadline: float,
     observation_interval_seconds: float = DEFAULT_OBSERVATION_INTERVAL_SECONDS,
     monotonic: Clock = time.monotonic,
     sleep: Sleeper = time.sleep,
@@ -1432,10 +1499,15 @@ def evaluate_health_contract_settling(
     probe FAILED, one still transient, because the deadline hit mid-round)
     become a false durable verdict.
 
-    ``settling_deadline_seconds``/``observation_interval_seconds`` are the
-    caller's ALREADY-CLAMPED policy (`_validate_settling_policy`) -- this
-    function trusts them as given rather than re-clamping, exactly as it
-    trusts every other already-validated field in ``probes``.
+    ``absolute_deadline`` is the ONE monotonic deadline for the whole
+    evaluation, established by `handle_request` from the caller's
+    ALREADY-CLAMPED policy (`_validate_settling_policy`) BEFORE the
+    prologue (`_local_node`, the first `revalidate_live_target`) runs. This
+    function never starts a fresh window of its own: whatever the prologue
+    already spent is spent (PR #80 review MINOR-1).
+    ``observation_interval_seconds`` is likewise already clamped -- this
+    function trusts both as given, exactly as it trusts every other
+    already-validated field in ``probes``.
     """
 
     # Structural target problems are round-independent: fixed forever, and
@@ -1449,14 +1521,13 @@ def evaluate_health_contract_settling(
     structural: dict[int, tuple[str, str]] = {}
     live_probes: list[dict[str, Any]] = []
     for probe in probes:
-        outcome = _structural_probe_outcome(str(probe["kind"]), str(probe["target"]))
+        outcome = _structural_probe_outcome(str(probe["kind"]), probe["target"])
         if outcome is None:
             live_probes.append(probe)
         else:
             structural[int(probe["index"])] = outcome
 
     start = monotonic()
-    absolute_deadline = start + settling_deadline_seconds
     budget = _RoundBudget()
 
     if not live_probes:
@@ -1556,6 +1627,134 @@ def evaluate_health_contract_settling(
 # typed context. Supported adapters: docker, systemd, guest (a fallback, not
 # a fourth workload adapter).
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Adapter PRESENCE oracle -- the load-bearing distinction between
+# "this guest has no Docker/systemd at all" and "Docker/systemd is here but
+# would not answer" (PR #80 review BLOCKER).
+#
+# The frozen rule is `uncertain discovery != no workload`, and the mirror of
+# it is equally load-bearing: an adapter that is genuinely NOT INSTALLED is a
+# POSITIVE, COMPLETE fact about that family -- zero candidates -- not an
+# uncertainty. Without this distinction a guest with no `docker` binary (the
+# ordinary bare or systemd-only guest the `guest_operational` fallback exists
+# for, see PRODUCT.md) answered `undecidable` forever: the fallback and every
+# systemd recommendation were unreachable in production, and the native
+# onboarding flow aborted every time.
+#
+# What this oracle deliberately is NOT: a reading of the family command's own
+# exit status. A bare `docker ps` returning 127 is far too close to the
+# execution/remote-command layer to be granted positive-absence authority --
+# `env`, `pct exec`, and the inter-node `ssh` hop can each produce it for
+# reasons that have nothing to do with whether Docker is installed. Instead
+# this asks one separate, fixed, code-owned question whose exit vocabulary is
+# CHOSEN by this file, so no generic shell/exec status can be mistaken for an
+# answer:
+#
+#     0                 -> adapter present
+#     10                -> adapter absent
+#     anything else     -> undecidable (127 no shell, 126, 255 pct/ssh, a
+#                          signal, a timeout, an output overflow, a failed
+#                          live-target revalidation)
+#
+# PATH fidelity. The family commands resolve their program through `env`
+# (`execvp`), so the oracle must resolve it the same way; it therefore uses
+# the shell's `command -v` under the identical `env LC_ALL=C` prefix rather
+# than testing an assumed absolute path like `/usr/bin/docker`. Verified on
+# Debian 13 / systemd 257: with `PATH` set both mechanisms search the exact
+# same list; with `PATH` unset, dash's built-in default
+# (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) is a
+# strict SUPERSET of `execvp`'s `confstr(_CS_PATH)` fallback
+# (`/bin:/usr/bin`). The only possible divergence is therefore
+# oracle-says-PRESENT while the family command still cannot resolve the
+# program -- which lands in "the query failed", i.e. undecidable. The
+# direction that would be dangerous (claiming ABSENT for a program the
+# family command could have run) cannot occur.
+# ---------------------------------------------------------------------------
+
+#: This file's OWN chosen exit vocabulary -- see the module comment above.
+ADAPTER_PRESENT_EXIT = 0
+ADAPTER_ABSENT_EXIT = 10
+
+ADAPTER_PRESENT = "present"
+ADAPTER_ABSENT = "absent"
+ADAPTER_UNDECIDABLE = "undecidable"
+
+#: The exact programs this file may ask about. Code-owned constants keyed by
+#: adapter; there is no request field through which a caller could name one,
+#: and nothing here is ever built from a target, a probe, or a selector.
+ADAPTER_PRESENCE_PROGRAMS: dict[str, str] = {
+    "docker": "docker",
+    "systemd": "systemctl",
+}
+
+
+def _adapter_presence_script(program: str) -> str:
+    """The complete, code-owned presence test for one fixed program.
+
+    ``program`` is only ever a value from `ADAPTER_PRESENCE_PROGRAMS`, so
+    the returned script is a constant selected from a closed set -- never
+    text assembled from anything a caller supplied.
+    """
+
+    if program not in ADAPTER_PRESENCE_PROGRAMS.values():
+        raise AssertionError("adapter presence program is not a code-owned constant")
+    return (
+        f"command -v {program} > /dev/null 2>&1 && exit {ADAPTER_PRESENT_EXIT}; "
+        f"exit {ADAPTER_ABSENT_EXIT}"
+    )
+
+
+def _adapter_presence(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    adapter: str,
+    *,
+    absolute_deadline: float,
+    monotonic: Clock,
+) -> str:
+    """Prove one adapter present or absent, or answer ``undecidable``.
+
+    Runs through the SAME `_run_guest_command` dispatcher as every other
+    guest command, so it inherits the same fresh live-target revalidation
+    and the same per-command timeout taken from the one absolute discovery
+    deadline. Nothing but this file's own constants crosses the boundary --
+    ``data_arguments`` is deliberately empty.
+    """
+
+    try:
+        result = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            (
+                "env",
+                "LC_ALL=C",
+                "sh",
+                "-c",
+                _adapter_presence_script(ADAPTER_PRESENCE_PROGRAMS[adapter]),
+            ),
+            max_output=4096,
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
+        )
+    except (ProbeUnknown, HealthError):
+        # The guest went away, moved node, or the budget ran out. Never
+        # absence -- this file could not ask the question at all.
+        return ADAPTER_UNDECIDABLE
+    if result.timed_out or result.output_exceeded:
+        return ADAPTER_UNDECIDABLE
+    if result.returncode == ADAPTER_PRESENT_EXIT:
+        return ADAPTER_PRESENT
+    if result.returncode == ADAPTER_ABSENT_EXIT:
+        return ADAPTER_ABSENT
+    # 127 (no shell), 126, 255 (pct/ssh), a signal, or anything else this
+    # file did not choose: the oracle itself did not answer.
+    return ADAPTER_UNDECIDABLE
+
 
 MAX_DOCKER_DISCOVERY_NAMES = 64
 MAX_SYSTEMD_DISCOVERY_UNITS = 128
@@ -1668,9 +1867,30 @@ def _discover_docker_candidates(
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Returns ``(candidates, undecided_status)``. ``undecided_status`` is
     ``None`` on a truthful, complete read (zero candidates included, since a
-    guest can legitimately have no Docker containers at all); otherwise one
-    of the bounded discovery statuses this family could not get past.
+    guest can legitimately have no Docker containers at all, and since a
+    guest can legitimately have no Docker AT ALL); otherwise one of the
+    bounded discovery statuses this family could not get past.
     """
+
+    presence = _adapter_presence(
+        runner,
+        vmid,
+        expected_node,
+        local_node,
+        "docker",
+        absolute_deadline=absolute_deadline,
+        monotonic=monotonic,
+    )
+    if presence == ADAPTER_UNDECIDABLE:
+        return [], "undecidable"
+    if presence == ADAPTER_ABSENT:
+        # POSITIVELY complete, with zero candidates: this guest has no
+        # Docker, so it cannot be running a Docker workload. Deliberately
+        # the same internal shape as "Docker is here and has no containers"
+        # -- the public response contract gains no new status, because the
+        # distinction that matters (proven vs. merely unobserved) has
+        # already been made HERE.
+        return [], None
 
     try:
         result = _run_guest_command(
@@ -1816,7 +2036,23 @@ def _discover_systemd_candidates(
     monotonic: Clock,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Returns ``(candidates, undecided_status)``, exactly like the Docker
-    family above."""
+    family above -- including the positive-absence case: a guest with no
+    ``systemctl`` at all cannot be running a systemd workload, and that is a
+    complete answer rather than an uncertainty."""
+
+    presence = _adapter_presence(
+        runner,
+        vmid,
+        expected_node,
+        local_node,
+        "systemd",
+        absolute_deadline=absolute_deadline,
+        monotonic=monotonic,
+    )
+    if presence == ADAPTER_UNDECIDABLE:
+        return [], "undecidable"
+    if presence == ADAPTER_ABSENT:
+        return [], None
 
     try:
         listed = _run_guest_command(
@@ -2041,16 +2277,21 @@ def discover_health_candidates(
     expected_node: str,
     local_node: str,
     *,
+    absolute_deadline: float,
     monotonic: Clock = time.monotonic,
 ) -> dict[str, Any]:
     """One bounded, ephemeral candidate-discovery read. Never persists
     anything; the caller (the backend) is the only place authority for a
     health contract can ever be created, and only via an explicit operator
     confirmation through the existing typed health-contract mutation.
-    """
 
-    start = monotonic()
-    absolute_deadline = start + DISCOVERY_DEADLINE_SECONDS
+    ``absolute_deadline`` is the ONE monotonic deadline for the whole
+    discovery operation, established by `handle_discover_request` BEFORE its
+    prologue (`_local_node`, the first `revalidate_live_target`). This
+    function never resets it after its caller has already spent time
+    (PR #80 review MINOR-1): the presence oracles and both family reads all
+    draw down the same remaining budget, in order.
+    """
 
     docker_candidates, docker_status = _discover_docker_candidates(
         runner,
@@ -2227,9 +2468,23 @@ def handle_discover_request(
     vmid = request["vmid"]
     expected_node = request["expected_node"]
     resource_id = request["ownership"]["resource_id"]
+    # ONE absolute monotonic deadline for the WHOLE discovery operation,
+    # established BEFORE the prologue so the local-node read, the first
+    # live-target revalidation, both adapter-presence oracles, and both
+    # family reads all draw down the same budget (PR #80 review MINOR-1).
+    absolute_deadline = monotonic() + DISCOVERY_DEADLINE_SECONDS
     try:
-        local_node = _local_node(runner)
-        revalidate_live_target(runner, vmid, expected_node)
+        local_node = _local_node(
+            runner, absolute_deadline=absolute_deadline, monotonic=monotonic
+        )
+        revalidate_live_target(
+            runner,
+            vmid,
+            expected_node,
+            timeout=_require_prologue_timeout(
+                absolute_deadline, monotonic=monotonic
+            ),
+        )
     except HealthError as exc:
         classification = (
             "guest_unavailable"
@@ -2245,7 +2500,12 @@ def handle_discover_request(
             "recommendation_basis": None,
         }
     discovered = discover_health_candidates(
-        runner, vmid, expected_node, local_node, monotonic=monotonic
+        runner,
+        vmid,
+        expected_node,
+        local_node,
+        absolute_deadline=absolute_deadline,
+        monotonic=monotonic,
     )
     return {
         "response_version": 1,
@@ -2280,9 +2540,25 @@ def handle_request(
     vmid = request["vmid"]
     expected_node = request["expected_node"]
     job_id = request["ownership"]["job_id"]
+    # ONE absolute monotonic deadline for the WHOLE evaluation, established
+    # from the already-clamped backend policy BEFORE the prologue, so the
+    # local-node read and the first live-target revalidation are inside the
+    # settling budget rather than added on top of it (PR #80 review
+    # MINOR-1). `evaluate_health_contract_settling` continues spending THIS
+    # deadline; it never starts a fresh one.
+    absolute_deadline = monotonic() + request["settling_deadline_seconds"]
     try:
-        local_node = _local_node(runner)
-        revalidate_live_target(runner, vmid, expected_node)
+        local_node = _local_node(
+            runner, absolute_deadline=absolute_deadline, monotonic=monotonic
+        )
+        revalidate_live_target(
+            runner,
+            vmid,
+            expected_node,
+            timeout=_require_prologue_timeout(
+                absolute_deadline, monotonic=monotonic
+            ),
+        )
     except HealthError as exc:
         return {
             "response_version": 1,
@@ -2300,7 +2576,7 @@ def handle_request(
         expected_node,
         local_node,
         request["probes"],
-        settling_deadline_seconds=request["settling_deadline_seconds"],
+        absolute_deadline=absolute_deadline,
         observation_interval_seconds=request["observation_interval_seconds"],
         monotonic=monotonic,
         sleep=sleep,

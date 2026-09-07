@@ -120,6 +120,17 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
     ),
 }
 
+#: Every probe kind that NAMES a target. `GUEST_OPERATIONAL` is deliberately
+#: absent: it names no container or unit, so no target-shaped reason can
+#: describe it.
+_TARGETED_HEALTH_PROBE_KINDS: frozenset[HealthProbeKind] = frozenset(
+    {
+        HealthProbeKind.SYSTEMD_UNIT_ACTIVE,
+        HealthProbeKind.DOCKER_CONTAINER_RUNNING,
+        HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+    }
+)
+
 HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
     "unit_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
     "unit_not_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
@@ -173,6 +184,14 @@ HEALTH_PROBE_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
         }
     ),
     "guest_operational_confirmed": frozenset({HealthProbeKind.GUEST_OPERATIONAL}),
+    # PR #80 final review: a probe kind that carries NO target can never
+    # truthfully report a target-SHAPED reason. Both tokens are produced
+    # only where a request-supplied target actually exists -- the systemd
+    # batch's positional block-count check, and the remote-node
+    # shell-inertness check over `data_arguments` -- and the
+    # `guest_operational` family passes no data arguments at all.
+    "probe_target_not_exact": frozenset(_TARGETED_HEALTH_PROBE_KINDS),
+    "probe_target_ambiguous": frozenset(_TARGETED_HEALTH_PROBE_KINDS),
 }
 
 
