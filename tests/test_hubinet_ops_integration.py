@@ -746,9 +746,24 @@ def resource_entity_states(
     return states
 
 
+def get_device(
+    registry: dr.DeviceRegistry, identifiers: set[tuple[str, str]]
+) -> dr.DeviceEntry | None:
+    """Look up a single device by identifiers without the deprecated,
+    HA 2026.9.1 ambiguity-resolving `DeviceRegistry.async_get_device`.
+
+    Every call site in this suite looks up one Hubinet-scoped identifier that
+    is unique across the test's config entries, so an unambiguous first match
+    from `async_get_devices` is equivalent for our purposes.
+    """
+    matches = registry.async_get_devices(identifiers=identifiers)
+    return matches[0] if matches else None
+
+
 def resource_device_id(hass: HomeAssistant, resource_id: str) -> str:
-    device = dr.async_get(hass).async_get_device(
-        {(DOMAIN, resource_registry_key(BACKEND_ID, resource_id))}
+    device = get_device(
+        dr.async_get(hass),
+        {(DOMAIN, resource_registry_key(BACKEND_ID, resource_id))},
     )
     assert device is not None
     return device.id
@@ -966,7 +981,8 @@ async def test_backend_instance_mismatch_preserves_previous_view_and_registry(
     )
     assert callback_events == []
     registry = dr.async_get(hass)
-    assert registry.async_get_device(
+    assert get_device(
+        registry,
         {(DOMAIN, node_registry_key(OTHER_BACKEND_ID, NODE_B))}
     ) is None
 
@@ -996,13 +1012,16 @@ async def test_devices_and_entities_are_keyed_by_backend_resource_id(
 ) -> None:
     entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
     registry = dr.async_get(hass)
-    source_device = registry.async_get_device(
+    source_device = get_device(
+        registry,
         {(DOMAIN, source_registry_key(BACKEND_ID, SOURCE_ID))}
     )
-    node_device = registry.async_get_device(
+    node_device = get_device(
+        registry,
         {(DOMAIN, node_registry_key(BACKEND_ID, NODE_A))}
     )
-    resource_device = registry.async_get_device(
+    resource_device = get_device(
+        registry,
         {(DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_CT))}
     )
     assert source_device is not None and node_device is not None
@@ -1064,7 +1083,7 @@ async def test_rename_preserves_identity_and_updates_device_name(
     await entry.runtime_data.async_request_refresh()
     await hass.async_block_till_done()
     assert registry_unique_ids(hass, entry, key) == before
-    device = dr.async_get(hass).async_get_device({(DOMAIN, key)})
+    device = get_device(dr.async_get(hass), {(DOMAIN, key)})
     assert device is not None and device.name == "CT101 Cloudflared Renamed"
 
 
@@ -1093,8 +1112,9 @@ async def test_node_migration_preserves_identity_and_updates_via_device(
     await entry.runtime_data.async_request_refresh()
     await hass.async_block_till_done()
     registry = dr.async_get(hass)
-    child = registry.async_get_device({(DOMAIN, key)})
-    parent = registry.async_get_device(
+    child = get_device(registry, {(DOMAIN, key)})
+    parent = get_device(
+        registry,
         {(DOMAIN, node_registry_key(BACKEND_ID, NODE_B))}
     )
     assert child is not None and parent is not None
@@ -1125,8 +1145,9 @@ async def test_unresolved_node_without_history_clears_via_device_id(
     )
     registry = dr.async_get(hass)
     key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
-    child = registry.async_get_device({(DOMAIN, key)})
-    parent = registry.async_get_device(
+    child = get_device(registry, {(DOMAIN, key)})
+    parent = get_device(
+        registry,
         {(DOMAIN, node_registry_key(BACKEND_ID, NODE_A))}
     )
     assert child is not None and parent is not None
@@ -1136,7 +1157,7 @@ async def test_unresolved_node_without_history_clears_via_device_id(
     await entry.runtime_data.async_request_refresh()
     await hass.async_block_till_done()
 
-    child = registry.async_get_device({(DOMAIN, key)})
+    child = get_device(registry, {(DOMAIN, key)})
     assert child is not None
     assert child.id == original_device_id
     assert child.via_device_id is None
@@ -1164,7 +1185,8 @@ async def test_unresolved_node_retains_last_known_via_device_id(
         FakeTransport([snapshot((INITIAL_RESOURCES[1],)), second]),
     )
     registry = dr.async_get(hass)
-    parent = registry.async_get_device(
+    parent = get_device(
+        registry,
         {(DOMAIN, node_registry_key(BACKEND_ID, NODE_A))}
     )
     assert parent is not None
@@ -1172,7 +1194,8 @@ async def test_unresolved_node_retains_last_known_via_device_id(
     await entry.runtime_data.async_request_refresh()
     await hass.async_block_till_done()
 
-    child = registry.async_get_device(
+    child = get_device(
+        registry,
         {(DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_CT))}
     )
     assert child is not None
@@ -1207,8 +1230,8 @@ async def test_retained_and_successor_generations_share_vmid_without_collision(
     registry = dr.async_get(hass)
     old_key = resource_registry_key(BACKEND_ID, old_id)
     successor_key = resource_registry_key(BACKEND_ID, successor_id)
-    old_device = registry.async_get_device({(DOMAIN, old_key)})
-    successor_device = registry.async_get_device({(DOMAIN, successor_key)})
+    old_device = get_device(registry, {(DOMAIN, old_key)})
+    successor_device = get_device(registry, {(DOMAIN, successor_key)})
     assert old_device is not None and successor_device is not None
     assert old_device.id != successor_device.id
     assert registry_unique_ids(hass, entry, old_key).isdisjoint(
@@ -1673,7 +1696,7 @@ async def test_view_update_plan_rejects_non_resource_hubinet_device(
         if device_kind == "source"
         else node_registry_key(BACKEND_ID, NODE_A)
     )
-    device = dr.async_get(hass).async_get_device({(DOMAIN, identifier)})
+    device = get_device(dr.async_get(hass), {(DOMAIN, identifier)})
     assert device is not None
 
     with pytest.raises(HomeAssistantError, match="exactly one.*resource"):
@@ -3109,7 +3132,7 @@ async def test_ambiguity_preserves_resource_binding_generation_and_device(
     assert current.locator_generation == 7
     assert set(entry.runtime_data.data.resources_by_id) == {RESOURCE_CT}
     key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
-    assert dr.async_get(hass).async_get_device({(DOMAIN, key)}) is not None
+    assert get_device(dr.async_get(hass), {(DOMAIN, key)}) is not None
 
 
 @pytest.mark.parametrize(
@@ -3607,10 +3630,12 @@ async def test_malformed_resource_type_is_rejected_before_publication_and_regist
     )
     assert callback_events == []
     registry = dr.async_get(hass)
-    assert registry.async_get_device(
+    assert get_device(
+        registry,
         {(DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_ADDED))}
     ) is None
-    existing = registry.async_get_device(
+    existing = get_device(
+        registry,
         {(DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_CT))}
     )
     assert existing is not None
@@ -4997,7 +5022,8 @@ async def test_second_entry_failure_leaves_first_intact_then_retry_loads_cleanly
     assert hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
     assert hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
 
-    device_id = dr.async_get(hass).async_get_device(
+    device_id = get_device(
+        dr.async_get(hass),
         {(DOMAIN, resource_registry_key(OTHER_BACKEND_ID, RESOURCE_CT))}
     ).id
     response = await hass.services.async_call(
@@ -5605,10 +5631,12 @@ async def test_health_contract_actions_use_the_dynamic_resource_device_selector(
     transport = FakeTransport([snapshot(INITIAL_RESOURCES)])
     await setup_entry(hass, transport)
     registry = dr.async_get(hass)
-    source_device = registry.async_get_device(
+    source_device = get_device(
+        registry,
         {(DOMAIN, source_registry_key(BACKEND_ID, SOURCE_ID))}
     )
-    node_device = registry.async_get_device(
+    node_device = get_device(
+        registry,
         {(DOMAIN, node_registry_key(BACKEND_ID, NODE_A))}
     )
     assert source_device is not None and node_device is not None

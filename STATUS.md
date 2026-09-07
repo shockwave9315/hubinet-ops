@@ -1121,7 +1121,7 @@ not attestation or defense against an omnipotent PVE root.
   boundary, and no filesystem attestation or cryptographic continuity system
   is planned for it.
 - The Home Assistant test suite requires Python ≥ 3.14.2 with
-  `homeassistant==2026.8.1` and does not run on native Windows, because Home
+  `homeassistant==2026.9.1` and does not run on native Windows, because Home
   Assistant imports POSIX `fcntl` at collection time. The pinned Linux suite in
   the existing local CI equivalent and GitHub CI is the compatibility gate. Do
   not patch Home Assistant or fake `fcntl` around this.
