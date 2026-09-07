@@ -4852,31 +4852,28 @@ class InventoryAuthority:
         is what lets an operator see an UNKNOWN result's exact blocking
         probe(s) without shell or SQLite access (`app/inventory_runtime.py`,
         ``_package_update_health_probes_body``).
+
+        GitHub review P2 #2: when ``probe_evidence`` is non-empty it is
+        testimony about the EXACT resource incarnation the caller's health
+        request named. The caller's own post-host re-proof necessarily runs
+        in a separate, already-closed read transaction, so it cannot by
+        itself close the window between "context was current" and "this
+        event is durably written" -- discovery/reconciliation could still
+        replace or move the resource in between. So THIS write re-proves the
+        identical exact-context predicate the decisive PASS/FAIL path
+        already commits under (:meth:`_post_mutation_job_context_is_current`)
+        atomically, inside this same transaction, immediately before
+        appending the event: if the context is no longer the one the
+        evidence describes, the evidence is dropped and the truthful
+        classification becomes ``resource_context_changed`` instead of
+        whatever blocking reason the now-unusable evidence implied. An
+        UNKNOWN event with no probe evidence at all makes no claim about the
+        current resource incarnation, so it needs no such proof.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
         bounded_reason = _require_unresolved_health_reason(reason)
         recorded_at = _timestamp(self._now())
-        details: dict[str, object] = {"reason": bounded_reason}
-        if probe_evidence:
-            details["probes"] = [
-                {
-                    "index": int(observation.probe_index),
-                    "outcome": HealthProbeOutcome(observation.outcome).value,
-                    "reason": _require_health_probe_reason(observation.reason),
-                }
-                for observation in probe_evidence
-            ]
-        if type(settling_rounds) is int and 0 <= settling_rounds <= 1000:
-            details["rounds"] = settling_rounds
-        if (
-            isinstance(settling_seconds, (int, float))
-            and not isinstance(settling_seconds, bool)
-            and 0 <= settling_seconds <= 3600
-        ):
-            details["settled_seconds"] = round(float(settling_seconds), 3)
-        if type(last_round_span_ms) is int and 0 <= last_round_span_ms <= 3_600_000:
-            details["last_round_span_ms"] = last_round_span_ms
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
@@ -4888,6 +4885,41 @@ class InventoryAuthority:
                 raise AuthorityConflict(
                     "package update job is not inside a health evaluation"
                 )
+
+            effective_reason = bounded_reason
+            effective_probe_evidence: Sequence[HealthProbeObservation] = (
+                probe_evidence
+            )
+            if effective_probe_evidence and not (
+                self._post_mutation_job_context_is_current(connection, job)
+            ):
+                effective_reason = "resource_context_changed"
+                effective_probe_evidence = ()
+
+            details: dict[str, object] = {"reason": effective_reason}
+            if effective_probe_evidence:
+                details["probes"] = [
+                    {
+                        "index": int(observation.probe_index),
+                        "outcome": HealthProbeOutcome(observation.outcome).value,
+                        "reason": _require_health_probe_reason(observation.reason),
+                    }
+                    for observation in effective_probe_evidence
+                ]
+            if type(settling_rounds) is int and 0 <= settling_rounds <= 1000:
+                details["rounds"] = settling_rounds
+            if (
+                isinstance(settling_seconds, (int, float))
+                and not isinstance(settling_seconds, bool)
+                and 0 <= settling_seconds <= 3600
+            ):
+                details["settled_seconds"] = round(float(settling_seconds), 3)
+            if (
+                type(last_round_span_ms) is int
+                and 0 <= last_round_span_ms <= 3_600_000
+            ):
+                details["last_round_span_ms"] = last_round_span_ms
+
             self._append_package_update_job_event(
                 connection,
                 job_id=canonical_job_id,

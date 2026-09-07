@@ -2188,6 +2188,86 @@ def test_an_unresolved_round_with_context_changed_in_flight_publishes_no_probe_e
     assert "probes" not in event.details
 
 
+def test_context_changed_after_post_host_proof_but_before_unknown_evidence_write_drops_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """P2 #2 regression: the orchestrator's own post-host re-proof (step E)
+    necessarily runs in a SEPARATE, already-closed read transaction from the
+    write that persists UNKNOWN probe evidence -- closing the host-call race
+    (the sibling test above) does not close THIS seam. Witness:
+
+    1. context is current before the host call, AND still current when the
+       orchestrator's post-host re-proof runs (`request_calls == 2`, exactly
+       like the decisive check/commit race test);
+    2. the host returned a valid UNRESOLVED result carrying real
+       observations;
+    3. context changes AFTER that post-host proof succeeded but BEFORE the
+       UNKNOWN evidence write commits -- modeled here by breaking
+       incarnation continuity from inside a patched
+       `record_package_update_health_outcome_unknown`, immediately before it
+       delegates to the real one;
+    4. the durably recorded reason is `resource_context_changed`, not the
+       probe's own now-stale blocking reason;
+    5. no probe evidence survives into the durable event.
+
+    This is the exact seam the authority-level fix closes: the write
+    transaction itself re-proves `_post_mutation_job_context_is_current`
+    (the same predicate the decisive PASS/FAIL path commits under)
+    atomically, immediately before appending the event, rather than trusting
+    a proof taken in an earlier, already-closed transaction.
+    """
+
+    from tests.test_package_update_snapshot_safety import (
+        _break_incarnation_continuity_at_the_same_locator,
+    )
+
+    _, store, authority, _, _, _, job = _mutated_job(tmp_path)
+    request_calls = 0
+    original_request = authority.package_update_health_request
+
+    def counted_request(job_id):
+        nonlocal request_calls
+        request_calls += 1
+        return original_request(job_id)
+
+    original_record_unknown = authority.record_package_update_health_outcome_unknown
+
+    def break_context_immediately_before_recording(job_id, reason, **kwargs):
+        # Both orchestrator read proofs -- pre-host (step B) and post-host
+        # (step E) -- have already succeeded by the time this UNKNOWN write
+        # is reached; this is the exact historical gap between that second
+        # proof's already-closed transaction and this write's own.
+        assert request_calls == 2
+        _break_incarnation_continuity_at_the_same_locator(store, authority)
+        return original_record_unknown(job_id, reason, **kwargs)
+
+    monkeypatch.setattr(authority, "package_update_health_request", counted_request)
+    monkeypatch.setattr(
+        authority,
+        "record_package_update_health_outcome_unknown",
+        break_context_immediately_before_recording,
+    )
+
+    host = FakeHealthHostControl(
+        outcomes=(HealthProbeOutcome.UNKNOWN, HealthProbeOutcome.PASSED)
+    )
+    result = PackageUpdateHealthOrchestrator(authority, host).evaluate_job_health(
+        job.job_id
+    )
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert result.job.health_completed_at is None
+    assert result.job.health_outcome is None
+    assert result.job.health_probe_results == ()
+
+    event = store.list_package_update_job_events(job.job_id)[-1]
+    assert event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN
+    assert event.details["reason"] == "resource_context_changed"
+    assert "probes" not in event.details
+
+
 def test_a_job_that_moved_on_mid_attempt_still_reports_no_verdict(
     tmp_path: Path,
 ) -> None:

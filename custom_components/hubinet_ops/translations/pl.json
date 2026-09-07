@@ -55,7 +55,8 @@
     "error": {
       "reset_not_confirmed": "Zaznacz pole potwierdzenia, aby przywrócić wbudowany kontrakt kondycji.",
       "reset_failed": "Hubinet Ops odmówił zresetowania kontraktu kondycji. Nic nie zostało zmienione.",
-      "revision_changed": "Kontrakt kondycji zmienił się od czasu odczytu przez ten formularz. Sprawdź odświeżony kontrakt poniżej i spróbuj ponownie."
+      "revision_changed": "Kontrakt kondycji zmienił się od czasu odczytu przez ten formularz. Sprawdź odświeżony kontrakt poniżej i spróbuj ponownie.",
+      "resource_no_longer_eligible": "Ten zasób nie kwalifikuje się już do utrzymania kontraktu kondycji. Wybierz inny poniżej."
     },
     "step": {
       "init": {

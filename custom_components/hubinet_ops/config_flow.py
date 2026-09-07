@@ -310,7 +310,30 @@ class HubinetOpsOptionsFlow(OptionsFlow):
         if not resources:
             return self.async_abort(reason="no_lxc_resources")
         if user_input is not None:
-            self._resource_id = user_input["resource_id"]
+            selected_resource_id = user_input["resource_id"]
+            # GitHub review P2 #1: `resources` above is rebuilt fresh on
+            # every call from the coordinator's CURRENT data, but the
+            # ``resource_id`` just submitted was chosen against whatever
+            # form was rendered earlier -- a coordinator refresh in between
+            # can make that exact resource lose
+            # `can_configure_health_contract` (or disappear) while this
+            # flow sat open. Never index a capability-filtered mapping with
+            # a selection that predates it: re-render this same step
+            # truthfully, with the freshly current selector and an error,
+            # rather than raise a raw ``KeyError`` or silently trust a stale
+            # choice. HA still owns no backend policy of its own here -- the
+            # membership check below is exactly the same
+            # `can_configure_health_contract` gate `resources` was just
+            # built from.
+            if selected_resource_id not in resources:
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=vol.Schema(
+                        {vol.Required("resource_id"): vol.In(resources)}
+                    ),
+                    errors={"base": "resource_no_longer_eligible"},
+                )
+            self._resource_id = selected_resource_id
             self._resource_name = resources[self._resource_id]
             return await self.async_step_reset_confirm()
         return self.async_show_form(

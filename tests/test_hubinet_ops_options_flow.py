@@ -181,6 +181,60 @@ async def test_no_eligible_lxc_produces_a_truthful_abort(hass: HomeAssistant) ->
 
 
 @pytest.mark.asyncio
+async def test_a_selection_that_loses_eligibility_while_the_form_is_open_is_reprompted(
+    hass: HomeAssistant,
+) -> None:
+    """GitHub review P2 #1's exact TOCTOU witness: two LXCs are eligible when
+    the init form is rendered, the operator selects one, a coordinator
+    refresh happens in the background WHILE that already-rendered form still
+    sits open and strips that exact resource's
+    `can_configure_health_contract` -- the OTHER LXC stays eligible, so the
+    freshly rebuilt `resources` mapping is not empty, it just no longer
+    contains the submitted id. The flow must re-render the same step
+    truthfully with an error, never raise a raw `KeyError` from indexing a
+    capability-filtered mapping with a stale selection -- and the operator
+    must be able to pick the still-eligible resource right away."""
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(can_configure_health_contract=True),
+            RESOURCE_TEST: OperatorCapabilities(can_configure_health_contract=True),
+        },
+    )
+    entry = await setup_entry(hass, transport)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    selectable = result["data_schema"].schema["resource_id"].container
+    assert RESOURCE_CT in selectable
+    assert RESOURCE_TEST in selectable
+
+    # The background coordinator refresh the already-open form cannot see:
+    # RESOURCE_CT loses the capability the about-to-be-submitted selection
+    # depends on, while RESOURCE_TEST remains eligible.
+    transport.operator_capabilities[RESOURCE_CT] = OperatorCapabilities()
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"resource_id": RESOURCE_CT}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    assert result["errors"] == {"base": "resource_no_longer_eligible"}
+    reoffered = result["data_schema"].schema["resource_id"].container
+    assert RESOURCE_CT not in reoffered
+    assert RESOURCE_TEST in reoffered
+
+    # The still-eligible resource can be selected cleanly, in the same flow.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"resource_id": RESOURCE_TEST}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reset_confirm"
+
+
+@pytest.mark.asyncio
 async def test_the_flow_shows_the_current_contract_and_writes_nothing(
     hass: HomeAssistant,
 ) -> None:

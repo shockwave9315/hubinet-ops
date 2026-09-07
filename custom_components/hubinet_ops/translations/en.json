@@ -55,7 +55,8 @@
     "error": {
       "reset_not_confirmed": "Check the confirmation box to restore the built-in health contract.",
       "reset_failed": "Hubinet Ops refused to reset the health contract. Nothing was changed.",
-      "revision_changed": "The health contract changed since this flow read it. Review the refreshed contract below and try again."
+      "revision_changed": "The health contract changed since this flow read it. Review the refreshed contract below and try again.",
+      "resource_no_longer_eligible": "That resource is no longer eligible for health-contract maintenance. Pick another one below."
     },
     "step": {
       "init": {
