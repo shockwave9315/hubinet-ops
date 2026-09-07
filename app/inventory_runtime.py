@@ -97,6 +97,7 @@ from app.inventory import (
     ProductUpdateFenceError,
     ResourceHealthContract,
     ResourceHealthProbe,
+    UNRESOLVED_HEALTH_REASONS,
 )
 from app.inventory_runtime_config import (
     PACKAGE_UPDATE_EXECUTION_TIMEOUT_SECONDS,
@@ -355,7 +356,7 @@ def _latest_health_outcome_unknown_event(
 
 def _package_update_health_observation_body(
     job: PackageUpdateJob, *, store: InventoryAuthorityStore
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
     """Render the LAST unresolved health evaluation's bounded evidence.
 
     Only meaningful while the job is ACTIVE at ``health_started`` with no
@@ -363,11 +364,26 @@ def _package_update_health_observation_body(
     caller and already gates on that). ``kind``/``target`` are joined here
     from the job's own frozen probe rows -- never repeated into event JSON,
     per `InventoryAuthority.record_package_update_health_outcome_unknown`.
+
+    The third element is that attempt's WHOLE-REQUEST classification, and it
+    is the only reason an operator has when the evaluation was refused
+    BEFORE any probe round ran -- the exact current LXC proven stopped being
+    the ordinary case now that `guest_operational` is the default contract.
+    Without it a readback of that job says nothing at all: no verdict, no
+    probe rows, and no reason. It is re-validated against the closed
+    taxonomy here rather than trusted from event JSON, and only ever the
+    LATEST attempt's -- attempts are never merged.
     """
 
     event = _latest_health_outcome_unknown_event(store, job.job_id)
     if event is None:
-        return [], None
+        return [], None, None
+    raw_reason = event.details.get("reason")
+    reason = (
+        raw_reason
+        if isinstance(raw_reason, str) and raw_reason in UNRESOLVED_HEALTH_REASONS
+        else None
+    )
     frozen_by_index = {probe.probe_index: probe for probe in job.health_probes}
     raw_probes = event.details.get("probes")
     probes: list[dict[str, Any]] = []
@@ -411,7 +427,7 @@ def _package_update_health_observation_body(
             "settled_seconds": settled_seconds,
             "last_round_span_ms": last_round_span_ms,
         }
-    return probes, settling
+    return probes, settling, reason
 
 
 def _package_update_health_body(
@@ -428,6 +444,27 @@ def _package_update_health_body(
     verdict always wins once one exists -- `health_completed_at` is set
     exactly once, by the same write-once boundary that would also stop any
     further UNKNOWN event from being appended for this job.
+
+    ``reason`` is the CURRENT unresolved attempt's whole-request bounded
+    classification, and it is deliberately independent of ``evidence``: a
+    refusal that happened before any probe round ran carries no per-probe
+    evidence at all, yet is exactly the case an operator most needs
+    explained. ``guest_operational`` is now the default contract and has no
+    FAIL outcome, so "the exact current LXC is stopped" reaches Home
+    Assistant as `evidence: None`, `probes: []`, `outcome: null` -- three
+    absences, and previously nothing else. `reason: "guest_unavailable"` is
+    the fourth field that makes that state readable.
+
+    It is present ONLY while the job is genuinely unresolved. Once a durable
+    verdict exists the prior attempt's UNKNOWN classification is history,
+    not current state, and publishing it beside a definitive result would
+    describe the job as still-blocked when it is not -- so the verdict
+    branch returns ``None`` for it, exactly as it does for settling.
+
+    Bounded by construction: exactly one token from the closed UNKNOWN
+    taxonomy, re-validated on the way out. Never the event's message, never
+    the rest of its ``details``, never helper stdout/stderr, and never an
+    exception string.
     """
 
     verdict_probes = _package_update_health_verdict_probes_body(job)
@@ -436,15 +473,32 @@ def _package_update_health_body(
             "evidence": "verdict",
             "probes": verdict_probes,
             "settling": None,
+            "reason": None,
         }
     if (
         job.status is PackageUpdateJobStatus.ACTIVE
         and job.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
     ):
-        probes, settling = _package_update_health_observation_body(job, store=store)
+        probes, settling, reason = _package_update_health_observation_body(
+            job, store=store
+        )
         if probes:
-            return {"evidence": "observation", "probes": probes, "settling": settling}
-    return {"evidence": None, "probes": [], "settling": None}
+            return {
+                "evidence": "observation",
+                "probes": probes,
+                "settling": settling,
+                "reason": reason,
+            }
+        if reason is not None:
+            # The whole-request refusal case: no round ever completed, so
+            # there is no observation to show -- only the classification.
+            return {
+                "evidence": None,
+                "probes": [],
+                "settling": None,
+                "reason": reason,
+            }
+    return {"evidence": None, "probes": [], "settling": None, "reason": None}
 
 
 def _package_update_job_body(

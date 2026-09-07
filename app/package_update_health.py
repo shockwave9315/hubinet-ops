@@ -296,11 +296,14 @@ class PackageUpdateHealthHostControl(Protocol):
 class PackageUpdateHealthOrchestrator:
     """Coordinate authority and one dark host boundary for one evaluation.
 
-    Instantiated only by hermetic tests in this stage. It performs no package
-    mutation, no snapshot operation, and no rollback -- and, critically, it
-    never CALLS the rollback stage either. A failing health verdict is
-    reported and nothing else happens; see `PRODUCT.md` on why automatic
-    compensation is a separate, unmade decision.
+    PRODUCTION-REACHABLE, and built by the composition root: see the module
+    docstring above -- `app/inventory_runtime.py`'s
+    `_build_package_update_runtime` constructs it and composes it into the
+    one `PackageUpdateWorker`, which is its only caller. It performs no
+    package mutation, no snapshot operation, and no rollback -- and,
+    critically, it never CALLS the rollback stage either. A failing health
+    verdict is reported and nothing else happens; see `PRODUCT.md` on why
+    automatic compensation is a separate, unmade decision.
 
     Every host round trip happens strictly OUTSIDE this store's writer
     transactions. The authority transitions here are short and local: start

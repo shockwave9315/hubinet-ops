@@ -2480,6 +2480,56 @@ def test_end_to_end_a_guest_that_is_not_running_is_unknown(tmp_path: Path) -> No
     assert event.details["reason"] == "guest_unavailable"
 
 
+def test_end_to_end_a_stopped_guest_under_the_default_contract_is_readable(
+    tmp_path: Path,
+) -> None:
+    """The MAJOR PR #80 review finding, end to end through the REAL helper.
+
+    `guest_operational` is the v0.5 default contract, so this is the
+    ORDINARY shape of "the update ran and the container did not come back":
+    PVE positively reports the exact current LXC stopped, the helper refuses
+    the whole request before any probe round, and the evaluation is UNKNOWN
+    with no verdict and no per-probe evidence to show.
+
+    Before the readback carried a bounded reason, that job reached Home
+    Assistant as three silent absences -- outcome null, evidence null,
+    probes empty -- and an operator had to read the backend's SQLite
+    database to learn the guest was simply not running. The whole-request
+    classification is now part of the explicit readback.
+    """
+
+    from app.inventory_runtime import _package_update_health_body
+
+    def stop_the_guest(guest):
+        guest.running = False
+
+    store, authority, guest, result = _end_to_end(
+        tmp_path,
+        stop_the_guest,
+        probes=(ResourceHealthProbe(kind=HealthProbeKind.GUEST_OPERATIONAL, target=None),),
+    )
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert result.job.health_outcome is None
+    assert result.job.health_probe_results == ()
+
+    body = _package_update_health_body(result.job, store=store)
+    assert body == {
+        "evidence": None,
+        "probes": [],
+        "settling": None,
+        "reason": "guest_unavailable",
+    }
+
+    # Recovery is untouched: the job still owns its snapshot, and explicit
+    # same-job rollback is still armable from `health_started`. Nothing here
+    # armed one -- there is no auto-rollback.
+    assert authority.package_update_rollback_identity(result.job.job_id)
+    assert result.job.rollback_may_have_started_at is None
+
+
 def test_end_to_end_a_guest_that_moved_node_is_unknown(tmp_path: Path) -> None:
     def move_the_guest(guest):
         guest.current_node = "pve-b"

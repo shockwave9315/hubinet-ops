@@ -111,6 +111,38 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
 #: durable, non-recheckable PASSED/FAILED result.
 HEALTH_EVIDENCE_KINDS: frozenset[str] = frozenset({"observation", "verdict"})
 
+#: Mirrors `app/inventory/health_observation.py::UNRESOLVED_HEALTH_REASONS`:
+#: the UNKNOWN family, and the ONLY tokens `health_reason` may carry.
+#:
+#: Deliberately mirrored rather than imported -- this integration validates
+#: what the backend sent instead of trusting it, and a shared import would
+#: make the two agree by construction rather than by proof. A backend that
+#: sends a PASSED-only token as the reason a job has no result is sending a
+#: self-contradictory payload, and it is refused here.
+UNRESOLVED_HEALTH_REASONS: frozenset[str] = frozenset(
+    {
+        "probe_target_not_exact",
+        "probe_target_ambiguous",
+        "guest_unavailable",
+        "command_failed",
+        "command_timed_out",
+        "malformed_output",
+        "docker_daemon_unavailable",
+        "host_unreachable",
+        "host_response_rejected",
+        "resource_context_changed",
+        "container_health_starting",
+        "container_restarting",
+        "container_not_started_yet",
+        "container_removing",
+        "unit_activating",
+        "unit_deactivating",
+        "unit_reloading",
+        "unit_job_pending",
+        "settling_budget_exhausted",
+    }
+)
+
 #: Mirrors `app/inventory/health_observation.py::HEALTH_PROBE_REASONS_BY_
 #: OUTCOME`. A reason token that is syntactically bounded (in
 #: `HEALTH_PROBE_REASONS`) but semantically impossible for the outcome it
@@ -386,6 +418,41 @@ def validate_package_update_job_view(view: "PackageUpdateJobView") -> None:
     _validate_package_update_job_health_probes(view)
 
 
+def _validate_unresolved_health_reason(view: "PackageUpdateJobView") -> None:
+    """Prove the whole-request UNKNOWN classification is bounded and CURRENT.
+
+    Two independent rules, and neither is derivable from the other:
+
+    - it is one token from the closed UNKNOWN family, or absent. A
+      free-form string, an unknown token, or a token that only ever
+      describes a positive proof (`unit_active`) or a proven-false conjunct
+      (`container_absent`) is a self-contradictory answer to "why is there
+      still no result", and is refused rather than rendered.
+    - it may accompany an unresolved job only. Once ``health_outcome``
+      exists the job HAS a definitive result, and a prior attempt's UNKNOWN
+      classification is history; publishing it alongside would describe a
+      finished job as still blocked. A PASSED verdict carrying
+      `guest_unavailable` is exactly the stale-reason payload this refuses.
+
+    Deliberately NOT coupled to ``health_evidence``: the case this field
+    exists for -- a refusal before any probe round ran -- has no evidence at
+    all, so requiring one would reject the very payload it must accept.
+    """
+
+    reason = view.health_reason
+    if reason is None:
+        return
+    if not isinstance(reason, str) or reason not in UNRESOLVED_HEALTH_REASONS:
+        raise ValueError(
+            "job health_reason is not a known bounded unresolved reason token"
+        )
+    if view.health_outcome is not None:
+        raise ValueError(
+            "job health_reason must be absent once a definitive health "
+            "verdict exists"
+        )
+
+
 def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> None:
     """Validate the per-probe health evidence, if any is present.
 
@@ -409,6 +476,7 @@ def _validate_package_update_job_health_probes(view: "PackageUpdateJobView") -> 
         raise ValueError("job health_probes exceeds the maximum probe count")
     if view.health_evidence is not None and view.health_evidence not in HEALTH_EVIDENCE_KINDS:
         raise ValueError("job health_evidence is not a known evidence kind")
+    _validate_unresolved_health_reason(view)
     if bool(probes) != (view.health_evidence is not None):
         raise ValueError(
             "job health_probes must be present exactly when health_evidence "

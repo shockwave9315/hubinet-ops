@@ -2191,18 +2191,24 @@ def test_no_detached_boundary_keeps_the_old_unchecked_spawn(source_name: str) ->
 
 
 def test_ha_integration_contains_no_docker_or_systemd_inspection_logic() -> None:
-    """Stage 4 (v20): health-candidate discovery -- Docker HEALTHCHECK
-    detection, systemd unit-file/failed-unit enumeration, and origin/
-    role_hint classification -- lives entirely on the backend
-    (`deploy/hubinet-package-health-helper.py`). Home Assistant only ever
-    renders an already-classified, already-bounded `HealthDiscoveryResult`
-    it fetched over one typed HTTP route; it must never itself run, parse,
-    or reimplement any part of that classification.
+    """Home Assistant is presentation plus explicit operator input.
 
-    Asserted as the absence of the exact literals the backend's own
-    discovery engine owns (Docker/systemd CLI invocations and output-field
-    names no HA-side parser has any legitimate reason to mention), across
-    every Python file the integration ships.
+    It contains no workload discovery and no workload inference of any kind
+    -- it never runs, parses, or reimplements a Docker or systemd read, and
+    it never decides from one what a resource's health contract should be.
+    The BASELINE is backend product policy (the built-in `guest_operational`
+    contract, provisioned during reconciliation). An ADVANCED Docker/systemd
+    contract is typed by an operator and forwarded unchanged. Docker and
+    systemd are actually executed in exactly one place: the job-bound
+    forced-command helper (`deploy/hubinet-package-health-helper.py`), for
+    probes an operator explicitly declared.
+
+    Asserted as the absence of the exact literals such logic would need --
+    Docker/systemd CLI invocations, their output-field names, and any local
+    execution primitive -- across every Python file the integration ships.
+    A multi-word literal is meaningful here because this scans RAW source
+    rather than a token stream (contrast `_WORKLOAD_INFERENCE_MARKERS`,
+    which must stay single-token for exactly that reason).
     """
 
     forbidden_substrings = (

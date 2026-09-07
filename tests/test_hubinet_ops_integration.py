@@ -5647,6 +5647,7 @@ def job_view(
     events: tuple[PackageUpdateJobEvent, ...] = (),
     health_probes: tuple[PackageUpdateJobHealthProbeResult, ...] = (),
     health_evidence: str | None = None,
+    health_reason: str | None = None,
 ) -> PackageUpdateJobView:
     if health_evidence is None and health_probes:
         health_evidence = "verdict"
@@ -5674,6 +5675,7 @@ def job_view(
         events=events,
         health_probes=health_probes,
         health_evidence=health_evidence,
+        health_reason=health_reason,
     )
 
 
@@ -6227,6 +6229,186 @@ async def test_view_update_job_notification_lists_which_probe_failed_and_why(
     assert r"weatherhub\-redis\-1" in message
     assert r"container\_unhealthy" in message
     assert r"docker\_container\_healthy" in message
+
+
+def _stopped_guest_job():
+    """The exact shape a stopped guest under the DEFAULT contract produces:
+    no verdict, no evidence kind, no probe rows -- and one bounded
+    whole-request classification."""
+
+    return job_view(
+        checkpoint="health_started",
+        health_outcome=None,
+        rollback_available=True,
+        health_probes=(),
+        health_evidence=None,
+        health_reason="guest_unavailable",
+    )
+
+
+def _stopped_guest_transport():
+    active = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        package_update_job=PackageUpdateJobSummary(
+            state=PackageUpdateJobState.ACTIVE,
+            job_id=JOB_ID,
+            checkpoint="health_started",
+            issued_at="2026-08-08T11:00:00+00:00",
+            package_count=24,
+            health_outcome=None,
+            health_started_at="2026-08-08T11:09:00+00:00",
+            snapshot_confirmed_at="2026-08-08T11:01:00+00:00",
+            mutation_completed_at="2026-08-08T11:08:00+00:00",
+            rollback_available=True,
+        ),
+    )
+    return FakeTransport(
+        [snapshot((active,))],
+        package_update_jobs={RESOURCE_CT: _stopped_guest_job()},
+        operator_capabilities={
+            RESOURCE_CT: OperatorCapabilities(can_view_update_job=True)
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_view_update_job_response_carries_the_unresolved_health_reason(
+    hass: HomeAssistant,
+) -> None:
+    """The MAJOR PR #80 review finding, at the action an operator invokes.
+
+    `guest_operational` is the default contract and has no FAIL outcome, so
+    "the container did not come back" arrives as no verdict, no evidence,
+    and no probe rows. The bounded whole-request classification is the only
+    field that makes that job explicable without backend shell access.
+    """
+
+    transport = _stopped_guest_transport()
+    await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_JOB,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response["health_outcome"] is None
+    assert response["health_evidence"] is None
+    assert response["health_probes"] == []
+    assert response["health_reason"] == "guest_unavailable"
+    assert response["rollback_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_view_update_job_notification_explains_a_stopped_guest(
+    hass: HomeAssistant,
+) -> None:
+    """The zero-probe case must still READ as something, in English.
+
+    The rendered text is this integration's own fixed translation of a
+    bounded token -- never backend prose, never helper output.
+    """
+
+    transport = _stopped_guest_transport()
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "view_update_job"
+                )
+            },
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    message = create_notification.call_args.args[1]
+    assert "No definitive result" in message
+    assert "**Reason:**" in message
+    assert "The guest is not running" in message
+    assert "trusted boundary" in message
+    # Truthfully still recoverable, and still explicitly so.
+    assert "**Rollback available:** Yes" in message
+    # The raw token is not what an operator is asked to interpret.
+    assert "guest_unavailable" not in message
+
+
+@pytest.mark.asyncio
+async def test_stopped_guest_notification_uses_polish_operator_translations(
+    hass: HomeAssistant,
+) -> None:
+    hass.config.language = "pl"
+    transport = _stopped_guest_transport()
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "view_update_job"
+                )
+            },
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    message = create_notification.call_args.args[1]
+    assert "**Powód:**" in message
+    assert "Kontener nie jest uruchomiony" in message
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_reason_token_degrades_to_the_token_not_a_crash(
+    hass: HomeAssistant,
+) -> None:
+    """A bounded token this integration has no translation for yet.
+
+    The taxonomy is backend-owned, so an integration built against an older
+    copy of it must still render the readback -- showing the raw token
+    rather than raising and hiding the whole job.
+    """
+
+    transport = _stopped_guest_transport()
+    transport.package_update_jobs[RESOURCE_CT] = job_view(
+        checkpoint="health_started",
+        rollback_available=True,
+        health_reason="settling_budget_exhausted",
+    )
+    entry = await setup_entry(hass, transport)
+
+    with patch(
+        "custom_components.hubinet_ops.button._tr_optional", return_value=None
+    ), patch(
+        "custom_components.hubinet_ops.button.persistent_notification.async_create"
+    ) as create_notification:
+        await hass.services.async_call(
+            "button",
+            "press",
+            {
+                "entity_id": resource_entity_id(
+                    hass, entry, RESOURCE_CT, "view_update_job"
+                )
+            },
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    message = create_notification.call_args.args[1]
+    assert r"settling\_budget\_exhausted" in message
 
 
 @pytest.mark.asyncio

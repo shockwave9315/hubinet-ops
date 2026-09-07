@@ -66,8 +66,8 @@ AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
 #: that enum (`_HEALTH_PROBE_KIND_SQL` below), so a new member changes the
 #: DDL text new databases are created with; an already-created v19
 #: database's existing CHECK does not retroactively gain it. `target` also
-#: becomes nullable for probes of this one kind (a guest-level fallback
-#: check has no container/unit target to name -- never a faked one; see
+#: becomes nullable for probes of this one kind (the built-in guest-liveness
+#: default names no container or unit -- never a faked one; see
 #: `_HEALTH_PROBE_TARGET_OR_GUEST_CHECK_SQL`). Pre-release authority schemas
 #: are not migrated in place (`AGENTS.md`): this is the anticipated
 #: backed-up-reset path, not an ad hoc in-place SQL migration.

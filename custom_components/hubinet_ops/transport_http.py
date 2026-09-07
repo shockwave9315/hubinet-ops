@@ -512,6 +512,12 @@ def _package_update_job_view(
         evidence = health.get("evidence")
         if evidence is not None:
             evidence = _strict_str(evidence, "health.evidence")
+        health_reason = health.get("reason")
+        if health_reason is not None:
+            # Strictly typed here; the closed-taxonomy and
+            # not-beside-a-verdict rules are re-proved independently in
+            # `validate_package_update_job_view`.
+            health_reason = _strict_str(health_reason, "health.reason")
         return PackageUpdateJobView(
             job_id=_strict_str(payload["job_id"], "job_id"),
             request_id=_strict_str(payload["request_id"], "request_id"),
@@ -556,6 +562,7 @@ def _package_update_job_view(
                 for probe in health.get("probes", ())
             ),
             health_evidence=evidence,
+            health_reason=health_reason,
         )
     except HubinetOpsInvalidResponse:
         raise

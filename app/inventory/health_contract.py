@@ -1,16 +1,25 @@
-"""Operator-declared per-resource workload health contracts.
+"""Per-resource workload health contracts.
 
 A health contract is CONFIGURATION, not a result. It says what "healthy"
 means for one exact dynamic resource incarnation, and nothing here executes,
 schedules, or interprets a probe: this module only canonicalizes, validates,
-and fingerprints the operator's declaration so the durable authority row is
-bounded and deterministic.
+and fingerprints a declaration so the durable authority row is bounded and
+deterministic.
 
-The three rules that shape everything below:
+Two things declare one, and the split is the whole v0.5 product decision.
+The BASELINE is BACKEND-OWNED: every current package-managed LXC is
+provisioned `DEFAULT_HEALTH_PROBES` below, as product policy. An ADVANCED
+contract is OPERATOR-DECLARED: an operator may explicitly replace that
+baseline with named Docker/systemd probes, and it is then theirs until they
+explicitly reset it. Neither half is INFERRED -- nothing anywhere reads a
+guest to decide what its contract should be.
 
-- **Health is operator-declared per `resource_id`.** Never per VMID, per
-  hostname, per node, and never from a repository or config file. A VMID-reused
-  replacement is a different resource incarnation and inherits nothing.
+The rules that shape everything below:
+
+- **A contract belongs to one exact `resource_id`.** Never a VMID, a
+  hostname, a node, or a repository/config file, and never derived from what
+  a guest appears to run. A VMID-reused replacement is a different resource
+  incarnation and inherits nothing.
 - **All configured probes are required.** There is no OR tree, no scoring, no
   percentage, and no boolean expression -- exactly an AND over the declared
   set. That is why a probe set needs no structure beyond a canonical ordering.

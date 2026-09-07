@@ -485,7 +485,10 @@ class PackageUpdateJobView:
     SQLite database directly to learn which frozen probe failed and why, so
     the per-probe evidence this stage already computes -- kind, target,
     outcome, checked-at, and a bounded reason token -- is now part of the
-    explicit readback too. It stays empty until a definitive verdict exists.
+    explicit readback too. It carries a definitive verdict's results, and
+    (post-Human1 Stage 2) an unresolved evaluation's bounded observation
+    evidence; it is empty when neither exists, including the whole-request
+    refusal that ``health_reason`` below is there to explain.
 
     ``rollback_available`` is the one *authority-freshness* exception, and
     deliberately so (GitHub
@@ -525,6 +528,21 @@ class PackageUpdateJobView:
     #: evidence from an unresolved evaluation), or ``"verdict"`` (a durable
     #: definitive result) -- see `PackageUpdateJobHealthProbeResult.definitive`.
     health_evidence: str | None = None
+    #: The CURRENT unresolved evaluation's whole-request classification: one
+    #: bounded token from the closed UNKNOWN taxonomy, or ``None``.
+    #:
+    #: Independent of ``health_evidence``, and that independence is the
+    #: point. A refusal that happened before any probe round ran carries no
+    #: per-probe evidence -- and with `guest_operational` as the default
+    #: contract, "the exact current LXC is stopped" is exactly that shape:
+    #: no verdict, no probes, no evidence. This field is what makes that
+    #: state readable instead of three silent absences.
+    #:
+    #: Present only while the job is genuinely unresolved. A durable verdict
+    #: retires it: a prior attempt's UNKNOWN classification is history, not
+    #: current state, and `validate_package_update_job_view` refuses a
+    #: payload that publishes one beside a definitive result.
+    health_reason: str | None = None
 
     def __post_init__(self) -> None:
         _require_uuid_identity(self.job_id, "job_id")

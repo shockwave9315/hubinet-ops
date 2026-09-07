@@ -517,7 +517,10 @@ def _job_response(
     included (post-Human1 correction): each frozen probe's kind, target,
     outcome, checked-at, and bounded reason token, so a FAILED or UNKNOWN
     health result is actionable from Home Assistant without shell/SQLite
-    access. It stays empty until a definitive verdict exists.
+    access. ``health_reason`` is the companion fact for the case that
+    evidence cannot cover: a whole-request refusal that happened before any
+    probe round ran leaves no verdict and no probes, and this bounded token
+    is the only thing that says why.
     """
 
     return {
@@ -541,6 +544,7 @@ def _job_response(
             None if job.health_outcome is None else job.health_outcome.value
         ),
         "health_evidence": job.health_evidence,
+        "health_reason": job.health_reason,
         "rollback_may_have_started_at": job.rollback_may_have_started_at,
         "rollback_completed_at": job.rollback_completed_at,
         "rollback_available": job.rollback_available,

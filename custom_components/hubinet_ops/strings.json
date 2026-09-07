@@ -355,7 +355,8 @@
         "mutation_completed": "Package mutation completed",
         "health_result": "Health result",
         "rollback_available": "Rollback available",
-        "terminal_reason": "Terminal reason"
+        "terminal_reason": "Terminal reason",
+        "health_reason": "Reason"
       },
       "health_probes": {
         "heading": "Per-probe health evidence",
@@ -366,6 +367,27 @@
           "failed": "FAILED",
           "unknown": "UNKNOWN"
         }
+      },
+      "health_reason": {
+        "command_failed": "A required read-only guest command did not succeed.",
+        "command_timed_out": "A required read-only guest command did not finish in time.",
+        "container_health_starting": "A declared container is still running its first health check after a restart.",
+        "container_not_started_yet": "A declared container has been created but not started yet.",
+        "container_removing": "A declared container is being removed.",
+        "container_restarting": "A declared container is restarting.",
+        "docker_daemon_unavailable": "The Docker daemon did not answer inside the guest.",
+        "guest_unavailable": "The guest is not running, or PVE could not reach it through the trusted boundary.",
+        "host_response_rejected": "The health boundary's answer could not be believed, so no verdict was recorded.",
+        "host_unreachable": "The health boundary did not return an answer.",
+        "malformed_output": "A required read-only guest command returned output that could not be read.",
+        "probe_target_ambiguous": "A declared probe target matched more than one object.",
+        "probe_target_not_exact": "A declared probe target could not be resolved to exactly one object.",
+        "resource_context_changed": "The exact resource, locator, or node this job names is no longer current.",
+        "settling_budget_exhausted": "The bounded settling window ran out before this probe could be evaluated.",
+        "unit_activating": "A declared systemd unit is still activating.",
+        "unit_deactivating": "A declared systemd unit is deactivating.",
+        "unit_job_pending": "A declared systemd unit still has a pending systemd job.",
+        "unit_reloading": "A declared systemd unit is reloading."
       }
     },
     "health": {

@@ -83,6 +83,7 @@ from .product_update_fence import (
 )
 from .health_observation import (
     HEALTH_PROBE_REASONS,
+    HEALTH_PROBE_REASONS_BY_OUTCOME,
     require_health_probe_semantics,
 )
 from .mutation_completion import (
@@ -162,6 +163,25 @@ def _require_health_probe_reason(value: object) -> str:
     if not isinstance(value, str) or value not in HEALTH_PROBE_REASONS:
         raise AuthorityConflict("health probe reason is not a known bounded token")
     return value
+
+
+def _require_unresolved_health_reason(value: object) -> str:
+    """The classification an UNKNOWN health evaluation may be recorded under.
+
+    Strictly the UNKNOWN family of the closed taxonomy, never the whole of
+    it. An attempt that reached no verdict cannot truthfully be summarized
+    by a token that only ever describes a POSITIVE proof (`unit_active`) or
+    a proven-false conjunct (`container_absent`), and this field is read
+    back to an operator as the current reason there is still no result -- so
+    a self-contradictory pairing is refused here rather than published.
+    """
+
+    reason = _require_health_probe_reason(value)
+    if reason not in HEALTH_PROBE_REASONS_BY_OUTCOME[HealthProbeOutcome.UNKNOWN]:
+        raise AuthorityConflict(
+            "an unresolved health evaluation reason must be an UNKNOWN-family token"
+        )
+    return reason
 
 
 def _match_health_observations_to_frozen_probes(
@@ -4813,7 +4833,7 @@ class InventoryAuthority:
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        bounded_reason = _require_health_probe_reason(reason)
+        bounded_reason = _require_unresolved_health_reason(reason)
         recorded_at = _timestamp(self._now())
         details: dict[str, object] = {"reason": bounded_reason}
         if probe_evidence:

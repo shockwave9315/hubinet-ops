@@ -74,9 +74,11 @@ a guest in Proxmox never requires touching this repository or its config.
   above, with per-resource **Start**, **View job**, **Resume**, and **Roll
   back** buttons. Concise sensors show the latest job status, checkpoint,
   package count, health outcome, and authoritative rollback availability;
-  exact bounded job details, recent durable events, and — once a definitive
-  health verdict exists — every frozen probe's kind, target, outcome, and a
-  bounded reason token appear in a persistent notification only when
+  exact bounded job details, recent durable events, every frozen probe's
+  kind, target, outcome, and bounded reason token, and — when an evaluation
+  reached no result at all, which is what a guest that did not come back
+  looks like — a fixed localized explanation of the bounded reason there is
+  still no verdict, all appear in a persistent notification only when
   requested.
 - An automated Proxmox bootstrap that provisions the whole backend.
 - An in-place updater for an existing installation: install once, update

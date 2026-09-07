@@ -121,6 +121,19 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
     ),
 }
 
+#: The UNKNOWN family, named once so every layer that has to talk about "why
+#: is there still no result" agrees on the same closed set: the authority's
+#: own unresolved-event validation, the R0 job readback, and Home Assistant's
+#: independent re-validation of what the backend sent.
+#:
+#: A whole-request refusal (`guest_unavailable` for an exact current LXC PVE
+#: proves stopped, say) is classified from exactly this set, so a job that
+#: reached no verdict can never be summarized by a token that only ever
+#: describes a positive proof or a proven-false conjunct.
+UNRESOLVED_HEALTH_REASONS: frozenset[str] = HEALTH_PROBE_REASONS_BY_OUTCOME[
+    HealthProbeOutcome.UNKNOWN
+]
+
 #: Every probe kind that NAMES a target. `GUEST_OPERATIONAL` is deliberately
 #: absent: it names no container or unit, so no target-shaped reason can
 #: describe it.

@@ -1203,6 +1203,121 @@ def test_package_update_job_view_defaults_to_no_probes_when_absent() -> None:
     assert view.health_probes == ()
 
 
+def test_package_update_job_view_parses_a_whole_request_unresolved_reason() -> None:
+    """The MAJOR PR #80 review finding, from Home Assistant's side.
+
+    The exact wire shape a stopped guest under the default
+    `guest_operational` contract produces: no verdict, no evidence kind, no
+    probe rows -- and one bounded classification that is the ONLY thing
+    telling an operator why. All four must survive the real parse together;
+    a payload like this used to arrive stripped of the fourth.
+    """
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_started"
+    payload["health"] = {
+        "contract_revision": 3,
+        "started_at": "2026-09-06T13:40:16.792041+00:00",
+        "completed_at": None,
+        "outcome": None,
+        "evidence": None,
+        "probes": [],
+        "settling": None,
+        "reason": "guest_unavailable",
+    }
+
+    view = _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+    assert view.health_outcome is None
+    assert view.health_evidence is None
+    assert view.health_probes == ()
+    assert view.health_reason == "guest_unavailable"
+
+
+def test_package_update_job_view_defaults_to_no_unresolved_reason() -> None:
+    """An absent key is "nothing to report", never a parse failure."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    assert "reason" not in payload["health"]
+
+    view = _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+    assert view.health_reason is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "definitely-not-a-token",
+        "",
+        "unit_active",
+        "container_absent",
+        7,
+        True,
+    ),
+    ids=(
+        "free_form",
+        "empty",
+        "passed_only_token",
+        "failed_only_token",
+        "integer",
+        "boolean",
+    ),
+)
+def test_package_update_job_view_rejects_a_non_unresolved_reason(reason) -> None:
+    """Home Assistant proves the taxonomy itself, never trusting a string
+    merely because a backend sent it.
+
+    `unit_active` and `container_absent` are the interesting rows: both ARE
+    bounded tokens of the wider probe taxonomy, and both are impossible as
+    the reason a job reached NO result -- one only ever describes a positive
+    proof, the other a proven-false conjunct.
+    """
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_started"
+    payload["health"] = {
+        "contract_revision": 3,
+        "outcome": None,
+        "evidence": None,
+        "probes": [],
+        "reason": reason,
+    }
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
+def test_package_update_job_view_rejects_a_stale_reason_beside_a_verdict() -> None:
+    """Once a durable verdict exists the earlier UNKNOWN classification is
+    history. A payload publishing both describes a finished job as still
+    blocked, and a PASSED job as having been unable to reach the guest --
+    self-contradictory, and refused rather than rendered."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_completed"
+    payload["health"] = {
+        "contract_revision": 3,
+        "outcome": "passed",
+        "evidence": "verdict",
+        "probes": [
+            {
+                "index": 0,
+                "kind": "guest_operational",
+                "target": None,
+                "outcome": "passed",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "guest_operational_confirmed",
+                "definitive": True,
+            },
+        ],
+        "reason": "guest_unavailable",
+    }
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
+
+
 def test_package_update_job_view_rejects_an_unknown_probe_outcome() -> None:
     """A malformed backend answer must fail closed, never render a guess."""
 

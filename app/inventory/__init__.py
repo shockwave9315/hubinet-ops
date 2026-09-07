@@ -22,6 +22,7 @@ from .health_contract import (
 )
 from .health_observation import (
     HEALTH_PROBE_REASONS,
+    UNRESOLVED_HEALTH_REASONS,
 )
 from .package_update_issuance import (
     PACKAGE_UPDATE_ISSUANCE_REFUSALS,
@@ -274,6 +275,7 @@ __all__ = [
     "SnapshotSubmissionRefusedBeforeCallback",
     "SourceEndpoint",
     "SourceRuntimeHealth",
+    "UNRESOLVED_HEALTH_REASONS",
     "WRITER_SCHEDULING_MARGIN_SECONDS",
     "aggregate_health_outcome",
     "build_snapshot_ownership",

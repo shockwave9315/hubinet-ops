@@ -1001,6 +1001,27 @@ The operator-triggered update lifecycle is production reachable.
   advanced operator configuration, executed by the same job-bound helper as
   before; their absence or failure has no influence on the default path.
 
+  **An unresolved health evaluation now publishes WHY, not only that it is
+  unresolved.** Independent review of the pivot found that the reason was
+  computed, bounded, and durably recorded — and then lost before Home
+  Assistant. With `guest_operational` as the default contract, PVE proving
+  the exact current LXC STOPPED is the ORDINARY post-update failure: the
+  helper refuses the whole request before any probe round, so the job
+  truthfully has no verdict, no evidence kind, and no probe rows. Those
+  three absences were all an operator saw; the actual classification
+  (`guest_unavailable`) lived only in the durable event's `details`, which
+  the HA transport does not carry. `GET .../package-update` now publishes
+  `health.reason` — exactly one token from the closed UNKNOWN taxonomy, from
+  the LATEST attempt only, never merged, and retired the moment a durable
+  verdict exists. Home Assistant re-proves the taxonomy itself rather than
+  trusting the string, refuses a reason published beside a definitive
+  verdict, and renders a fixed EN/PL description of the token — never
+  backend prose, never helper output. Nothing else about the event reaches
+  the wire. Rollback is unaffected and was reverified: `health_started` stays
+  rollback-eligible and `_post_mutation_job_context_is_current` still imposes
+  no running-status requirement, so a dead guest keeps its explicit same-job
+  recovery path. Still no auto-rollback, and still no new Repair family.
+
   **The `health_contract_unconfigured` Repair is a non-fixable safety net.**
   The backend default normally makes its premise unreachable; when it does
   occur it names the two explicit remedies (Options → reset, or

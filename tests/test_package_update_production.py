@@ -57,6 +57,7 @@ from app.inventory import (
     PackageUpdateIssuanceRefused,
     PackageUpdateJobStatus,
     ProductUpdateFenceError,
+    UNRESOLVED_HEALTH_REASONS,
     product_update_fence_path,
 )
 from app.package_scan import HostScanFailure, HostScanResult, expected_host_context
@@ -67,6 +68,7 @@ from app.package_update_health import (
     HealthEvaluationStatus,
     HostHealthResult,
     HostProbeResult,
+    PackageUpdateHealthError,
     PackageUpdateHealthOrchestrator,
 )
 from app.package_update_mutation import PackageUpdateMutationOrchestrator
@@ -2060,6 +2062,193 @@ def test_readback_includes_bounded_observation_evidence_when_unresolved(
             f"/r0/v1/resources/{system.resource_id}/package-update/resume"
         )
         assert resumed.status_code == 202
+    finally:
+        system.close()
+
+
+def _stopped_guest_refusal() -> PackageUpdateHealthError:
+    """Exactly what `SshPackageUpdateHealthHostControl` raises when the
+    deployed helper answers ``ok:false`` with classification
+    ``guest_unavailable`` -- the exact current LXC proven STOPPED by PVE.
+    Proved to be that mapping by
+    `tests/test_package_update_health.py::test_end_to_end_a_stopped_guest_
+    under_the_default_contract_is_readable`, which drives the real helper
+    and the real boundary."""
+
+    return PackageUpdateHealthError("guest is not running", reason="guest_unavailable")
+
+
+def test_readback_exposes_the_whole_request_reason_when_no_round_ran(
+    tmp_path: Path,
+) -> None:
+    """The MAJOR PR #80 review finding, through the real HTTP route.
+
+    A whole-request refusal produces NO per-probe evidence -- there was no
+    round to observe -- so `evidence` and `probes` are legitimately empty
+    and `outcome` is legitimately null. Without the bounded whole-request
+    classification beside them, the readback says nothing at all about a job
+    an operator is actively waiting on, and `guest_operational` being the
+    default contract makes that the ordinary post-update failure shape
+    rather than a corner case.
+    """
+
+    system = ApiSystem(tmp_path, health=[_stopped_guest_refusal()])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        body = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()
+        assert body["status"] == "active"
+        assert body["checkpoint"] == "health_started"
+        assert body["health"]["outcome"] is None
+        assert body["health"]["evidence"] is None
+        assert body["health"]["probes"] == []
+        assert body["health"]["settling"] is None
+        assert body["health"]["reason"] == "guest_unavailable"
+
+        # Recovery is still reachable, and the operator is told so.
+        assert body["rollback"]["available"] is True
+        capabilities = system.get("/r0/v1/operator-availability").json()[
+            "resources"
+        ][0]
+        assert capabilities["can_rollback_update"] is True
+        assert capabilities["can_rerun_health_evaluation"] is True
+    finally:
+        system.close()
+
+
+def test_readback_reason_is_the_latest_attempt_and_never_merged(
+    tmp_path: Path,
+) -> None:
+    """Re-running an unresolved evaluation replaces the reason; it never
+    accumulates. Only the LAST attempt describes the job's current state,
+    exactly as its per-probe observation evidence already did."""
+
+    system = ApiSystem(
+        tmp_path,
+        health=[
+            PackageUpdateHealthError("boundary silent", reason="host_unreachable"),
+            _stopped_guest_refusal(),
+        ],
+    )
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+        first = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()
+        assert first["health"]["reason"] == "host_unreachable"
+
+        # The explicit operator re-run control, not an automatic retry.
+        assert system.post(
+            f"/r0/v1/resources/{system.resource_id}/package-update/resume"
+        ).status_code == 202
+        system.run_worker()
+
+        second = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()
+        assert second["health"]["reason"] == "guest_unavailable"
+        assert second["health"]["evidence"] is None
+        assert second["health"]["probes"] == []
+    finally:
+        system.close()
+
+
+def test_a_definitive_verdict_retires_the_earlier_unresolved_reason(
+    tmp_path: Path,
+) -> None:
+    """A prior attempt's UNKNOWN classification is HISTORY once a durable
+    verdict exists, never current state. Publishing it beside a PASSED
+    verdict would describe a finished job as still blocked -- and the
+    durable event is still there for anyone reading the job's history."""
+
+    system = ApiSystem(tmp_path, health=[_stopped_guest_refusal(), "passed"])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+        assert (
+            system.get(
+                f"/r0/v1/resources/{system.resource_id}/package-update"
+            ).json()["health"]["reason"]
+            == "guest_unavailable"
+        )
+
+        assert system.post(
+            f"/r0/v1/resources/{system.resource_id}/package-update/resume"
+        ).status_code == 202
+        system.run_worker()
+
+        body = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()
+        assert body["status"] == "succeeded"
+        assert body["health"]["outcome"] == "passed"
+        assert body["health"]["evidence"] == "verdict"
+        assert body["health"]["reason"] is None
+
+        # The truthful history is untouched -- only the CURRENT state field
+        # stops advertising it.
+        events = [event["event_type"] for event in body["events"]]
+        assert "health_outcome_unknown" in events
+    finally:
+        system.close()
+
+
+def test_the_reason_field_leaks_no_event_details_or_helper_text(
+    tmp_path: Path,
+) -> None:
+    """Exposing ONE bounded token is not a door for the rest of the event.
+
+    The durable UNKNOWN event also carries a human-readable message and, in
+    other shapes, settling metadata and per-probe rows. The readback field
+    is exactly one token from the closed taxonomy -- never the event's
+    message, never its raw `details`, never the exception string the
+    boundary raised, and never helper stdout/stderr.
+    """
+
+    system = ApiSystem(tmp_path, health=[_stopped_guest_refusal()])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+        response = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        )
+        health = response.json()["health"]
+        assert set(health) == {
+            "contract_revision",
+            "contract_fingerprint",
+            "probe_count",
+            "started_at",
+            "completed_at",
+            "outcome",
+            "evidence",
+            "probes",
+            "settling",
+            "reason",
+        }
+        assert health["reason"] in UNRESOLVED_HEALTH_REASONS
+
+        # The raised boundary message never reaches the wire, and neither
+        # does anything else a helper could have said.
+        rendered = response.text
+        for forbidden in (
+            "guest is not running",
+            "stdout",
+            "stderr",
+            "pct exec",
+            "/bin/true",
+            "pvesh",
+            BEARER,
+            "PRIVATE KEY",
+        ):
+            assert forbidden not in rendered, forbidden
     finally:
         system.close()
 

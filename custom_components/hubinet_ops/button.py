@@ -130,6 +130,17 @@ def _tr(strings: Mapping[str, str], key: str, **values: Any) -> str:
     return strings[_translation_key(key)].format(**values)
 
 
+def _tr_optional(strings: Mapping[str, str], key: str) -> str | None:
+    """One translation that may legitimately not exist for this key.
+
+    Used for the bounded reason taxonomy: the backend owns that closed set,
+    and an integration built against an older copy of it must degrade to
+    showing the raw token rather than raising and hiding the whole readback.
+    """
+
+    return strings.get(_translation_key(key))
+
+
 async def _notification_translations(hass: HomeAssistant) -> Mapping[str, str]:
     return await async_get_translations(
         hass,
@@ -224,6 +235,21 @@ def _job_message(job: dict[str, Any], strings: Mapping[str, str]) -> str:
     lines = [
         f"- **{label}:** {_cell(value, unknown=unknown)}" for label, value in facts
     ]
+    # The whole-request classification of the CURRENT unresolved evaluation.
+    # Rendered as its own row rather than folded into "Health result",
+    # because it is a different fact: the result is still "no definitive
+    # result", and this says why there is not one yet. It is the ONLY thing
+    # a stopped-guest `guest_operational` readback carries -- no verdict, no
+    # probe rows -- so without it that job is unreadable from Home
+    # Assistant. The backend sends a bounded token; the text is this
+    # integration's own fixed translation of it, never backend prose.
+    health_reason = job.get("health_reason")
+    if health_reason:
+        described = _tr_optional(strings, f"job.health_reason.{health_reason}")
+        lines.append(
+            f"- **{_tr(strings, 'job.labels.health_reason')}:** "
+            f"{_cell(described or health_reason, unknown=unknown)}"
+        )
     if job["health_probes"]:
         heading_key = (
             "job.health_probes.heading"

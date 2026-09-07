@@ -355,7 +355,8 @@
         "mutation_completed": "Zmiana pakietów ukończona",
         "health_result": "Wynik kontroli kondycji",
         "rollback_available": "Wycofanie dostępne",
-        "terminal_reason": "Powód zakończenia"
+        "terminal_reason": "Powód zakończenia",
+        "health_reason": "Powód"
       },
       "health_probes": {
         "heading": "Szczegółowe wyniki sond kondycji",
@@ -366,6 +367,27 @@
           "failed": "NEGATYWNY",
           "unknown": "NIEZNANY"
         }
+      },
+      "health_reason": {
+        "command_failed": "Wymagane polecenie tylko do odczytu w kontenerze nie powiodło się.",
+        "command_timed_out": "Wymagane polecenie tylko do odczytu w kontenerze nie zakończyło się na czas.",
+        "container_health_starting": "Zadeklarowany kontener wciąż wykonuje pierwsze sprawdzenie kondycji po restarcie.",
+        "container_not_started_yet": "Zadeklarowany kontener został utworzony, ale jeszcze nie uruchomiony.",
+        "container_removing": "Zadeklarowany kontener jest usuwany.",
+        "container_restarting": "Zadeklarowany kontener jest restartowany.",
+        "docker_daemon_unavailable": "Demon Dockera nie odpowiedział wewnątrz kontenera.",
+        "guest_unavailable": "Kontener nie jest uruchomiony albo PVE nie mogło go osiągnąć przez zaufaną granicę.",
+        "host_response_rejected": "Odpowiedzi granicy sprawdzania kondycji nie można było uznać za wiarygodną, więc nie zapisano żadnego werdyktu.",
+        "host_unreachable": "Granica sprawdzania kondycji nie zwróciła odpowiedzi.",
+        "malformed_output": "Wymagane polecenie tylko do odczytu w kontenerze zwróciło dane, których nie dało się odczytać.",
+        "probe_target_ambiguous": "Zadeklarowany cel sondy pasował do więcej niż jednego obiektu.",
+        "probe_target_not_exact": "Zadeklarowanego celu sondy nie dało się rozwiązać do dokładnie jednego obiektu.",
+        "resource_context_changed": "Dokładny zasób, lokalizator lub węzeł wskazywany przez to zadanie nie jest już aktualny.",
+        "settling_budget_exhausted": "Ograniczone okno stabilizacji skończyło się, zanim tę sondę dało się ocenić.",
+        "unit_activating": "Zadeklarowana jednostka systemd wciąż się aktywuje.",
+        "unit_deactivating": "Zadeklarowana jednostka systemd jest dezaktywowana.",
+        "unit_job_pending": "Zadeklarowana jednostka systemd ma wciąż oczekujące zadanie systemd.",
+        "unit_reloading": "Zadeklarowana jednostka systemd jest przeładowywana."
       }
     },
     "health": {

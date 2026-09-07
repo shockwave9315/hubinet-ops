@@ -38,8 +38,8 @@ the invocation carrying that digest can submit (see "Crash-safe package
 mutation" below). Schema v14 adds the same-job rollback operation identity,
 its write-ahead uncertainty checkpoint, the observed PVE rollback task
 identity, and rollback completion (see "Same-job rollback execution" below).
-Schema v15 adds the operator-declared per-resource health contract (see
-"Dynamic per-resource health contracts" below). Schema v16 binds a job to the
+Schema v15 adds the per-resource health contract (see "Dynamic
+per-resource health contracts" below). Schema v16 binds a job to the
 exact health contract generation it froze at issuance, adds that generation's
 immutable probe rows and its durable definitive result rows, inserts the
 `health_completed` checkpoint, and states the terminal `succeeded` contract in
@@ -94,9 +94,9 @@ is configured true -- the five production update host controls and the one
 `/operator-availability`,
 two families of authority-metadata mutation
 (`PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
-`GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`), and the
-explicit operator update controls described under "Production update
-activation" below. Bearer authentication is required on every endpoint except
+`GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`, plus
+`POST .../health-contract/reset`), and the explicit operator update controls
+described under "Production update activation" below. Bearer authentication is required on every endpoint except
 the deliberately unauthenticated minimal `/r0/v1/health` liveness probe, which
 exposes no inventory or credential data. The two metadata families change only
 the authority database and have no host-control path of their own.
@@ -2224,8 +2224,20 @@ outside the worker and the explicit rollback route calls into it.
 
 Schema v15 adds the authority that says what "healthy" means for one workload.
 It is CONFIGURATION, and this stage builds only the configuration: nothing here
-executes, schedules, or evaluates a probe. See `PRODUCT.md`, "What healthy
-means", for why the definition is operator-declared rather than inferred.
+executes, schedules, or evaluates a probe.
+
+Two things own that configuration, and the split is deliberate. The BASELINE
+is backend-owned product policy: every current package-managed LXC is
+provisioned the built-in `guest_operational` contract during reconciliation
+(see "The built-in `guest_operational` default" below), so an approved update
+never waits on a health-onboarding step. An ADVANCED contract is
+operator-declared: an operator may explicitly replace that baseline with
+named Docker/systemd probes, and once they have, it is theirs until they
+explicitly reset it — reconciliation never sees it and never overwrites it.
+
+Neither half is inferred. See `PRODUCT.md`, "What healthy means", for why
+this product declares what healthy means rather than deducing it from what a
+guest appears to run.
 
 **Two tables, one current contract per resource.**
 `resource_health_contracts` holds one row per `resource_id` — `revision`,
@@ -2768,6 +2780,33 @@ structural and live probes still runs the live probes for one full round
 before returning rather than looping until the deadline for probes that can
 never become live.
 
+**An unresolved evaluation publishes WHY, not only that it is unresolved.**
+`health.reason` on `GET .../package-update` is the CURRENT unresolved
+attempt's whole-request classification: exactly one token from
+`UNRESOLVED_HEALTH_REASONS` (`app/inventory/health_observation.py` — the
+UNKNOWN family of the closed taxonomy), or `null`. It is deliberately
+independent of `health.evidence`. A refusal that happens BEFORE any probe
+round — the helper's prologue `revalidate_live_target` proving the exact
+current LXC stopped, say — produces no per-probe evidence at all, so such a
+job reaches Home Assistant as `outcome: null`, `evidence: null`, `probes:
+[]`. With `guest_operational` as the default contract that is the ORDINARY
+post-update failure shape, and those three absences alone told an operator
+nothing (PR #80 review, MAJOR): the reason token is the field that makes it
+readable.
+
+`_package_update_health_body` reads it from the LATEST
+`health_outcome_unknown` event's `details["reason"]` and re-validates it
+against the closed set on the way out — attempts are never merged, and the
+event's message, its remaining `details`, and every byte of helper
+stdout/stderr stay off the wire exactly as before. A durable verdict retires
+it (`reason: null` in the verdict branch): a prior attempt's UNKNOWN
+classification is history, not current state, and publishing it beside a
+definitive result would describe a finished job as still blocked.
+`InventoryAuthority.record_package_update_health_outcome_unknown` refuses to
+record a reason outside the UNKNOWN family, so an attempt that reached no
+verdict can never be summarized by a token that only ever describes a
+positive proof or a proven-false conjunct.
+
 **Home Assistant proves coherence independently, not just bounded-set
 membership.** `contract/package_update_validation.py` now checks, per probe,
 that `kind`/`outcome`/`reason` agree with the shared
@@ -2780,7 +2819,12 @@ contradicts its own evidence is refused, not rendered. Every JSON value is
 checked against its **exact** Python type (`_strict_bool`/`_strict_str`/
 `_strict_int`) rather than coerced: a malformed `"false"` string for a
 boolean field is refused rather than silently becoming `True`
-(`bool("false") is True` in Python).
+(`bool("false") is True` in Python). `health_reason` is proved the same way
+and from the same distrust: it must be absent or one token of HA's own
+mirrored `UNRESOLVED_HEALTH_REASONS`, and it must be absent once
+`health_outcome` exists — a `PASSED` verdict arriving alongside
+`guest_unavailable` is a stale-reason payload, and is refused rather than
+rendered.
 
 **Timing policy ownership is unambiguous.** The backend states
 `settling_policy: {deadline_seconds, observation_interval_seconds}` on every
@@ -2804,9 +2848,18 @@ its only claim is "the exact current LXC remained reachable through the
 trusted PVE boundary and executed a command", never "a workload is up".
 `_guest_operational_round` can only ever produce PASS
 (`guest_operational_confirmed`) or UNKNOWN (`command_timed_out` /
-`malformed_output` / `command_failed`); it never FAILs, because a guest that
-cannot currently run a trivial command is a liveness question, not proof this
-contract was violated. A partial unique index
+`malformed_output` / `command_failed`, and `guest_unavailable` when the
+live-target revalidation that precedes every guest command proves the guest
+went away, moved node, or is not running); it never FAILs, because a guest
+that cannot currently run a trivial command is a liveness question, not proof
+this contract was violated. A guest PVE positively reports STOPPED is refused
+by `handle_request`'s own prologue before any round, as a whole-request
+`guest_unavailable` — which the backend maps to UNKNOWN through
+`HOST_REFUSAL_REASONS` and now publishes as `health.reason` (see "Job-bound
+healthcheck execution" above). Explicit rollback stays available throughout:
+`health_started` is a rollback-eligible checkpoint and
+`_post_mutation_job_context_is_current` imposes no running-status
+requirement. A partial unique index
 (`... WHERE kind = 'guest_operational'`) permits at most one such probe per
 contract -- a plain column-level `UNIQUE` cannot express this, because SQL
 treats every `NULL` as distinct from every other `NULL`.
@@ -2828,7 +2881,10 @@ transaction of `complete_discovery_run_success`, which is the narrowest
 backend-owned point at which a resource actually becomes a CURRENT,
 package-managed LXC. It selects, through the exact same predicate package
 scanning uses (`_require_package_scan_target`: present, active, LXC, current
-locator binding, current node), every such resource with **no** contract row
+locator binding, current node — and deliberately NOT `status = 'running'`,
+which gates scan/update/health EXECUTION only, so a stopped managed LXC still
+owns the baseline rather than becoming update-blocked), every such resource
+with **no** contract row
 and writes `DEFAULT_HEALTH_PROBES` for it, allocating a revision from the same
 durable per-resource allocator every other contract generation uses. Three
 properties are load-bearing:
