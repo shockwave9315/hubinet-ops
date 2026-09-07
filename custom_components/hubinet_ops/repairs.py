@@ -55,6 +55,34 @@ def _issue_id(entry_id: str, resource_id: str) -> str:
     return f"{_ISSUE_PREFIX}::{entry_id}::{resource_id}"
 
 
+def _issue_id_prefix(entry_id: str) -> str:
+    return f"{_ISSUE_PREFIX}::{entry_id}::"
+
+
+def _registered_resource_ids(hass: HomeAssistant, entry_id: str) -> frozenset[str]:
+    """Every resource id THIS entry's health-contract issue family currently
+    has a row for in Home Assistant's own Issue Registry.
+
+    GitHub review P2 #3: the registry -- not a coordinator's in-memory
+    session bookkeeping -- is the durable source of truth for "is this issue
+    currently persisted". It survives a Home Assistant restart even though
+    session state does not, so deriving the deletion set from a caller-
+    remembered set (which starts empty on every restart) could never see,
+    and therefore could never clear, an issue this exact family raised in a
+    previous run. Scoped by the precise ``{prefix}::{entry_id}::`` issue id
+    shape, so this can never see -- and therefore never touch -- another
+    config entry's issues or an unrelated issue family under this domain.
+    """
+
+    prefix = _issue_id_prefix(entry_id)
+    registry = ir.async_get(hass)
+    return frozenset(
+        issue_id[len(prefix):]
+        for (domain, issue_id) in registry.issues
+        if domain == DOMAIN and issue_id.startswith(prefix)
+    )
+
+
 def _resource_display_name(resource) -> str:
     """Mirror ``coordinator.resource_device_name`` without importing it.
 
@@ -73,16 +101,18 @@ def async_sync_health_contract_repairs(
     *,
     entry_id: str,
     snapshot: HubinetOpsSnapshot,
-    previously_raised_resource_ids: frozenset[str],
-) -> frozenset[str]:
+) -> None:
     """Raise or clear the "approved but unconfigured" repair per resource.
 
-    Called once per coordinator refresh with the just-validated snapshot.
-    Returns the resource ids that currently carry the issue; the caller must
-    remember this and pass it back as ``previously_raised_resource_ids`` on
-    the next call so a resource that stops qualifying (contract configured,
-    approval no longer approved, resource retired/removed) gets its issue
-    cleared rather than left behind forever.
+    Called once per coordinator refresh with the just-validated snapshot,
+    including the very first refresh after Home Assistant itself restarts.
+    The stale side of the sync is reconciled against
+    `_registered_resource_ids` -- Home Assistant's own persisted Issue
+    Registry, entry-scoped -- rather than an in-memory set remembered across
+    calls: a resource that stops qualifying (contract configured, approval
+    no longer approved, resource retired/removed) gets its issue cleared
+    even if that issue was raised and persisted in a PREVIOUS Home Assistant
+    run this coordinator has no session memory of at all.
     """
 
     currently_blocked: set[str] = set()
@@ -110,16 +140,21 @@ def async_sync_health_contract_repairs(
                 data={"entry_id": entry_id, "resource_id": resource.resource_id},
             )
 
-    for resource_id in previously_raised_resource_ids - currently_blocked:
+    stale_resource_ids = _registered_resource_ids(hass, entry_id) - currently_blocked
+    for resource_id in stale_resource_ids:
         ir.async_delete_issue(hass, DOMAIN, _issue_id(entry_id, resource_id))
 
-    return frozenset(currently_blocked)
 
+def async_clear_health_contract_repairs(hass: HomeAssistant, *, entry_id: str) -> None:
+    """Remove every repair issue this entry currently owns, e.g. on unload.
 
-def async_clear_health_contract_repairs(
-    hass: HomeAssistant, *, entry_id: str, resource_ids: frozenset[str]
-) -> None:
-    """Remove every repair issue this entry currently owns, e.g. on unload."""
+    Entry-scoped against the Issue Registry itself
+    (`_registered_resource_ids`), for the same reason
+    `async_sync_health_contract_repairs` reconciles against it rather than a
+    caller-remembered set: unload must be correct even if it runs before
+    this entry's coordinator ever completed a refresh in THIS session, e.g.
+    immediately after a Home Assistant restart.
+    """
 
-    for resource_id in resource_ids:
+    for resource_id in _registered_resource_ids(hass, entry_id):
         ir.async_delete_issue(hass, DOMAIN, _issue_id(entry_id, resource_id))

@@ -5267,6 +5267,150 @@ async def test_repair_issue_is_cleared_on_unload(hass: HomeAssistant) -> None:
     assert _health_contract_repair_ids(hass) == set()
 
 
+# ---------------------------------------------------------------------------
+# GitHub review P2 #3: Home Assistant's Issue Registry persists across a
+# restart even though a coordinator's in-memory "which resources currently
+# carry the issue" bookkeeping does not. The witness: raise the issue, take
+# Home Assistant offline, let the backend resolve the resource while it is
+# offline, bring Home Assistant back up -- the FIRST sync of the new run
+# must still clear the now-stale, restart-persisted issue.
+#
+# A real process restart is not simulated here; instead, each test seeds the
+# Issue Registry with exactly what a previous run would have left behind
+# (`_seed_persisted_repair_issue`) for a config entry that has never yet run
+# a single coordinator refresh in THIS session, then sets that entry up --
+# which is the precise shape of "the first sync after Home Assistant
+# restarts" from the coordinator's point of view.
+# ---------------------------------------------------------------------------
+
+
+def _seed_persisted_repair_issue(
+    hass: HomeAssistant, *, entry_id: str, resource_id: str, name: str
+) -> str:
+    """Put exactly what a PREVIOUS Home Assistant run would have left in the
+    Issue Registry for one resource, before this session's entry ever runs
+    its own first refresh."""
+
+    issue_id = f"health_contract_unconfigured::{entry_id}::{resource_id}"
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        issue_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="health_contract_unconfigured",
+        translation_placeholders={"name": name},
+        data={"entry_id": entry_id, "resource_id": resource_id},
+    )
+    return issue_id
+
+
+@pytest.mark.asyncio
+async def test_a_stale_restart_persisted_repair_is_removed_on_first_sync(
+    hass: HomeAssistant,
+) -> None:
+    """The exact P2 #3 witness: RESOURCE_CT no longer qualifies (no approved
+    plan at all, in `INITIAL_RESOURCES`) by the time this run's very first
+    sync happens, yet its issue survived from a run this session has no
+    in-memory memory of whatsoever."""
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops Test",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+        version=1,
+        minor_version=1,
+    )
+    stale_issue_id = _seed_persisted_repair_issue(
+        hass,
+        entry_id=entry.entry_id,
+        resource_id=RESOURCE_CT,
+        name="CT101 Cloudflared",
+    )
+    assert ir.async_get(hass).async_get_issue(DOMAIN, stale_issue_id) is not None
+
+    install_factory(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert _health_contract_repair_ids(hass) == set()
+
+
+@pytest.mark.asyncio
+async def test_a_still_valid_restart_persisted_repair_is_recreated_correctly(
+    hass: HomeAssistant,
+) -> None:
+    """The positive control beside the witness above: a resource that is
+    STILL genuinely approved-and-unconfigured across the restart keeps a
+    fully populated, active issue -- the stale-reconciliation rule must never
+    touch a legitimately still-blocked resource's issue."""
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops Test",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+        version=1,
+        minor_version=1,
+    )
+    stale_issue_id = _seed_persisted_repair_issue(
+        hass,
+        entry_id=entry.entry_id,
+        resource_id=RESOURCE_CT,
+        name="CT101 Cloudflared",
+    )
+
+    planned = exact_plan_resource(approved=True)
+    install_factory(hass, FakeTransport([snapshot((planned,))]))
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert _health_contract_repair_ids(hass) == {stale_issue_id}
+    issue = ir.async_get(hass).issues[(DOMAIN, stale_issue_id)]
+    assert issue.is_fixable is False
+    assert issue.severity == ir.IssueSeverity.WARNING
+    assert issue.translation_key == "health_contract_unconfigured"
+    assert issue.translation_placeholders == {"name": "CT101 Cloudflared"}
+    assert issue.data == {"entry_id": entry.entry_id, "resource_id": RESOURCE_CT}
+
+
+@pytest.mark.asyncio
+async def test_one_config_entrys_sync_cannot_delete_another_entrys_repair(
+    hass: HomeAssistant,
+) -> None:
+    """Entry scoping is by construction -- the entry id is baked into the
+    issue id itself -- but this pins it as an executable regression: entry
+    A's sync must never see, let alone delete, an issue that names entry B,
+    even for the identical nominal resource id."""
+
+    entry_a = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops A",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+        version=1,
+        minor_version=1,
+    )
+    other_entry_id = "not-a-real-config-entry-but-a-distinct-entry-id"
+    foreign_issue_id = _seed_persisted_repair_issue(
+        hass,
+        entry_id=other_entry_id,
+        resource_id=RESOURCE_CT,
+        name="CT101 Cloudflared",
+    )
+
+    install_factory(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    entry_a.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry_a.entry_id)
+    await hass.async_block_till_done()
+
+    # Entry A's own (unrelated) issue is gone, but the foreign one is not.
+    assert ir.async_get(hass).async_get_issue(DOMAIN, foreign_issue_id) is not None
+
+
 @pytest.mark.asyncio
 async def test_set_health_contract_serializes_the_complete_declared_set(
     hass: HomeAssistant,

@@ -290,15 +290,50 @@ class HubinetOpsOptionsFlow(OptionsFlow):
         coordinator = self._coordinator()
         if coordinator is None:
             return self.async_abort(reason="entry_not_loaded")
+        # GitHub review P2 #2: `resource_type is LXC` alone is not enough --
+        # a failed/partial discovery can retain a historical/missing/
+        # uncertain LXC in the published snapshot, and this flow's terminal
+        # action (`async_reset_health_contract`) is a WRITE, not a read. Gate
+        # on the backend-owned `can_configure_health_contract` capability
+        # (not `can_view_health_contract`, which exists for the separate
+        # read-only "view_health_contract" button) so HA never offers a
+        # resource the backend would refuse this exact mutation for -- HA
+        # must not re-derive presence/binding/node currency itself.
         resources = {
             resource.resource_id: resource_device_name(resource)
             for resource in coordinator.data.resources
             if resource.resource_type is ResourceType.LXC
+            and coordinator.operator_capabilities(
+                resource.resource_id
+            ).can_configure_health_contract
         }
         if not resources:
             return self.async_abort(reason="no_lxc_resources")
         if user_input is not None:
-            self._resource_id = user_input["resource_id"]
+            selected_resource_id = user_input["resource_id"]
+            # GitHub review P2 #1: `resources` above is rebuilt fresh on
+            # every call from the coordinator's CURRENT data, but the
+            # ``resource_id`` just submitted was chosen against whatever
+            # form was rendered earlier -- a coordinator refresh in between
+            # can make that exact resource lose
+            # `can_configure_health_contract` (or disappear) while this
+            # flow sat open. Never index a capability-filtered mapping with
+            # a selection that predates it: re-render this same step
+            # truthfully, with the freshly current selector and an error,
+            # rather than raise a raw ``KeyError`` or silently trust a stale
+            # choice. HA still owns no backend policy of its own here -- the
+            # membership check below is exactly the same
+            # `can_configure_health_contract` gate `resources` was just
+            # built from.
+            if selected_resource_id not in resources:
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=vol.Schema(
+                        {vol.Required("resource_id"): vol.In(resources)}
+                    ),
+                    errors={"base": "resource_no_longer_eligible"},
+                )
+            self._resource_id = selected_resource_id
             self._resource_name = resources[self._resource_id]
             return await self.async_step_reset_confirm()
         return self.async_show_form(
