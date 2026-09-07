@@ -44,6 +44,37 @@
       }
     }
   },
+  "options": {
+    "abort": {
+      "entry_not_loaded": "Ten wpis Hubinet Ops nie jest obecnie załadowany.",
+      "no_lxc_resources": "Żadne zasoby LXC nie są obecnie załadowane przez Hubinet Ops.",
+      "health_contract_read_failed": "Nie udało się odczytać bieżącego kontraktu kondycji dla tego zasobu.",
+      "discovery_failed": "Nie udało się połączyć z backendem Hubinet Ops w celu wykrycia kandydatów."
+    },
+    "error": {
+      "no_probes_selected": "Wybierz co najmniej jedną sondę albo anuluj.",
+      "declare_failed": "Hubinet Ops odrzucił zadeklarowany kontrakt kondycji. Nic nie zostało zmienione.",
+      "revision_changed": "Kontrakt kondycji zmienił się od momentu jego odczytu przez ten formularz. Przejrzyj odświeżone bieżące sondy poniżej i spróbuj ponownie.",
+      "clear_not_confirmed": "Zaznacz pole potwierdzenia, aby wyczyścić kontrakt kondycji.",
+      "clear_failed": "Hubinet Ops odrzucił wyczyszczenie kontraktu kondycji. Nic nie zostało zmienione."
+    },
+    "step": {
+      "init": {
+        "title": "Zarządzaj kontraktem kondycji",
+        "description": "Wybierz zasób, którego kontrakt kondycji chcesz przejrzeć, edytować, zastąpić lub wyczyścić.",
+        "data": {"resource_id": "Zasób"}
+      },
+      "discover": {
+        "title": "Kontrakt kondycji dla {name}",
+        "description": "Obecnie zadeklarowane sondy i świeżo wykryci kandydaci dla {name}. Nic nie zostanie zapisane, dopóki nie wybierzesz **Zatwierdź** — dostosuj wybór do tego, co „zdrowy” oznacza dla tego obciążenia, a następnie zatwierdź, aby zastąpić zadeklarowany kontrakt.\n\n{candidates}"
+      },
+      "clear_confirm": {
+        "title": "Wyczyść kontrakt kondycji dla {name}",
+        "description": "Obecnie deklaruje to:\n\n{candidates}\n\nWyczyszczenie sprawi, że {name} stanie się nieskonfigurowany, co nie oznacza zdrowia, i zablokuje każdą przyszłą aktualizację pakietów do czasu ponownego zadeklarowania kontraktu. Zaznacz pole i wybierz **Zatwierdź**, aby potwierdzić.",
+        "data": {"confirm": "Rozumiem — wyczyść kontrakt kondycji"}
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "node_status": {"name": "Stan"},

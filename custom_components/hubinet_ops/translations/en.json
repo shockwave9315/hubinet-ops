@@ -44,6 +44,37 @@
       }
     }
   },
+  "options": {
+    "abort": {
+      "entry_not_loaded": "This Hubinet Ops entry is not currently loaded.",
+      "no_lxc_resources": "No LXC resources are currently loaded by Hubinet Ops.",
+      "health_contract_read_failed": "Could not read the current health contract for this resource.",
+      "discovery_failed": "Could not reach the Hubinet Ops backend to discover health-check candidates."
+    },
+    "error": {
+      "no_probes_selected": "Select at least one probe, or cancel.",
+      "declare_failed": "Hubinet Ops refused the declared health contract. Nothing was changed.",
+      "revision_changed": "The health contract changed since this flow read it. Review the refreshed current probes below and try again.",
+      "clear_not_confirmed": "Check the confirmation box to clear the health contract.",
+      "clear_failed": "Hubinet Ops refused to clear the health contract. Nothing was changed."
+    },
+    "step": {
+      "init": {
+        "title": "Maintain a health contract",
+        "description": "Select the resource whose health contract you want to view, edit, replace, or clear.",
+        "data": {"resource_id": "Resource"}
+      },
+      "discover": {
+        "title": "Health contract for {name}",
+        "description": "Currently declared probes and freshly discovered candidates for {name}. Nothing is written until you select **Submit** -- adjust the selection to match what \"healthy\" means for this workload, then submit to replace the declared contract.\n\n{candidates}"
+      },
+      "clear_confirm": {
+        "title": "Clear the health contract for {name}",
+        "description": "This currently declares:\n\n{candidates}\n\nClearing makes {name} unconfigured, which is not healthy, and blocks any future package update until a contract is declared again. Check the box and select **Submit** to confirm.",
+        "data": {"confirm": "I understand -- clear the health contract"}
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "node_status": {"name": "Status"},
