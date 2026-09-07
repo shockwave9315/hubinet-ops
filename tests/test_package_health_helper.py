@@ -126,11 +126,29 @@ class FakeGuest:
         self.commands: list[tuple[str, ...]] = []
         self.timeout_on: str | None = None
         self.guest_operational_ok = True
+        #: PR #80 review finding 1 regression support. A shared clock this
+        #: fake advances by (up to) the granted `timeout` before answering
+        #: call number N (0-based) -- modelling a subprocess that genuinely
+        #: takes real wall-clock time to answer, rather than the always-
+        #: instant default that could never expose stale-remaining-budget
+        #: reuse. Consumption is capped at the timeout actually granted: a
+        #: real bounded subprocess cannot run longer than its own timeout.
+        self.clock: FakeClock | None = None
+        self.consume_seconds_by_call_index: dict[int, float] = {}
+        self.call_index = 0
+        self.call_timeouts: list[float] = []
 
     # -- host commands -------------------------------------------------
 
     def __call__(self, argv, timeout, max_output):
         self.commands.append(tuple(argv))
+        self.call_timeouts.append(timeout)
+        requested_consumption = self.consume_seconds_by_call_index.get(
+            self.call_index, 0.0
+        )
+        if requested_consumption and self.clock is not None:
+            self.clock.t += min(requested_consumption, timeout)
+        self.call_index += 1
         if argv[:2] == ("pvesh", "get") and argv[2] == "/cluster/status":
             return self._ok(
                 json.dumps(
@@ -1136,6 +1154,127 @@ def test_every_guest_command_revalidates_the_live_target_first() -> None:
             assert sequence[index - 1] == "revalidate"
 
 
+# ===========================================================================
+# PR #80 review finding 1: a single stale ``remaining_budget`` reused across
+# multiple subprocess invocations could let one logical command path (most
+# concretely, live-target revalidation followed by the actual guest command
+# inside one `_run_guest_command` call) consume roughly TWICE its intended
+# share of the 180s settling deadline. Every timeout is now computed FRESH,
+# immediately before the specific subprocess it bounds, by reading the clock
+# again -- never a value calculated before an earlier subprocess in the same
+# chain consumed real wall-clock time. These tests make subprocess calls
+# consume real (virtual) time via `FakeGuest.consume_seconds_by_call_index`,
+# which the ordinary always-instant fake clock could never exercise.
+# ===========================================================================
+
+
+def test_revalidation_that_consumes_most_of_the_budget_does_not_hand_the_actual_command_the_old_full_timeout() -> None:
+    """Witness A. A single `guest_operational` probe issues exactly one
+    `_run_guest_command` call: its own live-target revalidation (call index
+    2, after `_local_node` and the pre-flight revalidation), then the actual
+    `/bin/true` (call index 3). Before this fix both calls received the
+    SAME timeout, computed once before either ran; this proves the second
+    call's timeout reflects what the first call actually consumed."""
+
+    guest = FakeGuest()
+    clock = FakeClock()
+    guest.clock = clock
+    guest.consume_seconds_by_call_index = {2: 20.0}
+
+    payload = _request((("guest_operational", None),))
+    payload["settling_policy"]["deadline_seconds"] = (
+        helper.MIN_SETTLING_DEADLINE_SECONDS
+    )
+    response = helper.handle_request(
+        payload, runner=guest, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+    assert response["ok"] is True
+
+    revalidation_timeout, command_timeout = guest.call_timeouts[2], guest.call_timeouts[3]
+    # The old bug: both calls would receive the identical value computed once
+    # by the caller before either subprocess ran.
+    assert command_timeout < revalidation_timeout
+    # Not merely smaller -- meaningfully smaller, reflecting the ~20s the
+    # revalidation call actually consumed.
+    assert command_timeout < revalidation_timeout - 15
+
+
+def test_an_earlier_family_that_exhausts_the_budget_stops_a_later_family_from_starting_at_all() -> None:
+    """Witness B. A systemd probe (family 1) and a `guest_operational` probe
+    (family 2) share one round. The systemd family's own guest command is
+    made to consume nearly the entire settling deadline; the guest family
+    must then never even ATTEMPT its own revalidation -- proving a later
+    family cannot begin once an earlier one has exhausted the real budget,
+    not only that its command gets a small timeout."""
+
+    guest = FakeGuest()
+    clock = FakeClock()
+    guest.clock = clock
+    # Call index 3 is the systemd family's own `systemctl show` -- consume
+    # its ENTIRE granted timeout (a real bounded command can never consume
+    # more than the timeout it was actually given).
+    guest.consume_seconds_by_call_index = {3: 1_000_000.0}
+
+    payload = _request(
+        (
+            ("systemd_unit_active", "nginx.service"),
+            ("guest_operational", None),
+        )
+    )
+    payload["settling_policy"]["deadline_seconds"] = (
+        helper.MIN_SETTLING_DEADLINE_SECONDS
+    )
+    response = helper.handle_request(
+        payload, runner=guest, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+    assert response["ok"] is True
+
+    # The guest_operational family's own revalidation (and therefore its
+    # `/bin/true`) was never launched: exactly the 4 pre-existing calls
+    # (_local_node, pre-flight revalidate, this round's systemd revalidate,
+    # this round's `systemctl show`) happened, and nothing after.
+    assert len(guest.commands) == 4
+    assert not any(argv[-1:] == ("/bin/true",) for argv in guest.commands)
+
+    outcomes = {probe["index"]: probe for probe in response["probes"]}
+    assert outcomes[1]["outcome"] == "unknown"
+    assert outcomes[1]["reason"] == "settling_budget_exhausted"
+    # Controlled unresolved result, never a durable verdict.
+    assert response["evaluation_status"] == "unresolved"
+    # The actual wall-clock runtime never ran meaningfully past the intended
+    # deadline -- only the bounded transport-return margin's worth, not a
+    # second full command's timeout on top of it (the original bug).
+    assert clock.t <= helper.MIN_SETTLING_DEADLINE_SECONDS + 5.0
+
+
+def test_sufficient_budget_still_lets_the_normal_two_round_pass_path_through() -> None:
+    """Positive control: with ample remaining budget (the ordinary case),
+    fresh-per-command timeout computation changes nothing about the normal
+    settling behaviour -- `MIN_DECISIVE_ROUND` still requires exactly two
+    rounds, the verdict still comes through, and every granted timeout stays
+    at the code-owned command ceiling rather than being starved merely
+    because the budget accounting is now computed fresh per call."""
+
+    guest = FakeGuest()
+    clock = FakeClock()
+    guest.clock = clock
+    response = _evaluate_full(guest, (("systemd_unit_active", "nginx.service"),), clock=clock)
+    assert response["evaluation_status"] == "decisive"
+    assert response["probes"] == [
+        {
+            "index": 0,
+            "kind": "systemd_unit_active",
+            "target": "nginx.service",
+            "outcome": "passed",
+            "reason": "unit_active",
+        }
+    ]
+    assert response["settling"]["rounds"] == 2
+    assert all(
+        timeout >= helper.COMMAND_TIMEOUT_SECONDS - 1.0 for timeout in guest.call_timeouts
+    )
+
+
 def test_a_guest_that_moved_node_refuses_the_whole_evaluation() -> None:
     guest = FakeGuest()
     guest.current_node = "pve-b"
@@ -1654,6 +1793,7 @@ def test_an_element_that_would_need_quoting_is_refused_rather_than_quoted() -> N
     """
 
     guest = RemoteGuest()
+    clock = FakeClock()
     with pytest.raises(helper.ProbeUnknown, match="probe_target_not_exact"):
         helper._run_guest_command(
             guest,
@@ -1662,6 +1802,8 @@ def test_an_element_that_would_need_quoting_is_refused_rather_than_quoted() -> N
             "pve-a",
             ("env", "LC_ALL=C", "systemctl", "show", "--", "a b.service"),
             data_arguments=("a b.service",),
+            absolute_deadline=clock.t + 60.0,
+            monotonic=clock.monotonic,
         )
     assert guest.remote_command_lines == []
 
@@ -1703,6 +1845,8 @@ def test_the_helper_can_only_report_reasons_the_backend_accepts() -> None:
             "command_timed_out",
             "docker_daemon_unavailable",
             "guest_unavailable",
+            "guest_operational_confirmed",
+            "settling_budget_exhausted",
         }
     )
     assert produced <= HOST_PROBE_REASONS, produced - HOST_PROBE_REASONS
@@ -1749,9 +1893,27 @@ class DiscoveryGuest:
         #: enabled unit if not overridden.
         self.unit_props: dict[str, dict[str, str]] = {}
         self.commands: list[tuple[str, ...]] = []
+        #: Docker inspect completeness-proof overrides (PR #80 review
+        #: finding 2/3A). When set, `_docker` answers verbatim with these
+        #: instead of synthesizing a clean row per `docker_info` entry.
+        self.docker_inspect_returncode = 0
+        self.docker_inspect_raw_stdout: bytes | None = None
+        #: Same virtual-clock consumption support as `FakeGuest`, for the
+        #: discovery deadline's own fresh-per-command timeout regression.
+        self.clock: FakeClock | None = None
+        self.consume_seconds_by_call_index: dict[int, float] = {}
+        self.call_index = 0
+        self.call_timeouts: list[float] = []
 
     def __call__(self, argv, timeout, max_output):
         self.commands.append(tuple(argv))
+        self.call_timeouts.append(timeout)
+        requested_consumption = self.consume_seconds_by_call_index.get(
+            self.call_index, 0.0
+        )
+        if requested_consumption and self.clock is not None:
+            self.clock.t += min(requested_consumption, timeout)
+        self.call_index += 1
         if argv[:2] == ("pvesh", "get") and argv[2] == "/cluster/status":
             return self._ok(
                 json.dumps([{"type": "node", "name": self.node, "local": 1}]).encode()
@@ -1793,18 +1955,25 @@ class DiscoveryGuest:
         assert tail[3] == "inspect", tail
         assert tail[7] == helper._DOCKER_DISCOVERY_INSPECT_FORMAT, tail
         requested = tail[9:]
+        if self.docker_inspect_raw_stdout is not None:
+            return helper.CommandResult(
+                self.docker_inspect_returncode, self.docker_inspect_raw_stdout, b""
+            )
         lines = []
         for name in requested:
             if name in self.docker_info:
                 status, hc = self.docker_info[name]
                 lines.append(f"/{name}\t{status}\t{hc}")
-        return self._ok(("\n".join(lines) + "\n").encode() if lines else b"")
+        stdout = ("\n".join(lines) + "\n").encode() if lines else b""
+        return helper.CommandResult(self.docker_inspect_returncode, stdout, b"")
 
     def _systemctl(self, tail):
         if tail[3] == "list-unit-files":
+            assert "--plain" in tail, tail
             lines = [f"{unit}    {state}    -" for unit, state in self.unit_files]
             return self._ok(("\n".join(lines) + "\n").encode())
         if tail[3] == "list-units":
+            assert "--plain" in tail, tail
             return self._ok(
                 ("\n".join(self.failed_units) + "\n").encode()
                 if self.failed_units
@@ -1997,6 +2166,184 @@ def test_systemd_command_failure_never_produces_the_guest_fallback() -> None:
     result = _discover(guest)
     assert result["status"] == "undecidable"
     assert result["recommendation_basis"] is None
+
+
+# ===========================================================================
+# PR #80 review finding 2/3A: Docker discovery completeness proof. Once
+# `docker ps` positively enumerates a set of names, the batched `docker
+# inspect` must prove it covered EXACTLY that set -- no fewer (a name
+# silently missing), no more (an unexpected name), never twice (a
+# duplicate), and no malformed/unrecognised line -- or the whole family is
+# undecidable. A partial accept here is exactly the "uncertainty read as
+# absence" the frozen architecture forbids, and could otherwise let a real
+# workload container go undiscovered while systemd alone recommends the
+# guest_operational fallback.
+# ===========================================================================
+
+
+def test_docker_inspect_partial_stdout_with_nonzero_rc_is_undecidable() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "none"), "redis": ("running", "none")}
+    guest.docker_inspect_returncode = 1
+    guest.docker_inspect_raw_stdout = b"/web\trunning\tnone\n"  # redis missing
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["candidates"] == []
+    assert result["recommendation_basis"] is None
+
+
+def test_docker_inspect_empty_stdout_with_nonzero_rc_is_undecidable() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "none")}
+    guest.docker_inspect_returncode = 1
+    guest.docker_inspect_raw_stdout = b""
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_docker_inspect_missing_one_enumerated_name_with_zero_rc_is_undecidable() -> None:
+    """Even a CLEAN (rc=0) answer that silently omits one enumerated name
+    must never be accepted as a complete batch."""
+
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "none"), "redis": ("running", "none")}
+    guest.docker_inspect_returncode = 0
+    guest.docker_inspect_raw_stdout = b"/web\trunning\tnone\n"  # redis missing
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_docker_inspect_duplicate_resolved_name_is_undecidable() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "none")}
+    guest.docker_inspect_raw_stdout = b"/web\trunning\tnone\n/web\trunning\tnone\n"
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_docker_inspect_unexpected_name_is_undecidable() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "none")}
+    guest.docker_inspect_raw_stdout = (
+        b"/web\trunning\tnone\n/ghost\trunning\tnone\n"
+    )
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_docker_inspect_malformed_line_is_undecidable() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "none")}
+    guest.docker_inspect_raw_stdout = b"/web\trunning\n"  # missing 3rd field
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_docker_inspect_unrecognised_status_token_is_undecidable() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "none")}
+    guest.docker_inspect_raw_stdout = b"/web\tsome-bogus-status\tnone\n"
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_docker_inspect_unrecognised_healthcheck_marker_is_undecidable() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "none")}
+    guest.docker_inspect_raw_stdout = b"/web\trunning\tbogus\n"
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+
+
+def test_docker_inspect_exact_complete_batch_is_positively_accepted() -> None:
+    """Positive control: a clean, complete, exactly-covering batch is still
+    accepted -- the completeness proof does not make ordinary discovery
+    stricter than it needs to be."""
+
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "healthcheck"), "redis": ("running", "none")}
+    result = _discover(guest)
+    assert result["status"] == "ok"
+    by_target = {c["target"]: c for c in result["candidates"]}
+    assert by_target["web"]["kind"] == "docker_container_healthy"
+    assert by_target["redis"]["kind"] == "docker_container_running"
+
+
+# ===========================================================================
+# PR #80 review finding 3B: `systemctl list-units --state=failed` prefixes a
+# failed unit's row with a bullet glyph even under `--no-legend`/`--no-
+# pager` (verified: systemd 257 -- see ARCHITECTURE.md). The fix requests
+# `--plain` (verified to remove it) rather than special-casing the glyph in
+# the parser; `DiscoveryGuest._systemctl` above already hard-asserts
+# `--plain` is present on every call, so any regression that drops it fails
+# every discovery test in this file, not only these two.
+# ===========================================================================
+
+
+def test_a_failed_unit_is_discovered_from_the_exact_plain_output_shape() -> None:
+    """The exact shape real `systemctl list-units --state=failed --plain`
+    was verified to produce: no leading glyph, unit name first. Before this
+    fix, a parser reading `parts[0]` off the UN-plained (bulleted) shape
+    would have silently dropped this exact unit."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = []
+    guest.failed_units = ["mosquitto.service loaded failed failed MQTT broker"]
+    guest.unit_props = {
+        "mosquitto.service": {
+            "Id": "mosquitto.service",
+            "LoadState": "loaded",
+            "ActiveState": "failed",
+            "UnitFileState": "enabled",
+            "FragmentPath": "/usr/lib/systemd/system/mosquitto.service",
+        },
+    }
+    result = _discover(guest)
+    assert result["status"] == "ok"
+    assert result["candidates"][0]["target"] == "mosquitto.service"
+
+
+def test_systemd_discovery_requests_plain_output_on_every_invocation() -> None:
+    """A hard pin against ever dropping `--plain` again: both the unit-file
+    enumeration and the failed-unit enumeration must request it."""
+
+    guest = DiscoveryGuest()
+    guest.unit_files = [("mariadb.service", "enabled")]
+    guest.failed_units = ["mosquitto.service loaded failed failed MQTT broker"]
+    _discover(guest)
+    list_unit_files_calls = [
+        cmd for cmd in guest.commands if "list-unit-files" in cmd
+    ]
+    list_units_calls = [
+        cmd
+        for cmd in guest.commands
+        if "list-units" in cmd and "list-unit-files" not in cmd
+    ]
+    assert list_unit_files_calls and all("--plain" in c for c in list_unit_files_calls)
+    assert list_units_calls and all("--plain" in c for c in list_units_calls)
+
+
+# ===========================================================================
+# PR #80 review finding 3C: guest_operational may be recommended only after
+# BOTH families positively and completely finished. Combining a partial
+# (undecidable) Docker batch with an otherwise-empty systemd read proves
+# the fallback is never reached merely because ONE family happened to look
+# empty.
+# ===========================================================================
+
+
+def test_a_partial_docker_batch_with_empty_systemd_is_undecidable_never_guest_fallback() -> None:
+    guest = DiscoveryGuest()
+    guest.docker_info = {"web": ("running", "none")}
+    guest.docker_inspect_returncode = 1
+    guest.docker_inspect_raw_stdout = b""
+    guest.unit_files = []  # systemd alone would otherwise recommend the
+    # guest_operational fallback -- must not matter once Docker is
+    # undecidable.
+    result = _discover(guest)
+    assert result["status"] == "undecidable"
+    assert result["recommendation_basis"] is None
+    assert result["candidates"] == []
 
 
 def test_docker_discovery_bound_is_enforced() -> None:

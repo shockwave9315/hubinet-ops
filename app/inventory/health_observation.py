@@ -53,6 +53,13 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "host_unreachable",
         "host_response_rejected",
         "resource_context_changed",
+        # PR #80 review finding 1: the absolute settling deadline ran out
+        # before this probe's own family could safely start (or finish)
+        # another subprocess -- computed fresh, immediately before each one,
+        # never inferred from a value calculated before an earlier
+        # subprocess in the same round consumed real wall-clock time. Never
+        # a verdict, and applies to any probe kind's family.
+        "settling_budget_exhausted",
     }
 )
 
@@ -108,6 +115,7 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
             "unit_deactivating",
             "unit_reloading",
             "unit_job_pending",
+            "settling_budget_exhausted",
         }
     ),
 }

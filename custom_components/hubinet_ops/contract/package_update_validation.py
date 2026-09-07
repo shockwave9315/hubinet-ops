@@ -100,6 +100,7 @@ HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
         "host_unreachable",
         "host_response_rejected",
         "resource_context_changed",
+        "settling_budget_exhausted",
     }
 )
 
@@ -154,6 +155,7 @@ HEALTH_PROBE_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
             "unit_deactivating",
             "unit_reloading",
             "unit_job_pending",
+            "settling_budget_exhausted",
         }
     ),
 }

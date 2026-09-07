@@ -237,34 +237,54 @@ MAX_GUEST_COMMANDS = 160
 #: ACTUALLY left of the 180s settling budget, never by the fixed 60s
 #: allowance alone.
 _TRANSPORT_RETURN_MARGIN_SECONDS = 2.0
-#: A command is never issued with a timeout below this, however little
-#: settling budget remains -- a command still gets a chance to answer
-#: instantly rather than being skipped outright, and `subprocess` timeouts
-#: of exactly zero are not a meaningful bound.
+#: The smallest timeout this file will ever actually GRANT a command -- not
+#: a floor applied when less is left. Once what remains of the settling
+#: budget (after `_TRANSPORT_RETURN_MARGIN_SECONDS`) would compute a smaller
+#: value than this, `_next_command_timeout` returns ``None`` instead: a
+#: `subprocess` timeout of (near-)zero is not a meaningful bound, and
+#: artificially flooring it up to this value would be extending the real
+#: deadline while still claiming to enforce it (PR #80 review finding 1).
+#: The caller reports the family/probe UNKNOWN/unresolved and never starts
+#: the command at all.
 _MIN_COMMAND_TIMEOUT_SECONDS = 0.05
 
 Clock = Callable[[], float]
 Sleeper = Callable[[float], None]
 
 
-def _clamped_command_timeout(remaining_budget: float) -> float:
-    """The timeout for ONE guest/host command, bounded by what is ACTUALLY
-    left of the settling window -- never by `COMMAND_TIMEOUT_SECONDS` alone.
+def _next_command_timeout(
+    absolute_deadline: float, *, monotonic: Clock
+) -> float | None:
+    """The timeout for exactly ONE subprocess invocation about to begin,
+    computed FRESH by reading the clock right now -- never a value computed
+    before an earlier subprocess in the same call chain consumed real
+    wall-clock time.
 
-    Frozen rule: never start an operation whose own bounded timeout could
-    exceed the remaining health-evaluation budget. A command that would only
-    get a sliver of time left still gets `_MIN_COMMAND_TIMEOUT_SECONDS`
-    rather than nothing -- it may simply time out quickly and honestly,
-    which this file already treats as a truthful UNKNOWN.
+    PR #80 review finding 1: a single ``remaining_budget`` float computed
+    once per round (or once per family) and then reused across several
+    sequential subprocess calls -- most concretely, live-target revalidation
+    followed by the actual guest command inside one ``_run_guest_command``
+    call -- let one logical command path consume roughly TWICE its intended
+    share of the settling budget, because the second call still believed the
+    budget the first call started with. There is exactly one absolute
+    monotonic deadline for an evaluation (or a discovery read); this function
+    is the ONLY place that may convert "how much of it is left" into a
+    per-command timeout, and it must be called again, immediately, before
+    every single subprocess this file issues.
+
+    Returns ``None`` when there is no longer enough real budget left to
+    safely start a command at all. The caller must then stop -- report the
+    family/probe controlled UNKNOWN/unresolved -- rather than launch one
+    with an artificially floored positive timeout that could not reflect a
+    genuine remaining budget: a positive floor here would be extending the
+    deadline in substance while still claiming to enforce it.
     """
 
-    return max(
-        _MIN_COMMAND_TIMEOUT_SECONDS,
-        min(
-            COMMAND_TIMEOUT_SECONDS,
-            remaining_budget - _TRANSPORT_RETURN_MARGIN_SECONDS,
-        ),
-    )
+    remaining = absolute_deadline - monotonic()
+    usable = remaining - _TRANSPORT_RETURN_MARGIN_SECONDS
+    if usable < _MIN_COMMAND_TIMEOUT_SECONDS:
+        return None
+    return min(COMMAND_TIMEOUT_SECONDS, usable)
 
 #: Execution-time systemd unit-name validation. Deliberately the SMALLEST
 #: restriction that makes the requested object unambiguous, and every part of
@@ -690,7 +710,7 @@ def revalidate_live_target(
 
     ``timeout`` is bounded by the caller to whatever settling budget actually
     remains (frozen rule: never start an operation whose own timeout could
-    exceed the remaining evaluation budget) -- see `_clamped_command_timeout`.
+    exceed the remaining evaluation budget) -- see `_next_command_timeout`.
     """
 
     result = _command(
@@ -740,9 +760,10 @@ def _run_guest_command(
     local_node: str,
     tail: tuple[str, ...],
     *,
+    absolute_deadline: float,
+    monotonic: Clock,
     data_arguments: Sequence[str] = (),
     max_output: int = MAX_COMMAND_OUTPUT_BYTES,
-    timeout: float = COMMAND_TIMEOUT_SECONDS,
 ) -> CommandResult:
     """Run one fixed ``pct exec`` shape on the node that currently holds it.
 
@@ -763,16 +784,29 @@ def _run_guest_command(
     proved shell-inert before it may cross that boundary. Every other element
     is a constant this file owns.
 
-    ``timeout`` bounds BOTH the revalidation call and the guest command
-    itself -- the caller has already clamped it to what remains of the
-    bounded settling budget (`_clamped_command_timeout`), so neither can run
-    long enough by itself to blow through that budget.
+    PR #80 review finding 1: the revalidation call and the actual guest
+    command are two SEPARATE subprocess invocations, and each gets its OWN
+    timeout computed FRESH, right before it starts
+    (`_next_command_timeout(absolute_deadline, monotonic=monotonic)`) --
+    never one value computed once and reused for both, which used to let one
+    logical command path consume roughly twice its intended share of the
+    settling budget. Either computation returning ``None`` (no real budget
+    left to safely start a command at all) stops here with
+    `ProbeUnknown("settling_budget_exhausted")` rather than launching a
+    command with an artificially floored timeout.
     """
 
-    revalidate_live_target(runner, vmid, expected_node, timeout=timeout)
+    revalidation_timeout = _next_command_timeout(absolute_deadline, monotonic=monotonic)
+    if revalidation_timeout is None:
+        raise ProbeUnknown("settling_budget_exhausted")
+    revalidate_live_target(runner, vmid, expected_node, timeout=revalidation_timeout)
+
+    command_timeout = _next_command_timeout(absolute_deadline, monotonic=monotonic)
+    if command_timeout is None:
+        raise ProbeUnknown("settling_budget_exhausted")
     inner = ("pct", "exec", str(vmid), "--", *tail)
     if expected_node == local_node:
-        result = _command(runner, inner, timeout=timeout, max_output=max_output)
+        result = _command(runner, inner, timeout=command_timeout, max_output=max_output)
     else:
         # Routing to another cluster member is the ONE place a command line
         # exists rather than an argv list, because that is what ssh hands the
@@ -801,7 +835,7 @@ def _run_guest_command(
             f"root@{expected_node}",
             shlex.join(inner),
         )
-        result = _command(runner, argv, timeout=timeout, max_output=max_output)
+        result = _command(runner, argv, timeout=command_timeout, max_output=max_output)
     if result.returncode == 255:
         raise ProbeUnknown("guest_unavailable")
     return result
@@ -902,7 +936,8 @@ def _systemd_round(
     targets: Sequence[str],
     budget: _RoundBudget,
     *,
-    remaining_budget: float,
+    absolute_deadline: float,
+    monotonic: Clock,
 ) -> dict[str, tuple[str, str]]:
     """One batched ``systemctl show`` covering every requested unit.
 
@@ -911,9 +946,9 @@ def _systemd_round(
     verified alias behaviour (``ssh.service``/``sshd.service``) means two
     distinct requested targets can report the identical ``Id``.
 
-    ``remaining_budget`` is what is ACTUALLY left of the bounded settling
-    deadline; the guest command this issues is clamped to it and can never
-    run long enough by itself to blow through that deadline.
+    ``absolute_deadline``/``monotonic`` are the settling window's single
+    reference clock; the guest command this issues gets a timeout computed
+    fresh, immediately before it starts, from what is ACTUALLY left of it.
     """
 
     if not targets:
@@ -940,7 +975,8 @@ def _systemd_round(
             ),
             data_arguments=targets,
             max_output=64 * 1024 * max(1, len(targets)),
-            timeout=_clamped_command_timeout(remaining_budget),
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
     except (ProbeUnknown, HealthError) as exc:
         reason = _guest_family_reason(exc)
@@ -1013,7 +1049,8 @@ def _docker_daemon_names(
     local_node: str,
     budget: _RoundBudget,
     *,
-    remaining_budget: float,
+    absolute_deadline: float,
+    monotonic: Clock,
 ) -> frozenset[str] | tuple[str, str]:
     """The fixed daemon oracle: every existing container name, or a family
     (outcome, reason) if the daemon could not be read this round."""
@@ -1036,7 +1073,8 @@ def _docker_daemon_names(
                 DOCKER_NAME_LIST_FORMAT,
             ),
             max_output=1024 * 1024,
-            timeout=_clamped_command_timeout(remaining_budget),
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
     except (ProbeUnknown, HealthError) as exc:
         return "unknown", _guest_family_reason(exc)
@@ -1070,7 +1108,8 @@ def _docker_inspect_batch(
     targets: Sequence[str],
     budget: _RoundBudget,
     *,
-    remaining_budget: float,
+    absolute_deadline: float,
+    monotonic: Clock,
 ) -> dict[str, tuple[str, str, str]] | tuple[str, str]:
     """One batched ``docker inspect``. Returns ``{name: (status, restarting,
     health)}`` for every target it could read, mapped BY NAME -- never by
@@ -1100,7 +1139,8 @@ def _docker_inspect_batch(
             ),
             data_arguments=targets,
             max_output=64 * 1024 * max(1, len(targets)),
-            timeout=_clamped_command_timeout(remaining_budget),
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
     except (ProbeUnknown, HealthError) as exc:
         return "unknown", _guest_family_reason(exc)
@@ -1167,7 +1207,8 @@ def _docker_round(
     probes: Sequence[dict[str, Any]],
     budget: _RoundBudget,
     *,
-    remaining_budget: float,
+    absolute_deadline: float,
+    monotonic: Clock,
 ) -> dict[int, tuple[str, str]]:
     """One round's worth of Docker probes: at most one ``docker ps`` and one
     ``docker inspect``, batched across every Docker target regardless of how
@@ -1182,7 +1223,8 @@ def _docker_round(
         expected_node,
         local_node,
         budget,
-        remaining_budget=remaining_budget,
+        absolute_deadline=absolute_deadline,
+        monotonic=monotonic,
     )
     if isinstance(daemon_names, tuple):
         outcome, reason = daemon_names
@@ -1196,7 +1238,8 @@ def _docker_round(
         local_node,
         present,
         budget,
-        remaining_budget=remaining_budget,
+        absolute_deadline=absolute_deadline,
+        monotonic=monotonic,
     )
     if isinstance(inspected, tuple):
         family_outcome, family_reason = inspected
@@ -1244,7 +1287,8 @@ def _guest_operational_round(
     probes: Sequence[dict[str, Any]],
     budget: _RoundBudget,
     *,
-    remaining_budget: float,
+    absolute_deadline: float,
+    monotonic: Clock,
 ) -> dict[int, tuple[str, str]]:
     """The one `guest_operational` probe, if the contract declares one.
 
@@ -1269,7 +1313,8 @@ def _guest_operational_round(
             local_node,
             GUEST_OPERATIONAL_COMMAND,
             max_output=1024,
-            timeout=_clamped_command_timeout(remaining_budget),
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
     except (ProbeUnknown, HealthError) as exc:
         reason = _guest_family_reason(exc)
@@ -1293,7 +1338,8 @@ def _run_one_round(
     probes: Sequence[dict[str, Any]],
     budget: _RoundBudget,
     *,
-    remaining_budget: float,
+    absolute_deadline: float,
+    monotonic: Clock,
 ) -> dict[int, tuple[str, str]]:
     """Observe EVERY still-live frozen probe in one bounded batched round."""
 
@@ -1315,7 +1361,8 @@ def _run_one_round(
             local_node,
             targets,
             budget,
-            remaining_budget=remaining_budget,
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
         for probe in systemd_probes:
             results[int(probe["index"])] = by_target[str(probe["target"])]
@@ -1328,7 +1375,8 @@ def _run_one_round(
                 local_node,
                 docker_probes,
                 budget,
-                remaining_budget=remaining_budget,
+                absolute_deadline=absolute_deadline,
+                monotonic=monotonic,
             )
         )
     if guest_probes:
@@ -1340,7 +1388,8 @@ def _run_one_round(
                 local_node,
                 guest_probes,
                 budget,
-                remaining_budget=remaining_budget,
+                absolute_deadline=absolute_deadline,
+                monotonic=monotonic,
             )
         )
     return results
@@ -1427,7 +1476,6 @@ def evaluate_health_contract_settling(
         # ever produce a verdict either -- one honest observation round for
         # them, then stop immediately rather than waiting out the deadline
         # for something time cannot resolve.
-        remaining = max(0.0, absolute_deadline - monotonic())
         round_start = monotonic()
         fresh = _run_one_round(
             runner,
@@ -1436,7 +1484,8 @@ def evaluate_health_contract_settling(
             local_node,
             live_probes,
             budget,
-            remaining_budget=remaining,
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
         round_span_ms = int((monotonic() - round_start) * 1000)
         return {
@@ -1460,7 +1509,6 @@ def evaluate_health_contract_settling(
         if round_index > 0 and monotonic() >= absolute_deadline:
             break
         round_index += 1
-        remaining = max(0.0, absolute_deadline - monotonic())
         round_start = monotonic()
         fresh = _run_one_round(
             runner,
@@ -1469,7 +1517,8 @@ def evaluate_health_contract_settling(
             local_node,
             live_probes,
             budget,
-            remaining_budget=remaining,
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
         round_span = monotonic() - round_start
         last_round_span_ms = int(round_span * 1000)
@@ -1519,6 +1568,15 @@ _DOCKER_DISCOVERY_INSPECT_FORMAT = (
     "{{.Name}}\t{{.State.Status}}\t"
     "{{if .Config.Healthcheck}}healthcheck{{else}}none{{end}}"
 )
+
+#: Every value `.State.Status` can actually report (Docker Engine API
+#: container state). Closed set: an unrecognised token is never guessed at,
+#: it makes the whole batch undecidable exactly like a malformed line does.
+_DOCKER_DISCOVERY_VALID_STATUSES = frozenset(
+    {"created", "running", "paused", "restarting", "removing", "exited", "dead"}
+)
+#: The template above has exactly two branches -- nothing else is legal.
+_DOCKER_DISCOVERY_VALID_HEALTHCHECK_MARKERS = frozenset({"healthcheck", "none"})
 
 #: Exact code-owned exclusions -- never a distro-specific deny-list grown ad
 #: hoc. A PACKAGE_UNIT origin never demotes a candidate by itself; only
@@ -1576,7 +1634,8 @@ def _discover_docker_candidates(
     expected_node: str,
     local_node: str,
     *,
-    remaining_budget: float,
+    absolute_deadline: float,
+    monotonic: Clock,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Returns ``(candidates, undecided_status)``. ``undecided_status`` is
     ``None`` on a truthful, complete read (zero candidates included, since a
@@ -1601,7 +1660,8 @@ def _discover_docker_candidates(
                 DOCKER_NAME_LIST_FORMAT,
             ),
             max_output=1024 * 1024,
-            timeout=_clamped_command_timeout(remaining_budget),
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
     except (ProbeUnknown, HealthError):
         return [], "undecidable"
@@ -1647,48 +1707,73 @@ def _discover_docker_candidates(
             ),
             data_arguments=names,
             max_output=64 * 1024 * len(names),
-            timeout=_clamped_command_timeout(remaining_budget),
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
     except (ProbeUnknown, HealthError):
         return [], "undecidable"
     if inspected.timed_out or inspected.output_exceeded:
         return [], "undecidable"
-
-    candidates: list[dict[str, Any]] = []
+    if inspected.returncode != 0:
+        # PR #80 review finding 2/3A: a complete, successful batch answers
+        # with rc=0 for every requested name. A non-zero exit means at least
+        # one lookup did not resolve cleanly, and this file never guesses
+        # which -- the whole family is undecidable rather than a fabricated
+        # subset that could make incomplete discovery look complete.
+        return [], "undecidable"
     try:
         stdout = inspected.stdout.decode("utf-8")
     except UnicodeDecodeError:
         return [], "undecidable"
+
+    # Positive completeness proof: `resolved` must end up covering EXACTLY
+    # the enumerated `names` set -- no fewer (a name silently missing), no
+    # more (an unexpected name), and never twice (a duplicate row). Any
+    # malformed line, unrecognised status, or unrecognised healthcheck
+    # marker makes the whole batch undecidable immediately: this file never
+    # drops a bad line and keeps the rest, because a partial accept is
+    # exactly the "uncertainty read as absence" the frozen architecture
+    # forbids.
+    resolved: dict[str, tuple[str, str]] = {}
     for line in stdout.splitlines():
         if not line.strip():
             continue
         fields = line.split("\t")
         if len(fields) != 3 or not fields[0].startswith("/"):
-            continue
+            return [], "undecidable"
         name, status, healthcheck = fields[0][1:], fields[1], fields[2]
-        if name not in names:
-            continue
-        has_healthcheck = healthcheck == "healthcheck"
-        candidates.append(
-            {
-                "adapter": "docker",
-                "kind": (
-                    "docker_container_healthy"
-                    if has_healthcheck
-                    else "docker_container_running"
-                ),
-                "target": name,
-                "observed_state": status if status else "unknown",
-                "origin": None,
-                "role_hint": "workload_candidate",
-                "recommended": False,
-                "rationale": (
-                    "docker_healthcheck_present"
-                    if has_healthcheck
-                    else "docker_container_exists"
-                ),
-            }
-        )
+        if (
+            name not in names
+            or name in resolved
+            or status not in _DOCKER_DISCOVERY_VALID_STATUSES
+            or healthcheck not in _DOCKER_DISCOVERY_VALID_HEALTHCHECK_MARKERS
+        ):
+            return [], "undecidable"
+        resolved[name] = (status, healthcheck)
+    if set(resolved) != set(names):
+        return [], "undecidable"
+
+    candidates: list[dict[str, Any]] = [
+        {
+            "adapter": "docker",
+            "kind": (
+                "docker_container_healthy"
+                if resolved[name][1] == "healthcheck"
+                else "docker_container_running"
+            ),
+            "target": name,
+            "observed_state": resolved[name][0],
+            "origin": None,
+            "role_hint": "workload_candidate",
+            "recommended": False,
+            "rationale": (
+                "docker_healthcheck_present"
+                if resolved[name][1] == "healthcheck"
+                else "docker_container_exists"
+            ),
+        }
+        for name in names
+    ]
     return candidates, None
 
 
@@ -1698,7 +1783,8 @@ def _discover_systemd_candidates(
     expected_node: str,
     local_node: str,
     *,
-    remaining_budget: float,
+    absolute_deadline: float,
+    monotonic: Clock,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Returns ``(candidates, undecided_status)``, exactly like the Docker
     family above."""
@@ -1717,9 +1803,11 @@ def _discover_systemd_candidates(
                 "--type=service",
                 "--no-legend",
                 "--no-pager",
+                "--plain",
             ),
             max_output=1024 * 1024,
-            timeout=_clamped_command_timeout(remaining_budget),
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
         failed = _run_guest_command(
             runner,
@@ -1736,9 +1824,11 @@ def _discover_systemd_candidates(
                 "--state=failed",
                 "--no-legend",
                 "--no-pager",
+                "--plain",
             ),
             max_output=1024 * 1024,
-            timeout=_clamped_command_timeout(remaining_budget),
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
     except (ProbeUnknown, HealthError):
         return [], "undecidable"
@@ -1768,7 +1858,18 @@ def _discover_systemd_candidates(
             parts = line.split()
             if not parts:
                 continue
-            unit = parts[0].lstrip("●").strip()
+            # PR #80 review finding 3B: `systemctl list-units --state=failed`
+            # prefixes a FAILED unit's row with a bullet glyph ("● unit.name
+            # loaded failed failed ...") even under `--no-legend`/`--no-
+            # pager` (verified: systemd 257), which used to make `parts[0]`
+            # the bullet itself rather than the unit name -- silently
+            # dropping every failed unit this family exists to find. Ad hoc
+            # stripping of that one glyph was never the fix: `--plain`
+            # (requested above, verified to remove it) is a machine-stable
+            # command CONTRACT, so this parses `parts[0]` directly and
+            # trusts it -- a token that still fails the unit-name shape
+            # below is treated as a malformed line, not specially unwrapped.
+            unit = parts[0]
             if (
                 SYSTEMD_UNIT_RE.fullmatch(unit)
                 and unit.endswith(SYSTEMD_UNIT_SUFFIXES)
@@ -1807,7 +1908,8 @@ def _discover_systemd_candidates(
             ),
             data_arguments=units,
             max_output=64 * 1024 * len(units),
-            timeout=_clamped_command_timeout(remaining_budget),
+            absolute_deadline=absolute_deadline,
+            monotonic=monotonic,
         )
     except (ProbeUnknown, HealthError):
         return [], "undecidable"
@@ -1868,21 +1970,23 @@ def discover_health_candidates(
     """
 
     start = monotonic()
-    deadline = start + DISCOVERY_DEADLINE_SECONDS
+    absolute_deadline = start + DISCOVERY_DEADLINE_SECONDS
 
     docker_candidates, docker_status = _discover_docker_candidates(
         runner,
         vmid,
         expected_node,
         local_node,
-        remaining_budget=max(0.0, deadline - monotonic()),
+        absolute_deadline=absolute_deadline,
+        monotonic=monotonic,
     )
     systemd_candidates, systemd_status = _discover_systemd_candidates(
         runner,
         vmid,
         expected_node,
         local_node,
-        remaining_budget=max(0.0, deadline - monotonic()),
+        absolute_deadline=absolute_deadline,
+        monotonic=monotonic,
     )
 
     # CRITICAL frozen rule: discovery uncertainty in EITHER family must

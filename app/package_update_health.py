@@ -180,6 +180,10 @@ HOST_PROBE_REASONS: frozenset[str] = frozenset(
         "command_timed_out",
         "malformed_output",
         "docker_daemon_unavailable",
+        # PR #80 review finding 1: the host's own absolute settling deadline
+        # ran out before this probe's family could safely start (or finish)
+        # another subprocess.
+        "settling_budget_exhausted",
     }
 )
 
