@@ -1318,6 +1318,83 @@ def test_package_update_job_view_rejects_a_stale_reason_beside_a_verdict() -> No
         _transport_http_module._package_update_job_view(RESOURCE_CT, payload)
 
 
+def _mixed_observation_payload(unresolved_reason: str) -> dict:
+    """The exact wire shape a NON-DECISIVE round over an advanced contract
+    produces: one probe still transient, one already PASSED, no verdict --
+    parameterized by the whole-request classification the backend puts
+    beside them."""
+
+    payload = _rollback_job_payload(RESOURCE_CT)
+    payload["checkpoint"] = "health_started"
+    payload["health"] = {
+        "contract_revision": 3,
+        "started_at": "2026-09-06T13:40:16.792041+00:00",
+        "completed_at": None,
+        "outcome": None,
+        "evidence": "observation",
+        "probes": [
+            {
+                "index": 0,
+                "kind": "docker_container_running",
+                "target": "web",
+                "outcome": "unknown",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "container_restarting",
+                "definitive": False,
+            },
+            {
+                "index": 1,
+                "kind": "systemd_unit_active",
+                "target": "nginx.service",
+                "outcome": "passed",
+                "checked_at": "2026-09-06T13:40:23.444652+00:00",
+                "reason": "unit_active",
+                "definitive": False,
+            },
+        ],
+        "settling": {"rounds": 3, "settled_seconds": 12.5, "last_round_span_ms": 40},
+        "reason": unresolved_reason,
+    }
+    return payload
+
+
+def test_a_mixed_observation_round_parses_with_its_own_blocking_reason() -> None:
+    """The corrected backend payload survives the real parse.
+
+    The attempt's classification is the BLOCKING probe's reason; the PASSED
+    probe keeps its own `unit_active` untouched. Both facts coexist, and
+    neither is derived from the other.
+    """
+
+    view = _transport_http_module._package_update_job_view(
+        RESOURCE_CT, _mixed_observation_payload("container_restarting")
+    )
+
+    assert view.health_outcome is None
+    assert view.health_evidence == "observation"
+    assert view.health_reason == "container_restarting"
+    assert [(probe.outcome.value, probe.reason) for probe in view.health_probes] == [
+        ("unknown", "container_restarting"),
+        ("passed", "unit_active"),
+    ]
+
+
+def test_the_last_probes_reason_is_not_a_legal_whole_request_reason() -> None:
+    """The consequence of the backend bug this test pins, from HA's side.
+
+    A readback that published the LAST probe's reason as the attempt's own
+    would send `unit_active` -- a PASSED-only token -- as the reason a job
+    reached NO result. Home Assistant refuses it, so the defect surfaced as
+    a rejected readback for exactly the advanced contracts that produce
+    mixed rounds, not as a subtly wrong string.
+    """
+
+    with pytest.raises(HubinetOpsInvalidResponse):
+        _transport_http_module._package_update_job_view(
+            RESOURCE_CT, _mixed_observation_payload("unit_active")
+        )
+
+
 def test_package_update_job_view_rejects_an_unknown_probe_outcome() -> None:
     """A malformed backend answer must fail closed, never render a guess."""
 

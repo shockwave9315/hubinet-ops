@@ -373,15 +373,27 @@ def _package_update_health_observation_body(
     probe rows, and no reason. It is re-validated against the closed
     taxonomy here rather than trusted from event JSON, and only ever the
     LATEST attempt's -- attempts are never merged.
+
+    ``unresolved_reason`` and a probe's own ``probe_reason`` are held in
+    SEPARATE names on purpose, and the names are load-bearing rather than
+    stylistic. They are two different facts drawn from two different closed
+    sets: the attempt's classification must be an UNKNOWN-family token,
+    while a probe's may be any bounded token including a PASSED-only one --
+    a non-decisive round legitimately contains a probe that already read
+    PASSED. Reusing one name let the loop's last iteration decide the
+    attempt's classification, which published `unit_active` as the reason a
+    job had no result: bounded, but self-contradictory, and correctly
+    refused by Home Assistant's own validator.
     """
 
     event = _latest_health_outcome_unknown_event(store, job.job_id)
     if event is None:
         return [], None, None
-    raw_reason = event.details.get("reason")
-    reason = (
-        raw_reason
-        if isinstance(raw_reason, str) and raw_reason in UNRESOLVED_HEALTH_REASONS
+    raw_unresolved_reason = event.details.get("reason")
+    unresolved_reason = (
+        raw_unresolved_reason
+        if isinstance(raw_unresolved_reason, str)
+        and raw_unresolved_reason in UNRESOLVED_HEALTH_REASONS
         else None
     )
     frozen_by_index = {probe.probe_index: probe for probe in job.health_probes}
@@ -393,15 +405,15 @@ def _package_update_health_observation_body(
                 continue
             index = raw.get("index")
             outcome = raw.get("outcome")
-            reason = raw.get("reason")
+            probe_reason = raw.get("reason")
             frozen = (
                 frozen_by_index.get(index) if type(index) is int else None
             )
             if (
                 frozen is None
                 or not isinstance(outcome, str)
-                or not isinstance(reason, str)
-                or reason not in HEALTH_PROBE_REASONS
+                or not isinstance(probe_reason, str)
+                or probe_reason not in HEALTH_PROBE_REASONS
             ):
                 continue
             probes.append(
@@ -411,7 +423,7 @@ def _package_update_health_observation_body(
                     "target": frozen.target,
                     "outcome": outcome,
                     "checked_at": event.created_at,
-                    "reason": reason,
+                    "reason": probe_reason,
                     # `evidence == "observation"`: never a verdict, and never
                     # merged from more than one round or attempt.
                     "definitive": False,
@@ -427,7 +439,7 @@ def _package_update_health_observation_body(
             "settled_seconds": settled_seconds,
             "last_round_span_ms": last_round_span_ms,
         }
-    return probes, settling, reason
+    return probes, settling, unresolved_reason
 
 
 def _package_update_health_body(

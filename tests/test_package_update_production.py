@@ -54,6 +54,7 @@ from app.inventory import (
     ObservedSnapshot,
     PackageScanFailure,
     PackageUpdateCheckpoint,
+    PackageUpdateEventType,
     PackageUpdateIssuanceRefused,
     PackageUpdateJobStatus,
     ProductUpdateFenceError,
@@ -235,6 +236,32 @@ class ScriptedHealthHostControl:
                 probes=(),
                 evaluation_status=HealthEvaluationStatus.UNRESOLVED,
                 reason="guest_unavailable",
+            )
+        if isinstance(outcome, tuple):
+            # One UNRESOLVED observation round with EXPLICIT per-probe
+            # (outcome, reason) pairs, in frozen index order. Unlike
+            # "probe_unknown" this can mix outcomes, which is what a
+            # non-decisive round legitimately looks like when one probe is
+            # still transient and another already read PASSED.
+            return HostHealthResult(
+                contract_revision=request.health_contract_revision,
+                contract_fingerprint=request.health_contract_fingerprint,
+                probes=tuple(
+                    HostProbeResult(
+                        probe_index=index,
+                        kind=probe.kind,
+                        target=probe.target,
+                        outcome=probe_outcome,
+                        reason=probe_reason,
+                    )
+                    for index, (probe, (probe_outcome, probe_reason)) in enumerate(
+                        zip(request.probes, outcome, strict=True)
+                    )
+                ),
+                evaluation_status=HealthEvaluationStatus.UNRESOLVED,
+                settling_rounds=3,
+                settling_seconds=12.5,
+                last_round_span_ms=40,
             )
         if outcome == "probe_unknown":
             # A genuine per-probe UNKNOWN (a settling window that ended
@@ -2196,6 +2223,111 @@ def test_a_definitive_verdict_retires_the_earlier_unresolved_reason(
         # stops advertising it.
         events = [event["event_type"] for event in body["events"]]
         assert "health_outcome_unknown" in events
+    finally:
+        system.close()
+
+
+#: The frozen contract every `ApiSystem` job carries, in canonical
+#: `(kind, target)` order -- `docker_container_running` sorts before
+#: `systemd_unit_active`, so index 0 is the Docker probe.
+_MIXED_OBSERVATION = (
+    (HealthProbeOutcome.UNKNOWN, "container_restarting"),
+    (HealthProbeOutcome.PASSED, "unit_active"),
+)
+
+#: Both probes unresolved, with DIFFERENT bounded reasons. Every token here
+#: is a legal UNKNOWN one, so nothing but the top-level reason's own
+#: correctness can distinguish a right answer from a wrong one.
+_TWO_UNKNOWN_OBSERVATION = (
+    (HealthProbeOutcome.UNKNOWN, "container_restarting"),
+    (HealthProbeOutcome.UNKNOWN, "unit_job_pending"),
+)
+
+
+def test_the_unresolved_reason_is_the_attempts_own_not_the_last_probes(
+    tmp_path: Path,
+) -> None:
+    """The whole-request classification and a probe's own reason are two
+    different facts, and the readback must not confuse them.
+
+    A non-decisive round legitimately mixes outcomes: one probe still
+    transient, another already read PASSED. The attempt's classification is
+    the BLOCKING probe's reason (`container_restarting`); `unit_active` is a
+    PASSED-only token that can never describe why an evaluation reached no
+    result. Publishing it as the top-level reason produces a payload that is
+    self-contradictory on its face -- and one Home Assistant's own validator
+    correctly refuses, so the bug would surface as a rejected readback for
+    exactly the advanced contracts this stage still supports.
+    """
+
+    system = ApiSystem(tmp_path, health=[_MIXED_OBSERVATION])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        health = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()["health"]
+
+        assert health["outcome"] is None
+        assert health["evidence"] == "observation"
+        assert health["reason"] == "container_restarting"
+        assert health["reason"] != "unit_active"
+        # It must be an UNKNOWN-family token by construction, never merely
+        # a bounded one -- that is the invariant HA independently re-proves.
+        assert health["reason"] in UNRESOLVED_HEALTH_REASONS
+
+        # Each probe still carries its OWN reason, untouched.
+        assert [
+            (probe["kind"], probe["outcome"], probe["reason"])
+            for probe in health["probes"]
+        ] == [
+            ("docker_container_running", "unknown", "container_restarting"),
+            ("systemd_unit_active", "passed", "unit_active"),
+        ]
+    finally:
+        system.close()
+
+
+def test_the_unresolved_reason_does_not_depend_on_which_probe_is_last(
+    tmp_path: Path,
+) -> None:
+    """The ordering witness, with every token individually legal.
+
+    Both probes are UNKNOWN and both reasons are valid UNKNOWN-family
+    tokens, so a payload built from either one would pass every bounded-set
+    check on both sides. Only the attempt's OWN classification -- the FIRST
+    unresolved probe, which is what the orchestrator recorded -- is correct,
+    and reading the last probe's reason instead is indistinguishable from
+    it by validation alone.
+    """
+
+    system = ApiSystem(tmp_path, health=[_TWO_UNKNOWN_OBSERVATION])
+    try:
+        started = system.start().json()
+        system.bind(started["job_id"])
+        system.run_worker()
+
+        health = system.get(
+            f"/r0/v1/resources/{system.resource_id}/package-update"
+        ).json()["health"]
+
+        assert health["reason"] == "container_restarting"
+        assert health["reason"] != "unit_job_pending"
+        assert [probe["reason"] for probe in health["probes"]] == [
+            "container_restarting",
+            "unit_job_pending",
+        ]
+        # The durable event is the authority for what was recorded; the
+        # readback must simply not corrupt it on the way out.
+        events = system.store.list_package_update_job_events(started["job_id"])
+        unknown = [
+            event
+            for event in events
+            if event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN
+        ][-1]
+        assert unknown.details["reason"] == "container_restarting"
     finally:
         system.close()
 
